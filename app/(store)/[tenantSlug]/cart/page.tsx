@@ -13,11 +13,11 @@ export default async function StoreCartPage({ params }: StoreCartPageProps) {
         href={`/${tenantSlug}`}
         className="text-sm font-medium text-zinc-600 hover:text-zinc-900"
       >
-        Back to storefront
+        العودة إلى المتجر
       </Link>
-      <h1 className="mt-4 text-2xl font-semibold text-zinc-900">Cart</h1>
+      <h1 className="mt-4 text-2xl font-semibold text-zinc-900">سلة التسوق</h1>
       <p className="mt-2 text-sm text-zinc-600">
-        Retailer order placement for {tenantSlug}.
+        إرسال طلب تجار التجزئة لـ {tenantSlug}.
       </p>
     </main>
   );
