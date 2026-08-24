@@ -1,0 +1,222 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  CASHIER
+}
+
+enum InvoiceStatus {
+  COMPLETED
+  PENDING_REVIEW
+}
+
+enum TenantSubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  PENDING
+}
+
+enum SubscriptionRecordStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  EXPIRED
+}
+
+model Tenant {
+  id                 String                   @id @default(cuid())
+  name               String
+  slug               String                   @unique
+  logo               String?
+  phone              String?
+  // Optional with no hard default: a brand-new tenant can be created before
+  // the merchant sets today's rate from the dashboard top bar. Enforce "must
+  // be set before first invoice" in application logic, not the schema.
+  dailyExchangeRate  Decimal?                 @db.Decimal(18, 4)
+  subscriptionStatus TenantSubscriptionStatus @default(PENDING)
+  expiresAt          DateTime?
+  createdAt          DateTime                 @default(now())
+
+  users            User[]
+  products         Product[]
+  customers        Customer[]
+  invoices         Invoice[]
+  customerPayments CustomerPayment[]
+  subscriptions    Subscription[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         UserRole
+  createdAt    DateTime @default(now())
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+
+  @@index([tenantId])
+}
+
+model Product {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  category  String?
+  isPublic  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  units        ProductUnit[]
+  batches      ProductBatch[]
+  invoiceItems InvoiceItem[]
+
+  @@index([tenantId])
+}
+
+model ProductUnit {
+  id               String  @id @default(cuid())
+  productId        String
+  unitName         String
+  conversionFactor Decimal @db.Decimal(18, 4)
+  priceUSD         Decimal @db.Decimal(18, 4)
+  barcode          String?
+
+  product      Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  batches      ProductBatch[]
+  invoiceItems InvoiceItem[]
+
+  @@index([productId])
+}
+
+model ProductBatch {
+  id          String    @id @default(cuid())
+  productId   String
+  unitId      String
+  batchNumber String
+  quantity    Decimal   @db.Decimal(18, 4)
+  expiryDate  DateTime?
+
+  product Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit    ProductUnit @relation(fields: [unitId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([unitId])
+  // Added: the T3 expiry dashboard (30/60-day alerts) queries this column on
+  // every load. Without an index, that's a full-table scan across every
+  // tenant's batches as the catalog grows.
+  @@index([expiryDate])
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  phone     String?
+  shopName  String?
+  createdAt DateTime @default(now())
+
+  // Deliberately no balanceDebtUSD column here — net debt is always
+  // computed on-the-fly as SUM(Invoice.debtAmountUSD) - SUM(CustomerPayment.amountUSD)
+  // to avoid a stored balance drifting from the transaction history.
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+  payments CustomerPayment[]
+
+  @@index([tenantId])
+}
+
+model Invoice {
+  id               String        @id @default(cuid())
+  tenantId         String
+  userId           String
+  customerId       String
+  totalUSD         Decimal       @db.Decimal(18, 4)
+  totalSYP         Decimal       @db.Decimal(18, 4)
+  exchangeRateUsed Decimal       @db.Decimal(18, 4)
+  paidAmountUSD    Decimal       @db.Decimal(18, 4)
+  debtAmountUSD    Decimal       @db.Decimal(18, 4)
+  isPaid           Boolean       @default(false)
+  status           InvoiceStatus @default(COMPLETED)
+  // Default true covers invoices created directly online (not via the
+  // offline queue). The /api/sync handler must set this explicitly to
+  // true alongside syncedAt = now() when it processes an offline payload —
+  // never rely on this default for anything that passed through Dexie.
+  isSynced         Boolean       @default(true)
+  offlineId        String?       @unique
+  syncedAt         DateTime?
+  createdAt        DateTime      @default(now())
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customer Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  items    InvoiceItem[]
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([offlineId])
+}
+
+model InvoiceItem {
+  id           String  @id @default(cuid())
+  invoiceId    String
+  productId    String
+  unitId       String
+  quantity     Decimal @db.Decimal(18, 4)
+  unitPriceUSD Decimal @db.Decimal(18, 4)
+
+  invoice Invoice     @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit    ProductUnit @relation(fields: [unitId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model CustomerPayment {
+  id            String    @id @default(cuid())
+  tenantId      String
+  customerId    String
+  amountUSD     Decimal   @db.Decimal(18, 4)
+  amountSYP     Decimal   @db.Decimal(18, 4)
+  exchangeRate  Decimal   @db.Decimal(18, 4)
+  paymentMethod String
+  receiptNo     String?
+  notes         String?
+  isSynced      Boolean   @default(true)
+  offlineId     String?   @unique
+  // Added: partial repayments are logged from the same offline POS as
+  // invoices (T4), so they're exposed to the exact same device clock-drift
+  // problem. Server sets this to now() on sync — mirrors Invoice.syncedAt.
+  syncedAt      DateTime?
+  createdAt     DateTime  @default(now())
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([offlineId])
+}
+
+model Subscription {
+  id              String                   @id @default(cuid())
+  tenantId        String
+  receiptImageURL String?
+  amountUSD       Decimal                  @db.Decimal(18, 4)
+  status          SubscriptionRecordStatus @default(PENDING_APPROVAL)
+  expiresAt       DateTime?
+  createdAt       DateTime                 @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
