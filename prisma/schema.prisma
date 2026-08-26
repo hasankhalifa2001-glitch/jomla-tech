@@ -12,9 +12,16 @@ enum UserRole {
   CASHIER
 }
 
+// VOIDED: a void is treated as a real stock return (see PaymentMethod note
+// below on business-rule docs) — the reversing invoice restores inventory
+// automatically. It is never an edit to the original invoice (that would
+// break the append-only guarantee everything else here relies on); instead
+// it's a new Invoice row that references the one it reverses — see
+// `voidsInvoiceId` below.
 enum InvoiceStatus {
   COMPLETED
   PENDING_REVIEW
+  VOIDED
 }
 
 enum TenantSubscriptionStatus {
@@ -29,36 +36,55 @@ enum SubscriptionRecordStatus {
   EXPIRED
 }
 
+// ADDED SYRIATEL_CASH: the SOW names Sham Cash, Syriatel Cash, and Office
+// Transfer explicitly as the three real payment rails merchants use. Only
+// SHAM_CASH existed here before — Syriatel Cash payments were silently
+// falling into OTHER, defeating the entire point of this being an enum
+// (reliable per-method reporting). BANK_TRANSFER kept as-is for now since
+// it's already in use; revisit naming it OFFICE_TRANSFER to match the SOW
+// exactly once real data exists under it.
+enum PaymentMethod {
+  CASH
+  SHAM_CASH
+  SYRIATEL_CASH
+  BANK_TRANSFER
+  OTHER
+}
+
 model Tenant {
   id                 String                   @id @default(cuid())
   name               String
   slug               String                   @unique
   logo               String?
   phone              String?
-  // Optional with no hard default: a brand-new tenant can be created before
-  // the merchant sets today's rate from the dashboard top bar. Enforce "must
-  // be set before first invoice" in application logic, not the schema.
   dailyExchangeRate  Decimal?                 @db.Decimal(18, 4)
   subscriptionStatus TenantSubscriptionStatus @default(PENDING)
   expiresAt          DateTime?
   createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
 
   users            User[]
   products         Product[]
+  productUnits     ProductUnit[]
+  productBatches   ProductBatch[]
   customers        Customer[]
   invoices         Invoice[]
+  invoiceItems     InvoiceItem[]
   customerPayments CustomerPayment[]
   subscriptions    Subscription[]
 }
 
 model User {
-  id           String   @id @default(cuid())
-  tenantId     String
-  name         String
-  email        String   @unique
-  passwordHash String
-  role         UserRole
-  createdAt    DateTime @default(now())
+  id              String   @id @default(cuid())
+  tenantId        String
+  name            String
+  email           String   @unique
+  passwordHash    String
+  role            UserRole
+  isPlatformAdmin Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
@@ -72,7 +98,9 @@ model Product {
   name      String
   category  String?
   isPublic  Boolean  @default(false)
+  isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   units        ProductUnit[]
@@ -80,39 +108,49 @@ model Product {
   invoiceItems InvoiceItem[]
 
   @@index([tenantId])
+  @@index([tenantId, isPublic])
 }
 
 model ProductUnit {
   id               String  @id @default(cuid())
+  tenantId         String
   productId        String
   unitName         String
   conversionFactor Decimal @db.Decimal(18, 4)
   priceUSD         Decimal @db.Decimal(18, 4)
   barcode          String?
 
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   product      Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
   batches      ProductBatch[]
   invoiceItems InvoiceItem[]
 
+  @@index([tenantId])
   @@index([productId])
+  @@unique([tenantId, barcode])
 }
 
 model ProductBatch {
   id          String    @id @default(cuid())
+  tenantId    String
   productId   String
   unitId      String
   batchNumber String
+  // Can legitimately go negative (concurrent offline oversell — see prior
+  // notes) and is also the field a VOIDED invoice's negative-quantity items
+  // increment back up on stock return. Do not add a non-negative constraint
+  // without revisiting both of those flows first.
   quantity    Decimal   @db.Decimal(18, 4)
   expiryDate  DateTime?
 
-  product Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  unit    ProductUnit @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product      Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit         ProductUnit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  invoiceItems InvoiceItem[]
 
+  @@index([tenantId])
   @@index([productId])
   @@index([unitId])
-  // Added: the T3 expiry dashboard (30/60-day alerts) queries this column on
-  // every load. Without an index, that's a full-table scan across every
-  // tenant's batches as the catalog grows.
   @@index([expiryDate])
 }
 
@@ -122,11 +160,9 @@ model Customer {
   name      String
   phone     String?
   shopName  String?
+  isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
-
-  // Deliberately no balanceDebtUSD column here — net debt is always
-  // computed on-the-fly as SUM(Invoice.debtAmountUSD) - SUM(CustomerPayment.amountUSD)
-  // to avoid a stored balance drifting from the transaction history.
+  updatedAt DateTime @updatedAt
 
   tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
@@ -140,25 +176,51 @@ model Invoice {
   tenantId         String
   userId           String
   customerId       String
+  // VALIDATION RULE (enforced in the API layer, not the schema): these
+  // four numeric fields are a snapshot taken once at creation, never
+  // recomputed — that's deliberate (see debtAmountUSD note below), but it
+  // means nothing stops a bad write from storing values that don't satisfy
+  // the arithmetic they imply. Every endpoint that creates an Invoice MUST
+  // validate, before insert:
+  //   totalSYP      ≈ totalUSD * exchangeRateUsed
+  //   debtAmountUSD ≈ totalUSD - paidAmountUSD
+  // (within a small rounding tolerance). Reject the write if either check
+  // fails — do not silently recompute and overwrite what the caller sent.
   totalUSD         Decimal       @db.Decimal(18, 4)
   totalSYP         Decimal       @db.Decimal(18, 4)
   exchangeRateUsed Decimal       @db.Decimal(18, 4)
   paidAmountUSD    Decimal       @db.Decimal(18, 4)
+  // Deliberately still a stored column, not a computed property, despite
+  // being logically derivable as (totalUSD - paidAmountUSD) — unlike
+  // Customer's balance (which mutates repeatedly over time and so drifts
+  // silently), this is written exactly once at invoice creation and never
+  // updated (see: no updatedAt on this model). The risk here isn't drift
+  // across time, it's a wrong value at write time — which validation
+  // catches at the door, not by giving up the historical snapshot. Keeping
+  // it stored also means a future change to rounding/exchange logic can
+  // never retroactively alter what a past invoice is shown to say.
   debtAmountUSD    Decimal       @db.Decimal(18, 4)
   isPaid           Boolean       @default(false)
   status           InvoiceStatus @default(COMPLETED)
-  // Default true covers invoices created directly online (not via the
-  // offline queue). The /api/sync handler must set this explicitly to
-  // true alongside syncedAt = now() when it processes an offline payload —
-  // never rely on this default for anything that passed through Dexie.
   isSynced         Boolean       @default(true)
   offlineId        String?       @unique
   syncedAt         DateTime?
   createdAt        DateTime      @default(now())
 
+  // BUSINESS RULE (decided): a void = a real physical stock return, not a
+  // pure bookkeeping correction. The application layer that creates a
+  // VOIDED invoice MUST include InvoiceItems mirroring the original ones
+  // with negated `quantity`, and MUST increment the matching
+  // ProductBatch.quantity by that same (absolute) amount when it does. A
+  // pure data-entry mistake with no physical stock movement is NOT handled
+  // by this mechanism — record an offsetting CustomerPayment instead.
+  voidsInvoiceId String?  @unique
+  voidsInvoice   Invoice? @relation("InvoiceVoid", fields: [voidsInvoiceId], references: [id], onDelete: Restrict)
+  voidedBy       Invoice? @relation("InvoiceVoid")
+
   tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  customer Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  customer Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
   items    InvoiceItem[]
 
   @@index([tenantId])
@@ -168,39 +230,59 @@ model Invoice {
 
 model InvoiceItem {
   id           String  @id @default(cuid())
+  tenantId     String
   invoiceId    String
   productId    String
   unitId       String
+  // REQUIRED (not nullable): every line item must record exactly which
+  // physical batch its stock came from — this is what makes FIFO deduction
+  // traceable and, critically, what a VOIDED invoice's reversal writes
+  // back to. Without this, "return the stock" has no unambiguous target
+  // once a product has more than one open batch.
+  //
+  // BUSINESS RULE: if a sold quantity spans more than one batch (the
+  // nearest batch doesn't have enough left), split it into multiple
+  // InvoiceItem rows on the SAME invoice — one per batch — rather than
+  // inventing a many-to-many allocation table. A 15-unit sale drawing 10
+  // from batch A and 5 from batch B is two InvoiceItem rows, not one.
+  //
+  // Negative `quantity` on a VOIDED invoice's items = stock returned to
+  // THIS specific batchId. Positive everywhere else = stock deducted from
+  // it. See the BUSINESS RULE note on Invoice.voidsInvoiceId above.
+  batchId      String
   quantity     Decimal @db.Decimal(18, 4)
   unitPriceUSD Decimal @db.Decimal(18, 4)
 
-  invoice Invoice     @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-  product Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  unit    ProductUnit @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoice Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  unit    ProductUnit  @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  // Restrict, matching product/unit above: a batch with sales history
+  // attached must never be hard-deletable, even once fully depleted.
+  batch   ProductBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
 
+  @@index([tenantId])
   @@index([invoiceId])
+  @@index([batchId])
 }
 
 model CustomerPayment {
-  id            String    @id @default(cuid())
+  id            String        @id @default(cuid())
   tenantId      String
   customerId    String
-  amountUSD     Decimal   @db.Decimal(18, 4)
-  amountSYP     Decimal   @db.Decimal(18, 4)
-  exchangeRate  Decimal   @db.Decimal(18, 4)
-  paymentMethod String
+  amountUSD     Decimal       @db.Decimal(18, 4)
+  amountSYP     Decimal       @db.Decimal(18, 4)
+  exchangeRate  Decimal       @db.Decimal(18, 4)
+  paymentMethod PaymentMethod
   receiptNo     String?
   notes         String?
-  isSynced      Boolean   @default(true)
-  offlineId     String?   @unique
-  // Added: partial repayments are logged from the same offline POS as
-  // invoices (T4), so they're exposed to the exact same device clock-drift
-  // problem. Server sets this to now() on sync — mirrors Invoice.syncedAt.
+  isSynced      Boolean       @default(true)
+  offlineId     String?       @unique
   syncedAt      DateTime?
-  createdAt     DateTime  @default(now())
+  createdAt     DateTime      @default(now())
 
   tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
 
   @@index([tenantId])
   @@index([customerId])
@@ -215,8 +297,10 @@ model Subscription {
   status          SubscriptionRecordStatus @default(PENDING_APPROVAL)
   expiresAt       DateTime?
   createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId])
+  @@index([status])
 }

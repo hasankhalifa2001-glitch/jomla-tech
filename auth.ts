@@ -1,0 +1,209 @@
+import NextAuth from "next-auth";
+import Credentials from "next-auth/providers/credentials";
+import bcrypt from "bcryptjs";
+import { prisma } from "@/lib/db";
+import type { DefaultSession } from "next-auth";
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
+declare module "next-auth" {
+    interface User {
+        id?: string;
+        role?: "ADMIN" | "CASHIER";
+        tenantId?: string;
+        tenantSlug?: string;
+        tenantName?: string;
+        dailyExchangeRate?: number | null;
+        subscriptionStatus?: "ACTIVE" | "EXPIRED" | "PENDING";
+        // Platform-level privilege (T6 Super-Admin dashboard), distinct
+        // from tenant-scoped `role` — a platform admin isn't a member of
+        // any tenant's staff, just additionally privileged.
+        isPlatformAdmin?: boolean;
+    }
+
+    interface Session {
+        user: {
+            id: string;
+            email: string;
+            name?: string | null;
+            image?: string | null;
+            role: "ADMIN" | "CASHIER";
+            tenantId: string;
+            tenantSlug: string;
+            tenantName: string;
+            // Snapshot from the moment this session was issued or last
+            // refreshed via update() — NOT a live value. The POS/dashboard
+            // must still poll or re-fetch the rate independently, since a
+            // second device (e.g. a cashier's phone) won't see an admin's
+            // edit until its own session is refreshed.
+            dailyExchangeRate: number | null;
+            subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+            isPlatformAdmin: boolean;
+        } & DefaultSession["user"];
+    }
+}
+
+declare module "@auth/core/jwt" {
+    interface JWT {
+        id?: string;
+        role?: "ADMIN" | "CASHIER";
+        tenantId?: string;
+        tenantSlug?: string;
+        tenantName?: string;
+        dailyExchangeRate?: number | null;
+        subscriptionStatus?: "ACTIVE" | "EXPIRED" | "PENDING";
+        isPlatformAdmin?: boolean;
+    }
+}
+
+// Fail fast if the secret is missing, instead of silently falling back to a
+// value that would otherwise sit in source control. An app running with an
+// unset AUTH_SECRET should never boot.
+function requireAuthSecret(): string {
+    const secret = process.env.AUTH_SECRET;
+    if (!secret || secret.trim().length === 0) {
+        throw new Error(
+            "AUTH_SECRET is not set. Generate one with `openssl rand -base64 32` " +
+            "and add it to your environment before starting the app."
+        );
+    }
+    return secret;
+}
+
+// Optional but recommended: throttle login attempts per email so a brute-
+// force script can't hammer authorize(). Reuses the same Upstash Redis
+// instance already provisioned for T5's order rate limiting. Activates
+// automatically once UPSTASH_REDIS_REST_URL/TOKEN are set — no-op until then.
+const loginRatelimit =
+    process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+        ? new Ratelimit({
+            redis: new Redis({
+                url: process.env.UPSTASH_REDIS_REST_URL,
+                token: process.env.UPSTASH_REDIS_REST_TOKEN,
+            }),
+            limiter: Ratelimit.slidingWindow(5, "5 m"), // 5 attempts / 5 min per email
+            prefix: "ratelimit:login",
+        })
+        : null;
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+    providers: [
+        Credentials({
+            name: "credentials",
+            credentials: {
+                email: { label: "Email", type: "email" },
+                password: { label: "Password", type: "password" },
+            },
+            async authorize(credentials) {
+                if (!credentials?.email || !credentials?.password) {
+                    return null;
+                }
+
+                const email = String(credentials.email).toLowerCase().trim();
+                const password = String(credentials.password);
+
+                if (loginRatelimit) {
+                    const { success } = await loginRatelimit.limit(email);
+                    if (!success) {
+                        throw new Error("Too many login attempts. Please try again in a few minutes.");
+                    }
+                }
+
+                const user = await prisma.user.findUnique({
+                    where: { email },
+                    include: { tenant: true },
+                });
+
+                if (!user || !user.passwordHash) {
+                    return null;
+                }
+
+                // A deactivated user (isActive = false — e.g. a cashier who
+                // left, or an account suspended by the tenant admin) must
+                // never be able to sign in, even with a correct password.
+                if (!user.isActive) {
+                    return null;
+                }
+
+                const passwordsMatch = await bcrypt.compare(password, user.passwordHash);
+
+                if (!passwordsMatch) {
+                    return null;
+                }
+
+                return {
+                    id: user.id,
+                    name: user.name,
+                    email: user.email,
+                    role: user.role,
+                    tenantId: user.tenantId,
+                    tenantSlug: user.tenant.slug,
+                    tenantName: user.tenant.name,
+                    dailyExchangeRate: user.tenant.dailyExchangeRate
+                        ? Number(user.tenant.dailyExchangeRate)
+                        : null,
+                    subscriptionStatus: user.tenant.subscriptionStatus,
+                    isPlatformAdmin: user.isPlatformAdmin,
+                };
+            },
+        }),
+    ],
+    session: {
+        strategy: "jwt",
+    },
+    pages: {
+        signIn: "/login",
+    },
+    callbacks: {
+        async jwt({ token, user, trigger, session }) {
+            if (user) {
+                token.id = user.id;
+                token.role = user.role;
+                token.tenantId = user.tenantId;
+                token.tenantSlug = user.tenantSlug;
+                token.tenantName = user.tenantName;
+                token.dailyExchangeRate = user.dailyExchangeRate;
+                token.subscriptionStatus = user.subscriptionStatus;
+                token.isPlatformAdmin = user.isPlatformAdmin;
+            }
+
+            // Allows the client to call `update({ dailyExchangeRate })` or
+            // `update({ subscriptionStatus })` after a PATCH to the DB, so
+            // THIS session's token reflects the change immediately without
+            // a full re-login. Other active sessions on other devices are
+            // unaffected until they call update() themselves.
+            if (trigger === "update" && session) {
+                if (session.dailyExchangeRate !== undefined) {
+                    token.dailyExchangeRate = session.dailyExchangeRate;
+                }
+                if (session.subscriptionStatus !== undefined) {
+                    token.subscriptionStatus = session.subscriptionStatus;
+                }
+            }
+
+            return token;
+        },
+        async session({ session, token }) {
+            if (token && session.user) {
+                session.user.id = token.id as string;
+                session.user.role = (token.role as "ADMIN" | "CASHIER") || "CASHIER";
+                session.user.tenantId = token.tenantId as string;
+                session.user.tenantSlug = (token.tenantSlug as string) || "";
+                session.user.tenantName = (token.tenantName as string) || "";
+                session.user.dailyExchangeRate = (token.dailyExchangeRate as number | null) ?? null;
+                // Fail-closed: if this field is ever missing/falsy on the
+                // token, treat the tenant as locked (EXPIRED) rather than
+                // fully active. A token glitch must never silently unlock a
+                // suspended tenant's write access.
+                session.user.subscriptionStatus =
+                    (token.subscriptionStatus as "ACTIVE" | "EXPIRED" | "PENDING") || "EXPIRED";
+                // Default false so a missing/stale token never grants
+                // platform-admin access.
+                session.user.isPlatformAdmin = (token.isPlatformAdmin as boolean) ?? false;
+            }
+            return session;
+        },
+    },
+    secret: requireAuthSecret(),
+    trustHost: true,
+});
