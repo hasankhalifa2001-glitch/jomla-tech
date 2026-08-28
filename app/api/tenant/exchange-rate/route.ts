@@ -4,7 +4,13 @@ import { prisma } from "@/lib/db";
 import { z } from "zod";
 
 const updateRateSchema = z.object({
-    rate: z.number().positive("يجب أن يكون سعر الصرف رقماً موجباً"),
+    rate: z
+        .number()
+        .positive("يجب أن يكون سعر الصرف رقماً موجباً")
+        // Sanity ceiling against a data-entry slip (e.g. cashier types 15
+        // instead of 15000) — not a hard business limit, just a guard
+        // against an obviously wrong value being saved silently.
+        .max(1_000_000, "القيمة أكبر من المتوقع، يرجى التأكد من الرقم المدخل"),
 });
 
 export async function POST(req: Request) {
@@ -18,11 +24,33 @@ export async function POST(req: Request) {
             );
         }
 
-        if (session.user.subscriptionStatus === "EXPIRED") {
+        // Admin-only: the daily exchange rate affects every invoice a
+        // cashier rings up tenant-wide, so it must never be editable by a
+        // CASHIER session — this was previously unchecked entirely.
+        if (session.user.role !== "ADMIN") {
             return NextResponse.json(
                 {
-                    error: "SUBSCRIPTION_EXPIRED",
-                    message: "عذراً، اشتراك هذا المتجر منتهي. يرجى تجديد الاشتراك للقيام بالتعديلات.",
+                    error: "FORBIDDEN",
+                    message: "هذا الإجراء متاح لمدير المتجر فقط.",
+                },
+                { status: 403 }
+            );
+        }
+
+        // Defense in depth: middleware.ts already blocks writes for
+        // EXPIRED/PENDING tenants at the edge, but this check must still
+        // match it exactly here in case this route is ever reached by a
+        // path that bypasses the middleware (a server-to-server call, a
+        // future matcher change, etc.). PENDING must be treated identically
+        // to EXPIRED everywhere in the codebase — never just one of the two.
+        if (
+            session.user.subscriptionStatus === "EXPIRED" ||
+            session.user.subscriptionStatus === "PENDING"
+        ) {
+            return NextResponse.json(
+                {
+                    error: "SUBSCRIPTION_LOCKED",
+                    message: "عذراً، اشتراك هذا المتجر غير مفعّل حالياً. يرجى التجديد للقيام بالتعديلات.",
                 },
                 { status: 403 }
             );
@@ -43,6 +71,9 @@ export async function POST(req: Request) {
 
         const { rate } = validation.data;
 
+        // Scoped by tenantId from the session, never trusting any tenant
+        // identifier from the request body — the same rule that applies to
+        // every write endpoint in this codebase.
         const updatedTenant = await prisma.tenant.update({
             where: { id: session.user.tenantId },
             data: { dailyExchangeRate: rate },

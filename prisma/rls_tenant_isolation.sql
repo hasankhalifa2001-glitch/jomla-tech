@@ -70,3 +70,37 @@ CREATE POLICY tenant_isolation_subscription ON "Subscription"
 -- must still SET app.current_tenant_id — resolved from the tenantSlug in
 -- the URL, not from a JWT — before querying, or RLS will simply return
 -- zero rows to it.
+
+-- =======================================================================
+-- STATUS AS OF T3 (inventory/CSV/FIFO API routes): DEFERRED, NOT WIRED UP
+-- =======================================================================
+-- The policies above are created and ENABLED on the database, but no
+-- application code calls `SET app.current_tenant_id` anywhere yet. Every
+-- API route built so far (products, batches, fifo-preview, import/*)
+-- queries through the default `prisma` client directly and relies solely
+-- on an explicit `where: { tenantId }` on every query — which has been
+-- applied consistently, but is NOT backed by this database-level policy
+-- as a second line of defense the way it's meant to be.
+--
+-- Why this was deferred rather than wired up immediately: correctly
+-- setting a session variable per request in a serverless/pooled-connection
+-- environment (Vercel + Neon/Supabase pooling) requires every single query
+-- to run inside an interactive `$transaction` that issues `SET LOCAL`
+-- first — a connection picked from a pool cannot be trusted to retain a
+-- plain `SET` from a previous request. That means retrofitting this is not
+-- a small helper function; it is a rewrite of the query pattern in every
+-- existing route (they currently call `prisma.model.method()` directly,
+-- not `tx.model.method()` inside a wrapping transaction), plus a
+-- performance cost (every read becomes a transaction). That's a
+-- deliberate, reviewable architectural change — not something to sprinkle
+-- in silently while fixing an unrelated bug.
+--
+-- Until that refactor happens: tenant isolation is enforced ONLY by the
+-- application-layer `tenantId` checks in each route. Keep enforcing the
+-- same discipline (every query filtered by `tenantId` from the session,
+-- every write validated against it) on every new route. Revisit wiring up
+-- SET app.current_tenant_id — likely via a Prisma Client Extension that
+-- wraps the query methods you actually use — once the route surface is
+-- large enough that manual review of every query stops being reliable, or
+-- before onboarding the first real (non-seed) tenant, whichever comes
+-- first.

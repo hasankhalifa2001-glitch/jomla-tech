@@ -36,13 +36,6 @@ enum SubscriptionRecordStatus {
   EXPIRED
 }
 
-// ADDED SYRIATEL_CASH: the SOW names Sham Cash, Syriatel Cash, and Office
-// Transfer explicitly as the three real payment rails merchants use. Only
-// SHAM_CASH existed here before — Syriatel Cash payments were silently
-// falling into OTHER, defeating the entire point of this being an enum
-// (reliable per-method reporting). BANK_TRANSFER kept as-is for now since
-// it's already in use; revisit naming it OFFICE_TRANSFER to match the SOW
-// exactly once real data exists under it.
 enum PaymentMethod {
   CASH
   SHAM_CASH
@@ -125,9 +118,9 @@ model ProductUnit {
   batches      ProductBatch[]
   invoiceItems InvoiceItem[]
 
+  @@unique([tenantId, barcode])
   @@index([tenantId])
   @@index([productId])
-  @@unique([tenantId, barcode])
 }
 
 model ProductBatch {
@@ -136,12 +129,19 @@ model ProductBatch {
   productId   String
   unitId      String
   batchNumber String
-  // Can legitimately go negative (concurrent offline oversell — see prior
-  // notes) and is also the field a VOIDED invoice's negative-quantity items
-  // increment back up on stock return. Do not add a non-negative constraint
-  // without revisiting both of those flows first.
+  // Can legitimately go negative (concurrent offline oversell) and is also
+  // the field a VOIDED invoice's negative-quantity items increment back up
+  // on stock return. Do not add a non-negative constraint without
+  // revisiting both of those flows first.
   quantity    Decimal   @db.Decimal(18, 4)
   expiryDate  DateTime?
+  // ADDED: resolveFifoAllocation's tie-break (when two batches share the
+  // same expiryDate, or both have none) previously fell back to comparing
+  // `id` as a string, relying on cuid's embedded timestamp ordering — an
+  // implementation detail of cuid, not a documented guarantee. This column
+  // makes "oldest received batch goes first" an explicit, intentional sort
+  // key instead of an accident of the ID format. See fifo.ts.
+  createdAt   DateTime  @default(now())
 
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   product      Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
@@ -176,29 +176,15 @@ model Invoice {
   tenantId         String
   userId           String
   customerId       String
-  // VALIDATION RULE (enforced in the API layer, not the schema): these
-  // four numeric fields are a snapshot taken once at creation, never
-  // recomputed — that's deliberate (see debtAmountUSD note below), but it
-  // means nothing stops a bad write from storing values that don't satisfy
-  // the arithmetic they imply. Every endpoint that creates an Invoice MUST
-  // validate, before insert:
+  // VALIDATION RULE (enforced in the API layer, not the schema):
   //   totalSYP      ≈ totalUSD * exchangeRateUsed
   //   debtAmountUSD ≈ totalUSD - paidAmountUSD
-  // (within a small rounding tolerance). Reject the write if either check
-  // fails — do not silently recompute and overwrite what the caller sent.
+  // Reject the write if either check fails at insert time — do not
+  // silently recompute and overwrite what the caller sent.
   totalUSD         Decimal       @db.Decimal(18, 4)
   totalSYP         Decimal       @db.Decimal(18, 4)
   exchangeRateUsed Decimal       @db.Decimal(18, 4)
   paidAmountUSD    Decimal       @db.Decimal(18, 4)
-  // Deliberately still a stored column, not a computed property, despite
-  // being logically derivable as (totalUSD - paidAmountUSD) — unlike
-  // Customer's balance (which mutates repeatedly over time and so drifts
-  // silently), this is written exactly once at invoice creation and never
-  // updated (see: no updatedAt on this model). The risk here isn't drift
-  // across time, it's a wrong value at write time — which validation
-  // catches at the door, not by giving up the historical snapshot. Keeping
-  // it stored also means a future change to rounding/exchange logic can
-  // never retroactively alter what a past invoice is shown to say.
   debtAmountUSD    Decimal       @db.Decimal(18, 4)
   isPaid           Boolean       @default(false)
   status           InvoiceStatus @default(COMPLETED)
@@ -207,13 +193,12 @@ model Invoice {
   syncedAt         DateTime?
   createdAt        DateTime      @default(now())
 
-  // BUSINESS RULE (decided): a void = a real physical stock return, not a
-  // pure bookkeeping correction. The application layer that creates a
-  // VOIDED invoice MUST include InvoiceItems mirroring the original ones
-  // with negated `quantity`, and MUST increment the matching
-  // ProductBatch.quantity by that same (absolute) amount when it does. A
-  // pure data-entry mistake with no physical stock movement is NOT handled
-  // by this mechanism — record an offsetting CustomerPayment instead.
+  // BUSINESS RULE: a void = a real physical stock return. The application
+  // layer creating a VOIDED invoice MUST include InvoiceItems mirroring the
+  // original ones with negated `quantity`, and MUST increment the matching
+  // ProductBatch.quantity by that same (absolute) amount. A pure data-entry
+  // mistake with no physical stock movement is corrected with an offsetting
+  // CustomerPayment instead, not this mechanism.
   voidsInvoiceId String?  @unique
   voidsInvoice   Invoice? @relation("InvoiceVoid", fields: [voidsInvoiceId], references: [id], onDelete: Restrict)
   voidedBy       Invoice? @relation("InvoiceVoid")
@@ -234,21 +219,10 @@ model InvoiceItem {
   invoiceId    String
   productId    String
   unitId       String
-  // REQUIRED (not nullable): every line item must record exactly which
-  // physical batch its stock came from — this is what makes FIFO deduction
-  // traceable and, critically, what a VOIDED invoice's reversal writes
-  // back to. Without this, "return the stock" has no unambiguous target
-  // once a product has more than one open batch.
-  //
-  // BUSINESS RULE: if a sold quantity spans more than one batch (the
-  // nearest batch doesn't have enough left), split it into multiple
-  // InvoiceItem rows on the SAME invoice — one per batch — rather than
-  // inventing a many-to-many allocation table. A 15-unit sale drawing 10
-  // from batch A and 5 from batch B is two InvoiceItem rows, not one.
-  //
-  // Negative `quantity` on a VOIDED invoice's items = stock returned to
-  // THIS specific batchId. Positive everywhere else = stock deducted from
-  // it. See the BUSINESS RULE note on Invoice.voidsInvoiceId above.
+  // REQUIRED: every line item records exactly which physical batch its
+  // stock came from. If a sale spans more than one batch, split it into
+  // multiple InvoiceItem rows on the SAME invoice — one per batch — never
+  // a single row spanning batches.
   batchId      String
   quantity     Decimal @db.Decimal(18, 4)
   unitPriceUSD Decimal @db.Decimal(18, 4)
@@ -257,8 +231,6 @@ model InvoiceItem {
   invoice Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   product Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
   unit    ProductUnit  @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  // Restrict, matching product/unit above: a batch with sales history
-  // attached must never be hard-deletable, even once fully depleted.
   batch   ProductBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
 
   @@index([tenantId])

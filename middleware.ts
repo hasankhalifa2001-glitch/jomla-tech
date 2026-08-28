@@ -1,9 +1,6 @@
 import { auth } from "@/auth";
 import { NextResponse } from "next/server";
 
-// Paths that belong to the authenticated tenant dashboard shell (Admin +
-// Cashier), never the public storefront. Used both to protect them and to
-// make sure the subdomain rewrite below never swallows them by mistake.
 const DASHBOARD_PATH_PREFIXES = [
     "/dashboard",
     "/pos",
@@ -17,9 +14,6 @@ function isPathUnder(pathname: string, prefixes: string[]) {
     return prefixes.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 }
 
-// Resolve the platform's own root host once, from env, instead of guessing
-// from dot-count. Segment-count heuristics misfire on hosts like
-// `myapp-git-branch.vercel.app`, which also happen to have 3 parts.
 const APP_ROOT_HOST = (() => {
     try {
         return new URL(process.env.NEXT_PUBLIC_APP_URL || "").host.split(":")[0];
@@ -28,22 +22,16 @@ const APP_ROOT_HOST = (() => {
     }
 })();
 
-/**
- * Returns the tenant slug if `host` is a genuine tenant subdomain of our
- * known root domain (or `tenant.localhost` in dev) — otherwise null.
- * Never guesses on hosts that aren't provably ours (preview URLs, etc.).
- */
 function resolveTenantSlugFromHost(host: string): string | null {
     const hostWithoutPort = host.split(":")[0];
 
-    // tenant.localhost during local dev
     if (hostWithoutPort.endsWith(".localhost") && hostWithoutPort !== "localhost") {
         const sub = hostWithoutPort.slice(0, -".localhost".length);
         return sub && sub !== "www" && sub !== "app" ? sub : null;
     }
 
     if (!APP_ROOT_HOST) return null;
-    if (hostWithoutPort === APP_ROOT_HOST) return null; // the platform's own root/app domain
+    if (hostWithoutPort === APP_ROOT_HOST) return null;
 
     if (hostWithoutPort.endsWith(`.${APP_ROOT_HOST}`)) {
         const sub = hostWithoutPort.slice(0, -(`.${APP_ROOT_HOST}`.length));
@@ -55,6 +43,17 @@ function resolveTenantSlugFromHost(host: string): string | null {
     return null;
 }
 
+// Endpoints that are POST (because they need a request body) but are
+// strictly read-only — no database write happens. The isWriteMethod check
+// below can't tell these apart from a real write by HTTP method alone, so
+// they're listed explicitly here. Locked-tenant "read-only mode" must still
+// let a merchant preview things (FIFO allocation, a CSV import) even while
+// blocked from committing anything.
+const READ_ONLY_POST_PREFIXES = [
+    "/api/inventory/fifo-preview",
+    "/api/inventory/import/preview",
+];
+
 export default auth((req) => {
     const { nextUrl } = req;
     const isLoggedIn = !!req.auth;
@@ -63,7 +62,7 @@ export default auth((req) => {
 
     // ── 1a. Explicit sub-link rewrite: /store/tenantSlug/... -> /tenantSlug/...
     if (pathname.startsWith("/store/")) {
-        const segments = pathname.split("/").filter(Boolean); // ["store", "tenantSlug", ...]
+        const segments = pathname.split("/").filter(Boolean);
         if (segments.length >= 2) {
             const tenantSlug = segments[1];
             const rest = segments.slice(2).join("/");
@@ -77,9 +76,6 @@ export default auth((req) => {
     const tenantSlug = resolveTenantSlugFromHost(host);
 
     if (tenantSlug) {
-        // Only the public storefront lives under a tenant subdomain. Dashboard,
-        // admin, auth, and API paths must never be rewritten — a merchant who
-        // bookmarks tenant.domain.com/pos should still reach the real POS.
         const isReservedPath =
             isPathUnder(pathname, DASHBOARD_PATH_PREFIXES) ||
             pathname.startsWith("/admin") ||
@@ -93,8 +89,7 @@ export default auth((req) => {
         }
     }
 
-    // ── 2. Platform Super-Admin routes — a distinct privilege from tenant
-    // ADMIN, and checked before any tenant-scoped logic below.
+    // ── 2. Platform Super-Admin routes
     if (pathname.startsWith("/admin")) {
         if (!isLoggedIn) {
             const loginUrl = new URL("/login", req.url);
@@ -117,7 +112,6 @@ export default auth((req) => {
             return NextResponse.redirect(loginUrl);
         }
 
-        // 3a. Role restriction: CASHIER cannot access settings routes.
         const isSettingsRoute = pathname === "/settings" || pathname.startsWith("/settings/");
         if (user?.role === "CASHIER" && isSettingsRoute) {
             const redirectedUrl = new URL("/dashboard", req.url);
@@ -125,15 +119,6 @@ export default auth((req) => {
             return NextResponse.redirect(redirectedUrl);
         }
 
-        // 3b. Expired or pending subscription: full read-only lockout on the
-        // dashboard shell itself (not just the API layer).
-        //
-        // FIX: a CASHIER has no permission to view /settings/billing in the
-        // first place (see 3a above) — redirecting a locked tenant's cashier
-        // there just bounced them straight back out to /dashboard, which
-        // re-triggered this same lockout check, producing an infinite
-        // redirect loop. Cashiers now go to a standalone informational page
-        // outside /settings entirely; only ADMIN gets sent to billing.
         const isBillingRoute = pathname.startsWith("/settings/billing");
         const isAccountLockedRoute = pathname.startsWith("/account-locked");
         const isLocked =
@@ -150,15 +135,19 @@ export default auth((req) => {
     }
 
     // ── 4. Block write operations on API endpoints for expired/pending tenants.
-    // Mirrors the dashboard lockout above so a direct API call (not just page
-    // navigation) can never bypass it.
     if (pathname.startsWith("/api/") && !pathname.startsWith("/api/auth")) {
         const isWriteMethod = ["POST", "PUT", "DELETE", "PATCH"].includes(req.method);
         const isReceiptUpload = pathname.startsWith("/api/upload/receipt");
+        // FIX: fifo-preview and import/preview are POST (they need a request
+        // body) but never write to the database. Without this exception, a
+        // locked tenant couldn't even preview a FIFO allocation or a CSV
+        // import — which defeats the point of "read-only mode" being
+        // read-only rather than fully inert.
+        const isReadOnlyAction = READ_ONLY_POST_PREFIXES.some((p) => pathname.startsWith(p));
         const isLocked =
             user?.subscriptionStatus === "EXPIRED" || user?.subscriptionStatus === "PENDING";
 
-        if (isWriteMethod && !isReceiptUpload && isLocked) {
+        if (isWriteMethod && !isReceiptUpload && !isReadOnlyAction && isLocked) {
             return NextResponse.json(
                 {
                     error: "SUBSCRIPTION_LOCKED",
