@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
 import { useState } from "react";
@@ -14,18 +15,21 @@ interface CsvImportModalProps {
   onSuccess: () => void;
 }
 
-interface RejectedRow {
-  lineNumber: number;
-  rowContent: string;
-  reason: string;
-}
-
+// NOTE: field names mirror NewProductImportData / PriceUpdateImportData /
+// RejectedRowData in lib/inventory/csv-parser.ts exactly — this is exactly
+// what /api/inventory/import/preview returns and what
+// /api/inventory/import/commit expects back unmodified.
 interface NewProductRow {
   lineNumber: number;
-  name: string;
   barcode?: string;
+  name: string;
+  category?: string;
   unitName: string;
+  conversionFactor: number;
   priceUSD: number;
+  batchNumber?: string;
+  quantity?: number;
+  expiryDate?: string;
 }
 
 interface PriceUpdateRow {
@@ -36,6 +40,12 @@ interface PriceUpdateRow {
   currentPriceUSD: number;
   newPriceUSD: number;
   unitId: string;
+}
+
+interface RejectedRow {
+  lineNumber: number;
+  rowContent: string;
+  reason: string;
 }
 
 interface PreviewData {
@@ -63,20 +73,32 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
   const [preview, setPreview] = useState<PreviewData | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [loadingCommit, setLoadingCommit] = useState(false);
-  // FIX (feature completion): commitCsvImport() was updated on the backend
-  // to catch a per-row barcode collision (P2002) instead of aborting the
-  // whole import, reporting those rows in `failedNewProducts` instead of
-  // silently dropping them. This modal previously ignored that field
-  // entirely and just closed on any 2xx response — a merchant could see
-  // "تم تنفيذ الاستيراد بنجاح" while one or more products silently failed
-  // to import. commitResult now holds that response so it can be shown
-  // instead of immediately closing the dialog.
+  // commitCsvImport() catches a per-row barcode collision (P2002) instead
+  // of aborting the whole import, and separately reports a price update
+  // whose unitId didn't resolve to a real tenant-owned ProductUnit as
+  // `skippedPriceUpdates` rather than failing outright. commitResult holds
+  // that response so both kinds of partial failure can be rendered instead
+  // of closing blindly on a false "fully successful" assumption.
   const [commitResult, setCommitResult] = useState<CommitResult | null>(null);
 
   const resetAll = () => {
     setFile(null);
     setPreview(null);
     setCommitResult(null);
+  };
+
+  // Returns to the file-picker step without closing the dialog — lets the
+  // merchant fix their CSV and retry without losing their place.
+  const resetToFilePicker = () => {
+    setFile(null);
+    setPreview(null);
+  };
+
+  const handleClose = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      resetAll();
+    }
+    onOpenChange(nextOpen);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -147,17 +169,16 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
 
       onSuccess();
 
-      // FIX: only auto-close and reset when nothing failed. If
-      // hasFailures is true, keep the dialog open and show exactly which
-      // rows failed and why — closing immediately would hide that from
-      // the merchant entirely.
+      // Only auto-close when nothing failed AND nothing was skipped. If
+      // hasFailures is true (server now checks both failedNewProducts and
+      // skippedPriceUpdates), keep the dialog open and show exactly what
+      // didn't go through — closing immediately would hide that entirely.
       if (data.hasFailures) {
         setCommitResult(data.result);
-        toast.warning(data.message || "تم الاستيراد مع بعض الأخطاء.");
+        toast.warning(data.message || "تم الاستيراد جزئياً مع بعض الأخطاء.");
       } else {
         toast.success(data.message || "تم تنفيذ الاستيراد بنجاح!");
-        onOpenChange(false);
-        resetAll();
+        handleClose(false);
       }
     } catch (err: any) {
       toast.error(err.message || "فشلت عملية حفظ الاستيراد.");
@@ -166,14 +187,14 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
     }
   };
 
+  const canCommit =
+    !!preview && (preview.newProducts.length > 0 || preview.priceUpdates.length > 0);
+
+  const hasPartialFailure =
+    !!commitResult && (commitResult.failedNewProducts.length > 0 || commitResult.skippedPriceUpdates > 0);
+
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        onOpenChange(next);
-        if (!next) resetAll();
-      }}
-    >
+    <Dialog open={open} onOpenChange={handleClose}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto" dir="rtl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-xl">
@@ -186,40 +207,52 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
         </DialogHeader>
 
         <div className="space-y-5 py-2">
-          {/* Post-commit failures panel — shown only after a commit that
-              had partial failures. Takes priority over the upload/preview
-              UI so the merchant sees it immediately. */}
-          {commitResult && commitResult.failedNewProducts.length > 0 && (
+          {/* Post-commit partial-failure panel — takes priority over
+              everything else so neither a failed product nor a skipped
+              price update is ever missed. */}
+          {hasPartialFailure && commitResult && (
             <div className="p-4 rounded-xl border border-amber-300 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/20 space-y-3">
               <div className="flex items-center gap-2">
                 <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
                 <span className="font-semibold text-sm text-amber-800 dark:text-amber-300">
-                  تم إنشاء {commitResult.createdProductsCount} منتج وتحديث {commitResult.updatedPricesCount} سعر،
-                  لكن تعذّر إنشاء {commitResult.failedNewProducts.length} منتج
+                  تم إنشاء {commitResult.createdProductsCount} منتج وتحديث {commitResult.updatedPricesCount} سعر.
+                  {commitResult.failedNewProducts.length > 0 &&
+                    ` تعذّر إنشاء ${commitResult.failedNewProducts.length} منتج.`}
+                  {commitResult.skippedPriceUpdates > 0 &&
+                    ` تم تجاهل ${commitResult.skippedPriceUpdates} تحديث سعر (الوحدة غير موجودة).`}
                 </span>
               </div>
-              <div className="space-y-1.5">
-                {commitResult.failedNewProducts.map((row) => (
-                  <div
-                    key={row.lineNumber}
-                    className="p-2.5 bg-white dark:bg-zinc-900 rounded-lg border border-amber-200 dark:border-amber-900/50 text-xs"
-                  >
-                    <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                      السطر {row.lineNumber} — {row.name}
-                      {row.barcode ? ` (${row.barcode})` : ""}:
-                    </span>{" "}
-                    <span className="text-amber-700 dark:text-amber-400">{row.reason}</span>
-                  </div>
-                ))}
-              </div>
+
+              {commitResult.failedNewProducts.length > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">منتجات لم يتم إنشاؤها:</p>
+                  {commitResult.failedNewProducts.map((row) => (
+                    <div
+                      key={row.lineNumber}
+                      className="p-2.5 bg-white dark:bg-zinc-900 rounded-lg border border-amber-200 dark:border-amber-900/50 text-xs"
+                    >
+                      <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                        السطر {row.lineNumber} — {row.name}
+                        {row.barcode ? ` (${row.barcode})` : ""}:
+                      </span>{" "}
+                      <span className="text-amber-700 dark:text-amber-400">{row.reason}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {commitResult.skippedPriceUpdates > 0 && (
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  {commitResult.skippedPriceUpdates} تحديث سعر تم تجاهله لأن الوحدة المرتبطة به لم تعد موجودة —
+                  يُنصح بإعادة معاينة الملف واستيراده من جديد للتأكد من سلامة البيانات.
+                </p>
+              )}
+
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  onOpenChange(false);
-                  resetAll();
-                }}
+                onClick={() => handleClose(false)}
                 className="text-xs"
               >
                 إغلاق
@@ -227,7 +260,7 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
             </div>
           )}
 
-          {!commitResult && (
+          {!hasPartialFailure && (
             <>
               <div className="p-4 border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-xl flex flex-col items-center justify-center bg-zinc-50 dark:bg-zinc-900/50 text-center">
                 <UploadCloud className="w-8 h-8 text-zinc-400 mb-2" />
@@ -235,7 +268,7 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                   اختر ملف CSV من جهازك
                 </p>
                 <p className="text-xs text-zinc-400 mt-1 mb-3">
-                  يدعم أعمدة: الباركود، اسم المنتج، التصنيف، الوحدة، معامل التحويل، السعر (USD)، رقم الدفعة، الكمية، تاريخ الانتهاء.
+                  يدعم أعمدة: الباركود، اسم المنتج، التصنيف، الوحدة، معامل التحويل، السعر (USD)، رقم الدفعة، الكمية، تاريخ الانتهاء (YYYY-MM-DD).
                 </p>
                 <input
                   type="file"
@@ -243,6 +276,11 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                   onChange={handleFileChange}
                   className="text-xs text-zinc-500 file:ml-4 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer"
                 />
+                {file && (
+                  <p className="text-[11px] text-zinc-500 mt-2">
+                    الملف المحدد: <span className="font-medium">{file.name}</span>
+                  </p>
+                )}
               </div>
 
               {file && !preview && (
@@ -278,6 +316,16 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                     </div>
                   </div>
 
+                  {preview.summary.rejectedRowsCount > 0 && (
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/50 text-xs text-amber-800 dark:text-amber-300">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>
+                        يوجد {preview.summary.rejectedRowsCount} سطر مرفوض لن يتم استيراده. راجع تبويب
+                        &quot;المرفوضة&quot; أدناه، وبإمكانك المتابعة باستيراد باقي الأسطر الصالحة.
+                      </span>
+                    </div>
+                  )}
+
                   <Tabs defaultValue={preview.summary.rejectedRowsCount > 0 ? "rejected" : "new"} dir="rtl">
                     <TabsList className="w-full grid grid-cols-3">
                       <TabsTrigger value="rejected" className="text-xs gap-1">
@@ -296,15 +344,23 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
 
                     <TabsContent value="rejected" className="mt-3">
                       {preview.rejectedRows.length === 0 ? (
-                        <p className="text-xs text-zinc-400 text-center py-6">لا توجد أسطر مرفوضة.</p>
+                        <p className="text-xs text-zinc-400 text-center py-6">لا توجد أسطر مرفوضة. كل الأسطر صالحة للاستيراد.</p>
                       ) : (
-                        <div className="space-y-1.5 max-h-64 overflow-y-auto">
-                          {preview.rejectedRows.map((row) => (
+                        <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                          {preview.rejectedRows.map((row, idx) => (
                             <div
-                              key={row.lineNumber}
+                              key={`${row.lineNumber}-${idx}`}
                               className="p-2.5 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900/50 rounded-lg text-xs"
                             >
-                              <span className="text-red-700 dark:text-red-400">{row.reason}</span>
+                              <p className="font-semibold text-red-700 dark:text-red-400">
+                                السطر {row.lineNumber}
+                              </p>
+                              <p className="text-red-600 dark:text-red-400 mt-0.5">{row.reason}</p>
+                              {row.rowContent && (
+                                <p className="text-zinc-400 mt-1 font-mono text-[10px] truncate" title={row.rowContent}>
+                                  {row.rowContent}
+                                </p>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -315,18 +371,26 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                       {preview.newProducts.length === 0 ? (
                         <p className="text-xs text-zinc-400 text-center py-6">لا توجد منتجات جديدة في هذا الملف.</p>
                       ) : (
-                        <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                        <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
                           {preview.newProducts.map((row) => (
                             <div
                               key={row.lineNumber}
-                              className="p-2.5 bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-900/50 rounded-lg flex items-center justify-between text-xs"
+                              className="p-2.5 bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-900/50 rounded-lg flex items-center justify-between gap-3 text-xs"
                             >
-                              <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                                {row.name} {row.barcode ? `(${row.barcode})` : ""}
-                              </span>
-                              <span className="font-mono text-emerald-700 dark:text-emerald-400 font-bold">
-                                ${row.priceUSD.toFixed(2)} / {row.unitName}
-                              </span>
+                              <div>
+                                <p className="font-semibold text-zinc-900 dark:text-zinc-100">
+                                  السطر {row.lineNumber}: {row.name}
+                                </p>
+                                <p className="text-zinc-500 mt-0.5">
+                                  {row.unitName} · معامل {row.conversionFactor}
+                                  {row.barcode ? ` · باركود ${row.barcode}` : " · بدون باركود"}
+                                  {row.quantity ? ` · كمية أولية ${row.quantity}` : ""}
+                                  {row.expiryDate ? ` · ينتهي ${row.expiryDate}` : ""}
+                                </p>
+                              </div>
+                              <div className="font-mono font-bold text-emerald-700 dark:text-emerald-400 shrink-0">
+                                ${row.priceUSD.toFixed(2)}
+                              </div>
                             </div>
                           ))}
                         </div>
@@ -337,19 +401,25 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                       {preview.priceUpdates.length === 0 ? (
                         <p className="text-xs text-zinc-400 text-center py-6">لا توجد تحديثات أسعار في هذا الملف.</p>
                       ) : (
-                        <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                        <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
                           {preview.priceUpdates.map((row) => (
                             <div
                               key={row.lineNumber}
-                              className="p-2.5 bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900/50 rounded-lg flex items-center justify-between text-xs"
+                              className="p-2.5 bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900/50 rounded-lg flex items-center justify-between gap-3 text-xs"
                             >
-                              <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                                {row.productName} — {row.unitName}
-                              </span>
-                              <span className="font-mono text-xs">
-                                <span className="text-zinc-400 line-through ml-1">${row.currentPriceUSD.toFixed(2)}</span>
-                                <span className="text-blue-700 dark:text-blue-400 font-bold">${row.newPriceUSD.toFixed(2)}</span>
-                              </span>
+                              <div>
+                                <p className="font-semibold text-zinc-900 dark:text-zinc-100">
+                                  السطر {row.lineNumber}: {row.productName}
+                                </p>
+                                <p className="text-zinc-500 mt-0.5">
+                                  {row.unitName} · باركود {row.barcode}
+                                </p>
+                              </div>
+                              <div className="text-left font-mono text-xs shrink-0">
+                                <span className="text-zinc-400 line-through">${row.currentPriceUSD.toFixed(2)}</span>
+                                <span className="mx-1 text-zinc-400">→</span>
+                                <span className="font-bold text-blue-700 dark:text-blue-400">${row.newPriceUSD.toFixed(2)}</span>
+                              </div>
                             </div>
                           ))}
                         </div>
@@ -357,32 +427,44 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                     </TabsContent>
                   </Tabs>
 
-                  <Button
-                    type="button"
-                    onClick={handleCommitImport}
-                    disabled={loadingCommit || (preview.newProducts.length === 0 && preview.priceUpdates.length === 0)}
-                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white gap-2"
-                  >
-                    <CheckCircle className={`w-4 h-4 ${loadingCommit ? "animate-pulse" : ""}`} />
-                    <span>{loadingCommit ? "جاري تنفيذ الاستيراد..." : "تأكيد وحفظ الاستيراد"}</span>
-                  </Button>
+                  <div className="flex items-center justify-between gap-3 pt-1">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={resetToFilePicker}
+                      className="text-xs"
+                    >
+                      اختيار ملف آخر
+                    </Button>
+
+                    <Badge variant="outline" className="text-[11px] text-zinc-500">
+                      سيتم استيراد {preview.summary.newProductsCount + preview.summary.priceUpdatesCount} من أصل {preview.summary.totalRows} سطر
+                    </Badge>
+                  </div>
                 </div>
               )}
             </>
           )}
         </div>
 
-        <DialogFooter dir="rtl">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => {
-              onOpenChange(false);
-              resetAll();
-            }}
-          >
-            {commitResult ? "تم" : "إلغاء"}
+        <DialogFooter className="gap-2 sm:gap-0" dir="rtl">
+          <Button type="button" variant="outline" onClick={() => handleClose(false)}>
+            {hasPartialFailure ? "تم" : "إلغاء"}
           </Button>
+          {/* This is the confirmation step the T3 spec requires: nothing
+              from the preview above is written to the database until the
+              merchant explicitly presses this button. */}
+          {!hasPartialFailure && (
+            <Button
+              type="button"
+              onClick={handleCommitImport}
+              disabled={!canCommit || loadingCommit}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white gap-2"
+            >
+              <CheckCircle className="w-4 h-4" />
+              <span>{loadingCommit ? "جاري تنفيذ الاستيراد..." : "تأكيد الاستيراد وحفظ البيانات"}</span>
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -214,8 +215,8 @@ export function InventoryClient() {
             size="sm"
             onClick={() => setActiveFilter("public")}
             className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "public"
-                ? "bg-blue-600 text-white hover:bg-blue-700"
-                : "border-blue-200 text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-400"
+              ? "bg-blue-600 text-white hover:bg-blue-700"
+              : "border-blue-200 text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-400"
               }`}
           >
             <Globe className="w-3.5 h-3.5" />
@@ -227,8 +228,8 @@ export function InventoryClient() {
             size="sm"
             onClick={() => setActiveFilter("expiring")}
             className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "expiring"
-                ? "bg-amber-600 text-white hover:bg-amber-700"
-                : "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400"
+              ? "bg-amber-600 text-white hover:bg-amber-700"
+              : "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400"
               }`}
           >
             <AlertCircle className="w-3.5 h-3.5" />
@@ -240,8 +241,8 @@ export function InventoryClient() {
             size="sm"
             onClick={() => setActiveFilter("out_of_stock")}
             className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "out_of_stock"
-                ? "bg-red-600 text-white hover:bg-red-700"
-                : "border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400"
+              ? "bg-red-600 text-white hover:bg-red-700"
+              : "border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400"
               }`}
           >
             <Package className="w-3.5 h-3.5" />
@@ -260,6 +261,7 @@ export function InventoryClient() {
         togglingPublicId={togglingPublicId}
         onAddBatch={handleOpenAddBatch}
         onFifoPreview={handleOpenFifoPreview}
+        isAdmin={isAdmin}
       />
 
       {/* Modals */}

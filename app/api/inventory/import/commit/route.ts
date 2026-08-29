@@ -4,6 +4,9 @@ import { prisma } from "@/lib/db";
 import { commitCsvImport } from "@/lib/inventory/csv-parser";
 import { z } from "zod";
 
+// Field names below match NewProductImportData / PriceUpdateImportData in
+// lib/inventory/csv-parser.ts exactly — keep them in sync if that file's
+// shape changes.
 const newProductRowSchema = z.object({
   lineNumber: z.number(),
   barcode: z.string().optional(),
@@ -39,6 +42,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
+    // ADMIN-only: a bulk import is a catalog-wide operation, same reasoning
+    // as manual product creation and the storefront toggle.
     if (session.user.role !== "ADMIN") {
       return NextResponse.json(
         { error: "FORBIDDEN", message: "استيراد المنتجات بالجملة متاح لمدير المتجر فقط." },
@@ -76,32 +81,37 @@ export async function POST(req: Request) {
       );
     }
 
-    // FIX (critical): previously this call was wrapped in
-    // `prisma.$transaction(async (tx) => commitCsvImport(tx, ...))`. On
-    // PostgreSQL, ANY error inside a transaction — even one caught and
+    // FIX (critical): NOT wrapped in prisma.$transaction(...). On
+    // PostgreSQL, any error inside a transaction — even one caught and
     // handled in application code — leaves that transaction in an aborted
-    // state at the database level; every subsequent statement on the same
-    // transaction then fails too, forcing a full rollback of rows that had
-    // already committed. That silently defeated the entire point of
-    // commitCsvImport's per-row try/catch: one barcode collision midway
-    // through a large file could wipe out every row that succeeded before
-    // it, while the response still claimed a partial success.
-    //
+    // state; every subsequent statement on the same transaction then fails
+    // too, forcing a full rollback of rows that had already committed.
     // commitCsvImport does not need an outer transaction: each row's
-    // product/unit/batch creation, and each price update, is already an
-    // atomic operation on its own. Passing the plain `prisma` client here
-    // makes each row's success or failure genuinely independent, which is
-    // what "a failing row does not block the rows around it" requires.
+    // product/unit/batch creation, and each price update, is already
+    // atomic on its own. Passing the plain `prisma` client makes each
+    // row's success or failure genuinely independent.
     const result = await commitCsvImport(prisma, tenantId, {
       newProducts,
       priceUpdates,
     });
 
-    const hasFailures = result.failedNewProducts.length > 0;
+    // FIX: previously only checked failedNewProducts.length, silently
+    // missing the case where a price update was skipped (its unitId
+    // didn't resolve to a real ProductUnit in this tenant — e.g. deleted,
+    // or a tampered request between preview and commit). A skipped update
+    // is exactly as much a "not fully successful" outcome as a failed
+    // product creation and must not be reported as a clean success.
+    const hasFailures = result.failedNewProducts.length > 0 || result.skippedPriceUpdates > 0;
+
     const baseMessage = `تم تنفيذ الاستيراد: تم إنشاء ${result.createdProductsCount} منتج جديد وتحديث ${result.updatedPricesCount} سعر.`;
-    const failureSuffix = hasFailures
-      ? ` تعذّر إنشاء ${result.failedNewProducts.length} منتج بسبب تعارض في الباركود — راجع التفاصيل أدناه.`
-      : "";
+    const failureParts: string[] = [];
+    if (result.failedNewProducts.length > 0) {
+      failureParts.push(`تعذّر إنشاء ${result.failedNewProducts.length} منتج بسبب تعارض في الباركود`);
+    }
+    if (result.skippedPriceUpdates > 0) {
+      failureParts.push(`تم تجاهل ${result.skippedPriceUpdates} تحديث سعر (الوحدة غير موجودة)`);
+    }
+    const failureSuffix = failureParts.length > 0 ? ` ${failureParts.join("، ")} — راجع التفاصيل أدناه.` : "";
 
     return NextResponse.json({
       success: true,

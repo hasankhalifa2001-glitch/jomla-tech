@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
 import { useState } from "react";
@@ -21,8 +22,7 @@ interface AddProductModalProps {
   onSuccess: () => void;
 }
 
-// تعريف القيمة الافتراضية خارج المكون لمنع إعادة إنشائها مع كل Render
-const DEFAULT_UNITS: UnitForm[] = [
+const EMPTY_UNITS: UnitForm[] = [
   { unitName: "قطعة", conversionFactor: 1, priceUSD: 1.0, barcode: "" },
 ];
 
@@ -31,30 +31,36 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const [category, setCategory] = useState("");
   const [isPublic, setIsPublic] = useState(false);
 
-  const [units, setUnits] = useState<UnitForm[]>(DEFAULT_UNITS);
+  const [units, setUnits] = useState<UnitForm[]>(EMPTY_UNITS);
 
   const [hasInitialBatch, setHasInitialBatch] = useState(false);
   const [batchUnitIndex, setBatchUnitIndex] = useState(0);
   const [batchNumber, setBatchNumber] = useState("");
-  const [batchQuantity, setBatchQuantity] = useState<number>(10);
+  // 0, not an arbitrary starting quantity like 10 — forces a deliberate
+  // entry instead of letting a merchant submit an unintended default
+  // quantity for the initial batch. Mirrors the same fix on AddBatchModal.
+  const [batchQuantity, setBatchQuantity] = useState<number>(0);
   const [expiryDate, setExpiryDate] = useState("");
 
   const [loading, setLoading] = useState(false);
 
-  // دالة تصفير الحقول
   const resetForm = () => {
     setName("");
     setCategory("");
     setIsPublic(false);
-    setUnits(DEFAULT_UNITS);
+    setUnits(EMPTY_UNITS);
     setHasInitialBatch(false);
     setBatchUnitIndex(0);
     setBatchNumber("");
-    setBatchQuantity(10);
+    setBatchQuantity(0);
     setExpiryDate("");
   };
 
-  // دالة التحكم في فتح/إغلاق النافذة وتنظيف البيانات
+  // Wraps the Dialog's own onOpenChange rather than watching `open` via a
+  // render-time comparison: every path that closes the dialog (Cancel,
+  // Escape, an outside click, or a successful save calling this with
+  // `false`) already funnels through this single callback, so there's no
+  // prop-derived state to reconcile — just react to the close event here.
   const handleOpenChange = (isOpen: boolean) => {
     if (!isOpen) {
       resetForm();
@@ -99,6 +105,22 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
+    // Catches a duplicate barcode across this product's OWN units before
+    // hitting the network — the database's @@unique([tenantId, barcode])
+    // constraint would catch it too, but there's no reason to make a round
+    // trip for a mistake that's checkable instantly from what's already
+    // on screen.
+    const enteredBarcodes = units.map((u) => u.barcode.trim()).filter(Boolean);
+    if (new Set(enteredBarcodes).size !== enteredBarcodes.length) {
+      toast.error("لا يمكن استخدام نفس الباركود لأكثر من وحدة قياس ضمن المنتج نفسه.");
+      return;
+    }
+
+    if (hasInitialBatch && (!batchQuantity || batchQuantity <= 0)) {
+      toast.error("يرجى إدخال كمية أكبر من الصفر للدفعة المخزونية الأولية، أو إلغاء تفعيلها.");
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -136,7 +158,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
       toast.success("تم إدخال المنتج ووحداته بنجاح!");
       onSuccess();
-      handleOpenChange(false); // تم استخدام الدالة الجديدة هنا لإغلاق النافذة وتصفيرها
+      handleOpenChange(false); // closes AND resets in one call
     } catch (err: any) {
       toast.error(err.message || "فشلت عملية الإضافة.");
     } finally {
@@ -325,7 +347,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
           </div>
 
           <DialogFooter className="gap-2 sm:gap-0">
-            <Button type="button" variant="outline" onClick={() => handleOpenChange(false)}>
+            <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={loading}>
               إلغاء
             </Button>
             <Button type="submit" disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 text-white">

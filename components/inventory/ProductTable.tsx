@@ -49,6 +49,12 @@ interface ProductTableProps {
   togglingPublicId: string | null;
   onAddBatch: (productId: string) => void;
   onFifoPreview: (productId: string) => void;
+  // ADDED: toggling storefront visibility is ADMIN-only server-side (see
+  // toggle-public/route.ts). The switch stays visible to a CASHIER — it's
+  // useful read-only information (is this product listed publicly right
+  // now?) — but is disabled rather than hidden, so a cashier isn't misled
+  // into thinking a tap will do something the server will just reject.
+  isAdmin: boolean;
 }
 
 export function ProductTable({
@@ -60,6 +66,7 @@ export function ProductTable({
   togglingPublicId,
   onAddBatch,
   onFifoPreview,
+  isAdmin,
 }: ProductTableProps) {
   if (loading) {
     return (
@@ -95,9 +102,6 @@ export function ProductTable({
                 <th className="py-3 px-4 text-center">إجراءات</th>
               </tr>
             </thead>
-            {/* FIX: this <tbody> was missing entirely — the file had a
-                closing </tbody> with no matching opener, which is invalid
-                HTML/JSX and would fail to compile. */}
             <tbody>
               {products.map((product) => {
                 const isExpanded = expandedProductIds.has(product.id);
@@ -149,8 +153,9 @@ export function ProductTable({
                       <div className="flex items-center gap-2">
                         <Switch
                           checked={product.isPublic}
-                          disabled={togglingPublicId === product.id}
+                          disabled={togglingPublicId === product.id || !isAdmin}
                           onCheckedChange={() => handleTogglePublic(product.id)}
+                          title={!isAdmin ? "تعديل حالة النشر متاح لمدير المتجر فقط" : undefined}
                         />
                         <span className="text-[11px] text-zinc-500">
                           {product.isPublic ? "معروض للجمهور" : "مخفي"}
