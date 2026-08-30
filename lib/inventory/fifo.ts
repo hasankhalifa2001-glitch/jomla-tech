@@ -1,4 +1,4 @@
-import { PrismaClient, Prisma } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 
 export interface FifoRequest {
   tenantId: string;
@@ -30,6 +30,19 @@ export interface FifoResolution {
 
 type PrismaTx = PrismaClient | Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends">;
 
+interface BatchRecord {
+  id: string;
+  batchNumber: string;
+  quantity: unknown;
+  expiryDate: Date | null | string;
+  createdAt: Date | string;
+  unitId: string;
+  unit?: {
+    conversionFactor: unknown;
+    unitName: string;
+  } | null;
+}
+
 /**
  * Shared Pure FIFO Allocation Resolver
  *
@@ -49,8 +62,10 @@ export async function resolveFifoAllocation(
     throw new Error("الكمية المطلوبة يجب أن تكون أكبر من الصفر.");
   }
 
+  const client = tx as unknown as PrismaClient;
+
   // 1. Fetch requested unit
-  const requestedUnit = await (tx as any).productUnit.findFirst({
+  const requestedUnit = await client.productUnit.findFirst({
     where: {
       id: unitId,
       productId,
@@ -65,13 +80,8 @@ export async function resolveFifoAllocation(
   const requestedFactor = Number(requestedUnit.conversionFactor) || 1;
   const requestedQtyInBase = requestedQty * requestedFactor;
 
-  // TEMPORARY DECISION (pending first-merchant feedback): batches whose
-  // expiryDate has already passed are NOT excluded here — they're still
-  // offered by FIFO like any other batch with quantity > 0. Revisit once
-  // real usage shows whether merchants actually leave expired stock sitting
-  // in inventory long enough for this to matter in practice.
   // 2. Fetch available batches for this product with quantity > 0
-  const batches = await (tx as any).productBatch.findMany({
+  const batches = (await client.productBatch.findMany({
     where: {
       tenantId,
       productId,
@@ -80,15 +90,10 @@ export async function resolveFifoAllocation(
     include: {
       unit: true,
     },
-  });
+  })) as unknown as BatchRecord[];
 
   // 3. Sort batches: expiryDate ASC NULLS LAST, then createdAt ASC.
-  // FIX: the tie-break used to compare `id` as a string, which happened to
-  // work only because cuid embeds a timestamp — an implementation detail
-  // of cuid, not a documented ordering guarantee. Sorting on the schema's
-  // explicit `createdAt` column makes "oldest received batch first" the
-  // actual intent of the code, not an accident of the ID format.
-  const sortedBatches = [...batches].sort((a: any, b: any) => {
+  const sortedBatches = [...batches].sort((a: BatchRecord, b: BatchRecord) => {
     if (a.expiryDate && b.expiryDate) {
       const diff = new Date(a.expiryDate).getTime() - new Date(b.expiryDate).getTime();
       if (diff !== 0) return diff;

@@ -1,21 +1,28 @@
 "use client";
 
 import { create } from "zustand";
+import { setCachedDailyExchangeRate, getCachedDailyExchangeRate } from "@/lib/offline";
 
 interface ExchangeRateState {
     dailyExchangeRate: number | null;
     isUpdating: boolean;
     error: string | null;
-    setExchangeRate: (rate: number | null) => void;
-    updateExchangeRate: (newRate: number) => Promise<boolean>;
+    setExchangeRate: (rate: number | null, tenantId?: string) => void;
+    updateExchangeRate: (newRate: number, tenantId?: string) => Promise<boolean>;
+    hydrateFromCache: (tenantId?: string) => Promise<number | null>;
 }
 
-export const useExchangeRateStore = create<ExchangeRateState>((set) => ({
+export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
     dailyExchangeRate: null,
     isUpdating: false,
     error: null,
-    setExchangeRate: (rate) => set({ dailyExchangeRate: rate, error: null }),
-    updateExchangeRate: async (newRate: number) => {
+    setExchangeRate: (rate, tenantId) => {
+        set({ dailyExchangeRate: rate, error: null });
+        if (rate !== null && rate > 0) {
+            void setCachedDailyExchangeRate(rate, tenantId);
+        }
+    },
+    updateExchangeRate: async (newRate: number, tenantId?: string) => {
         if (isNaN(newRate) || newRate <= 0) {
             set({ error: "يرجى إدخال سعر صرف صحيح بأرقام أكبر من الصفر." });
             return false;
@@ -40,6 +47,8 @@ export const useExchangeRateStore = create<ExchangeRateState>((set) => ({
             }
 
             set({ dailyExchangeRate: newRate, isUpdating: false, error: null });
+            // Cache locally in Dexie whenever updated online
+            void setCachedDailyExchangeRate(newRate, tenantId);
             return true;
         } catch (err) {
             console.error("Failed to update exchange rate:", err);
@@ -48,6 +57,17 @@ export const useExchangeRateStore = create<ExchangeRateState>((set) => ({
                 isUpdating: false,
             });
             return false;
+        }
+    },
+    hydrateFromCache: async (tenantId?: string) => {
+        try {
+            const cached = await getCachedDailyExchangeRate(tenantId);
+            if (cached !== null && get().dailyExchangeRate === null) {
+                set({ dailyExchangeRate: cached });
+            }
+            return cached;
+        } catch {
+            return null;
         }
     },
 }));

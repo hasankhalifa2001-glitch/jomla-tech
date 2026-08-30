@@ -5,8 +5,19 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertOctagon, LogOut, ShieldAlert, Store } from "lucide-react";
 
+import { SessionProvider } from "@/components/providers/session-provider";
+
 export default function AccountLockedPage() {
-  const { data: session } = useSession();
+  return (
+    <SessionProvider>
+      <AccountLockedContent />
+    </SessionProvider>
+  );
+}
+
+function AccountLockedContent() {
+  const sessionResult = useSession();
+  const session = sessionResult?.data;
   const tenantName = session?.user?.tenantName || "المتجر";
   const subscriptionStatus = session?.user?.subscriptionStatus || "EXPIRED";
 

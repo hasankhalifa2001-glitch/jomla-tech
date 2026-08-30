@@ -24,6 +24,27 @@ async function main() {
 
     const passwordHash = await bcrypt.hash("password123", 10);
 
+    async function ensureSystemCustomer(tenantId: string) {
+        const tenant = await prisma.tenant.findUnique({
+            where: { id: tenantId },
+            select: { systemCustomerId: true },
+        });
+
+        if (!tenant?.systemCustomerId) {
+            const sysCustomer = await prisma.customer.create({
+                data: {
+                    tenantId,
+                    name: "زبون نقدي عام",
+                    isSystemGenerated: true,
+                },
+            });
+            await prisma.tenant.update({
+                where: { id: tenantId },
+                data: { systemCustomerId: sysCustomer.id },
+            });
+        }
+    }
+
     // ---------------------------------------------------------------------
     // 1. Tenant: Active subscription (al-baraka)
     // ---------------------------------------------------------------------
@@ -41,6 +62,8 @@ async function main() {
             subscriptionStatus: TenantSubscriptionStatus.ACTIVE,
         },
     });
+
+    await ensureSystemCustomer(tenantAlBaraka.id);
 
     const adminAlBaraka = await prisma.user.upsert({
         where: { email: "admin@albaraka.com" },
@@ -81,7 +104,9 @@ async function main() {
                     tenantId: tenantAlBaraka.id,
                     unitName: "كيس 25كغ",
                     conversionFactor: 1,
-                    priceUSD: 20.0,
+                    priceWholesale: 20.0,
+                    priceRetail: 22.0,
+                    pricingCurrency: "USD",
                     barcode: "6291001001",
                 },
             },
@@ -114,7 +139,9 @@ async function main() {
                     tenantId: tenantAlBaraka.id,
                     unitName: "طرد 12 لتر",
                     conversionFactor: 1,
-                    priceUSD: 18.5,
+                    priceWholesale: 18.5,
+                    priceRetail: 20.0,
+                    pricingCurrency: "USD",
                     barcode: "6291001002",
                 },
             },
@@ -267,6 +294,8 @@ async function main() {
         },
     });
 
+    await ensureSystemCustomer(tenantAlNoor.id);
+
     await prisma.user.upsert({
         where: { email: "admin@alnoor.com" },
         update: { passwordHash, role: UserRole.ADMIN, isPlatformAdmin: false },
@@ -312,6 +341,8 @@ async function main() {
             subscriptionStatus: TenantSubscriptionStatus.PENDING,
         },
     });
+
+    await ensureSystemCustomer(tenantAlFajr.id);
 
     await prisma.user.upsert({
         where: { email: "admin@alfajr.com" },

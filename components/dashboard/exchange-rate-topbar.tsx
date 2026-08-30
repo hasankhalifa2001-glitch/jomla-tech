@@ -9,7 +9,7 @@ import { toast } from "sonner";
 import { DollarSign, RefreshCw, CheckCircle2 } from "lucide-react";
 
 export function ExchangeRateTopbar() {
-    const { update: updateSession } = useSession();
+    const { data: session, update: updateSession } = useSession();
     const { dailyExchangeRate, isUpdating, updateExchangeRate } = useExchangeRateStore();
     const [inputValue, setInputValue] = useState<string>("");
     const [isEditing, setIsEditing] = useState<boolean>(false);
@@ -31,7 +31,7 @@ export function ExchangeRateTopbar() {
             return;
         }
 
-        const success = await updateExchangeRate(numericRate);
+        const success = await updateExchangeRate(numericRate, session?.user?.tenantId);
         if (success) {
             toast.success(
                 `تم تحديث سعر الصرف اليومي بنجاح (${numericRate.toLocaleString("ar-SY")} ل.س / 1$)`,
