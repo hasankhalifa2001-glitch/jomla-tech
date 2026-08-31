@@ -187,6 +187,17 @@ model Tenant {
   // as a fast filter flag, carrying no uniqueness enforcement itself.
   // @unique here additionally prevents the same Customer row from ever
   // being wired up as the system customer for more than one Tenant.
+  //
+  // REVIEW NOTE (not a schema change — flagged for T7's test suite):
+  // because isSystemGenerated carries no uniqueness enforcement of its
+  // own, nothing at the database level stops a second, stray
+  // isSystemGenerated = true Customer row from existing under the same
+  // tenant (only this field, systemCustomerId, says which one is
+  // authoritative). This should never happen through normal application
+  // flows (only T2's onboarding transaction ever sets the flag), but
+  // since it's not DB-enforced, add an explicit T7 test asserting exactly
+  // one isSystemGenerated = true row exists per tenant at all times, not
+  // just immediately after onboarding.
   systemCustomerId String?   @unique
   systemCustomer   Customer? @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
 }
@@ -257,14 +268,39 @@ model ProductUnit {
   // storefront (T5) alike. Changed only by explicit merchant action on
   // this exact ProductUnit; never recalculated in bulk when the daily
   // exchange rate changes.
+  //
+  // NOTE ON JOMLA-VS-MFAREQ (wholesale-vs-retail-by-quantity) PRICING:
+  // the price difference between buying a single قطعة and a full طرد/
+  // كرتونة of the same product is modeled ENTIRELY by giving each
+  // ProductUnit row its own independent priceWholesale — a merchant sets
+  // the قطعة row and the طرد row separately, with whatever per-unit
+  // markdown they choose for buying in bulk. conversionFactor is used
+  // only to translate quantities/stock between units; it is never used
+  // to derive one unit's price from another's. There is no separate
+  // "wholesale vs. retail" price pair on a single unit — see priceRetail
+  // below for what that field is actually for, which is a different
+  // concept entirely.
   priceWholesale  Decimal         @db.Decimal(18, 4)
-  // A suggested retail price, shown ALONGSIDE priceWholesale as a
-  // marketing/profit-margin hint for the buying retailer — it is never
-  // charged and never written to any Invoice/InvoiceItem. Nullable
-  // because plenty of wholesale-only merchants never set one; nullable
-  // independently per ProductUnit, not per tenant, because a single
-  // merchant can sell some items pure-wholesale and others retail-and-
-  // wholesale at the same time.
+  // A suggested RESALE price — informational only, aimed at a B2B
+  // retailer who buys this exact ProductUnit from this wholesaler and
+  // intends to resell it onward to their own end customer. It answers
+  // "what should I charge when I resell this?", not "what does this cost
+  // me here" — priceWholesale is what this platform actually charges, on
+  // POS (T4b) and the B2B storefront (T5) alike, regardless of who is
+  // buying or through which channel. priceRetail is never charged and
+  // never written to any Invoice/InvoiceItem.
+  //
+  // IMPORTANT — this is NOT how per-unit-size pricing (a single قطعة
+  // costing proportionally more than a full طرد) is modeled; see the note
+  // on priceWholesale immediately above for that mechanism. priceRetail
+  // plays no role in it — it exists one layer further down the chain,
+  // for the retailer's OWN resale decision after they've already bought
+  // at priceWholesale.
+  //
+  // Nullable because plenty of wholesale-only merchants never set one;
+  // nullable independently per ProductUnit, not per tenant, because a
+  // single merchant can sell some items pure-wholesale and others
+  // retail-and-wholesale at the same time.
   priceRetail     Decimal?        @db.Decimal(18, 4)
   // ---------------------------------------------------------------------
 
@@ -382,7 +418,9 @@ model Customer {
   // see `Tenant.systemCustomerId`, a single nullable scalar field that by
   // construction can only ever point at one Customer row. This field
   // remains purely a fast filter flag (e.g. excluding the system customer
-  // from T4e's ledger customer list without a join to Tenant).
+  // from T4e's ledger customer list without a join to Tenant). See the
+  // review note on Tenant.systemCustomerId above for the T7 test this
+  // implies.
   isSystemGenerated      Boolean @default(false)
   // Reverse side of Tenant.systemCustomerId — lets a Customer row know
   // it's wired up as its tenant's system customer, if it is.
@@ -425,6 +463,14 @@ model Customer {
   // customers?") and cross-checking against VerifiedRetailer.phone below.
   // Deliberately NOT @@unique([tenantId, phone]) — see the note on
   // offlineId above for why a hard unique here is the wrong tool.
+  //
+  // REVIEW NOTE: this is a plain index on `phone` alone rather than a
+  // composite (tenantId, phone). Since the stated use case is per-tenant
+  // ("across my customers"), a composite index would serve that lookup
+  // more directly; a lone `phone` index still works (Postgres can filter
+  // the remaining tenantId condition after the index scan) but is worth
+  // revisiting if this lookup shows up in slow-query logs post-launch —
+  // not a correctness issue, a possible future performance tweak.
   @@index([phone])
   // [v3.3] Supports onboarding/lookup of a tenant's system-generated
   // customer without a full scan.
