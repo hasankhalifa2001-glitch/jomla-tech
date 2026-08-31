@@ -116,10 +116,21 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
           </Card>
         ) : (
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
-            {tenant.products.map((product) => {
+            {tenant.products.map((product: any) => {
               const primaryUnit = product.units[0];
-              const priceUSD = primaryUnit ? Number(primaryUnit.priceUSD) : 0;
-              const priceSYP = exchangeRate ? priceUSD * exchangeRate : null;
+              const currency = primaryUnit?.pricingCurrency || "SYP";
+              const rawPrice = primaryUnit ? Number(primaryUnit.priceWholesale) : 0;
+              
+              let priceUSD = 0;
+              let priceSYP: number | null = null;
+
+              if (currency === "USD") {
+                priceUSD = rawPrice;
+                priceSYP = exchangeRate ? rawPrice * exchangeRate : null;
+              } else {
+                priceSYP = rawPrice;
+                priceUSD = exchangeRate && exchangeRate > 0 ? rawPrice / exchangeRate : 0;
+              }
 
               return (
                 <Card key={product.id} className="flex flex-col justify-between border-zinc-200 dark:border-zinc-800 hover:shadow-lg transition-shadow">

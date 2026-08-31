@@ -120,7 +120,7 @@ export async function getOfflineCustomers(query?: string): Promise<SelectedCusto
       id: c.id,
       name: c.name,
       shopName: c.shopName,
-      balanceDebtUSD: c.cachedBalanceDebtUSD || 0,
+      balanceDebtUSD: Number(c.cachedBalanceDebtUSD) || 0,
     })),
     ...offlineList.map((c) => ({
       type: "WALK_IN" as const,
@@ -263,11 +263,12 @@ export async function seedSampleOfflineData(): Promise<void> {
       {
         id: "prod-1",
         name: "سكر أبيض ناعم (الأسرة)",
+        priceWholesale: 1.2,
         priceUSD: 1.2,
         units: [
-          { id: "unit-1-1", unitName: "كيس (1 كغ)", conversionFactor: 1, priceUSD: 1.2, barcode: "6291001001" },
-          { id: "unit-1-2", unitName: "شوال (10 كغ)", conversionFactor: 10, priceUSD: 11.5, barcode: "6291001002" },
-          { id: "unit-1-3", unitName: "شوال كبير (50 كغ)", conversionFactor: 50, priceUSD: 55.0, barcode: "6291001003" },
+          { id: "unit-1-1", unitName: "كيس (1 كغ)", conversionFactor: 1, priceWholesale: 1.2, priceUSD: 1.2, barcode: "6291001001" },
+          { id: "unit-1-2", unitName: "شوال (10 كغ)", conversionFactor: 10, priceWholesale: 11.5, priceUSD: 11.5, barcode: "6291001002" },
+          { id: "unit-1-3", unitName: "شوال كبير (50 كغ)", conversionFactor: 50, priceWholesale: 55.0, priceUSD: 55.0, barcode: "6291001003" },
         ],
         batches: [
           { id: "batch-1-1", unitId: "unit-1-1", batchNumber: "B2026-01", quantity: 150, expiryDate: "2027-01-01" },
@@ -277,10 +278,11 @@ export async function seedSampleOfflineData(): Promise<void> {
       {
         id: "prod-2",
         name: "زيت دوار الشمس (عافية 1.5 لتر)",
+        priceWholesale: 3.5,
         priceUSD: 3.5,
         units: [
-          { id: "unit-2-1", unitName: "عبوة (1.5 لتر)", conversionFactor: 1, priceUSD: 3.5, barcode: "6292002001" },
-          { id: "unit-2-2", unitName: "كرتونة (6 عبوات)", conversionFactor: 6, priceUSD: 20.0, barcode: "6292002002" },
+          { id: "unit-2-1", unitName: "عبوة (1.5 لتر)", conversionFactor: 1, priceWholesale: 3.5, priceUSD: 3.5, barcode: "6292002001" },
+          { id: "unit-2-2", unitName: "كرتونة (6 عبوات)", conversionFactor: 6, priceWholesale: 20.0, priceUSD: 20.0, barcode: "6292002002" },
         ],
         batches: [
           { id: "batch-2-1", unitId: "unit-2-1", batchNumber: "AF-998", quantity: 85, expiryDate: "2026-12-31" },
@@ -289,10 +291,11 @@ export async function seedSampleOfflineData(): Promise<void> {
       {
         id: "prod-3",
         name: "شاي أسود فرط (الكبوس 450 غرام)",
+        priceWholesale: 4.8,
         priceUSD: 4.8,
         units: [
-          { id: "unit-3-1", unitName: "باكيت (450 غ)", conversionFactor: 1, priceUSD: 4.8, barcode: "6293003001" },
-          { id: "unit-3-2", unitName: "كرتونة (24 باكيت)", conversionFactor: 24, priceUSD: 110.0, barcode: "6293003002" },
+          { id: "unit-3-1", unitName: "باكيت (450 غ)", conversionFactor: 1, priceWholesale: 4.8, priceUSD: 4.8, barcode: "6293003001" },
+          { id: "unit-3-2", unitName: "كرتونة (24 باكيت)", conversionFactor: 24, priceWholesale: 110.0, priceUSD: 110.0, barcode: "6293003002" },
         ],
         batches: [
           { id: "batch-3-1", unitId: "unit-3-1", batchNumber: "KBS-44", quantity: 60, expiryDate: "2028-02-15" },
@@ -301,10 +304,11 @@ export async function seedSampleOfflineData(): Promise<void> {
       {
         id: "prod-4",
         name: "أرز بسمتي هندي (أبو كاس 5 كغ)",
+        priceWholesale: 8.5,
         priceUSD: 8.5,
         units: [
-          { id: "unit-4-1", unitName: "كيس (5 كغ)", conversionFactor: 1, priceUSD: 8.5, barcode: "6294004001" },
-          { id: "unit-4-2", unitName: "كرتونة (4 أكياس)", conversionFactor: 4, priceUSD: 33.0, barcode: "6294004002" },
+          { id: "unit-4-1", unitName: "كيس (5 كغ)", conversionFactor: 1, priceWholesale: 8.5, priceUSD: 8.5, barcode: "6294004001" },
+          { id: "unit-4-2", unitName: "كرتونة (4 أكياس)", conversionFactor: 4, priceWholesale: 33.0, priceUSD: 33.0, barcode: "6294004002" },
         ],
         batches: [
           { id: "batch-4-1", unitId: "unit-4-1", batchNumber: "RICE-2026", quantity: 120, expiryDate: "2027-09-30" },
@@ -313,10 +317,11 @@ export async function seedSampleOfflineData(): Promise<void> {
       {
         id: "prod-5",
         name: "حليب مجفف كامل الدسم (نيدو 900 غرام)",
+        priceWholesale: 7.2,
         priceUSD: 7.2,
         units: [
-          { id: "unit-5-1", unitName: "علبة (900 غ)", conversionFactor: 1, priceUSD: 7.2, barcode: "6295005001" },
-          { id: "unit-5-2", unitName: "كرتونة (12 علبة)", conversionFactor: 12, priceUSD: 84.0, barcode: "6295005002" },
+          { id: "unit-5-1", unitName: "علبة (900 غ)", conversionFactor: 1, priceWholesale: 7.2, priceUSD: 7.2, barcode: "6295005001" },
+          { id: "unit-5-2", unitName: "كرتونة (12 علبة)", conversionFactor: 12, priceWholesale: 84.0, priceUSD: 84.0, barcode: "6295005002" },
         ],
         batches: [
           { id: "batch-5-1", unitId: "unit-5-1", batchNumber: "NID-110", quantity: 45, expiryDate: "2026-11-20" },
@@ -325,10 +330,11 @@ export async function seedSampleOfflineData(): Promise<void> {
       {
         id: "prod-6",
         name: "معكرونة إيطالية (سباغيتي 500 غ)",
+        priceWholesale: 0.85,
         priceUSD: 0.85,
         units: [
-          { id: "unit-6-1", unitName: "كيس (500 غ)", conversionFactor: 1, priceUSD: 0.85, barcode: "6296006001" },
-          { id: "unit-6-2", unitName: "طرد (20 كيس)", conversionFactor: 20, priceUSD: 16.0, barcode: "6296006002" },
+          { id: "unit-6-1", unitName: "كيس (500 غ)", conversionFactor: 1, priceWholesale: 0.85, priceUSD: 0.85, barcode: "6296006001" },
+          { id: "unit-6-2", unitName: "طرد (20 كيس)", conversionFactor: 20, priceWholesale: 16.0, priceUSD: 16.0, barcode: "6296006002" },
         ],
         batches: [
           { id: "batch-6-1", unitId: "unit-6-1", batchNumber: "PST-88", quantity: 300, expiryDate: "2027-05-10" },

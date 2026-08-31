@@ -138,7 +138,7 @@ export function ProductCatalog({
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {products.map((product) => {
               const defaultUnit = product.units?.[0];
-              const priceUSD = defaultUnit?.priceUSD || product.priceUSD || 0;
+              const priceUSD = Number(defaultUnit?.priceUSD ?? defaultUnit?.priceWholesale ?? product.priceUSD ?? product.priceWholesale ?? 0);
               const convertedSYP = exchangeRate ? priceUSD * exchangeRate : null;
 
               return (
@@ -192,7 +192,7 @@ export function ProductCatalog({
                             <Plus className="h-3 w-3 text-emerald-600" />
                             <span className="font-semibold">{unit.unitName}</span>
                             <span className="text-[10px] text-zinc-500 font-mono">
-                              (${unit.priceUSD.toFixed(2)})
+                              (${Number(unit.priceUSD ?? unit.priceWholesale ?? 0).toFixed(2)})
                             </span>
                           </button>
                         ))}

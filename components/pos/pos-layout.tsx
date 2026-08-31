@@ -64,10 +64,11 @@ export function PosLayout() {
     setIsLoadingProducts(true);
     try {
       await hydrateExchangeRate();
-      const prods = await getOfflineProducts(searchQuery);
+      const [prods, offlineInvoices] = await Promise.all([
+        getOfflineProducts(searchQuery),
+        getOfflineInvoicesList(),
+      ]);
       setProducts(prods);
-
-      const offlineInvoices = await getOfflineInvoicesList();
       const pendingCount = offlineInvoices.filter((inv) => inv.status === "PENDING").length;
       setPendingInvoicesCount(pendingCount);
     } catch (err) {
@@ -75,11 +76,25 @@ export function PosLayout() {
     } finally {
       setIsLoadingProducts(false);
     }
-  }, [isDbReady, searchQuery, hydrateExchangeRate]);
+  }, [isDbReady, hydrateExchangeRate]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Dynamic product search filtering without triggering full page loading state or re-hydrating store
+  useEffect(() => {
+    if (!isDbReady) return;
+    let isSubscribed = true;
+    getOfflineProducts(searchQuery).then((prods) => {
+      if (isSubscribed) {
+        setProducts(prods);
+      }
+    });
+    return () => {
+      isSubscribed = false;
+    };
+  }, [isDbReady, searchQuery]);
 
   // 2. Keyboard Shortcuts (F2: Search, F4: Customer, F9: Checkout, Esc: Close)
   useEffect(() => {
@@ -137,7 +152,7 @@ export function PosLayout() {
         unitName: unit.unitName,
         conversionFactor: unit.conversionFactor,
         quantity: 1,
-        unitPriceUSD: unit.priceUSD || product.priceUSD || 0,
+        unitPriceUSD: Number(unit.priceUSD ?? unit.priceWholesale ?? product.priceUSD ?? product.priceWholesale ?? 0),
       };
       return [...prev, newItem];
     });
@@ -179,7 +194,7 @@ export function PosLayout() {
               unitId: selectedUnit.id,
               unitName: selectedUnit.unitName,
               conversionFactor: selectedUnit.conversionFactor,
-              unitPriceUSD: selectedUnit.priceUSD,
+              unitPriceUSD: Number(selectedUnit.priceUSD ?? selectedUnit.priceWholesale ?? 0),
             };
           }
         }
@@ -231,6 +246,10 @@ export function PosLayout() {
     setCompletedInvoice(savedInvoice);
     setCompletedCustomer(selectedCustomer);
     setCompletedItems([...cartItems]);
+
+    // Clear active cart & customer for next sale
+    setCartItems([]);
+    setSelectedCustomer(null);
 
     // Close payment modal and open confirmation
     setIsPaymentModalOpen(false);

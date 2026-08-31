@@ -43,6 +43,12 @@ function resolveTenantSlugFromHost(host: string): string | null {
     return null;
 }
 
+function resolveTenantSlugFromStorePath(pathname: string): string | null {
+    if (!pathname.startsWith("/store/")) return null;
+    const segments = pathname.split("/").filter(Boolean);
+    return segments.length >= 2 ? segments[1] : null;
+}
+
 // Endpoints that are POST (because they need a request body) but are
 // strictly read-only — no database write happens. The isWriteMethod check
 // below can't tell these apart from a real write by HTTP method alone, so
@@ -54,28 +60,50 @@ const READ_ONLY_POST_PREFIXES = [
     "/api/inventory/import/preview",
 ];
 
+// FIX #1 (chicken-and-egg): a PENDING tenant is locked by definition until
+// its FIRST subscription is approved — so the write path that actually
+// *submits* that first subscription request must stay reachable while
+// locked, not just the receipt-image upload step that precedes it. Both
+// prefixes are listed explicitly rather than inferring "billing-related"
+// from the URL, so this stays an intentional allow-list, not a guess.
+//
+// NOTE: adjust "/api/subscriptions" to match T6's real route name once
+// that endpoint is implemented — this middleware cannot verify the route
+// exists, only that it won't be blocked here if it's named this.
+const WRITE_ALLOWED_WHEN_LOCKED_PREFIXES = [
+    "/api/upload/receipt",
+    "/api/subscriptions",
+];
+
 export default auth((req) => {
     const { nextUrl } = req;
     const isLoggedIn = !!req.auth;
     const user = req.auth?.user;
     const pathname = nextUrl.pathname;
 
+    // Resolved once, used both for the rewrite below AND forwarded to
+    // downstream route handlers via a header — see FIX #3.
+    const host = req.headers.get("host") || "";
+    const tenantSlug =
+        resolveTenantSlugFromStorePath(pathname) || resolveTenantSlugFromHost(host);
+
     // ── 1a. Explicit sub-link rewrite: /store/tenantSlug/... -> /tenantSlug/...
     if (pathname.startsWith("/store/")) {
         const segments = pathname.split("/").filter(Boolean);
         if (segments.length >= 2) {
-            const tenantSlug = segments[1];
+            const slug = segments[1];
             const rest = segments.slice(2).join("/");
-            const targetPath = `/${tenantSlug}${rest ? `/${rest}` : ""}`;
-            return NextResponse.rewrite(new URL(targetPath, req.url));
+            const targetPath = `/${slug}${rest ? `/${rest}` : ""}`;
+            const rewritten = NextResponse.rewrite(new URL(targetPath, req.url));
+            rewritten.headers.set("x-tenant-slug", slug);
+            return rewritten;
         }
     }
 
     // ── 1b. Subdomain rewrite: tenant.domain.com -> /tenantSlug
-    const host = req.headers.get("host") || "";
-    const tenantSlug = resolveTenantSlugFromHost(host);
+    const subdomainSlug = resolveTenantSlugFromHost(host);
 
-    if (tenantSlug) {
+    if (subdomainSlug) {
         const isReservedPath =
             isPathUnder(pathname, DASHBOARD_PATH_PREFIXES) ||
             pathname.startsWith("/admin") ||
@@ -84,8 +112,12 @@ export default auth((req) => {
             pathname.startsWith("/register") ||
             pathname.startsWith("/account-locked");
 
-        if (!isReservedPath && !pathname.startsWith(`/${tenantSlug}`)) {
-            return NextResponse.rewrite(new URL(`/${tenantSlug}${pathname}`, req.url));
+        if (!isReservedPath && !pathname.startsWith(`/${subdomainSlug}`)) {
+            const rewritten = NextResponse.rewrite(
+                new URL(`/${subdomainSlug}${pathname}`, req.url)
+            );
+            rewritten.headers.set("x-tenant-slug", subdomainSlug);
+            return rewritten;
         }
     }
 
@@ -132,22 +164,43 @@ export default auth((req) => {
             billingUrl.searchParams.set("reason", user!.subscriptionStatus!.toLowerCase());
             return NextResponse.redirect(billingUrl);
         }
+
+        // FIX #4: an ADMIN who navigates to /account-locked directly (e.g. a
+        // stale bookmark, or a link meant for a CASHIER) is bounced to
+        // /settings/billing instead — keeping the ADMIN-vs-CASHIER lockout
+        // split (T1/T2) enforced regardless of how the ADMIN got there, not
+        // just on the initial redirect.
+        if (isAccountLockedRoute && user?.role === "ADMIN" && isLocked) {
+            const billingUrl = new URL("/settings/billing", req.url);
+            billingUrl.searchParams.set("reason", user!.subscriptionStatus!.toLowerCase());
+            return NextResponse.redirect(billingUrl);
+        }
     }
 
     // ── 4. Block write operations on API endpoints for expired/pending tenants.
+    //
+    // SCOPE NOTE (FIX #3): this check is necessarily session-based — it can
+    // only ever lock down writes made by an AUTHENTICATED merchant user
+    // (ADMIN/CASHIER on their own dashboard, e.g. /api/sync). It does NOT
+    // and architecturally CANNOT cover /api/store/* (the public B2B
+    // storefront submission endpoint): a retail customer placing an order
+    // has no session at all, so there is no `user.subscriptionStatus` to
+    // read here regardless of how this block is written. Locking a
+    // suspended tenant's storefront must be enforced inside the
+    // /api/store/orders route handler itself, keyed off the TARGET
+    // tenant's live status (looked up via the `x-tenant-slug` header this
+    // middleware sets above, or re-derived from the host), not the
+    // requester's session — there isn't one to check.
     if (pathname.startsWith("/api/") && !pathname.startsWith("/api/auth")) {
         const isWriteMethod = ["POST", "PUT", "DELETE", "PATCH"].includes(req.method);
-        const isReceiptUpload = pathname.startsWith("/api/upload/receipt");
-        // FIX: fifo-preview and import/preview are POST (they need a request
-        // body) but never write to the database. Without this exception, a
-        // locked tenant couldn't even preview a FIFO allocation or a CSV
-        // import — which defeats the point of "read-only mode" being
-        // read-only rather than fully inert.
+        const isAllowedWhenLocked = WRITE_ALLOWED_WHEN_LOCKED_PREFIXES.some((p) =>
+            pathname.startsWith(p)
+        );
         const isReadOnlyAction = READ_ONLY_POST_PREFIXES.some((p) => pathname.startsWith(p));
         const isLocked =
             user?.subscriptionStatus === "EXPIRED" || user?.subscriptionStatus === "PENDING";
 
-        if (isWriteMethod && !isReceiptUpload && !isReadOnlyAction && isLocked) {
+        if (isWriteMethod && !isAllowedWhenLocked && !isReadOnlyAction && isLocked) {
             return NextResponse.json(
                 {
                     error: "SUBSCRIPTION_LOCKED",
@@ -158,7 +211,11 @@ export default auth((req) => {
         }
     }
 
-    return NextResponse.next();
+    const response = NextResponse.next();
+    if (tenantSlug) {
+        response.headers.set("x-tenant-slug", tenantSlug);
+    }
+    return response;
 });
 
 export const config = {

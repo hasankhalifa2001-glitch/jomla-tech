@@ -155,7 +155,7 @@ export function CartPanel({
                       <SelectContent dir="rtl">
                         {item.product.units?.map((u) => (
                           <SelectItem key={u.id} value={u.id} className="text-xs">
-                            {u.unitName} (${u.priceUSD.toFixed(2)})
+                            {u.unitName} (${Number(u.priceUSD ?? u.priceWholesale ?? 0).toFixed(2)})
                           </SelectItem>
                         ))}
                       </SelectContent>

@@ -95,7 +95,7 @@ export interface OfflineCustomer {
  */
 export interface CachedTenantSettings {
   tenantId: string;
-  dailyExchangeRate: string | number;
+  dailyExchangeRate: string; // decimal.js-serialized — never a native number
   cachedAt: Date;
 }
 

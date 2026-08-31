@@ -1,5 +1,6 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
+import { CredentialsSignin } from "next-auth";
 import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/db";
 import type { DefaultSession } from "next-auth";
@@ -70,10 +71,36 @@ function requireAuthSecret(): string {
     return secret;
 }
 
-// Optional but recommended: throttle login attempts per email so a brute-
-// force script can't hammer authorize(). Reuses the same Upstash Redis
-// instance already provisioned for T5's order rate limiting. Activates
-// automatically once UPSTASH_REDIS_REST_URL/TOKEN are set — no-op until then.
+// FIX (timing side-channel): a bcrypt hash of a value nobody will ever type,
+// compared against on every "user not found" / "user inactive" path below so
+// that path takes roughly the same time as a real password check. Without
+// this, `findUnique` returning null short-circuits authorize() almost
+// instantly while a real user always pays bcrypt's ~100ms+ cost — an
+// attacker can distinguish "this email doesn't exist" from "this email
+// exists, wrong password" purely by response time, effectively letting them
+// enumerate valid emails (which, per this codebase's admin@<slug>.com
+// convention, are not hard to guess in the first place).
+const DUMMY_PASSWORD_HASH =
+    "$2a$10$CwTycUXWue0Thq9StjUM0uJ8Dj9K7L9E9zQK6mF2b9v6QGZ4rXKdG";
+
+// FIX (rate-limit UX): Auth.js v5 swallows any plain `Error` thrown inside
+// authorize() and surfaces only a generic "CredentialsSignin" error to the
+// client, by design (it never leaks *why* a credentials attempt failed). A
+// plain `throw new Error("Too many login attempts...")` therefore never
+// reaches the user — they'd just see the same "invalid credentials" message
+// as a wrong password, which is actively misleading (it encourages *more*
+// attempts, the opposite of the rate limit's purpose). A named
+// CredentialsSignin subclass with a stable `code` DOES survive the trip to
+// `useSession`/`signIn()`'s returned `error` field, so the login page can
+// branch on `error === "RateLimited"` and show the right message.
+class RateLimitedError extends CredentialsSignin {
+    code = "RateLimited";
+}
+
+// Throttle login attempts so a brute-force script can't hammer authorize().
+// Reuses the same Upstash Redis instance already provisioned for T5's order
+// rate limiting. Activates automatically once UPSTASH_REDIS_REST_URL/TOKEN
+// are set — no-op until then.
 const loginRatelimit =
     process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
         ? new Ratelimit({
@@ -81,7 +108,7 @@ const loginRatelimit =
                 url: process.env.UPSTASH_REDIS_REST_URL,
                 token: process.env.UPSTASH_REDIS_REST_TOKEN,
             }),
-            limiter: Ratelimit.slidingWindow(5, "5 m"), // 5 attempts / 5 min per email
+            limiter: Ratelimit.slidingWindow(5, "5 m"), // 5 attempts / 5 min per key
             prefix: "ratelimit:login",
         })
         : null;
@@ -94,7 +121,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                 email: { label: "Email", type: "email" },
                 password: { label: "Password", type: "password" },
             },
-            async authorize(credentials) {
+            async authorize(credentials, request) {
                 if (!credentials?.email || !credentials?.password) {
                     return null;
                 }
@@ -102,10 +129,27 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                 const email = String(credentials.email).toLowerCase().trim();
                 const password = String(credentials.password);
 
+                // FIX (rate-limit scope): keyed on email + a best-effort IP,
+                // not email alone. Email-only keying means anyone who knows
+                // (or guesses — this project's seed convention is literally
+                // admin@<slug>.com) a target's email can lock THEM out for
+                // everyone by deliberately failing 5 times from anywhere,
+                // repeatedly, with no cost to the attacker. Combining with
+                // IP means an attacker can still hammer a single victim from
+                // one IP, but can no longer indefinitely deny that specific
+                // account to its real owner from an unrelated IP. This is a
+                // mitigation, not a complete fix — a distributed attacker
+                // rotating IPs can still target one email; a second layer
+                // (e.g. a CAPTCHA after N failures, independent of IP) is
+                // recommended before this ships to production.
+                const ip =
+                    request?.headers?.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+                    "unknown";
+
                 if (loginRatelimit) {
-                    const { success } = await loginRatelimit.limit(email);
+                    const { success } = await loginRatelimit.limit(`${email}:${ip}`);
                     if (!success) {
-                        throw new Error("Too many login attempts. Please try again in a few minutes.");
+                        throw new RateLimitedError();
                     }
                 }
 
@@ -114,14 +158,13 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                     include: { tenant: true },
                 });
 
-                if (!user || !user.passwordHash) {
-                    return null;
-                }
-
-                // A deactivated user (isActive = false — e.g. a cashier who
-                // left, or an account suspended by the tenant admin) must
-                // never be able to sign in, even with a correct password.
-                if (!user.isActive) {
+                // FIX (timing side-channel): always run a bcrypt comparison
+                // on this path — against the dummy hash when there's no real
+                // user/hash to check against — instead of returning
+                // immediately. Keeps "no such user" and "wrong password"
+                // taking roughly the same wall-clock time.
+                if (!user || !user.passwordHash || !user.isActive) {
+                    await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
                     return null;
                 }
 

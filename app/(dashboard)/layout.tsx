@@ -26,7 +26,7 @@ export default function DashboardLayout({
           <DashboardTopBar />
 
           {/* Page Body View */}
-          <main className="flex-1 overflow-y-auto p-6 bg-zinc-50 dark:bg-zinc-950">
+          <main className="flex-1 overflow-y-auto p-6 pb-20 md:pb-6 bg-zinc-50 dark:bg-zinc-950">
             <div className="mx-auto max-w-7xl">{children}</div>
           </main>
         </div>

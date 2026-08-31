@@ -17,6 +17,12 @@ import { Store, Lock, Mail, Loader2, AlertCircle, ShieldCheck } from "lucide-rea
 // versa. Never rely on NODE_ENV !== "production" as the sole gate for
 // something this sensitive (it silently reveals real merchant emails and
 // the shared seed password to any visitor otherwise).
+//
+// DEPLOYMENT NOTE: NEXT_PUBLIC_* vars are inlined at BUILD time, not read
+// at runtime in the browser. This gate only works if staging and
+// production are built separately with different values for this
+// variable — deploying one shared build artifact to both environments
+// with a runtime env override does NOT change this flag's baked-in value.
 const SHOW_DEMO_LOGINS = process.env.NEXT_PUBLIC_SHOW_DEMO_LOGINS === "true";
 
 const DEMO_ACCOUNTS = [
@@ -40,10 +46,26 @@ const DEMO_ACCOUNTS = [
   },
 ] as const;
 
+// FIX (open redirect): only ever trust callbackUrl if it's a same-app
+// relative path. `callbackUrl` arrives via a query param the user's browser
+// URL bar fully controls — not just via the middleware's own generation
+// (see middleware.ts's `loginUrl.searchParams.set("callbackUrl", pathname)`,
+// which is safe on its own, but nothing stops someone from sharing a
+// hand-crafted `/login?callbackUrl=https://evil.example.com` link instead).
+// A leading single "/" that is NOT a protocol-relative "//" is the standard
+// safe-relative-path check; anything else falls back to "/dashboard".
+function sanitizeCallbackUrl(raw: string | null): string {
+  if (!raw) return "/dashboard";
+  if (raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\")) {
+    return raw;
+  }
+  return "/dashboard";
+}
+
 function LoginFormContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const callbackUrl = searchParams.get("callbackUrl") || "/dashboard";
+  const callbackUrl = sanitizeCallbackUrl(searchParams.get("callbackUrl"));
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -63,14 +85,19 @@ function LoginFormContent() {
         });
 
         if (res?.error) {
-          // authorize() throws a distinct "Too many login attempts" message
-          // when the Upstash rate limiter trips (see auth.ts) — surface that
-          // specifically, or a rate-limited user sees "wrong password" and
-          // has no idea they should just wait instead of retrying, which
-          // only extends their own lockout window.
-          const message = res.error.toLowerCase().includes("too many")
-            ? "محاولات دخول كثيرة جداً. الرجاء الانتظار بضع دقائق قبل إعادة المحاولة."
-            : "بيانات الدخول غير صحيحة. يرجى التثبت من البريد الإلكتروني وكلمة المرور.";
+          // FIX: auth.ts's rate-limit failure is a named CredentialsSignin
+          // subclass with `code = "RateLimited"`. With `redirect: false`,
+          // Auth.js surfaces that code verbatim as `res.error` — NOT the
+          // original error message text — so this must match the code
+          // exactly, not sniff for a substring of a message that no longer
+          // exists. Any other error type (wrong password, inactive user,
+          // missing user) falls through to the generic message, which is
+          // intentional — Auth.js deliberately doesn't distinguish those
+          // from each other to avoid leaking which part was wrong.
+          const message =
+            res.error === "RateLimited"
+              ? "محاولات دخول كثيرة جداً. الرجاء الانتظار بضع دقائق قبل إعادة المحاولة."
+              : "بيانات الدخول غير صحيحة. يرجى التثبت من البريد الإلكتروني وكلمة المرور.";
           setError(message);
           setIsLoading(false);
           return;

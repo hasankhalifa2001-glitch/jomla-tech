@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { prisma } from "@/lib/db";
+import { getTenantDb } from "@/lib/db";
 import { z } from "zod";
 
 const updateRateSchema = z.object({
@@ -12,6 +12,36 @@ const updateRateSchema = z.object({
         // against an obviously wrong value being saved silently.
         .max(1_000_000, "القيمة أكبر من المتوقع، يرجى التأكد من الرقم المدخل"),
 });
+
+export async function GET() {
+    try {
+        const session = await auth();
+
+        if (!session || !session.user || !session.user.tenantId) {
+            return NextResponse.json(
+                { error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." },
+                { status: 401 }
+            );
+        }
+
+        const db = getTenantDb(session.user.tenantId);
+        const tenant = await db.tenant.findUnique({
+            where: { id: session.user.tenantId },
+            select: { dailyExchangeRate: true },
+        });
+
+        return NextResponse.json({
+            success: true,
+            dailyExchangeRate: tenant?.dailyExchangeRate != null ? Number(tenant.dailyExchangeRate) : null,
+        });
+    } catch (error) {
+        console.error("Error fetching exchange rate:", error);
+        return NextResponse.json(
+            { error: "SERVER_ERROR", message: "حدث خطأ غير متوقع أثناء جلب سعر الصرف." },
+            { status: 500 }
+        );
+    }
+}
 
 export async function POST(req: Request) {
     try {
@@ -74,7 +104,8 @@ export async function POST(req: Request) {
         // Scoped by tenantId from the session, never trusting any tenant
         // identifier from the request body — the same rule that applies to
         // every write endpoint in this codebase.
-        const updatedTenant = await prisma.tenant.update({
+        const db = getTenantDb(session.user.tenantId);
+        const updatedTenant = await db.tenant.update({
             where: { id: session.user.tenantId },
             data: { dailyExchangeRate: rate },
         });

@@ -145,10 +145,10 @@ export function CheckoutSuccessModal({
               <span className="text-zinc-600 dark:text-zinc-400">إجمالي الفاتورة:</span>
               <div className="text-left">
                 <span className="text-emerald-700 dark:text-emerald-400 font-extrabold ml-2">
-                  ${invoice.totalUSD.toFixed(2)}
+                  ${Number(invoice.totalUSD).toFixed(2)}
                 </span>
                 <span className="text-purple-600 dark:text-purple-400 text-[11px]">
-                  ({Math.round(invoice.totalSYP).toLocaleString("ar-SY")} ل.س)
+                  ({Math.round(Number(invoice.totalSYP)).toLocaleString("ar-SY")} ل.س)
                 </span>
               </div>
             </div>
@@ -156,21 +156,21 @@ export function CheckoutSuccessModal({
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">سعر الصرف المعتمد:</span>
               <span className="font-mono text-zinc-600 dark:text-zinc-400">
-                {invoice.exchangeRateUsed.toLocaleString("ar-SY")} ل.س / $
+                {Number(invoice.exchangeRateUsed).toLocaleString("ar-SY")} ل.س / $
               </span>
             </div>
 
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">المبلغ المدفوع:</span>
               <span className="font-bold text-emerald-600">
-                ${invoice.paidAmountUSD.toFixed(2)}
+                ${Number(invoice.paidAmountUSD).toFixed(2)}
               </span>
             </div>
 
-            {invoice.debtAmountUSD > 0 && (
+            {Number(invoice.debtAmountUSD) > 0 && (
               <div className="flex justify-between text-xs font-bold text-red-600 dark:text-red-400">
                 <span>المتبقي على الحساب (دين):</span>
-                <span>${invoice.debtAmountUSD.toFixed(2)}</span>
+                <span>${Number(invoice.debtAmountUSD).toFixed(2)}</span>
               </div>
             )}
           </div>

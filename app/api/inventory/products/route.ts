@@ -59,14 +59,14 @@ export async function GET(req: Request) {
 
     const now = new Date();
 
-    const processedProducts = products.map((product) => {
-      const baseUnit = product.units.find((u) => Number(u.conversionFactor) === 1) || product.units[0];
+    const processedProducts = products.map((product: any) => {
+      const baseUnit = product.units.find((u: any) => Number(u.conversionFactor) === 1) || product.units[0];
       const baseFactor = baseUnit ? Number(baseUnit.conversionFactor) : 1;
 
       let totalBaseStock = 0;
       let hasExpiringSoonBatch = false;
 
-      const processedBatches = product.batches.map((batch) => {
+      const processedBatches = product.batches.map((batch: any) => {
         const batchUnitFactor = batch.unit ? Number(batch.unit.conversionFactor) : 1;
         const batchQty = Number(batch.quantity);
         totalBaseStock += batchQty * batchUnitFactor;
@@ -112,7 +112,7 @@ export async function GET(req: Request) {
         isPublic: product.isPublic,
         isActive: product.isActive,
         createdAt: product.createdAt,
-        units: product.units.map((u) => ({
+        units: product.units.map((u: any) => ({
           id: u.id,
           unitName: u.unitName,
           conversionFactor: Number(u.conversionFactor),
@@ -131,16 +131,16 @@ export async function GET(req: Request) {
 
     if (q) {
       const lowerQ = q.toLowerCase();
-      filtered = filtered.filter((p) => {
-        const barcodeMatch = p.units.some((u) => u.barcode && u.barcode.toLowerCase().includes(lowerQ));
+      filtered = filtered.filter((p: any) => {
+        const barcodeMatch = p.units.some((u: any) => u.barcode && u.barcode.toLowerCase().includes(lowerQ));
         const nameMatch = p.name.toLowerCase().includes(lowerQ);
         const categoryMatch = p.category && p.category.toLowerCase().includes(lowerQ);
         return barcodeMatch || nameMatch || categoryMatch;
       });
 
-      filtered.sort((a, b) => {
-        const aExactBarcode = a.units.some((u) => u.barcode && u.barcode.toLowerCase() === lowerQ);
-        const bExactBarcode = b.units.some((u) => u.barcode && u.barcode.toLowerCase() === lowerQ);
+      filtered.sort((a: any, b: any) => {
+        const aExactBarcode = a.units.some((u: any) => u.barcode && u.barcode.toLowerCase() === lowerQ);
+        const bExactBarcode = b.units.some((u: any) => u.barcode && u.barcode.toLowerCase() === lowerQ);
         if (aExactBarcode && !bExactBarcode) return -1;
         if (!aExactBarcode && bExactBarcode) return 1;
         return 0;
@@ -148,11 +148,11 @@ export async function GET(req: Request) {
     }
 
     if (filter === "public") {
-      filtered = filtered.filter((p) => p.isPublic);
+      filtered = filtered.filter((p: any) => p.isPublic);
     } else if (filter === "expiring") {
-      filtered = filtered.filter((p) => p.hasExpiringSoonBatch);
+      filtered = filtered.filter((p: any) => p.hasExpiringSoonBatch);
     } else if (filter === "out_of_stock") {
-      filtered = filtered.filter((p) => p.isOutOfStock);
+      filtered = filtered.filter((p: any) => p.isOutOfStock);
     }
 
     return NextResponse.json({
@@ -223,7 +223,7 @@ export async function POST(req: Request) {
       }
     }
 
-    const createdProduct = await prisma.$transaction(async (tx) => {
+    const createdProduct = await prisma.$transaction(async (tx: any) => {
       const product = await tx.product.create({
         data: {
           tenantId,

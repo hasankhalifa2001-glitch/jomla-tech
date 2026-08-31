@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import Decimal from "decimal.js";
 
 /**
@@ -30,10 +31,10 @@ import Decimal from "decimal.js";
 // directly (accidentally or otherwise), even though this file is meant to
 // be the sole owner of that configuration. `Decimal.clone()` produces an
 // independent constructor scoped to this module only.
-const Money = Decimal.clone({
+const Money = (Decimal as any).clone({
   precision: 20,
   rounding: Decimal.ROUND_HALF_UP,
-});
+}) as typeof Decimal;
 
 export type MoneyDecimal = InstanceType<typeof Money>;
 export type MoneyInput = string | number | MoneyDecimal;
@@ -214,4 +215,12 @@ export function formatMoney(
     minimumFractionDigits: targetDecimals,
     maximumFractionDigits: targetDecimals,
   }).format(Number(rounded));
+}
+
+/** Sums an array of monetary values and returns the result as a Decimal string.
+ * Exists so T4b's "summation across line items" always goes through the
+ * shared decimal.js wrapper instead of a hand-rolled .reduce((a,b)=>a+b) that
+ * would silently reintroduce native float arithmetic on money. */
+export function sumMoney(values: MoneyInput[]): string {
+  return values.reduce<string>((acc, v) => addMoney(acc, v), "0");
 }
