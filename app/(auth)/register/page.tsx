@@ -1,3 +1,4 @@
+/* app/(auth)/register/page.tsx */
 "use client";
 
 import { useState } from "react";
@@ -10,11 +11,32 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Store, User, Mail, Lock, Phone, Loader2, AlertCircle } from "lucide-react";
 
+// Kept in sync with the server's RESERVED_SLUGS (app/api/auth/register/route.ts)
+// so the client can reject/avoid these instantly instead of round-tripping
+// to the server first. The server list stays the source of truth — this is
+// purely a faster feedback loop, not a substitute for the server check.
+const RESERVED_SLUGS = new Set([
+  "login", "register", "admin", "api", "dashboard", "pos", "inventory",
+  "ledger", "orders", "settings", "account-locked", "store", "www", "app",
+]);
+
+// FIX: strips leading/trailing dashes too (the old regex only collapsed
+// consecutive dashes in the middle), and the caller below now checks the
+// RESULT length rather than trusting any non-empty string.
+function toSlug(val: string): string {
+  return val
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
 export default function RegisterPage() {
   const router = useRouter();
 
   const [tenantName, setTenantName] = useState("");
   const [tenantSlug, setTenantSlug] = useState("");
+  const [slugTouchedManually, setSlugTouchedManually] = useState(false);
   const [phone, setPhone] = useState("");
   const [adminName, setAdminName] = useState("");
   const [adminEmail, setAdminEmail] = useState("");
@@ -24,17 +46,24 @@ export default function RegisterPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const handleSlugChange = (val: string) => {
-    const sanitized = val
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, "-")
-      .replace(/-+/g, "-");
-    setTenantSlug(sanitized);
+    setSlugTouchedManually(true);
+    setTenantSlug(toSlug(val));
   };
 
+  // FIX: for an Arabic business name (the expected common case on an
+  // Arabic-first platform), every character maps to "-", collapsing to a
+  // single "-" — useless as a slug. Only auto-fill when the derived slug is
+  // actually usable (length >= 2 after stripping edge dashes); otherwise
+  // leave the field for the merchant to fill in manually with a Latin
+  // identifier, same as they'd have to do anyway once toSlug() empties out
+  // a pure-Arabic name. Also stops overwriting a slug the merchant already
+  // edited by hand, tracked via slugTouchedManually instead of re-deriving
+  // and comparing against the previous name on every keystroke.
   const handleNameChange = (val: string) => {
     setTenantName(val);
-    if (!tenantSlug || tenantSlug === tenantName.toLowerCase().replace(/[^a-z0-9-]/g, "-")) {
-      const suggested = val.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
+    if (slugTouchedManually) return;
+    const suggested = toSlug(val);
+    if (suggested.length >= 2) {
       setTenantSlug(suggested);
     }
   };
@@ -50,6 +79,11 @@ export default function RegisterPage() {
 
     if (tenantSlug.length < 2) {
       setErrorMessage("معرف المتجر يجب أن يكون حرفين على الأقل.");
+      return;
+    }
+
+    if (RESERVED_SLUGS.has(tenantSlug)) {
+      setErrorMessage("معرف المتجر هذا محجوز، الرجاء اختيار معرف آخر.");
       return;
     }
 
@@ -91,7 +125,14 @@ export default function RegisterPage() {
       if (loginRes?.error) {
         router.push("/login?registered=true");
       } else {
-        router.push("/dashboard");
+        // FIX: was router.push("/dashboard") — middleware would still
+        // catch the PENDING lockout and bounce an ADMIN to
+        // /settings/billing (see middleware.ts §3), so the old code wasn't
+        // wrong, just an unnecessary extra redirect hop. Going straight
+        // there skips it. Still relies on the middleware as the real
+        // enforcement point — this is a UX shortcut, not a new access
+        // control decision made here.
+        router.push("/settings/billing?reason=pending");
         router.refresh();
       }
     } catch (err) {
@@ -125,7 +166,6 @@ export default function RegisterPage() {
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Store Info Section */}
             <div className="space-y-3 rounded-xl border border-zinc-200 bg-zinc-50/50 p-3.5 dark:border-zinc-800 dark:bg-zinc-900/50">
               <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400 block">
                 1. بيانات المنشأة والمتجر
@@ -184,7 +224,6 @@ export default function RegisterPage() {
               </div>
             </div>
 
-            {/* Admin Info Section */}
             <div className="space-y-3 rounded-xl border border-zinc-200 bg-zinc-50/50 p-3.5 dark:border-zinc-800 dark:bg-zinc-900/50">
               <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400 block">
                 2. حساب مدير المتجر (Admin)

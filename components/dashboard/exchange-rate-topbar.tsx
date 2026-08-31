@@ -10,17 +10,50 @@ import { DollarSign, RefreshCw, CheckCircle2 } from "lucide-react";
 
 export function ExchangeRateTopbar() {
     const { data: session, update: updateSession } = useSession();
-    const { dailyExchangeRate, isUpdating, updateExchangeRate } = useExchangeRateStore();
-    const [inputValue, setInputValue] = useState<string>("");
+    const { dailyExchangeRate, isUpdating, error, updateExchangeRate, setExchangeRate } =
+        useExchangeRateStore();
     const [isEditing, setIsEditing] = useState<boolean>(false);
 
+    // FIX #1: dropped `hasHydrated` entirely — it was redundant. The guard
+    // condition (`dailyExchangeRate === null`) already prevents this from
+    // re-firing once setExchangeRate() runs once, so a separate "have we
+    // hydrated yet" flag was tracking information the store's own state
+    // already carried. This is still legitimately a `useEffect` — syncing
+    // TWO external systems (next-auth's session, Zustand's store) is
+    // exactly what effects are for — the fix removes the unnecessary local
+    // useState, not the effect itself.
     useEffect(() => {
-        if (dailyExchangeRate !== null && dailyExchangeRate !== undefined) {
-            setInputValue(String(dailyExchangeRate));
-        } else {
-            setInputValue("");
+        if (session?.user?.dailyExchangeRate !== undefined && dailyExchangeRate === null) {
+            setExchangeRate(session.user.dailyExchangeRate, session.user.tenantId);
         }
-    }, [dailyExchangeRate]);
+    }, [session, dailyExchangeRate, setExchangeRate]);
+
+    // FIX #2: `inputValue` is local component state DERIVED from the
+    // store's `dailyExchangeRate` — this is the documented React pattern
+    // for "adjusting state when a value it depends on changes" (see
+    // react.dev/learn/you-might-not-need-an-effect). Instead of letting the
+    // component commit with a stale inputValue and then correcting it one
+    // render later via an effect, we compare against the last-seen rate
+    // DURING render and adjust immediately — React discards that render
+    // and re-renders synchronously before anything is painted, so there's
+    // no visible flicker and no extra effect pass.
+    const [inputValue, setInputValue] = useState<string>("");
+    const [lastSyncedRate, setLastSyncedRate] = useState<number | null>(null);
+
+    if (dailyExchangeRate !== lastSyncedRate) {
+        setLastSyncedRate(dailyExchangeRate);
+        setInputValue(
+            dailyExchangeRate !== null && dailyExchangeRate !== undefined
+                ? String(dailyExchangeRate)
+                : ""
+        );
+    }
+
+    useEffect(() => {
+        if (error) {
+            toast.error(error);
+        }
+    }, [error]);
 
     const handleSave = async (e?: React.FormEvent) => {
         if (e) e.preventDefault();
@@ -38,10 +71,7 @@ export function ExchangeRateTopbar() {
                 { icon: <CheckCircle2 className="h-4 w-4 text-emerald-500" /> }
             );
             setIsEditing(false);
-            // Trigger session update to sync session context
             await updateSession({ dailyExchangeRate: numericRate });
-        } else {
-            toast.error("حدث خطأ أثناء تحديث سعر الصرف.");
         }
     };
 
@@ -69,11 +99,6 @@ export function ExchangeRateTopbar() {
                         setInputValue(e.target.value);
                         setIsEditing(true);
                     }}
-                    onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                            handleSave();
-                        }
-                    }}
                     className="h-8 w-28 text-center text-xs font-mono font-bold bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 border-zinc-300 focus-visible:ring-emerald-500"
                     disabled={isUpdating}
                 />
@@ -82,7 +107,12 @@ export function ExchangeRateTopbar() {
             <Button
                 type="submit"
                 size="sm"
-                disabled={isUpdating || (!isEditing && dailyExchangeRate === parseFloat(inputValue))}
+                disabled={
+                    isUpdating ||
+                    inputValue.trim() === "" ||
+                    isNaN(parseFloat(inputValue)) ||
+                    (!isEditing && dailyExchangeRate === parseFloat(inputValue))
+                }
                 className="h-8 px-2.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white dark:bg-emerald-600 dark:hover:bg-emerald-500"
             >
                 {isUpdating ? (

@@ -2,12 +2,7 @@ import { auth } from "@/auth";
 import { NextResponse } from "next/server";
 
 const DASHBOARD_PATH_PREFIXES = [
-    "/dashboard",
-    "/pos",
-    "/inventory",
-    "/ledger",
-    "/orders",
-    "/settings",
+    "/dashboard", "/pos", "/inventory", "/ledger", "/orders", "/settings", "/account-locked",
 ];
 
 function isPathUnder(pathname: string, prefixes: string[]) {

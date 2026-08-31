@@ -1,3 +1,4 @@
+/* SublinkLauncher.tsx */
 "use client";
 
 import { useSession } from "next-auth/react";
@@ -7,8 +8,26 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Store, ExternalLink } from "lucide-react";
 
 export function SublinkLauncher() {
-    const { data: session } = useSession();
-    const tenantSlug = session?.user?.tenantSlug || "demo";
+    const { data: session, status } = useSession();
+
+    // FIX: no more "demo" fallback flashing while the session is still
+    // loading — render a disabled placeholder instead of a link that could
+    // briefly point at a fake tenant.
+    if (status === "loading" || !session?.user?.tenantSlug) {
+        return (
+            <Button
+                variant="outline"
+                size="sm"
+                disabled
+                className="gap-2 border-zinc-200 bg-zinc-50/50 text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900/30"
+            >
+                <Store className="h-4 w-4" />
+                <span className="hidden sm:inline font-medium text-xs">المتجر الإلكتروني</span>
+            </Button>
+        );
+    }
+
+    const tenantSlug = session.user.tenantSlug;
     const sublinkUrl = `/store/${tenantSlug}`;
 
     return (

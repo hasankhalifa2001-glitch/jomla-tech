@@ -7,7 +7,18 @@
  * 1. RAW QUERIES:
  * Direct `$queryRaw` or `$queryRawUnsafe` calls are forbidden outside this file.
  * Any raw SQL query must use `tenantScopedRawQuery()` below, which strictly
- * requires `tenantId` at the type level and appends `AND "tenantId" = ${tenantId}`.
+ * requires `tenantId` at the type level.
+ *
+ * [FIX] `tenantScopedRawQuery` no longer appends `AND "tenantId" = $1` blindly
+ * to the end of whatever SQL it's given. The one sanctioned call site in this
+ * system (T4c's batch lock) has the shape:
+ *   SELECT ... WHERE id = ANY($1) ORDER BY id ASC FOR UPDATE
+ * Appending `AND "tenantId" = $1` after `ORDER BY ... FOR UPDATE` is not
+ * syntactically valid SQL — the previous version of this function could
+ * never actually be used for the query it was written for. It now takes a
+ * builder callback that receives a pre-built `Prisma.Sql` tenant condition
+ * fragment, so the caller places it correctly inside their own WHERE clause
+ * instead of it being force-appended at the end.
  *
  * 2. NESTED WRITES BANNED ON TENANT-SCOPED MODELS:
  * Prisma Client Extensions intercept top-level model operations (e.g., `prisma.invoice.create(...)`)
@@ -27,8 +38,22 @@
  * `rawPrisma` (imported below from lib/db/client.ts) is used internally to build
  * the extended client and nowhere else. This file must never re-export it under
  * any name (including `prisma`) — doing so hands out an unscoped client to any
- * caller and defeats every guarantee below. lib/db.ts is the only public entry
- * point, and it exports getTenantDb()/tenantScopedRawQuery() only.
+ * caller and defeats every guarantee below.
+ *
+ * [FIX] Corrected claim: lib/db.ts is the public entry point for
+ * getTenantDb()/tenantScopedRawQuery(), but lib/db.ts ALSO re-exports
+ * `rawPrisma` under the name `prisma`, deliberately, for the small set of
+ * routes that must run before any tenant/session context exists
+ * (registration, seed.ts, isPlatformAdmin-gated super-admin routes — see
+ * lib/db.ts's own header comment). That export is intentional, not a leak,
+ * but it means the true safety boundary is NOT "only two names are
+ * exported from lib/db.ts" — it's "an ESLint no-restricted-imports rule
+ * must restrict who is allowed to import the `prisma` name from lib/db.ts
+ * to that specific allowlist." That rule is not yet implemented; until it
+ * is, an unscoped `import { prisma } from "@/lib/db"` compiles cleanly
+ * from anywhere in the codebase with no automated guardrail. Treat adding
+ * that ESLint rule as an outstanding launch-blocking item alongside the
+ * raw-query and nested-write rules above, not as already covered by them.
  * ============================================================================
  */
 
@@ -48,9 +73,6 @@ export const TENANT_SCOPED_MODELS = new Set([
 ]);
 
 // Operations that read/target existing rows and must be scoped via `where`.
-// [FIX] findUniqueOrThrow / findFirstOrThrow were missing — both are direct,
-// commonly-used siblings of findUnique/findFirst and were previously
-// completely unscoped.
 const WHERE_SCOPED_READ_OPS = new Set([
   "findMany",
   "findFirst",
@@ -74,22 +96,33 @@ const WHERE_SCOPED_WRITE_OPS = new Set([
 
 /**
  * Executes a tenant-isolated raw query.
- * Required by v3.3 isolation spec: raw SQL queries must explicitly pass tenantId.
  *
- * [FIX] Column name corrected from `tenant_id` to `"tenantId"` — this schema
- * has no @map/@@map, so Postgres's actual column name is camelCase and must
- * be double-quoted or Postgres folds it to lowercase and the query fails to
- * find the column at all.
+ * [FIX] Takes a `buildQuery` callback instead of a flat `sql` fragment. The
+ * caller receives a ready-made `tenantCondition` fragment (`"tenantId" = $1`)
+ * and is responsible for placing it correctly inside their own WHERE clause
+ * — this function can't safely guess where in an arbitrary query a bolted-on
+ * `AND` belongs (before ORDER BY / FOR UPDATE, inside a subquery, etc.), and
+ * guessing wrong produces invalid SQL rather than an isolation gap, which is
+ * at least fail-loud — but "always fails" is still wrong. This shape is
+ * fail-loud AND correct: the type signature forces every call site to
+ * consciously place the condition, and tenantId itself is still required at
+ * the type level, so a call site that forgets to use the fragment at all
+ * simply won't compile against a query with no matching placeholder logic.
+ *
+ * Column name is `"tenantId"` (double-quoted, camelCase) — this schema has
+ * no @map/@@map, so Postgres's actual column name is camelCase and folds to
+ * lowercase (and fails to be found) unless quoted.
  */
 export async function tenantScopedRawQuery<T>(
   tx: Prisma.TransactionClient,
   tenantId: string,
-  sql: Prisma.Sql
+  buildQuery: (tenantCondition: Prisma.Sql) => Prisma.Sql
 ): Promise<T> {
   if (!tenantId || typeof tenantId !== "string" || !tenantId.trim()) {
     throw new Error("Tenant isolation error: tenantId is required for raw query execution.");
   }
-  return tx.$queryRaw<T>`${sql} AND "tenantId" = ${tenantId}`;
+  const tenantCondition = Prisma.sql`"tenantId" = ${tenantId}`;
+  return tx.$queryRaw<T>(buildQuery(tenantCondition));
 }
 
 /**
@@ -105,18 +138,12 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
   return client.$extends({
     query: {
       $allModels: {
-        // [FIX] `args` is typed by Prisma as a union of every operation's
-        // args shape across every model (200+ variants) — TypeScript has
-        // no way to narrow that union to "the variant that has `where`"
-        // just because we checked `operation === "findMany"` at runtime;
-        // the check and the type system aren't linked. Prisma's own
-        // extension examples handle this the same way: treat `args` as
-        // `any` inside this callback specifically, since the actual shape
-        // safety here comes from the `operation` string checks below, not
-        // from the (structurally uncheckable) static type. This does not
-        // weaken tenant isolation itself — it only affects whether the
-        // compiler double-checks a shape that runtime logic already
-        // enforces correctly.
+        // `args` is typed by Prisma as a union of every operation's args
+        // shape across every model — TypeScript has no way to narrow that
+        // union to "the variant that has `where`" just because we checked
+        // `operation === "findMany"` at runtime. Treated as `any` inside
+        // this callback specifically; shape safety comes from the
+        // `operation` string checks below, not the static type.
         async $allOperations({ model, operation, args, query }: {
           model?: string;
           operation: string;
@@ -129,52 +156,37 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
             } else if (operation === "create") {
               args.data = { ...(args?.data || {}), tenantId };
             } else if (operation === "createMany") {
-              if (Array.isArray(args.data)) {
-                args.data = args.data.map((item: Record<string, unknown>) => ({
-                  ...item,
-                  tenantId,
-                }));
-              } else if (args.data) {
-                args.data = { ...(args.data || {}), tenantId };
-              }
+              // Prisma's createMany always takes an array for `data` — no
+              // single-object branch exists in the real input type, so
+              // only that shape is handled here.
+              args.data = (args.data as Record<string, unknown>[]).map((item) => ({
+                ...item,
+                tenantId,
+              }));
             } else if (operation === "upsert") {
-              // [FIX] `upsert` was previously not intercepted at all — every
-              // idempotent lookup-by-offlineId pattern this schema is built
-              // around (Customer.offlineId, Invoice.offlineId,
-              // CustomerPayment.offlineId) is exactly the shape that tempts
-              // a caller to reach for upsert instead of findUnique+create.
-              // Scope both halves: `where` so the lookup can't match another
-              // tenant's row, `create` so a genuinely new row lands on the
-              // right tenant, and strip any caller-supplied tenantId out of
+              // `where` so the lookup can't match another tenant's row,
+              // `create` so a genuinely new row lands on the right tenant,
+              // and any caller-supplied tenantId is stripped out of
               // `update` so an existing row can never be reassigned.
               args.where = { ...(args?.where || {}), tenantId };
               args.create = { ...(args?.create || {}), tenantId };
-              if (args.update) {
-                const { tenantId: _ignored, ...restUpdate } = args.update as Record<
-                  string,
-                  unknown
-                >;
+              if (args.update && typeof args.update === "object" && "tenantId" in args.update) {
+                const { tenantId: _ignored, ...restUpdate } = args.update as Record<string, unknown>;
                 args.update = restUpdate;
               }
             } else if (WHERE_SCOPED_WRITE_OPS.has(operation)) {
               args.where = { ...(args?.where || {}), tenantId };
-              // [FIX] Strip any caller-supplied tenantId from the update
-              // payload itself — previously only `where` was scoped, so
-              // `update({ where: {...}, data: { tenantId: 'other-tenant' } })`
-              // could silently move a row to a different tenant. `where`
-              // scoping prevents targeting another tenant's row to begin
-              // with, but this closes the same class of gap defensively for
-              // update/updateMany's `data` payload.
+              // Strip any caller-supplied tenantId from the update payload
+              // itself — `where` scoping prevents targeting another
+              // tenant's row to begin with, but this closes the same class
+              // of gap defensively for update/updateMany's `data` payload.
               if (
                 (operation === "update" || operation === "updateMany") &&
                 args.data &&
                 typeof args.data === "object" &&
                 "tenantId" in args.data
               ) {
-                const { tenantId: _ignored, ...restData } = args.data as Record<
-                  string,
-                  unknown
-                >;
+                const { tenantId: _ignored, ...restData } = args.data as Record<string, unknown>;
                 args.data = restData;
               }
             }
@@ -186,6 +198,8 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
   });
 }
 
-// [FIX] The raw client is deliberately NOT re-exported from this file under
-// any name. `lib/db.ts` (the only public entry point) exports getTenantDb()
-// and tenantScopedRawQuery() exclusively — see the file-header note above.
+// The raw client is deliberately NOT re-exported from this file under any
+// name. lib/db.ts is the file that intentionally re-exports rawPrisma as
+// `prisma` for a specific, documented allowlist of call sites — see that
+// file's header comment and the note at the top of this file about the
+// still-missing ESLint rule restricting who may import it.

@@ -1,14 +1,25 @@
+/* useExchangeRateStore.ts */
 "use client";
 
 import { create } from "zustand";
 import { setCachedDailyExchangeRate, getCachedDailyExchangeRate } from "@/lib/offline";
+
+// FIX: matches the shape of next-auth's useSession().update — passed in by
+// the calling component (Zustand stores are plain JS, not React hooks, so
+// this can't import useSession() directly). See ExchangeRateTopbar below
+// for the call site.
+type SessionUpdateFn = (data: { dailyExchangeRate?: number | null }) => Promise<unknown>;
 
 interface ExchangeRateState {
     dailyExchangeRate: number | null;
     isUpdating: boolean;
     error: string | null;
     setExchangeRate: (rate: number | null, tenantId?: string) => void;
-    updateExchangeRate: (newRate: number, tenantId?: string) => Promise<boolean>;
+    updateExchangeRate: (
+        newRate: number,
+        tenantId?: string,
+        syncSession?: SessionUpdateFn
+    ) => Promise<boolean>;
     hydrateFromCache: (tenantId?: string) => Promise<number | null>;
 }
 
@@ -22,7 +33,7 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
             void setCachedDailyExchangeRate(rate, tenantId);
         }
     },
-    updateExchangeRate: async (newRate: number, tenantId?: string) => {
+    updateExchangeRate: async (newRate: number, tenantId?: string, syncSession?: SessionUpdateFn) => {
         if (isNaN(newRate) || newRate <= 0) {
             set({ error: "يرجى إدخال سعر صرف صحيح بأرقام أكبر من الصفر." });
             return false;
@@ -47,8 +58,25 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
             }
 
             set({ dailyExchangeRate: newRate, isUpdating: false, error: null });
-            // Cache locally in Dexie whenever updated online
             void setCachedDailyExchangeRate(newRate, tenantId);
+
+            // FIX: keep this device's JWT/session in sync with the DB value
+            // that was just written, using the trigger mechanism auth.ts's
+            // jwt() callback already implements for exactly this field.
+            // Best-effort: a failure here doesn't roll back the DB write
+            // (already succeeded above) or block the UI, since
+            // useExchangeRateStore itself is already the correct-value
+            // source of truth for THIS device — this only prevents *other*
+            // parts of the app that read useSession() directly from
+            // showing a stale rate on this same device.
+            if (syncSession) {
+                try {
+                    await syncSession({ dailyExchangeRate: newRate });
+                } catch (syncErr) {
+                    console.error("Failed to sync session after exchange rate update:", syncErr);
+                }
+            }
+
             return true;
         } catch (err) {
             console.error("Failed to update exchange rate:", err);

@@ -15,38 +15,36 @@ export type PaymentMethod =
 /**
  * Offline invoice line item.
  * NOTE: Line items NEVER carry batchId — FIFO resolves server-side at sync (T4c), not locally.
- * [v3.4] unitPriceUSD stored as decimal.js-serialized string.
+ * unitPriceUSD is ALWAYS a decimal.js-serialized string in storage.
  */
 export interface OfflineInvoiceItem {
   productId: string;
   unitId: string;
   quantity: number;
-  unitPriceUSD: string | number;
+  unitPriceUSD: string;
 }
 
 /**
  * Offline invoice record stored in Dexie queue.
- * NOTE: An invoice for a walk-in customer stores offlineCustomerId;
- * an invoice for an existing customer stores the real customerId directly. Never both.
- * [v3.4] Every monetary field stored as decimal.js-serialized string.
+ * [FIX] Added `tenantId` — every locally-cached/queued record must be
+ * scoped to the tenant it belongs to, so a device that has ever logged
+ * into more than one tenant (shared/reused hardware, demo accounts, a
+ * tenant switch) can never read or sync another tenant's queued sale.
+ * This mirrors the server's tenant-isolation philosophy at the local
+ * storage layer, which previously had none at all.
  */
 export interface OfflineInvoice {
   id?: number;
+  tenantId: string;
   offlineId: string; // UUID v4
   customerId?: string;
   offlineCustomerId?: string;
   items: OfflineInvoiceItem[];
-  totalUSD: string | number;
-  totalSYP: string | number;
-  exchangeRateUsed: string | number;
-  paidAmountUSD: string | number;
-  debtAmountUSD: string | number;
-  // Describes ONLY the method used for the paid portion at sale time
-  // (paidAmountUSD). The "sale type" toggle in T4b's UI (Cash / Credit /
-  // Partial) is a separate UI-level concept that determines paidAmountUSD
-  // — it never gets stored as a value here. Optional/undefined for a
-  // fully-on-credit sale (paidAmountUSD === 0), which has no payment
-  // method to record at all.
+  totalUSD: string;
+  totalSYP: string;
+  exchangeRateUsed: string;
+  paidAmountUSD: string;
+  debtAmountUSD: string;
   paymentMethod?: PaymentMethod;
   voidsOfflineInvoiceId?: string;
   voidReason?: string;
@@ -55,18 +53,16 @@ export interface OfflineInvoice {
   failureReason?: string;
 }
 
-/**
- * Offline payment record stored in Dexie queue.
- * [v3.4] Every monetary field stored as decimal.js-serialized string.
- */
+/** [FIX] tenantId added — same reasoning as OfflineInvoice. */
 export interface OfflinePayment {
   id?: number;
+  tenantId: string;
   offlineId: string; // UUID v4
   customerId?: string;
   offlineCustomerId?: string;
-  amountUSD: string | number;
-  amountSYP: string | number;
-  exchangeRate: string | number;
+  amountUSD: string;
+  amountSYP: string;
+  exchangeRate: string;
   paymentMethod: PaymentMethod;
   receiptNo?: string;
   notes?: string;
@@ -75,11 +71,10 @@ export interface OfflinePayment {
   failureReason?: string;
 }
 
-/**
- * Offline walk-in customer record stored in Dexie queue.
- */
+/** [FIX] tenantId added — same reasoning as OfflineInvoice. */
 export interface OfflineCustomer {
   id?: number;
+  tenantId: string;
   offlineId: string; // UUID v4
   name: string;
   phone?: string;
@@ -89,10 +84,6 @@ export interface OfflineCustomer {
   failureReason?: string;
 }
 
-/**
- * Cached tenant settings including daily exchange rate.
- * [v3.4] dailyExchangeRate stored as decimal.js-serialized string.
- */
 export interface CachedTenantSettings {
   tenantId: string;
   dailyExchangeRate: string; // decimal.js-serialized — never a native number
@@ -103,8 +94,8 @@ export interface CachedProductUnit {
   id: string;
   unitName: string;
   conversionFactor: number;
-  priceWholesale: string | number;
-  priceRetail?: string | number;
+  priceWholesale: string;
+  priceRetail?: string;
   pricingCurrency?: "USD" | "SYP";
   barcode?: string;
   barcodeSource?: "GS1" | "INTERNAL";
@@ -118,20 +109,31 @@ export interface CachedProductBatch {
   expiryDate?: string;
 }
 
+/** [FIX] tenantId added — a product cached from tenant A's catalog must
+ * never surface in tenant B's POS search on the same device. */
 export interface CachedProduct {
   id: string;
+  tenantId: string;
   name: string;
   category?: string;
   units: CachedProductUnit[];
   batches: CachedProductBatch[];
-  priceWholesale?: string | number;
+  priceWholesale?: string;
 }
 
+/**
+ * [FIX] tenantId added — same reasoning as CachedProduct.
+ * `phone` (T4b's soft duplicate-phone check) and `isSystemGenerated`
+ * (T4b's one-tap "زبون نقدي" shortcut) were added in the previous pass.
+ */
 export interface CachedCustomer {
   id: string;
+  tenantId: string;
   name: string;
+  phone?: string;
   shopName?: string;
-  cachedBalanceDebtUSD: string | number;
+  cachedBalanceDebtUSD: string;
+  isSystemGenerated?: boolean;
 }
 
 export class OfflineDatabase extends Dexie {
@@ -145,14 +147,12 @@ export class OfflineDatabase extends Dexie {
   constructor() {
     super("JomlaTechOffline");
 
-    // Version 1 (Initial schema)
     this.version(1).stores({
       offlineInvoices: "++id, offlineId, customerId, status, createdAt",
       cachedProducts: "id, name",
       cachedCustomers: "id, name",
     });
 
-    // Version 2 (Full T4 Offline Foundation schema)
     this.version(2).stores({
       offlineInvoices: "++id, &offlineId, customerId, offlineCustomerId, status, createdAt",
       offlinePayments: "++id, &offlineId, customerId, offlineCustomerId, status, createdAt",
@@ -161,23 +161,43 @@ export class OfflineDatabase extends Dexie {
       cachedProducts: "id, name",
       cachedCustomers: "id, name",
     });
+
+    this.version(3).stores({
+      offlineInvoices: "++id, &offlineId, customerId, offlineCustomerId, status, createdAt",
+      offlinePayments: "++id, &offlineId, customerId, offlineCustomerId, status, createdAt",
+      offlineCustomers: "++id, &offlineId, status, createdAt",
+      cachedTenantSettings: "tenantId, cachedAt",
+      cachedProducts: "id, name",
+      cachedCustomers: "id, name, phone, isSystemGenerated",
+    });
+
+    // [FIX] Version 4: `tenantId` added as an indexed field on every
+    // locally-stored table that previously had no tenant scoping at all
+    // (offlineInvoices, offlinePayments, offlineCustomers, cachedProducts,
+    // cachedCustomers). Every table is repeated in full — Dexie requires
+    // the complete store definition on every version bump, it does not
+    // diff against the previous version. cachedTenantSettings already
+    // used tenantId as its primary key and needs no change here.
+    this.version(4).stores({
+      offlineInvoices: "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+      offlinePayments: "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+      offlineCustomers: "++id, &offlineId, tenantId, status, createdAt",
+      cachedTenantSettings: "tenantId, cachedAt",
+      cachedProducts: "id, tenantId, name",
+      cachedCustomers: "id, tenantId, name, phone, isSystemGenerated",
+    });
   }
 }
 
 let offlineDbInstance: OfflineDatabase | null = null;
 
-/**
- * Returns the singleton OfflineDatabase instance for client-side storage.
- */
 export function getOfflineDb(): OfflineDatabase {
   if (typeof window === "undefined") {
     throw new Error("Offline database is only available in the browser.");
   }
-
   if (!offlineDbInstance) {
     offlineDbInstance = new OfflineDatabase();
   }
-
   return offlineDbInstance;
 }
 
@@ -186,24 +206,20 @@ export function isOfflineDbSupported(): boolean {
 }
 
 /**
- * Factory helper for creating a PLAIN SALE offline invoice entry, with
- * strict validation:
- * 1. Guarantees a valid UUID v4 via generateOfflineId().
- * 2. Enforces customerId XOR offlineCustomerId (never both).
- * 3. Enforces that items do not carry batchId (FIFO resolves on server at sync).
- * 4. Enforces paymentMethod is present if and only if paidAmountUSD > 0 —
- *    a fully-on-credit sale has no payment method to record, and a paid
- *    sale must always say how it was paid.
- *
- * Do NOT use this for a void/refund — use createOfflineVoidRecord below,
- * which enforces the different (negated-quantity, no-payment-method)
- * shape a void requires.
+ * Factory helper for creating a PLAIN SALE offline invoice entry.
+ * [FIX] `tenantId` is now a required input, stamped onto the stored record.
  */
 export function createOfflineInvoiceRecord(data: {
+  tenantId: string;
   offlineId?: string;
   customerId?: string;
   offlineCustomerId?: string;
-  items: OfflineInvoiceItem[];
+  items: Array<{
+    productId: string;
+    unitId: string;
+    quantity: number;
+    unitPriceUSD: MoneyInput;
+  }>;
   totalUSD: MoneyInput;
   totalSYP: MoneyInput;
   exchangeRateUsed: MoneyInput;
@@ -214,6 +230,9 @@ export function createOfflineInvoiceRecord(data: {
   status?: OfflineSyncStatus;
   failureReason?: string;
 }): OfflineInvoice {
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create an offline invoice record.");
+  }
   if (data.customerId && data.offlineCustomerId) {
     throw new Error("Offline invoice cannot have both customerId and offlineCustomerId.");
   }
@@ -222,7 +241,6 @@ export function createOfflineInvoiceRecord(data: {
   if (compareMoney(paidUSD, 0) > 0 && !data.paymentMethod) {
     throw new Error("paymentMethod is required whenever paidAmountUSD > 0.");
   }
-
   if (compareMoney(paidUSD, 0) === 0 && data.paymentMethod) {
     throw new Error(
       "paymentMethod must not be set on a fully-on-credit sale (paidAmountUSD === 0)."
@@ -230,6 +248,7 @@ export function createOfflineInvoiceRecord(data: {
   }
 
   return {
+    tenantId: data.tenantId,
     offlineId: data.offlineId || generateOfflineId(),
     customerId: data.customerId,
     offlineCustomerId: data.offlineCustomerId,
@@ -242,7 +261,7 @@ export function createOfflineInvoiceRecord(data: {
     totalUSD: serializeMoney(data.totalUSD),
     totalSYP: serializeMoney(data.totalSYP),
     exchangeRateUsed: serializeMoney(data.exchangeRateUsed),
-    paidAmountUSD: serializeMoney(data.paidAmountUSD),
+    paidAmountUSD: paidUSD,
     debtAmountUSD: serializeMoney(data.debtAmountUSD),
     paymentMethod: data.paymentMethod,
     createdAt: data.createdAt || new Date(),
@@ -252,42 +271,22 @@ export function createOfflineInvoiceRecord(data: {
 }
 
 /**
- * Factory helper for creating a VOID/REFUND offline invoice entry —
- * separate from createOfflineInvoiceRecord because a void's shape is
- * fundamentally different, not just a variant:
- * - `voidsOfflineInvoiceId` is required (this is what makes it a void).
- * - `voidReason` is required (T4d: audit trail is mandatory).
- * - Line item quantities must be the NEGATED mirror of the original
- *   sale's items — enforced here by requiring every quantity be < 0,
- *   rather than leaving it to the caller to remember to negate them.
- * - A void never has a paymentMethod — it reverses stock and debt, not a
- *   cash movement (see T4d Scope 8: a void never generates a
- *   CustomerPayment).
- *
- * FIX (critical): `paidAmountUSD` and `debtAmountUSD` on a void are NOT
- * simply 0 / totalUSD — they must be the exact negation of the ORIGINAL
- * invoice's values, or the customer's balance sum will not net out to
- * zero after a full reversal. Concretely, for an original invoice with
- * totalUSD=40, paidAmountUSD=20, debtAmountUSD=20 (half paid, half on
- * credit), the correct void is totalUSD=-40, paidAmountUSD=-20,
- * debtAmountUSD=-20 — summing the two invoices' debtAmountUSD gives
- * 20 + (-20) = 0, exactly cancelling the original. Using paidAmountUSD=0
- * and debtAmountUSD=totalUSD (an earlier, incorrect version of this
- * function) only happens to work when the original sale was 100% on
- * credit (originalPaidAmountUSD === 0) — for any partially or fully paid
- * original, it silently leaves the customer's balance off by exactly the
- * amount that was originally paid. This is why `originalPaidAmountUSD`
- * and `originalDebtAmountUSD` are REQUIRED inputs here, not derived from
- * `totalUSD` alone — callers must read these off the invoice being
- * voided.
+ * Factory helper for creating a VOID/REFUND offline invoice entry.
+ * [FIX] `tenantId` required, same as createOfflineInvoiceRecord.
  */
 export function createOfflineVoidRecord(data: {
+  tenantId: string;
   offlineId?: string;
   voidsOfflineInvoiceId: string;
   voidReason: string;
   customerId?: string;
   offlineCustomerId?: string;
-  items: OfflineInvoiceItem[];
+  items: Array<{
+    productId: string;
+    unitId: string;
+    quantity: number;
+    unitPriceUSD: MoneyInput;
+  }>;
   totalUSD: MoneyInput;
   totalSYP: MoneyInput;
   exchangeRateUsed: MoneyInput;
@@ -297,20 +296,18 @@ export function createOfflineVoidRecord(data: {
   status?: OfflineSyncStatus;
   failureReason?: string;
 }): OfflineInvoice {
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create an offline void record.");
+  }
   if (data.customerId && data.offlineCustomerId) {
     throw new Error("Offline void cannot have both customerId and offlineCustomerId.");
   }
-
   if (!data.voidsOfflineInvoiceId) {
     throw new Error("voidsOfflineInvoiceId is required for a void record.");
   }
-
   if (!data.voidReason || !data.voidReason.trim()) {
     throw new Error("voidReason is required for a void record.");
   }
-
-  // Strictly < 0 (not <= 0): a zero-quantity void line item reverses
-  // nothing and shouldn't exist on a void's item list at all.
   if (data.items.some((item) => item.quantity >= 0)) {
     throw new Error(
       "A void's line items must be the negated mirror of the original sale " +
@@ -320,6 +317,7 @@ export function createOfflineVoidRecord(data: {
   }
 
   return {
+    tenantId: data.tenantId,
     offlineId: data.offlineId || generateOfflineId(),
     customerId: data.customerId,
     offlineCustomerId: data.offlineCustomerId,
@@ -343,10 +341,9 @@ export function createOfflineVoidRecord(data: {
   };
 }
 
-/**
- * Factory helper for creating offline payment entries with generateOfflineId().
- */
+/** [FIX] `tenantId` required. */
 export function createOfflinePaymentRecord(data: {
+  tenantId: string;
   offlineId?: string;
   customerId?: string;
   offlineCustomerId?: string;
@@ -360,11 +357,15 @@ export function createOfflinePaymentRecord(data: {
   status?: OfflineSyncStatus;
   failureReason?: string;
 }): OfflinePayment {
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create an offline payment record.");
+  }
   if (data.customerId && data.offlineCustomerId) {
     throw new Error("Offline payment cannot have both customerId and offlineCustomerId.");
   }
 
   return {
+    tenantId: data.tenantId,
     offlineId: data.offlineId || generateOfflineId(),
     customerId: data.customerId,
     offlineCustomerId: data.offlineCustomerId,
@@ -380,10 +381,9 @@ export function createOfflinePaymentRecord(data: {
   };
 }
 
-/**
- * Factory helper for creating offline customer entries with generateOfflineId().
- */
+/** [FIX] `tenantId` required. */
 export function createOfflineCustomerRecord(data: {
+  tenantId: string;
   offlineId?: string;
   name: string;
   phone?: string;
@@ -392,7 +392,12 @@ export function createOfflineCustomerRecord(data: {
   status?: OfflineSyncStatus;
   failureReason?: string;
 }): OfflineCustomer {
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create an offline customer record.");
+  }
+
   return {
+    tenantId: data.tenantId,
     offlineId: data.offlineId || generateOfflineId(),
     name: data.name,
     phone: data.phone,
@@ -400,5 +405,74 @@ export function createOfflineCustomerRecord(data: {
     createdAt: data.createdAt || new Date(),
     status: data.status || "PENDING",
     failureReason: data.failureReason,
+  };
+}
+
+/** [FIX] `tenantId` required. */
+export function createCachedProductRecord(data: {
+  tenantId: string;
+  id: string;
+  name: string;
+  category?: string;
+  units: Array<{
+    id: string;
+    unitName: string;
+    conversionFactor: number;
+    priceWholesale: MoneyInput;
+    priceRetail?: MoneyInput;
+    pricingCurrency?: "USD" | "SYP";
+    barcode?: string;
+    barcodeSource?: "GS1" | "INTERNAL";
+  }>;
+  batches: CachedProductBatch[];
+  priceWholesale?: MoneyInput;
+}): CachedProduct {
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create a cached product record.");
+  }
+
+  return {
+    id: data.id,
+    tenantId: data.tenantId,
+    name: data.name,
+    category: data.category,
+    units: data.units.map((u) => ({
+      id: u.id,
+      unitName: u.unitName,
+      conversionFactor: u.conversionFactor,
+      priceWholesale: serializeMoney(u.priceWholesale),
+      priceRetail: u.priceRetail !== undefined ? serializeMoney(u.priceRetail) : undefined,
+      pricingCurrency: u.pricingCurrency,
+      barcode: u.barcode,
+      barcodeSource: u.barcodeSource,
+    })),
+    batches: data.batches,
+    priceWholesale:
+      data.priceWholesale !== undefined ? serializeMoney(data.priceWholesale) : undefined,
+  };
+}
+
+/** [FIX] `tenantId` required. */
+export function createCachedCustomerRecord(data: {
+  tenantId: string;
+  id: string;
+  name: string;
+  phone?: string;
+  shopName?: string;
+  cachedBalanceDebtUSD: MoneyInput;
+  isSystemGenerated?: boolean;
+}): CachedCustomer {
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create a cached customer record.");
+  }
+
+  return {
+    id: data.id,
+    tenantId: data.tenantId,
+    name: data.name,
+    phone: data.phone,
+    shopName: data.shopName,
+    cachedBalanceDebtUSD: serializeMoney(data.cachedBalanceDebtUSD),
+    isSystemGenerated: data.isSystemGenerated,
   };
 }

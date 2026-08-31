@@ -7,6 +7,7 @@ import { useSession, signOut } from "next-auth/react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger, SheetClose } from "@/components/ui/sheet";
 import {
@@ -25,6 +26,11 @@ import {
     ExternalLink,
 } from "lucide-react";
 
+function isRouteActive(pathname: string, href: string): boolean {
+    if (href === "/dashboard") return pathname === "/dashboard";
+    return pathname === href || pathname.startsWith(`${href}/`);
+}
+
 const navItems = [
     { href: "/dashboard", label: "الرئيسية", icon: LayoutDashboard },
     { href: "/pos", label: "نقطة البيع", icon: ShoppingCart },
@@ -38,9 +44,18 @@ export function DashboardSidebar() {
     const [collapsed, setCollapsed] = useState(false);
     const [mobileOpen, setMobileOpen] = useState(false);
     const pathname = usePathname();
-    const { data: session } = useSession();
+    const { data: session, status: sessionStatus } = useSession();
 
     const userRole = session?.user?.role || "CASHIER";
+    // FIX (role flash): while the session is still resolving, we don't yet
+    // know if this user is ADMIN or CASHIER. `userRole` defaults to
+    // CASHIER during that window (fail-closed, unchanged), but instead of
+    // silently dropping the adminOnly item from the list (which pops in a
+    // moment later once the real role loads), we render a skeleton
+    // placeholder in its slot below — same list length throughout, no
+    // layout jump, no abrupt appearance.
+    const isRoleKnown = sessionStatus !== "loading";
+
     const userName = session?.user?.name || "المستخدم";
     const tenantName = session?.user?.tenantName || "جملة تك";
     const tenantSlug = session?.user?.tenantSlug || "";
@@ -51,6 +66,12 @@ export function DashboardSidebar() {
         }
         return true;
     });
+
+    // FIX: while role is unknown, an adminOnly item is neither confirmed
+    // shown nor confirmed hidden — this flag drives the skeleton row
+    // rendered alongside filteredNavItems below, in each of the three nav
+    // surfaces (desktop, mobile bottom bar, mobile sheet).
+    const showAdminSkeleton = !isRoleKnown && navItems.some((i) => i.adminOnly);
 
     const primaryMobileItems = filteredNavItems.slice(0, 4);
 
@@ -97,9 +118,7 @@ export function DashboardSidebar() {
                 <nav className="flex-1 space-y-1.5 p-3 overflow-y-auto">
                     {filteredNavItems.map((item) => {
                         const Icon = item.icon;
-                        const isActive =
-                            pathname === item.href ||
-                            (item.href !== "/dashboard" && pathname.startsWith(item.href));
+                        const isActive = isRouteActive(pathname, item.href);
 
                         const navLink = (
                             <Link
@@ -136,6 +155,19 @@ export function DashboardSidebar() {
 
                         return navLink;
                     })}
+
+                    {/* FIX (role flash): reserves the settings item's slot
+                        while we don't yet know if this user is ADMIN.
+                        Disappears the instant sessionStatus resolves —
+                        either the real item renders above (ADMIN) or
+                        nothing does (CASHIER), with no size change since
+                        this placeholder is gone by then either way. */}
+                    {showAdminSkeleton && (
+                        <div className={cn("flex items-center gap-3 rounded-xl px-3 py-2.5", collapsed && "justify-center px-0")}>
+                            <Skeleton className="h-5 w-5 shrink-0 rounded" />
+                            {!collapsed && <Skeleton className="h-4 w-24 rounded" />}
+                        </div>
+                    )}
                 </nav>
 
                 {/* Expand Sidebar Floating Toggle (when collapsed) */}
@@ -223,7 +255,7 @@ export function DashboardSidebar() {
             <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white dark:bg-zinc-950 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-around h-16 px-1 shadow-lg">
                 {primaryMobileItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = pathname === item.href || (item.href !== "/dashboard" && pathname.startsWith(item.href));
+                    const isActive = isRouteActive(pathname, item.href);
                     return (
                         <Link
                             key={item.href}
@@ -246,7 +278,7 @@ export function DashboardSidebar() {
                     <SheetTrigger asChild>
                         <button
                             type="button"
-                            className="flex flex-col items-center justify-center gap-1 w-full h-full py-1 text-[10px] font-semibold text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+                            className="flex flex-col items-center justify-center gap-1 w-full h-full py-1 text-[10px] font-semibold text-zinc-500 hover:text-zinc-900 dark:text-zinc-100"
                         >
                             <Menu className="h-5 w-5" />
                             <span>المزيد</span>
@@ -273,7 +305,7 @@ export function DashboardSidebar() {
                             <div className="p-3 space-y-1">
                                 {filteredNavItems.map((item) => {
                                     const Icon = item.icon;
-                                    const isActive = pathname === item.href || (item.href !== "/dashboard" && pathname.startsWith(item.href));
+                                    const isActive = isRouteActive(pathname, item.href);
                                     return (
                                         <SheetClose key={item.href} asChild>
                                             <Link
@@ -291,6 +323,13 @@ export function DashboardSidebar() {
                                         </SheetClose>
                                     );
                                 })}
+
+                                {showAdminSkeleton && (
+                                    <div className="flex items-center gap-3 rounded-xl px-3.5 py-3">
+                                        <Skeleton className="h-4 w-4 shrink-0 rounded" />
+                                        <Skeleton className="h-3.5 w-28 rounded" />
+                                    </div>
+                                )}
 
                                 {tenantSlug && (
                                     <SheetClose asChild>
