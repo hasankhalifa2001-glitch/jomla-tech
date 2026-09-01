@@ -79,6 +79,11 @@ const eslintConfig = defineConfig([
       "seed.ts",
       "app/(dashboard)/admin/**",
       "app/api/admin/**",
+      "app/(store)/**",
+      "app/api/catalog/**", // [ADD] storefront pages (e.g. [tenantSlug]/page.tsx)
+      // run with no session/tenantId — they look up the
+      // Tenant by slug via the raw client before any
+      // tenant-scoped query is even possible.
     ],
     rules: {
       "no-restricted-imports": "off",

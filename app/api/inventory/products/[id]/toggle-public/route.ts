@@ -1,6 +1,19 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { prisma } from "@/lib/db";
+// [FIX — real gap, not just hygiene] The raw `prisma.product.update(...)`
+// call below had `where: { id }` with NO `tenantId` at all — the preceding
+// `findFirst` check confirms tenant ownership before this call, but the
+// `update` itself carried zero protection of its own. If that `findFirst`
+// pre-check were ever removed (e.g. as a perceived "duplicate" query
+// during a refactor) or this pattern were copied elsewhere without it,
+// this would become a real cross-tenant write: any authenticated ADMIN
+// could toggle any OTHER tenant's product's storefront visibility just by
+// knowing its id. Switching to `getTenantDb(tenantId)` closes this
+// concretely, not just in principle — the Client Extension injects
+// `tenantId` into this exact `update` call's `where` automatically (see
+// lib/db/tenant-scope.ts's WHERE_SCOPED_WRITE_OPS handling), so the write
+// is scoped correctly even if a future edit ever removes the pre-check.
+import { getTenantDb } from "@/lib/db/tenant-scope";
 
 export async function PATCH(
   req: Request,
@@ -21,6 +34,7 @@ export async function PATCH(
       );
     }
 
+    // [v3.5] Locked out identically for EXPIRED and PENDING.
     if (session.user.subscriptionStatus === "EXPIRED" || session.user.subscriptionStatus === "PENDING") {
       return NextResponse.json(
         { error: "SUBSCRIPTION_LOCKED", message: "اشتراكك منتهي أو معلق. لا يمكنك تعديل المنتجات." },
@@ -30,11 +44,14 @@ export async function PATCH(
 
     const { id } = await params;
     const tenantId = session.user.tenantId;
+    const db = getTenantDb(tenantId);
 
-    const existingProduct = await prisma.product.findFirst({
+    const existingProduct = await db.product.findFirst({
       where: {
         id,
-        tenantId,
+      },
+      include: {
+        units: true,
       },
     });
 
@@ -42,10 +59,40 @@ export async function PATCH(
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    const updated = await prisma.product.update({
+    const nextIsPublic = !existingProduct.isPublic;
+
+    // PUBLISHING GATE RULE: block isPublic = true unless priceRetail and imageUrl are both filled in on at least one unit.
+    if (nextIsPublic) {
+      const isPublishable = existingProduct.units.some(
+        (u) =>
+          u.priceRetail !== null &&
+          u.priceRetail !== undefined &&
+          Number(u.priceRetail) > 0 &&
+          u.imageUrl !== null &&
+          u.imageUrl !== undefined &&
+          u.imageUrl.trim().length > 0
+      );
+
+      if (!isPublishable) {
+        return NextResponse.json(
+          {
+            error: "PUBLISH_GATE_BLOCKED",
+            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة سعر التجزئة وصورة المنتج على الأقل.",
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // [FIX] `where: { id }` now goes through `db` (getTenantDb(tenantId)),
+    // so the extension injects `tenantId` into this update's `where`
+    // automatically — this write can no longer target a row belonging to
+    // a different tenant under any circumstance, independent of whether
+    // the `findFirst` pre-check above stays in place.
+    const updated = await db.product.update({
       where: { id },
       data: {
-        isPublic: !existingProduct.isPublic,
+        isPublic: nextIsPublic,
       },
     });
 

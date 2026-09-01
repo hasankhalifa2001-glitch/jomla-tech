@@ -1,19 +1,26 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Plus, Trash2, PackagePlus } from "lucide-react";
+import { Plus, Trash2, PackagePlus, Camera, Crop, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
+import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
+import { ImageCropModal } from "@/components/inventory/ImageCropModal";
+import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 
 interface UnitForm {
   unitName: string;
   conversionFactor: number;
-  priceUSD: number;
+  pricingCurrency: "SYP" | "USD";
+  priceWholesale: number;
+  priceRetail: number | "";
   barcode: string;
+  barcodeSource: "GS1" | "INTERNAL" | "";
+  imageUrl: string;
 }
 
 interface AddProductModalProps {
@@ -22,45 +29,78 @@ interface AddProductModalProps {
   onSuccess: () => void;
 }
 
-const EMPTY_UNITS: UnitForm[] = [
-  { unitName: "قطعة", conversionFactor: 1, priceUSD: 1.0, barcode: "" },
-];
+const DEFAULT_BASE_UNIT: UnitForm = {
+  unitName: "قطعة",
+  conversionFactor: 1,
+  pricingCurrency: "SYP",
+  priceWholesale: 1000,
+  priceRetail: "",
+  barcode: "",
+  barcodeSource: "",
+  imageUrl: "",
+};
+
+interface CatalogEntryInfo {
+  id: string;
+  barcode: string;
+  name: string;
+  category: string | null;
+  imageUrl: string | null;
+  isOwner: boolean;
+}
 
 export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductModalProps) {
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [isPublic, setIsPublic] = useState(false);
 
-  const [units, setUnits] = useState<UnitForm[]>(EMPTY_UNITS);
+  const [units, setUnits] = useState<UnitForm[]>([{ ...DEFAULT_BASE_UNIT }]);
 
   const [hasInitialBatch, setHasInitialBatch] = useState(false);
   const [batchUnitIndex, setBatchUnitIndex] = useState(0);
   const [batchNumber, setBatchNumber] = useState("");
-  // 0, not an arbitrary starting quantity like 10 — forces a deliberate
-  // entry instead of letting a merchant submit an unintended default
-  // quantity for the initial batch. Mirrors the same fix on AddBatchModal.
   const [batchQuantity, setBatchQuantity] = useState<number>(0);
   const [expiryDate, setExpiryDate] = useState("");
 
   const [loading, setLoading] = useState(false);
 
+  // Modal child states
+  const [scannerModalOpen, setScannerModalOpen] = useState(false);
+  const [activeUnitForScan, setActiveUnitForScan] = useState<number>(0);
+
+  const [cropModalOpen, setCropModalOpen] = useState(false);
+  const [activeUnitForCrop, setActiveUnitForCrop] = useState<number>(0);
+
+  const [catalogInfo, setCatalogInfo] = useState<CatalogEntryInfo | null>(null);
+  const [reportModalOpen, setReportModalOpen] = useState(false);
+
+  // [FIX] Debounce + cancellation for the manual barcode lookup, mirroring
+  // the pattern already used correctly in InventoryClient.tsx's product
+  // search. Without this, every keystroke fired its own fetch with nothing
+  // stopping an older, slower response from overwriting a newer one.
+  const lookupAbortRef = useRef<AbortController | null>(null);
+  const lookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
+      lookupAbortRef.current?.abort();
+    };
+  }, []);
+
   const resetForm = () => {
     setName("");
     setCategory("");
     setIsPublic(false);
-    setUnits(EMPTY_UNITS);
+    setUnits([{ ...DEFAULT_BASE_UNIT }]);
     setHasInitialBatch(false);
     setBatchUnitIndex(0);
     setBatchNumber("");
     setBatchQuantity(0);
     setExpiryDate("");
+    setCatalogInfo(null);
   };
 
-  // Wraps the Dialog's own onOpenChange rather than watching `open` via a
-  // render-time comparison: every path that closes the dialog (Cancel,
-  // Escape, an outside click, or a successful save calling this with
-  // `false`) already funnels through this single callback, so there's no
-  // prop-derived state to reconcile — just react to the close event here.
   const handleOpenChange = (isOpen: boolean) => {
     if (!isOpen) {
       resetForm();
@@ -71,7 +111,16 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const handleAddUnit = () => {
     setUnits([
       ...units,
-      { unitName: "طرد", conversionFactor: 12, priceUSD: 10.0, barcode: "" },
+      {
+        unitName: "كرتونة",
+        conversionFactor: 12,
+        pricingCurrency: "SYP",
+        priceWholesale: 12000,
+        priceRetail: "",
+        barcode: "",
+        barcodeSource: "",
+        imageUrl: "",
+      },
     ]);
   };
 
@@ -87,10 +136,112 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     }
   };
 
-  const handleUnitChange = (index: number, field: keyof UnitForm, value: string | number) => {
+  const handleUnitChange = (index: number, field: keyof UnitForm, value: any) => {
     const updated = [...units];
     updated[index] = { ...updated[index], [field]: value };
     setUnits(updated);
+  };
+
+  // [FIX] `targetUnitIndex` is now an explicit, required parameter instead
+  // of implicitly reading `activeUnitForScan` from state. `activeUnitForScan`
+  // is only ever updated when the CAMERA scanner is opened
+  // (`setActiveUnitForScan(idx)` in the onClick below) — it is never
+  // touched when a barcode is typed manually into a specific unit's input.
+  // Previously, typing a barcode into e.g. unit #2 while `activeUnitForScan`
+  // still held a stale value of 0 (from a previous camera scan, or its
+  // initial default) could silently apply the catalog's suggested image to
+  // unit #1 instead of the unit actually being edited.
+  //
+  // [FIX] Debounced (300ms) and cancels any in-flight request before
+  // starting a new one — every keystroke no longer fires its own
+  // uncancelled fetch.
+  const lookupBarcodeInCatalog = (barcodeVal: string, targetUnitIndex: number) => {
+    if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
+
+    const cleanBarcode = barcodeVal.trim();
+    if (!cleanBarcode) {
+      return;
+    }
+
+    lookupTimerRef.current = setTimeout(async () => {
+      lookupAbortRef.current?.abort();
+      const controller = new AbortController();
+      lookupAbortRef.current = controller;
+
+      try {
+        const res = await fetch(`/api/catalog/lookup?barcode=${encodeURIComponent(cleanBarcode)}`, {
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (res.ok && data.success && data.entry) {
+          setCatalogInfo(data.entry);
+          if (data.entry.name) {
+            setName((prev) => prev || data.entry.name);
+          }
+          if (data.entry.category) {
+            setCategory((prev) => prev || data.entry.category);
+          }
+          if (data.entry.imageUrl) {
+            setUnits((prevUnits) => {
+              const updated = [...prevUnits];
+              if (updated[targetUnitIndex] && !updated[targetUnitIndex].imageUrl) {
+                updated[targetUnitIndex] = {
+                  ...updated[targetUnitIndex],
+                  imageUrl: data.entry.imageUrl,
+                };
+              }
+              return updated;
+            });
+          }
+          toast.success(`تم العثور على المنتج في الكتالوج المشترك: "${data.entry.name}"`);
+        } else {
+          setCatalogInfo(null);
+        }
+      } catch (err: any) {
+        if (err?.name === "AbortError") return;
+        // Ignore other lookup network errors — this is a convenience
+        // lookup, not a required step.
+      }
+    }, 300);
+  };
+
+  const handleBarcodeScanResult = (scannedBarcode: string) => {
+    const updated = [...units];
+    updated[activeUnitForScan] = {
+      ...updated[activeUnitForScan],
+      barcode: scannedBarcode,
+      barcodeSource: "GS1",
+    };
+    setUnits(updated);
+    lookupBarcodeInCatalog(scannedBarcode, activeUnitForScan);
+  };
+
+  const handleCropResult = (croppedDataUrl: string) => {
+    const updated = [...units];
+    updated[activeUnitForCrop] = {
+      ...updated[activeUnitForCrop],
+      imageUrl: croppedDataUrl,
+    };
+    setUnits(updated);
+  };
+
+  const handleTogglePublic = (checked: boolean) => {
+    if (checked) {
+      const isPublishable = units.some(
+        (u) =>
+          u.priceRetail !== "" &&
+          Number(u.priceRetail) > 0 &&
+          u.imageUrl &&
+          u.imageUrl.trim().length > 0
+      );
+
+      if (!isPublishable) {
+        toast.error("لا يمكن نشر المنتج في المتجر إلا بعد إدخال سعر التجزئة وصورة المنتج على الأقل لإحدى الوحدات.");
+        setIsPublic(false);
+        return;
+      }
+    }
+    setIsPublic(checked);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -100,16 +251,11 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
-    if (units.some((u) => !u.unitName.trim() || u.conversionFactor <= 0 || u.priceUSD <= 0)) {
-      toast.error("يرجى التأكد من ملء جميع الوحدات بمعاملات وسعر أكبر من الصفر.");
+    if (units.some((u) => !u.unitName.trim() || u.conversionFactor <= 0 || u.priceWholesale <= 0)) {
+      toast.error("يرجى التأكد من ملء جميع الوحدات بمعامل تحويل وسعر جملة أكبر من الصفر.");
       return;
     }
 
-    // Catches a duplicate barcode across this product's OWN units before
-    // hitting the network — the database's @@unique([tenantId, barcode])
-    // constraint would catch it too, but there's no reason to make a round
-    // trip for a mistake that's checkable instantly from what's already
-    // on screen.
     const enteredBarcodes = units.map((u) => u.barcode.trim()).filter(Boolean);
     if (new Set(enteredBarcodes).size !== enteredBarcodes.length) {
       toast.error("لا يمكن استخدام نفس الباركود لأكثر من وحدة قياس ضمن المنتج نفسه.");
@@ -119,6 +265,20 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     if (hasInitialBatch && (!batchQuantity || batchQuantity <= 0)) {
       toast.error("يرجى إدخال كمية أكبر من الصفر للدفعة المخزونية الأولية، أو إلغاء تفعيلها.");
       return;
+    }
+
+    if (isPublic) {
+      const isPublishable = units.some(
+        (u) =>
+          u.priceRetail !== "" &&
+          Number(u.priceRetail) > 0 &&
+          u.imageUrl &&
+          u.imageUrl.trim().length > 0
+      );
+      if (!isPublishable) {
+        toast.error("شروط النشر بالمتجر غير مكتملة (تتطلب سعر تجزئة وصورة للمنتج).");
+        return;
+      }
     }
 
     setLoading(true);
@@ -131,8 +291,12 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         units: units.map((u) => ({
           unitName: u.unitName.trim(),
           conversionFactor: Number(u.conversionFactor),
-          priceUSD: Number(u.priceUSD),
+          pricingCurrency: u.pricingCurrency,
+          priceWholesale: Number(u.priceWholesale),
+          priceRetail: u.priceRetail !== "" ? Number(u.priceRetail) : null,
           barcode: u.barcode.trim() || null,
+          barcodeSource: u.barcode.trim() ? (u.barcodeSource || "INTERNAL") : null,
+          imageUrl: u.imageUrl.trim() || null,
         })),
         initialBatch: hasInitialBatch
           ? {
@@ -158,7 +322,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
       toast.success("تم إدخال المنتج ووحداته بنجاح!");
       onSuccess();
-      handleOpenChange(false); // closes AND resets in one call
+      handleOpenChange(false);
     } catch (err: any) {
       toast.error(err.message || "فشلت عملية الإضافة.");
     } finally {
@@ -167,195 +331,361 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto" dir="rtl">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2 text-xl">
-            <PackagePlus className="w-5 h-5 text-emerald-600" />
-            <span>إضافة منتج جديد متعدد الوحدات</span>
-          </DialogTitle>
-          <DialogDescription>
-            حدد اسم المنتج والتصنيف، وأضف وحدة القياس الأساسية والفرعية مع معامل التحويل وسعر البيع.
-          </DialogDescription>
-        </DialogHeader>
+    <>
+      <Dialog open={open} onOpenChange={handleOpenChange}>
+        <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl" dir="rtl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-lg font-bold">
+              <PackagePlus className="w-5 h-5 text-emerald-600" />
+              <span>إضافة منتج جديد متعدد الوحدات</span>
+            </DialogTitle>
+            <DialogDescription className="text-xs text-zinc-500">
+              أدخل بيانات المنتج، وحدات التعبئة (طرد / كرتونة / قطعة)، أسعار الجملة والتجزئة، وتصنيف الباركود.
+            </DialogDescription>
+          </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="space-y-6 py-2">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="product-name">اسم المنتج *</Label>
-              <Input
-                id="product-name"
-                placeholder="مثال: أرز مصري ممتاز"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                required
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="product-category">التصنيف (اختياري)</Label>
-              <Input
-                id="product-category"
-                placeholder="مثال: المواد الغذائية"
-                value={category}
-                onChange={(e) => setCategory(e.target.value)}
-              />
-            </div>
-          </div>
+          <form onSubmit={handleSubmit} className="space-y-4 my-2 text-xs">
+            {catalogInfo && (
+              <div className="p-3 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900/50 rounded-lg flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                  <div>
+                    <p className="font-bold text-blue-900 dark:text-blue-300">
+                      تم جلب البيانات من الكتالوج المشترك (GS1)
+                    </p>
+                    <p className="text-[11px] text-blue-700 dark:text-blue-400">
+                      المنتج: {catalogInfo.name} {catalogInfo.category ? `(${catalogInfo.category})` : ""}
+                    </p>
+                  </div>
+                </div>
+                {!catalogInfo.isOwner && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setReportModalOpen(true)}
+                    className="text-[11px] h-7 border-blue-300 dark:border-blue-800 text-blue-800 dark:text-blue-300 gap-1 shrink-0"
+                  >
+                    <AlertTriangle className="w-3 h-3 text-amber-500" />
+                    <span>تقديم اقتراح تصحيح</span>
+                  </Button>
+                )}
+              </div>
+            )}
 
-          <div className="space-y-3 border-t border-zinc-200 dark:border-zinc-800 pt-4">
-            <div className="flex items-center justify-between">
-              <h3 className="font-semibold text-sm text-zinc-900 dark:text-zinc-100">
-                وحدات التعبئة والأسعار (Packaging Units)
-              </h3>
-              <Button type="button" variant="outline" size="sm" onClick={handleAddUnit} className="gap-1">
-                <Plus className="w-4 h-4" />
-                <span>إضافة وحدة فرعية</span>
-              </Button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-lg border border-zinc-200 dark:border-zinc-800">
+              <div>
+                <Label className="text-xs font-semibold">اسم المنتج الرئيسي *</Label>
+                <Input
+                  placeholder="مثال: زيت زيتون ممتاز 1 ليتر"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="h-8 text-xs mt-1"
+                  required
+                />
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold">التصنيف / الفئة</Label>
+                <Input
+                  placeholder="مثال: زيوت ومواد غذائية"
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value)}
+                  className="h-8 text-xs mt-1"
+                />
+              </div>
+
+              <div className="sm:col-span-2 flex items-center gap-2 pt-1">
+                <input
+                  type="checkbox"
+                  id="is-public-toggle"
+                  checked={isPublic}
+                  onChange={(e) => handleTogglePublic(e.target.checked)}
+                  className="rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
+                />
+                <Label htmlFor="is-public-toggle" className="cursor-pointer font-semibold text-xs text-zinc-800 dark:text-zinc-200">
+                  عرض المنتج في متجر العملاء الإلكتروني (يتطلب سعر تجزئة وصورة للمنتج)
+                </Label>
+              </div>
             </div>
 
             <div className="space-y-3">
-              {units.map((unit, idx) => (
-                <div
-                  key={idx}
-                  className="p-3 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg space-y-3"
+              <div className="flex items-center justify-between">
+                <Label className="font-bold text-sm text-zinc-900 dark:text-zinc-100">
+                  وحدات التعبئة والأسعار (Packaging Units)
+                </Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleAddUnit}
+                  className="gap-1 h-7 text-xs border-emerald-600 text-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-950/30"
                 >
-                  <div className="flex items-center justify-between text-xs text-zinc-500 font-medium">
-                    <span>{idx === 0 ? "الوحدة الأساسية (Base Unit)" : `وحدة فرعية (${idx + 1})`}</span>
-                    {units.length > 1 && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="h-6 w-6 text-red-500 hover:text-red-700"
-                        onClick={() => handleRemoveUnit(idx)}
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </Button>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <div>
-                      <Label className="text-xs">اسم الوحدة</Label>
-                      <Input
-                        placeholder="مثال: قطعة / طرد"
-                        value={unit.unitName}
-                        onChange={(e) => handleUnitChange(idx, "unitName", e.target.value)}
-                        className="h-8 text-xs"
-                        required
-                      />
-                    </div>
-                    <div>
-                      <Label className="text-xs">معامل التحويل</Label>
-                      <Input
-                        type="number"
-                        step="any"
-                        min="0.0001"
-                        value={unit.conversionFactor}
-                        onChange={(e) => handleUnitChange(idx, "conversionFactor", parseFloat(e.target.value) || 1)}
-                        className="h-8 text-xs"
-                        required
-                      />
-                    </div>
-                    <div>
-                      <Label className="text-xs">السعر ($USD)</Label>
-                      <Input
-                        type="number"
-                        step="0.01"
-                        min="0.01"
-                        value={unit.priceUSD}
-                        onChange={(e) => handleUnitChange(idx, "priceUSD", parseFloat(e.target.value) || 0)}
-                        className="h-8 text-xs"
-                        required
-                      />
-                    </div>
-                    <div>
-                      <Label className="text-xs">الباركود</Label>
-                      <Input
-                        placeholder="رمز الباركود"
-                        value={unit.barcode}
-                        onChange={(e) => handleUnitChange(idx, "barcode", e.target.value)}
-                        className="h-8 text-xs font-mono"
-                      />
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="space-y-3 border-t border-zinc-200 dark:border-zinc-800 pt-4">
-            <div className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                id="has-batch"
-                checked={hasInitialBatch}
-                onChange={(e) => setHasInitialBatch(e.target.checked)}
-                className="rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
-              />
-              <Label htmlFor="has-batch" className="cursor-pointer font-semibold text-sm">
-                إضافة دفعة مخزونية أولية فوراً
-              </Label>
-            </div>
-
-            {hasInitialBatch && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-900/50 rounded-lg">
-                <div>
-                  <Label className="text-xs">الوحدة المستلمة</Label>
-                  <select
-                    value={batchUnitIndex}
-                    onChange={(e) => setBatchUnitIndex(parseInt(e.target.value))}
-                    className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2"
-                  >
-                    {units.map((u, i) => (
-                      <option key={i} value={i}>
-                        {u.unitName} (معامل {u.conversionFactor})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <Label className="text-xs">رقم الدفعة</Label>
-                  <Input
-                    placeholder="مثال: BATCH-2026-001"
-                    value={batchNumber}
-                    onChange={(e) => setBatchNumber(e.target.value)}
-                    className="h-8 text-xs"
-                  />
-                </div>
-                <div>
-                  <Label className="text-xs">الكمية المستلمة</Label>
-                  <Input
-                    type="number"
-                    min="0"
-                    value={batchQuantity}
-                    onChange={(e) => setBatchQuantity(parseFloat(e.target.value) || 0)}
-                    className="h-8 text-xs"
-                  />
-                </div>
-                <div>
-                  <Label className="text-xs">تاريخ الانتهاء</Label>
-                  <Input
-                    type="date"
-                    value={expiryDate}
-                    onChange={(e) => setExpiryDate(e.target.value)}
-                    className="h-8 text-xs"
-                  />
-                </div>
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>إضافة وحدة فرعية/ثانوية</span>
+                </Button>
               </div>
-            )}
-          </div>
 
-          <DialogFooter className="gap-2 sm:gap-0">
-            <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={loading}>
-              إلغاء
-            </Button>
-            <Button type="submit" disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 text-white">
-              {loading ? "جاري الحفظ..." : "حفظ المنتج"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+              <div className="space-y-3">
+                {units.map((unit, idx) => (
+                  <div
+                    key={idx}
+                    className="p-3 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg space-y-3 shadow-2xs"
+                  >
+                    <div className="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-2">
+                      <span className="font-bold text-xs text-zinc-700 dark:text-zinc-300">
+                        {idx === 0 ? "الوحدة الأساسية (Base Unit)" : `وحدة تجميعية #${idx + 1}`}
+                      </span>
+                      {units.length > 1 && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleRemoveUnit(idx)}
+                          className="h-6 w-6 p-0 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/30"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </Button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                      <div>
+                        <Label className="text-[11px]">اسم الوحدة *</Label>
+                        <Input
+                          placeholder="مثال: قطعة / كرتونة / طرد"
+                          value={unit.unitName}
+                          onChange={(e) => handleUnitChange(idx, "unitName", e.target.value)}
+                          className="h-8 text-xs mt-1"
+                          required
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px]">معامل التحويل (عدد الوحدات الأساسية) *</Label>
+                        <Input
+                          type="number"
+                          step="any"
+                          min="0.0001"
+                          disabled={idx === 0}
+                          value={idx === 0 ? 1 : unit.conversionFactor}
+                          onChange={(e) => handleUnitChange(idx, "conversionFactor", parseFloat(e.target.value) || 1)}
+                          className="h-8 text-xs mt-1"
+                          required
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px]">العملة *</Label>
+                        <select
+                          value={unit.pricingCurrency}
+                          onChange={(e) => handleUnitChange(idx, "pricingCurrency", e.target.value as "SYP" | "USD")}
+                          className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2 mt-1"
+                        >
+                          <option value="SYP">ليرة سورية (SYP)</option>
+                          <option value="USD">دولار أمريكي (USD)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px]">سعر الجملة *</Label>
+                        <Input
+                          type="number"
+                          step="any"
+                          min="0.01"
+                          value={unit.priceWholesale}
+                          onChange={(e) => handleUnitChange(idx, "priceWholesale", parseFloat(e.target.value) || 0)}
+                          className="h-8 text-xs mt-1 font-mono"
+                          required
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px]">سعر التجزئة للمتجر (اختياري)</Label>
+                        <Input
+                          type="number"
+                          step="any"
+                          min="0"
+                          placeholder="للنشر بالمتجر"
+                          value={unit.priceRetail}
+                          onChange={(e) => handleUnitChange(idx, "priceRetail", e.target.value)}
+                          className="h-8 text-xs mt-1 font-mono"
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px]">تصنيف الباركود</Label>
+                        <select
+                          value={unit.barcodeSource}
+                          onChange={(e) => handleUnitChange(idx, "barcodeSource", e.target.value)}
+                          className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2 mt-1"
+                        >
+                          <option value="">بدون تصنيف</option>
+                          <option value="GS1">دولي (GS1 / EAN)</option>
+                          <option value="INTERNAL">داخلي للمتجر (INTERNAL)</option>
+                        </select>
+                      </div>
+                      <div className="sm:col-span-2">
+                        <Label className="text-[11px]">الباركود (Barcode)</Label>
+                        <div className="flex items-center gap-1.5 mt-1">
+                          <Input
+                            placeholder="امسح أو أدخل الباركود"
+                            value={unit.barcode}
+                            onChange={(e) => {
+                              handleUnitChange(idx, "barcode", e.target.value);
+                              // [FIX] Pass `idx` explicitly — the unit
+                              // being typed into right now, not whatever
+                              // `activeUnitForScan` last happened to be.
+                              lookupBarcodeInCatalog(e.target.value, idx);
+                            }}
+                            className="h-8 text-xs font-mono"
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setActiveUnitForScan(idx);
+                              setScannerModalOpen(true);
+                            }}
+                            className="h-8 px-2.5 shrink-0 gap-1 text-xs"
+                            title="مسح الكاميرا"
+                          >
+                            <Camera className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>كاميرا</span>
+                          </Button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px]">صورة الوحدة/المنتج</Label>
+                        <div className="flex items-center gap-1.5 mt-1">
+                          <Input
+                            placeholder="رابط الصورة"
+                            value={unit.imageUrl}
+                            onChange={(e) => handleUnitChange(idx, "imageUrl", e.target.value)}
+                            className="h-8 text-xs truncate"
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setActiveUnitForCrop(idx);
+                              setCropModalOpen(true);
+                            }}
+                            className="h-8 px-2.5 shrink-0 gap-1 text-xs"
+                            title="معالجة وقص الصورة"
+                          >
+                            <Crop className="w-3.5 h-3.5 text-blue-600" />
+                            <span>قص</span>
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-3 border-t border-zinc-200 dark:border-zinc-800 pt-4">
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="has-batch"
+                  checked={hasInitialBatch}
+                  onChange={(e) => setHasInitialBatch(e.target.checked)}
+                  className="rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
+                />
+                <Label htmlFor="has-batch" className="cursor-pointer font-semibold text-sm">
+                  إضافة دفعة مخزونية أولية فوراً
+                </Label>
+              </div>
+
+              {hasInitialBatch && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-900/50 rounded-lg">
+                  <div>
+                    <Label className="text-xs">الوحدة المستلمة</Label>
+                    <select
+                      value={batchUnitIndex}
+                      onChange={(e) => setBatchUnitIndex(parseInt(e.target.value))}
+                      className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2"
+                    >
+                      {units.map((u, i) => (
+                        <option key={i} value={i}>
+                          {u.unitName} (معامل {u.conversionFactor})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <Label className="text-xs">رقم الدفعة</Label>
+                    <Input
+                      placeholder="مثال: BATCH-2026-001"
+                      value={batchNumber}
+                      onChange={(e) => setBatchNumber(e.target.value)}
+                      className="h-8 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label className="text-xs">الكمية المستلمة</Label>
+                    <Input
+                      type="number"
+                      min="0"
+                      value={batchQuantity}
+                      onChange={(e) => setBatchQuantity(parseFloat(e.target.value) || 0)}
+                      className="h-8 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label className="text-xs">تاريخ الانتهاء</Label>
+                    <Input
+                      type="date"
+                      value={expiryDate}
+                      onChange={(e) => setExpiryDate(e.target.value)}
+                      className="h-8 text-xs"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button type="button" variant="outline" onClick={() => handleOpenChange(false)} disabled={loading}>
+                إلغاء
+              </Button>
+              <Button type="submit" disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+                {loading ? "جاري الحفظ..." : "حفظ المنتج"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Barcode Scanner Modal */}
+      <BarcodeScannerModal
+        open={scannerModalOpen}
+        onOpenChange={setScannerModalOpen}
+        onScan={handleBarcodeScanResult}
+      />
+
+      {/* Image Crop Modal */}
+      <ImageCropModal
+        open={cropModalOpen}
+        onOpenChange={setCropModalOpen}
+        onCropComplete={handleCropResult}
+      />
+
+      {/* Shared Catalog Correction Report Modal */}
+      {catalogInfo && (
+        <CatalogReportModal
+          open={reportModalOpen}
+          onOpenChange={setReportModalOpen}
+          catalogEntryId={catalogInfo.id}
+          currentName={catalogInfo.name}
+          currentCategory={catalogInfo.category || undefined}
+        />
+      )}
+    </>
   );
 }

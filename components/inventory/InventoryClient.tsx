@@ -13,7 +13,15 @@ import { CsvImportModal } from "@/components/inventory/CsvImportModal";
 import { FifoPreviewModal } from "@/components/inventory/FifoPreviewModal";
 import { ProductTable, ProductItem } from "@/components/inventory/ProductTable";
 
-type FilterTab = "all" | "public" | "expiring" | "out_of_stock";
+// [FIX] Added "needs_reconciliation" — the backend (/api/inventory/products
+// GET) already supports this filter value (see route.ts's
+// `hasNegativeStockBatch` branch), but no UI tab ever sent it. T3's
+// acceptance criterion ("Any batch with quantity < 0 shows the negative-
+// stock badge and appears under the 'يحتاج تسوية' filter tab") was
+// therefore only half-met. Standardized on "needs_reconciliation" only —
+// the backend's "reconcile" alias is redundant and dropped there too, so
+// there is exactly one accepted value for this filter going forward.
+type FilterTab = "all" | "public" | "expiring" | "out_of_stock" | "needs_reconciliation";
 
 export function InventoryClient() {
   // "New product" and "CSV import" are ADMIN-only server-side (see
@@ -38,14 +46,28 @@ export function InventoryClient() {
   const [fifoPreviewOpen, setFifoPreviewOpen] = useState(false);
   const [preselectedProductId, setPreselectedProductId] = useState<string | undefined>(undefined);
 
+  // [FIX] Cancels any in-flight request before starting a new one. Without
+  // this, a slow debounced search response landing after a fast filter-tab
+  // response (or vice versa) could overwrite the screen with stale,
+  // filter-mismatched results — a real (if rare) race, not just a style
+  // nitpick, since the two triggers now fire on different timers (see the
+  // debounce fix below).
+  const abortRef = useRef<AbortController | null>(null);
+
   const fetchProducts = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (searchQuery.trim()) params.set("q", searchQuery.trim());
       if (activeFilter !== "all") params.set("filter", activeFilter);
 
-      const res = await fetch(`/api/inventory/products?${params.toString()}`);
+      const res = await fetch(`/api/inventory/products?${params.toString()}`, {
+        signal: controller.signal,
+      });
       const data = await res.json();
 
       if (!res.ok) {
@@ -54,9 +76,12 @@ export function InventoryClient() {
 
       setProducts(data.products || []);
     } catch (err: any) {
+      if (err?.name === "AbortError") return;
       toast.error(err.message || "فشل تحميل قائمة المنتجات.");
     } finally {
-      setLoading(false);
+      if (abortRef.current === controller) {
+        setLoading(false);
+      }
     }
   }, [searchQuery, activeFilter]);
 
@@ -234,6 +259,22 @@ export function InventoryClient() {
           >
             <AlertCircle className="w-3.5 h-3.5" />
             <span>قريب من الانتهاء</span>
+          </Button>
+
+          {/* [FIX] New tab — was entirely missing. Color aligned with
+              NegativeStockBadge (purple), which is the badge this filter's
+              results are meant to correspond to at the row/batch level. */}
+          <Button
+            variant={activeFilter === "needs_reconciliation" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setActiveFilter("needs_reconciliation")}
+            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "needs_reconciliation"
+              ? "bg-purple-600 text-white hover:bg-purple-700"
+              : "border-purple-200 text-purple-700 hover:bg-purple-50 dark:border-purple-900 dark:text-purple-400"
+              }`}
+          >
+            <AlertCircle className="w-3.5 h-3.5" />
+            <span>يحتاج تسوية</span>
           </Button>
 
           <Button

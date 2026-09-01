@@ -18,7 +18,14 @@ export function ExpiryBadge({ daysToExpiry, expiryDate, status }: ExpiryBadgePro
     );
   }
 
-  const formattedDate = new Date(expiryDate).toLocaleDateString("ar-EG", {
+  // [FIX] Was "ar-EG" — the rest of this app's locale-sensitive formatting
+  // (per the Global UI/UX spec's Intl.NumberFormat('ar-SY') requirement for
+  // currency) targets Syrian Arabic specifically. "ar-EG" produces
+  // Egyptian month names (e.g. "يناير") rather than the Levantine
+  // convention Syrian users expect (e.g. "كانون الثاني"), which reads as a
+  // locale mismatch even though both are valid Arabic. Aligned to "ar-SY"
+  // for consistency with the currency formatting used elsewhere.
+  const formattedDate = new Date(expiryDate).toLocaleDateString("ar-SY", {
     year: "numeric",
     month: "short",
     day: "numeric",

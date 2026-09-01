@@ -5,6 +5,8 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Layers, ChevronDown, ChevronUp, Package, RefreshCw } from "lucide-react";
 import { ExpiryBadge } from "@/components/inventory/ExpiryBadge";
+import { NegativeStockBadge } from "@/components/inventory/NegativeStockBadge";
+import { formatMoney } from "@/lib/utils/money";
 
 export interface BatchItem {
   id: string;
@@ -15,14 +17,24 @@ export interface BatchItem {
   expiryDate: string | null;
   daysToExpiry: number | null;
   expiryStatus: "RED" | "YELLOW" | "NORMAL";
+  isNegative?: boolean;
 }
 
 export interface UnitItem {
   id: string;
   unitName: string;
   conversionFactor: number;
-  priceUSD: number;
+  pricingCurrency?: "SYP" | "USD";
+  priceWholesale: number;
+  priceRetail?: number | null;
+  // [FIX] `priceUSD` removed — that column does not exist on ProductUnit
+  // (see T1 acceptance criteria; schema.prisma's v3.1 note: "priceUSD
+  // (v3.0) is REMOVED"). `priceWholesale` + `pricingCurrency` is the only
+  // source of truth for what a unit is billed at. Reintroducing this field
+  // here would let a stale/undefined value reach the UI again.
   barcode: string | null;
+  barcodeSource?: "GS1" | "INTERNAL" | null;
+  imageUrl?: string | null;
 }
 
 export interface ProductItem {
@@ -37,6 +49,7 @@ export interface ProductItem {
   totalStockInBase: number;
   baseUnitName: string;
   hasExpiringSoonBatch: boolean;
+  hasNegativeStockBatch?: boolean;
   isOutOfStock: boolean;
 }
 
@@ -108,8 +121,20 @@ export function ProductTable({
                 return (
                   <tr key={product.id} className="hover:bg-zinc-50/50 dark:hover:bg-zinc-800/30 transition-colors">
                     <td className="py-3.5 px-4 align-top">
-                      <div className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">
-                        {product.name}
+                      <div className="flex items-center gap-2">
+                        <div className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">
+                          {product.name}
+                        </div>
+                        {/* Row-level heads-up when any batch under this
+                            product needs reconciliation, so a merchant
+                            doesn't have to expand every row to find out.
+                            Uses the already-computed, derived-on-read flag
+                            from the API — never a stored field. */}
+                        {product.hasNegativeStockBatch && (
+                          <span title="يوجد دفعة بمخزون سالب تحتاج تسوية">
+                            <Package className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
+                          </span>
+                        )}
                       </div>
                       {product.category && (
                         <Badge variant="outline" className="mt-1 text-[10px] text-zinc-500 border-zinc-200">
@@ -124,9 +149,20 @@ export function ProductTable({
                           <div key={unit.id} className="flex items-center gap-2 text-xs">
                             <span className="font-medium text-zinc-800 dark:text-zinc-200">{unit.unitName}</span>
                             <span className="text-zinc-400 text-[11px]">(معامل {unit.conversionFactor})</span>
+                            {/* [FIX] priceUSD replaced with priceWholesale +
+                                pricingCurrency, formatted through the shared
+                                money module — this is the only figure ever
+                                billed (T1), in whichever currency it was
+                                actually set in (SYP or USD), never a
+                                hardcoded "$". */}
                             <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">
-                              ${unit.priceUSD.toFixed(2)}
+                              {formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}
                             </span>
+                            {unit.priceRetail != null && (
+                              <span className="text-[10px] text-zinc-400">
+                                (تجزئة: {formatMoney(unit.priceRetail, unit.pricingCurrency ?? "SYP")})
+                              </span>
+                            )}
                             {unit.barcode && (
                               <span className="font-mono text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-500">
                                 {unit.barcode}
@@ -251,12 +287,23 @@ export function ProductTable({
                             </div>
                           </div>
 
-                          <div className="text-left">
+                          {/* [FIX] NegativeStockBadge was imported but never
+                              rendered — T3's acceptance criterion ("Any
+                              batch with quantity < 0 shows the negative-
+                              stock badge...") was silently unmet. Derived
+                              directly from batch.quantity (not the
+                              batch.isNegative field) per the schema's
+                              "derive, don't store" rule for this exact
+                              flag. */}
+                          <div className="text-left flex flex-col items-end gap-1">
                             <ExpiryBadge
                               daysToExpiry={batch.daysToExpiry}
                               expiryDate={batch.expiryDate}
                               status={batch.expiryStatus}
                             />
+                            {batch.quantity < 0 && (
+                              <NegativeStockBadge quantity={batch.quantity} unitName={batch.unitName} />
+                            )}
                           </div>
                         </div>
                       ))}

@@ -1,25 +1,87 @@
-import { notFound } from "next/navigation";
+// eslint-disable-next-line no-restricted-imports
 import { prisma } from "@/lib/db";
+import { Prisma } from "@prisma/client";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Store, Phone, ShoppingCart, DollarSign, PackageCheck, AlertCircle } from "lucide-react";
+import { Store, Phone, ShoppingCart, DollarSign, PackageCheck, AlertCircle, ImageOff } from "lucide-react";
+import { convertCurrency, formatMoney, toDecimal } from "@/lib/utils/money";
+
+// [ADD] Honest, narrow types instead of `product: any` — matches the
+// pattern already used in app/api/inventory/products/route.ts.
+type StorefrontProductUnit = {
+  id: string;
+  unitName: string;
+  conversionFactor: Prisma.Decimal | number;
+  pricingCurrency: string;
+  priceWholesale: Prisma.Decimal | number;
+  priceRetail: Prisma.Decimal | number | null;
+  imageUrl: string | null;
+  barcode: string | null;
+};
+
+type StorefrontProduct = {
+  id: string;
+  name: string;
+  category: string | null;
+  units: StorefrontProductUnit[];
+};
 
 type StorefrontPageProps = {
   params: Promise<{ tenantSlug: string }>;
 };
 
+// [ADD] Picks the unit the storefront should actually display for a
+// product card. The publishing gate (T3) only requires ONE unit to carry
+// both priceRetail + imageUrl before Product.isPublic can be true — it
+// does NOT guarantee that unit is the base unit (conversionFactor === 1)
+// or the first unit in the array. Preference order:
+//   1. base unit (conversionFactor === 1) that is itself gate-eligible
+//   2. any other gate-eligible unit
+//   3. base unit (fallback, should not normally be reached on a public
+//      product, but keeps this defensive rather than throwing)
+//   4. first unit (last-resort fallback)
+function pickDisplayUnit(units: StorefrontProductUnit[]): StorefrontProductUnit | undefined {
+  const isEligible = (u: StorefrontProductUnit) =>
+    u.priceRetail !== null && u.priceRetail !== undefined && u.imageUrl && u.imageUrl.trim().length > 0;
+
+  return (
+    units.find((u) => Number(u.conversionFactor) === 1 && isEligible(u)) ??
+    units.find(isEligible) ??
+    units.find((u) => Number(u.conversionFactor) === 1) ??
+    units[0]
+  );
+}
+
 export default async function StorefrontPage({ params }: StorefrontPageProps) {
   const { tenantSlug } = await params;
 
+  // [NOTE] Raw `prisma` is intentional and required here — this route runs
+  // with no session/tenantId (public storefront, visited by anonymous
+  // retailers), so getTenantDb(tenantId) is not callable until AFTER the
+  // Tenant is found by slug. `Tenant` itself is not in
+  // TENANT_SCOPED_MODELS (it's the tenant registry, not a tenant-scoped
+  // row), and `products` below is fetched via a relation `include` nested
+  // under one specific Tenant row — Prisma can only return rows that
+  // actually belong to that Tenant via the FK relation, so this is safe
+  // despite using the unscoped client. Add "app/(store)/**" to the
+  // no-restricted-imports allowlist in eslint.config.mjs alongside
+  // registration/seed/admin routes.
   const tenant = await prisma.tenant.findUnique({
     where: { slug: tenantSlug },
     include: {
       products: {
-        where: { isPublic: true },
+        // [FIX] Added `isActive: true` — a soft-deleted product that was
+        // previously isPublic must never remain visible on the public
+        // storefront just because isPublic was never explicitly reset.
+        where: { isPublic: true, isActive: true },
         include: { units: true },
-        take: 12,
+        // [FIX] Removed `take: 12`. A hard cap silently hid the rest of a
+        // tenant's catalog with no pagination UI to reach it, and the
+        // "N منتج متاح" badge below then reported the capped count (12)
+        // as if it were the tenant's full public catalog size — actively
+        // misleading for any tenant with more than 12 published products.
       },
     },
   });
@@ -41,7 +103,20 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
     );
   }
 
-  const exchangeRate = tenant.dailyExchangeRate ? Number(tenant.dailyExchangeRate) : null;
+  // [FIX] Routed through toDecimal(...).toNumber() instead of a bare
+  // Number(...) — a genuinely corrupted dailyExchangeRate now fails
+  // loudly (caught below) instead of silently becoming NaN and quietly
+  // breaking every price conversion on the page with no error surfaced.
+  let exchangeRate: number | null = null;
+  if (tenant.dailyExchangeRate) {
+    try {
+      exchangeRate = toDecimal(tenant.dailyExchangeRate.toString()).toNumber();
+    } catch {
+      exchangeRate = null;
+    }
+  }
+
+  const products = tenant.products as unknown as StorefrontProduct[];
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 font-sans text-zinc-900 dark:text-zinc-100">
@@ -76,7 +151,7 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
             {exchangeRate ? (
               <Badge className="bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border-emerald-200 px-3 py-1.5 text-xs font-semibold gap-1.5">
                 <DollarSign className="h-3.5 w-3.5 text-emerald-600" />
-                <span>سعر الصرف اليومي: {exchangeRate.toLocaleString("ar-SY")} ل.س / $</span>
+                <span>سعر الصرف اليومي: {formatMoney(exchangeRate, "SYP", 0)} ل.س / $</span>
               </Badge>
             ) : (
               <Badge variant="secondary" className="text-xs">
@@ -102,11 +177,11 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
             <p className="text-xs text-zinc-500">اختر الكميات واضغط لإضافة المنتجات لسلة الشراء المباشر.</p>
           </div>
           <Badge variant="secondary" className="text-xs">
-            {tenant.products.length} منتج متاح
+            {products.length} منتج متاح
           </Badge>
         </div>
 
-        {tenant.products.length === 0 ? (
+        {products.length === 0 ? (
           <Card className="p-12 text-center border-dashed">
             <PackageCheck className="mx-auto h-12 w-12 text-zinc-400" />
             <h3 className="mt-4 text-base font-semibold">لا توجد منتجات معروضة حالياً</h3>
@@ -116,24 +191,75 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
           </Card>
         ) : (
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
-            {tenant.products.map((product: any) => {
-              const primaryUnit = product.units[0];
-              const currency = primaryUnit?.pricingCurrency || "SYP";
-              const rawPrice = primaryUnit ? Number(primaryUnit.priceWholesale) : 0;
-              
-              let priceUSD = 0;
-              let priceSYP: number | null = null;
+            {products.map((product) => {
+              const displayUnit = pickDisplayUnit(product.units);
 
-              if (currency === "USD") {
-                priceUSD = rawPrice;
-                priceSYP = exchangeRate ? rawPrice * exchangeRate : null;
-              } else {
-                priceSYP = rawPrice;
-                priceUSD = exchangeRate && exchangeRate > 0 ? rawPrice / exchangeRate : 0;
+              if (!displayUnit) {
+                return null;
               }
 
+              const currency = displayUnit.pricingCurrency || "SYP";
+              const rawPriceStr = displayUnit.priceWholesale.toString();
+
+              // [FIX] Currency conversion now goes through
+              // lib/utils/money.ts's convertCurrency/formatMoney instead
+              // of native +/-/*// on Number(Decimal) — same precision
+              // discipline the rest of the system enforces for stored
+              // money, applied here for display. Wrapped in try/catch
+              // because convertCurrency throws (by design) on a zero/
+              // negative rate — shown as "unavailable" rather than
+              // silently displaying $0.00.
+              let priceUSDDisplay: string | null = null;
+              let priceSYPDisplay: string | null = null;
+              try {
+                if (currency === "USD") {
+                  priceUSDDisplay = formatMoney(rawPriceStr, "USD");
+                  if (exchangeRate) {
+                    priceSYPDisplay = formatMoney(
+                      convertCurrency(rawPriceStr, exchangeRate, "USD", "SYP"),
+                      "SYP"
+                    );
+                  }
+                } else {
+                  priceSYPDisplay = formatMoney(rawPriceStr, "SYP");
+                  if (exchangeRate) {
+                    priceUSDDisplay = formatMoney(
+                      convertCurrency(rawPriceStr, exchangeRate, "SYP", "USD"),
+                      "USD"
+                    );
+                  }
+                }
+              } catch {
+                // exchangeRate was invalid — leave conversion null, show
+                // the base-currency price only rather than a wrong number.
+              }
+
+              const priceRetailDisplay =
+                displayUnit.priceRetail !== null && displayUnit.priceRetail !== undefined
+                  ? formatMoney(displayUnit.priceRetail.toString(), currency === "USD" ? "USD" : "SYP")
+                  : null;
+
               return (
-                <Card key={product.id} className="flex flex-col justify-between border-zinc-200 dark:border-zinc-800 hover:shadow-lg transition-shadow">
+                <Card
+                  key={product.id}
+                  className="flex flex-col justify-between border-zinc-200 dark:border-zinc-800 hover:shadow-lg transition-shadow overflow-hidden"
+                >
+                  {/* [ADD] Product image — the publishing gate requires
+                      every publishable unit to have an imageUrl, but the
+                      previous version of this page never rendered it. */}
+                  <div className="aspect-square w-full bg-zinc-100 dark:bg-zinc-900 flex items-center justify-center overflow-hidden">
+                    {displayUnit.imageUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={displayUnit.imageUrl}
+                        alt={product.name}
+                        className="h-full w-full object-cover"
+                      />
+                    ) : (
+                      <ImageOff className="h-10 w-10 text-zinc-300" />
+                    )}
+                  </div>
+
                   <CardHeader className="pb-3">
                     {product.category && (
                       <Badge variant="outline" className="w-fit text-[10px] mb-1">
@@ -144,25 +270,39 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
                       {product.name}
                     </CardTitle>
                     <CardDescription className="text-xs">
-                      الوحدة الأساسية: {primaryUnit?.unitName || "قطعة"}
+                      الوحدة: {displayUnit.unitName}
                     </CardDescription>
                   </CardHeader>
 
-                  <CardContent className="pb-4">
+                  <CardContent className="pb-4 space-y-1">
                     <div className="flex items-baseline gap-2">
-                      <span className="text-lg font-extrabold text-emerald-600 dark:text-emerald-400">
-                        ${priceUSD.toFixed(2)}
-                      </span>
-                      {priceSYP && (
-                        <span className="text-xs font-semibold text-zinc-500">
-                          ({priceSYP.toLocaleString("ar-SY")} ل.س)
+                      {priceUSDDisplay ? (
+                        <span className="text-lg font-extrabold text-emerald-600 dark:text-emerald-400">
+                          ${priceUSDDisplay}
                         </span>
+                      ) : (
+                        <span className="text-sm font-semibold text-zinc-400">السعر غير متاح حالياً</span>
+                      )}
+                      {priceSYPDisplay && (
+                        <span className="text-xs font-semibold text-zinc-500">({priceSYPDisplay} ل.س)</span>
                       )}
                     </div>
+                    {/* [ADD] priceRetail — spec (T5 Scope 1) requires it be
+                        "visibly distinguished" from the charged wholesale
+                        price, not omitted. */}
+                    {priceRetailDisplay && (
+                      <p className="text-[11px] text-zinc-400">
+                        السعر المقترح للتجزئة: {priceRetailDisplay}
+                      </p>
+                    )}
                   </CardContent>
 
-                  <CardFooter className="pt-0 border-t border-zinc-100 dark:border-zinc-900 pt-3 mt-auto">
-                    <Button size="sm" variant="outline" className="w-full text-xs gap-2 hover:bg-emerald-50 hover:text-emerald-700 hover:border-emerald-300">
+                  <CardFooter className="border-t border-zinc-100 dark:border-zinc-900 pt-3 mt-auto">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full text-xs gap-2 hover:bg-emerald-50 hover:text-emerald-700 hover:border-emerald-300"
+                    >
                       <ShoppingCart className="h-3.5 w-3.5" />
                       <span>إضافة للطلب</span>
                     </Button>

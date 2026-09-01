@@ -12,7 +12,9 @@ export interface NewProductImportData {
   category?: string;
   unitName: string;
   conversionFactor: number;
-  priceUSD: number;
+  priceWholesale: number;
+  priceRetail?: number;
+  pricingCurrency?: "SYP" | "USD";
   batchNumber?: string;
   quantity?: number;
   expiryDate?: string;
@@ -23,8 +25,9 @@ export interface PriceUpdateImportData {
   barcode: string;
   productName: string;
   unitName: string;
-  currentPriceUSD: number;
-  newPriceUSD: number;
+  currentPriceWholesale: number;
+  newPriceWholesale: number;
+  pricingCurrency: "SYP" | "USD";
   unitId: string;
 }
 
@@ -46,20 +49,26 @@ export interface CsvPreviewResult {
   rejectedRows: RejectedRowData[];
 }
 
-// The Arabic error message has always claimed "YYYY-MM-DD" but the old code
-// just called `new Date(str)`, which happily parses ambiguous formats like
-// "03/04/2026" (day/month or month/day, interpreted silently depending on
-// engine). A strict format check means a badly-formatted date is REJECTED
-// with a clear reason instead of silently imported as the wrong date.
 const STRICT_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
-type PrismaTx = PrismaClient | Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends">;
+type PrismaReadClient = PrismaClient | Prisma.TransactionClient;
+type PrismaWriteClient = PrismaClient;
 
 /**
  * Two-Pass Validation (Pass 1): Parse & Validate CSV without writing to DB
+ *
+ * [FIX — duplicate barcode on price-update rows] The previous version only
+ * tracked `seenBarcodesInFile` inside the NEW-product branch. Two rows in
+ * the same file that both matched an EXISTING unit by the same barcode
+ * (i.e., two price-update rows for the same product) were never flagged —
+ * both silently entered `priceUpdates` targeting the same `unitId`, and at
+ * commit time the second `updateMany` would just overwrite the first with
+ * no warning (last-write-wins, invisible to the merchant). A separate
+ * `seenUpdateBarcodesInFile` set now catches this the same way duplicate
+ * new-product barcodes were already caught.
  */
 export async function validateAndPreviewCsv(
-  tx: PrismaTx,
+  db: PrismaReadClient,
   tenantId: string,
   csvString: string
 ): Promise<CsvPreviewResult> {
@@ -85,31 +94,30 @@ export async function validateAndPreviewCsv(
     });
   }
 
-  const existingUnits = await (tx as any).productUnit.findMany({
+  const existingUnits = await db.productUnit.findMany({
     where: {
       tenantId,
-      barcode: { not: null },
     },
     include: {
       product: true,
     },
   });
 
-  const barcodeMap = new Map<string, any>();
+  const barcodeMap = new Map<string, (typeof existingUnits)[number]>();
+
   for (const u of existingUnits) {
     if (u.barcode) {
       barcodeMap.set(u.barcode.trim(), u);
     }
   }
 
-  // Tracks barcodes already claimed by an earlier row in THIS SAME file.
-  // Without this, two new-product rows sharing one not-yet-registered
-  // barcode both sail through Pass 1 as valid "new products" — then Pass 2
-  // hits the DB's @@unique([tenantId, barcode]) constraint on the second
-  // one. See commitCsvImport below for the second half of this protection
-  // (a concurrent import racing THIS one, which no amount of in-file
-  // checking here can catch).
   const seenBarcodesInFile = new Set<string>();
+  const seenNamesInFile = new Map<string, number>(); // normalized name -> first line number
+  // [FIX] Tracks barcodes already claimed by a PRICE-UPDATE row in this
+  // file — a separate set from `seenBarcodesInFile` (which only guards
+  // NEW-product rows) since the two branches represent different kinds of
+  // duplicates and must not share one counter.
+  const seenUpdateBarcodesInFile = new Map<string, number>(); // barcode -> first line number
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -125,10 +133,10 @@ export async function validateAndPreviewCsv(
     const batchNumber = (row.batchNumber || "").trim() || undefined;
     const expiryDateStr = (row.expiryDate || "").trim() || undefined;
 
-    const rawPrice = (row.priceUSD || "").toString().trim();
-    const priceUSD = parseFloat(rawPrice);
+    const rawPrice = (row.priceWholesale || "").toString().trim();
+    const priceWholesale = parseFloat(rawPrice);
 
-    if (!rawPrice || isNaN(priceUSD) || priceUSD <= 0) {
+    if (!rawPrice || isNaN(priceWholesale) || priceWholesale <= 0) {
       rejectedRows.push({
         lineNumber,
         rowContent: rowContentSummary,
@@ -136,6 +144,24 @@ export async function validateAndPreviewCsv(
       });
       continue;
     }
+
+    let priceRetail: number | undefined = undefined;
+    const rawRetail = (row.priceRetail || "").toString().trim();
+    if (rawRetail) {
+      priceRetail = parseFloat(rawRetail);
+      if (isNaN(priceRetail) || priceRetail < 0) {
+        rejectedRows.push({
+          lineNumber,
+          rowContent: rowContentSummary,
+          reason: `السطر ${lineNumber}: سعر التجزئة يجب أن يكون رقماً غير سالب.`,
+        });
+        continue;
+      }
+    }
+
+    const currencyInputRaw = (row.pricingCurrency || "").toString().trim().toUpperCase();
+    const currencyInput: "SYP" | "USD" | undefined =
+      currencyInputRaw === "USD" ? "USD" : currencyInputRaw === "SYP" ? "SYP" : undefined;
 
     const rawFactor = (row.conversionFactor || "").toString().trim();
     let conversionFactor = 1;
@@ -155,19 +181,17 @@ export async function validateAndPreviewCsv(
     const rawQty = (row.quantity || "").toString().trim();
     if (rawQty) {
       quantity = parseFloat(rawQty);
-      if (isNaN(quantity) || quantity < 0) {
+      if (isNaN(quantity)) {
         rejectedRows.push({
           lineNumber,
           rowContent: rowContentSummary,
-          reason: `السطر ${lineNumber}: الكمية يجب أن تكون رقماً غير سالب.`,
+          reason: `السطر ${lineNumber}: الكمية يجب أن تكون رقماً صالحاً.`,
         });
         continue;
       }
     }
 
     if (expiryDateStr) {
-      // FIX: reject anything that isn't strictly YYYY-MM-DD before even
-      // trying `new Date()` — see STRICT_DATE_REGEX comment above.
       if (!STRICT_DATE_REGEX.test(expiryDateStr)) {
         rejectedRows.push({
           lineNumber,
@@ -187,52 +211,101 @@ export async function validateAndPreviewCsv(
       }
     }
 
-    if (barcode && barcodeMap.has(barcode)) {
-      const existingUnit = barcodeMap.get(barcode)!;
-      priceUpdates.push({
-        lineNumber,
-        barcode,
-        productName: existingUnit.product?.name || "منتج غير مسمى",
-        unitName: existingUnit.unitName,
-        currentPriceUSD: Number(existingUnit.priceUSD),
-        newPriceUSD: priceUSD,
-        unitId: existingUnit.id,
-      });
-    } else {
-      if (!name) {
+    const existingUnit = barcode ? barcodeMap.get(barcode) : undefined;
+
+    if (existingUnit) {
+      // [FIX] Reject a second (or later) price-update row in this same
+      // file claiming the same barcode — same "duplicate within file"
+      // protection new-product rows already had, extended to this branch.
+      if (barcode) {
+        const firstSeenLine = seenUpdateBarcodesInFile.get(barcode);
+        if (firstSeenLine !== undefined) {
+          rejectedRows.push({
+            lineNumber,
+            rowContent: rowContentSummary,
+            reason: `السطر ${lineNumber}: الباركود (${barcode}) مكرر ضمن نفس الملف لتحديث سعر (أول ظهور في السطر ${firstSeenLine}) — تم رفض هذا السطر لتفادي تعارض الأسعار.`,
+          });
+          continue;
+        }
+        seenUpdateBarcodesInFile.set(barcode, lineNumber);
+      }
+
+      const existingCurrency = existingUnit.pricingCurrency as "SYP" | "USD";
+
+      if (currencyInput && currencyInput !== existingCurrency) {
         rejectedRows.push({
           lineNumber,
           rowContent: rowContentSummary,
-          reason: `السطر ${lineNumber}: اسم المنتج مطلوب للمنتجات الجديدة التي لا تملك باركود مسجل سابقاً.`,
+          reason:
+            `السطر ${lineNumber}: عملة السعر في الملف (${currencyInput}) لا تطابق عملة المنتج الحالية ` +
+            `(${existingCurrency}) لهذه الوحدة. لتغيير عملة التسعير يجب تعديلها يدوياً من صفحة المنتج، ` +
+            `وليس عبر استيراد CSV — تم رفض هذا السطر لتفادي احتساب السعر بعملة خاطئة.`,
         });
         continue;
       }
 
-      if (barcode) {
-        if (seenBarcodesInFile.has(barcode)) {
-          rejectedRows.push({
-            lineNumber,
-            rowContent: rowContentSummary,
-            reason: `السطر ${lineNumber}: الباركود (${barcode}) مكرر ضمن نفس الملف.`,
-          });
-          continue;
-        }
-        seenBarcodesInFile.add(barcode);
-      }
-
-      newProducts.push({
+      priceUpdates.push({
         lineNumber,
-        barcode: barcode || undefined,
-        name,
-        category,
-        unitName,
-        conversionFactor,
-        priceUSD,
-        batchNumber,
-        quantity,
-        expiryDate: expiryDateStr,
+        barcode: existingUnit.barcode || barcode,
+        productName: existingUnit.product?.name || name || "منتج غير مسمى",
+        unitName: existingUnit.unitName,
+        currentPriceWholesale: Number(existingUnit.priceWholesale ?? 0),
+        newPriceWholesale: priceWholesale,
+        pricingCurrency: existingCurrency,
+        unitId: existingUnit.id,
       });
+      continue;
     }
+
+    if (!name) {
+      rejectedRows.push({
+        lineNumber,
+        rowContent: rowContentSummary,
+        reason: `السطر ${lineNumber}: اسم المنتج مطلوب للمنتجات الجديدة التي لا تملك باركود مسجل سابقاً.`,
+      });
+      continue;
+    }
+
+    if (barcode) {
+      if (seenBarcodesInFile.has(barcode)) {
+        rejectedRows.push({
+          lineNumber,
+          rowContent: rowContentSummary,
+          reason: `السطر ${lineNumber}: الباركود (${barcode}) مكرر ضمن نفس الملف.`,
+        });
+        continue;
+      }
+      seenBarcodesInFile.add(barcode);
+    }
+
+    const normName = name.toLowerCase();
+    const firstSeenLine = seenNamesInFile.get(normName);
+    if (firstSeenLine !== undefined) {
+      rejectedRows.push({
+        lineNumber,
+        rowContent: rowContentSummary,
+        reason: `السطر ${lineNumber}: اسم المنتج "${name}" مكرر ضمن نفس الملف (أول ظهور في السطر ${firstSeenLine}) — تم الاحتفاظ بالسطر الأول فقط.`,
+      });
+      continue;
+    }
+    seenNamesInFile.set(normName, lineNumber);
+
+    const pricingCurrency: "SYP" | "USD" = currencyInput ?? "SYP";
+
+    newProducts.push({
+      lineNumber,
+      barcode: barcode || undefined,
+      name,
+      category,
+      unitName,
+      conversionFactor,
+      priceWholesale,
+      priceRetail,
+      pricingCurrency,
+      batchNumber,
+      quantity,
+      expiryDate: expiryDateStr,
+    });
   }
 
   return {
@@ -253,26 +326,32 @@ export interface CommitCsvImportResult {
   updatedPricesCount: number;
   skippedPriceUpdates: number;
   failedNewProducts: { lineNumber: number; name: string; barcode?: string; reason: string }[];
+  // [FIX] New — mirrors `failedNewProducts`'s shape. Previously a price
+  // update that hit an unexpected error (not just "0 rows matched") threw
+  // and killed the entire remaining commit (new products included), with
+  // no record of which row or why. Every failure is now caught per-row
+  // and reported here instead of aborting the whole import.
+  failedPriceUpdates: { lineNumber: number; barcode: string; unitName: string; reason: string }[];
 }
 
 /**
  * Import Confirmation (Pass 2): Write validated CSV payload to DB.
  *
- * FIX (critical, see import/commit/route.ts): this function must be called
- * with the plain `prisma` client, NOT a `tx` obtained from an outer
- * `prisma.$transaction(async (tx) => ...)`. Each `product.create()` /
- * `productUnit.updateMany()` call below is already an atomic write on its
- * own (Prisma nested writes are atomic per call); wrapping the whole loop
- * in one outer transaction meant that on PostgreSQL, a single row's P2002 error
- * — even though caught here in JS — left the *entire* database transaction
- * in an "aborted" state, causing every subsequent row's write to fail too
- * and forcing a full rollback of rows that had already committed
- * successfully. Calling this with a non-transactional client means each
- * row's success or failure is now genuinely independent, matching what the
- * comments below (and the T3 spec) actually promise.
+ * [FIX — price-update loop error isolation] The previous version's
+ * price-update loop had no try/catch at all, unlike the new-products loop
+ * right below it. A single `updateMany` throwing for any reason (a
+ * transient DB error, a constraint violation, anything) aborted the ENTIRE
+ * `commitCsvImport` call immediately — silently skipping every remaining
+ * price update AND every new product in the same payload, with zero
+ * indication of which row caused it. That directly contradicted this
+ * function's own stated design goal ("Each row here is independent").
+ * Each price-update row is now wrapped individually, matching the
+ * new-products loop's pattern, and failures are collected into
+ * `failedPriceUpdates` with the specific line/barcode/reason instead of
+ * propagating and killing the rest of the import.
  */
 export async function commitCsvImport(
-  tx: PrismaTx,
+  db: PrismaWriteClient,
   tenantId: string,
   payload: {
     newProducts: NewProductImportData[];
@@ -283,82 +362,94 @@ export async function commitCsvImport(
   let createdProductsCount = 0;
   let skippedPriceUpdates = 0;
   const failedNewProducts: CommitCsvImportResult["failedNewProducts"] = [];
+  const failedPriceUpdates: CommitCsvImportResult["failedPriceUpdates"] = [];
 
   for (const update of payload.priceUpdates) {
-    const result = await (tx as any).productUnit.updateMany({
-      where: {
-        id: update.unitId,
-        tenantId,
-      },
-      data: {
-        priceUSD: update.newPriceUSD,
-      },
-    });
-
-    if (result.count === 0) {
-      skippedPriceUpdates++;
-      continue;
-    }
-    updatedPricesCount++;
-  }
-
-  for (const np of payload.newProducts) {
-    // Each row's create is its own atomic unit of work — see the function
-    // doc comment above. A P2002 here (barcode claimed by a concurrent
-    // import between preview and commit) only ever affects THIS row.
     try {
-      const createdProduct = await (tx as any).product.create({
-        data: {
+      const result = await db.productUnit.updateMany({
+        where: {
+          id: update.unitId,
           tenantId,
-          name: np.name,
-          category: np.category || null,
-          isPublic: false,
-          units: {
-            create: {
-              tenantId,
-              unitName: np.unitName,
-              conversionFactor: np.conversionFactor,
-              priceUSD: np.priceUSD,
-              barcode: np.barcode || null,
-            },
-          },
         },
-        include: {
-          units: true,
+        data: {
+          priceWholesale: update.newPriceWholesale,
         },
       });
 
-      createdProductsCount++;
+      if (result.count === 0) {
+        skippedPriceUpdates++;
+        continue;
+      }
+      updatedPricesCount++;
+    } catch (error) {
+      const reason =
+        error instanceof Error
+          ? `السطر ${update.lineNumber}: تعذّر تحديث السعر (${error.message}).`
+          : `السطر ${update.lineNumber}: تعذّر تحديث السعر بسبب خطأ غير متوقع.`;
+      failedPriceUpdates.push({
+        lineNumber: update.lineNumber,
+        barcode: update.barcode,
+        unitName: update.unitName,
+        reason,
+      });
+    }
+  }
 
-      if (np.batchNumber || (np.quantity !== undefined && np.quantity > 0)) {
-        const createdUnit = createdProduct.units[0];
-        const batchNum = np.batchNumber || `BATCH-INIT-${Date.now().toString().slice(-6)}-${np.lineNumber}`;
-        const batchQty = np.quantity !== undefined ? np.quantity : 0;
-        const expDate = np.expiryDate ? new Date(np.expiryDate) : null;
+  for (const np of payload.newProducts) {
+    try {
+      await db.$transaction(async (rowTx) => {
+        const createdProduct = await rowTx.product.create({
+          data: {
+            tenantId,
+            name: np.name,
+            category: np.category || null,
+            isPublic: false,
+          },
+        });
 
-        await (tx as any).productBatch.create({
+        const createdUnit = await rowTx.productUnit.create({
           data: {
             tenantId,
             productId: createdProduct.id,
-            unitId: createdUnit.id,
-            batchNumber: batchNum,
-            quantity: batchQty,
-            expiryDate: expDate,
+            unitName: np.unitName,
+            conversionFactor: np.conversionFactor,
+            pricingCurrency: np.pricingCurrency || "SYP",
+            priceWholesale: np.priceWholesale,
+            priceRetail: np.priceRetail !== undefined ? np.priceRetail : null,
+            barcode: np.barcode || null,
           },
         });
-      }
+
+        if (np.batchNumber || (np.quantity !== undefined && np.quantity > 0)) {
+          const batchNum =
+            np.batchNumber || `BATCH-INIT-${Date.now().toString().slice(-6)}-${np.lineNumber}`;
+          const batchQty = np.quantity !== undefined ? np.quantity : 0;
+          const expDate = np.expiryDate ? new Date(np.expiryDate) : null;
+
+          await rowTx.productBatch.create({
+            data: {
+              tenantId,
+              productId: createdProduct.id,
+              unitId: createdUnit.id,
+              batchNumber: batchNum,
+              quantity: batchQty,
+              expiryDate: expDate,
+            },
+          });
+        }
+      });
+
+      createdProductsCount++;
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
         failedNewProducts.push({
           lineNumber: np.lineNumber,
           name: np.name,
           barcode: np.barcode,
-          reason: `السطر ${np.lineNumber}: الباركود (${np.barcode}) تم استخدامه من قبل عملية استيراد أخرى في نفس اللحظة تقريباً. لم يتم إنشاء هذا المنتج — يرجى مراجعته وإعادة استيراده منفرداً إذا لزم الأمر.`,
+          reason: `السطر ${np.lineNumber}: تعارض في البيانات للباركود أو الاسم. لم يتم إنشاء هذا المنتج.`,
         });
         continue;
       }
-      // Any other error is unexpected (not a barcode race) — rethrow so it
-      // still surfaces as a real 500 rather than being silently swallowed.
       throw error;
     }
   }
@@ -368,6 +459,7 @@ export async function commitCsvImport(
     updatedPricesCount,
     skippedPriceUpdates,
     failedNewProducts,
+    failedPriceUpdates,
   };
 }
 
@@ -381,7 +473,9 @@ function normalizeHeaderKey(key: string): string {
   if (["category", "التصنيف", "الفئة", "قسم"].includes(k)) return "category";
   if (["unitname", "unit", "اسم الوحدة", "الوحدة", "اسم_الوحدة"].includes(k)) return "unitName";
   if (["conversionfactor", "factor", "معامل التحويل", "معامل_التحويل", "المعامل"].includes(k)) return "conversionFactor";
-  if (["priceusd", "price", "السعر", "السعر (usd)", "السعر_بالدولار", "سعر_البيع"].includes(k)) return "priceUSD";
+  if (["pricewholesale", "priceusd", "price", "السعر", "السعر (usd)", "السعر_بالدولار", "سعر_البيع", "سعر_الجملة", "سعر الجملة"].includes(k)) return "priceWholesale";
+  if (["priceretail", "سعر_التجزئة", "سعر التجزئة", "تجزئة"].includes(k)) return "priceRetail";
+  if (["pricingcurrency", "currency", "العملة", "عملة_السعر", "عملة السعر"].includes(k)) return "pricingCurrency";
   if (["batchnumber", "batch", "رقم الدفعة", "رقم_الدفعة", "الدفعة"].includes(k)) return "batchNumber";
   if (["quantity", "qty", "الكمية", "العدد", "كمية_المخزون"].includes(k)) return "quantity";
   if (["expirydate", "expiry", "تاريخ الانتهاء", "تاريخ_الانتهاء", "تاريخ الصلاحية"].includes(k)) return "expiryDate";
