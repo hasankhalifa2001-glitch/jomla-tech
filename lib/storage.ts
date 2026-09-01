@@ -1,7 +1,7 @@
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 // ============================================================================
-// SHARED CLOUD STORAGE HELPER (Cloudflare R2, S3-compatible)
+// SHARED CLOUD STORAGE HELPER (Supabase Storage — replaces Cloudflare R2)
 // ============================================================================
 // Used by BOTH:
 //   - T3 product images (app/api/upload/receipt/route.ts, "product" kind)
@@ -11,25 +11,33 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 // describes it as a general "Cloud storage upload handler for compressed
 // receipt/product images," not a receipt-only endpoint.
 //
-// [ADDED — beyond T1's original env var list] T1 specifies
-// S3_UPLOAD_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET_NAME. Those
-// four are enough to AUTHENTICATE and WRITE to R2, but R2's S3-API endpoint
-// itself is not a public, GET-able URL — reading an uploaded object back
-// requires either R2's public bucket dev URL (https://pub-<hash>.r2.dev) or
-// a custom domain mapped to the bucket. A fifth variable,
-// `S3_PUBLIC_URL_BASE`, is required to construct the URL this app actually
-// stores in ProductUnit.imageUrl / Subscription.receiptImageURL and serves
-// back to the browser. Add it to .env / .env.example:
-//   S3_PUBLIC_URL_BASE=https://pub-xxxxxxxxxxxx.r2.dev
-//   (or your mapped custom domain, e.g. https://cdn.yourdomain.com)
+// WHY SUPABASE INSTEAD OF R2: R2's free tier still requires a bank card on
+// file for account verification, which is not obtainable from Syria under
+// current sanctions. Supabase Storage's free tier (1GB storage / 2GB
+// egress per month) requires only an email to sign up. This file is a
+// drop-in replacement — every exported name, signature, and error-message
+// shape below is preserved from the R2 version, so
+// app/api/upload/receipt/route.ts requires ZERO changes.
+//
+// ENV VARS (replaces S3_UPLOAD_ENDPOINT / S3_ACCESS_KEY / S3_SECRET_KEY /
+// S3_BUCKET_NAME / S3_PUBLIC_URL_BASE):
+//   SUPABASE_URL               — Project Settings -> API -> Project URL
+//   SUPABASE_SERVICE_ROLE_KEY  — Project Settings -> API -> service_role
+//                                 secret (NOT the anon/public key — this
+//                                 runs server-side only and needs full
+//                                 write access to a bucket that is not
+//                                 publicly writable)
+//   SUPABASE_BUCKET_NAME       — the Storage bucket to upload into; create
+//                                 it in the Supabase dashboard and mark it
+//                                 Public so getPublicUrl() resolves to a
+//                                 browser-servable URL, mirroring what
+//                                 S3_PUBLIC_URL_BASE did for R2.
 // ============================================================================
 
 const REQUIRED_ENV_VARS = [
-    "S3_UPLOAD_ENDPOINT",
-    "S3_ACCESS_KEY",
-    "S3_SECRET_KEY",
-    "S3_BUCKET_NAME",
-    "S3_PUBLIC_URL_BASE",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_BUCKET_NAME",
 ] as const;
 
 function assertStorageEnv(): void {
@@ -41,24 +49,21 @@ function assertStorageEnv(): void {
     }
 }
 
-let cachedClient: S3Client | null = null;
+let cachedClient: SupabaseClient | null = null;
 
-function getS3Client(): S3Client {
+
+
+
+function getSupabaseClient(): SupabaseClient {
     assertStorageEnv();
 
     if (!cachedClient) {
-        cachedClient = new S3Client({
-            region: "auto", // R2 ignores region but the SDK requires a value.
-            endpoint: process.env.S3_UPLOAD_ENDPOINT,
-            credentials: {
-                accessKeyId: process.env.S3_ACCESS_KEY as string,
-                secretAccessKey: process.env.S3_SECRET_KEY as string,
-            },
-            // R2 (and most non-AWS S3-compatible services) require path-style
-            // addressing — virtual-hosted-style (bucket.endpoint.com) is an
-            // AWS-specific default that does not resolve correctly against R2.
-            forcePathStyle: true,
-        });
+        cachedClient = createClient(
+            process.env.SUPABASE_URL as string,
+            // service_role key, never the anon key — see header comment.
+            process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+            { auth: { persistSession: false } }
+        );
     }
 
     return cachedClient;
@@ -81,6 +86,8 @@ export const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"] as 
 // This is a server-side backstop, not the primary size control — a client
 // can be modified or bypassed entirely, so the real ceiling must live here,
 // independent of whatever the browser claims it already did.
+//
+// Also comfortably inside Supabase's free-tier egress budget per file.
 export const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
 
 export interface UploadFileParams {
@@ -90,25 +97,29 @@ export interface UploadFileParams {
 }
 
 /**
- * Uploads a file buffer to Cloudflare R2 and returns its public URL.
+ * Uploads a file buffer to Supabase Storage and returns its public URL.
  * Callers are responsible for their own content-type/size validation
  * before calling this (see app/api/upload/receipt/route.ts) — this
  * function performs the upload only, it does not re-validate.
  */
 export async function uploadFileToStorage(params: UploadFileParams): Promise<string> {
-    const client = getS3Client();
+    assertStorageEnv();
+    const client = getSupabaseClient();
+    const bucket = process.env.SUPABASE_BUCKET_NAME as string;
 
-    await client.send(
-        new PutObjectCommand({
-            Bucket: process.env.S3_BUCKET_NAME,
-            Key: params.key,
-            Body: params.buffer,
-            ContentType: params.contentType,
-        })
-    );
+    const { error } = await client.storage
+        .from(bucket)
+        .upload(params.key, params.buffer, {
+            contentType: params.contentType,
+            upsert: false,
+        });
 
-    const publicBase = (process.env.S3_PUBLIC_URL_BASE as string).replace(/\/+$/, "");
-    return `${publicBase}/${params.key}`;
+    if (error) {
+        throw new Error(`Cloud storage upload failed: ${error.message}`);
+    }
+
+    const { data } = client.storage.from(bucket).getPublicUrl(params.key);
+    return data.publicUrl;
 }
 
 /**
