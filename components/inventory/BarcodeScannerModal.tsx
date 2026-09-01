@@ -17,11 +17,9 @@ export function BarcodeScannerModal({ open, onOpenChange, onScan }: BarcodeScann
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
 
-  // تم حذف isScanning كـ State تماماً
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
 
-  // [الحل الجذري] استنتاج حالة المسح مباشرة (Derived State)
   const isScanning = open && !cameraError;
 
   const onScanRef = useRef(onScan);
@@ -35,7 +33,6 @@ export function BarcodeScannerModal({ open, onOpenChange, onScan }: BarcodeScann
     onOpenChangeRef.current = onOpenChange;
   }, [onOpenChange]);
 
-  // تصفير الأخطاء يتم عبر التفاعل المباشر (Event Handlers) وليس الـ Effect
   const handleOpenChange = useCallback((newOpen: boolean) => {
     if (!newOpen) {
       setCameraError(null);
@@ -60,14 +57,36 @@ export function BarcodeScannerModal({ open, onOpenChange, onScan }: BarcodeScann
     const codeReader = new BrowserMultiFormatReader();
     readerRef.current = codeReader;
 
-    // تم إزالة جميع عمليات setState المتزامنة من هنا!
+    // [FIX] `decodeFromConstraints` scans CONTINUOUSLY — it re-invokes this
+    // callback on every camera frame that decodes successfully, not once
+    // per "scan session". If the camera keeps seeing the same barcode for
+    // a few frames (the normal case: frames arrive every ~16-33ms) while
+    // the modal is still in the process of closing — closing requires a
+    // state update to propagate up to the parent and a subsequent effect
+    // run before `readerRef.current.reset()` actually executes — this
+    // callback can fire several times for what is, to the user, a single
+    // scan. That previously meant a repeated toast, a repeated beep, and
+    // redundant onScan() calls. `hasScannedRef` makes the first successful
+    // frame the only one that does anything; it is reset to false at the
+    // start of every new scan session (effect re-run) below.
+    const hasScannedRef = { current: false };
 
     codeReader
       .decodeFromConstraints(
         { video: { facingMode: "environment" } },
         videoRef.current!,
         (result) => {
-          if (result) {
+          if (result && !hasScannedRef.current) {
+            hasScannedRef.current = true;
+
+            // Stop the reader immediately, synchronously, inside the
+            // callback itself — waiting for React's state update and the
+            // next effect run (the `open` cleanup path) is too slow
+            // relative to how fast subsequent frames arrive.
+            if (readerRef.current) {
+              readerRef.current.reset();
+            }
+
             const barcodeText = result.getText();
             try {
               const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -90,7 +109,6 @@ export function BarcodeScannerModal({ open, onOpenChange, onScan }: BarcodeScann
       )
       .catch((err) => {
         console.error("Barcode scanner camera error:", err);
-        // تحديث الـ State بشكل غير متزامن (Asynchronous) مسموح تماماً ولا يسبب مشاكل
         setCameraError("تعذّر الوصول إلى الكاميرا. يرجى التأكد من السماح باستخدام الكاميرا.");
       });
 

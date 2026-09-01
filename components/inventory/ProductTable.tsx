@@ -3,7 +3,7 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
-import { Layers, ChevronDown, ChevronUp, Package, RefreshCw } from "lucide-react";
+import { Layers, ChevronDown, ChevronUp, Package, RefreshCw, Clock } from "lucide-react";
 import { ExpiryBadge } from "@/components/inventory/ExpiryBadge";
 import { NegativeStockBadge } from "@/components/inventory/NegativeStockBadge";
 import { formatMoney } from "@/lib/utils/money";
@@ -27,11 +27,6 @@ export interface UnitItem {
   pricingCurrency?: "SYP" | "USD";
   priceWholesale: number;
   priceRetail?: number | null;
-  // [FIX] `priceUSD` removed — that column does not exist on ProductUnit
-  // (see T1 acceptance criteria; schema.prisma's v3.1 note: "priceUSD
-  // (v3.0) is REMOVED"). `priceWholesale` + `pricingCurrency` is the only
-  // source of truth for what a unit is billed at. Reintroducing this field
-  // here would let a stale/undefined value reach the UI again.
   barcode: string | null;
   barcodeSource?: "GS1" | "INTERNAL" | null;
   imageUrl?: string | null;
@@ -62,11 +57,6 @@ interface ProductTableProps {
   togglingPublicId: string | null;
   onAddBatch: (productId: string) => void;
   onFifoPreview: (productId: string) => void;
-  // ADDED: toggling storefront visibility is ADMIN-only server-side (see
-  // toggle-public/route.ts). The switch stays visible to a CASHIER — it's
-  // useful read-only information (is this product listed publicly right
-  // now?) — but is disabled rather than hidden, so a cashier isn't misled
-  // into thinking a tap will do something the server will just reject.
   isAdmin: boolean;
 }
 
@@ -125,14 +115,24 @@ export function ProductTable({
                         <div className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">
                           {product.name}
                         </div>
-                        {/* Row-level heads-up when any batch under this
-                            product needs reconciliation, so a merchant
-                            doesn't have to expand every row to find out.
-                            Uses the already-computed, derived-on-read flag
-                            from the API — never a stored field. */}
                         {product.hasNegativeStockBatch && (
                           <span title="يوجد دفعة بمخزون سالب تحتاج تسوية">
                             <Package className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
+                          </span>
+                        )}
+                        {/* [FIX] `hasExpiringSoonBatch` was declared on the
+                            interface (and clearly returned by the API) but
+                            never rendered anywhere in this component — a
+                            merchant had no row-level way to know a product
+                            has a batch nearing expiry without expanding
+                            every single row, unlike `hasNegativeStockBatch`
+                            right above, which already gets exactly this
+                            kind of heads-up. Amber to match the "قريب من
+                            الانتهاء" filter tab and ExpiryBadge's own
+                            YELLOW/RED palette. */}
+                        {product.hasExpiringSoonBatch && (
+                          <span title="يوجد دفعة قريبة من تاريخ الانتهاء">
+                            <Clock className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
                           </span>
                         )}
                       </div>
@@ -149,12 +149,6 @@ export function ProductTable({
                           <div key={unit.id} className="flex items-center gap-2 text-xs">
                             <span className="font-medium text-zinc-800 dark:text-zinc-200">{unit.unitName}</span>
                             <span className="text-zinc-400 text-[11px]">(معامل {unit.conversionFactor})</span>
-                            {/* [FIX] priceUSD replaced with priceWholesale +
-                                pricingCurrency, formatted through the shared
-                                money module — this is the only figure ever
-                                billed (T1), in whichever currency it was
-                                actually set in (SYP or USD), never a
-                                hardcoded "$". */}
                             <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">
                               {formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}
                             </span>
@@ -287,14 +281,6 @@ export function ProductTable({
                             </div>
                           </div>
 
-                          {/* [FIX] NegativeStockBadge was imported but never
-                              rendered — T3's acceptance criterion ("Any
-                              batch with quantity < 0 shows the negative-
-                              stock badge...") was silently unmet. Derived
-                              directly from batch.quantity (not the
-                              batch.isNegative field) per the schema's
-                              "derive, don't store" rule for this exact
-                              flag. */}
                           <div className="text-left flex flex-col items-end gap-1">
                             <ExpiryBadge
                               daysToExpiry={batch.daysToExpiry}

@@ -16,6 +16,19 @@ interface CatalogReportModalProps {
   currentCategory?: string;
 }
 
+// [FIX] The stale-draft bug (a report typed for one catalog entry, then
+// cancelled, could leak into a report submitted for a DIFFERENT entry) is
+// now solved at the call site instead of with a `useEffect` here — see
+// AddProductModal's `key={catalogInfo.id}` on this component's usage.
+// React's own guidance for exactly this situation ("resetting all state
+// when a prop changes", linked from the you-might-not-need-an-effect
+// docs) is to force a remount via `key`, not to synchronously call
+// setState inside an effect body — the previous version's effect
+// triggered React's "avoid calling setState() directly within an effect"
+// warning for precisely that reason. A `key` change gives every field
+// here (reason, suggestedName, suggestedCategory, loading) a fresh
+// `useState("")` on the very first render for the new entry — no extra
+// render pass, no warning.
 export function CatalogReportModal({ open, onOpenChange, catalogEntryId, currentName, currentCategory }: CatalogReportModalProps) {
   const [reason, setReason] = useState("");
   const [suggestedName, setSuggestedName] = useState("");
@@ -24,8 +37,12 @@ export function CatalogReportModal({ open, onOpenChange, catalogEntryId, current
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!reason.trim()) {
-      toast.error("يرجى كتابة سبب البلاغ أو الملاحظة.");
+    // [FIX] Matches the backend's actual constraint (reportSchema:
+    // `reason: z.string().min(3, ...)`) instead of only checking for a
+    // non-empty string — a 1-2 character reason previously passed this
+    // check and then failed at the server with an extra round trip.
+    if (reason.trim().length < 3) {
+      toast.error("يرجى كتابة سبب البلاغ (3 أحرف على الأقل).");
       return;
     }
 

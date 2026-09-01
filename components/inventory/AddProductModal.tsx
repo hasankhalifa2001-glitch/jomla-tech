@@ -74,10 +74,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const [catalogInfo, setCatalogInfo] = useState<CatalogEntryInfo | null>(null);
   const [reportModalOpen, setReportModalOpen] = useState(false);
 
-  // [FIX] Debounce + cancellation for the manual barcode lookup, mirroring
-  // the pattern already used correctly in InventoryClient.tsx's product
-  // search. Without this, every keystroke fired its own fetch with nothing
-  // stopping an older, slower response from overwriting a newer one.
+  // Debounce + cancellation for the manual/scanned barcode lookup, mirroring
+  // the pattern used in InventoryClient.tsx's product search. Without this,
+  // every keystroke fires its own fetch with nothing stopping an older,
+  // slower response from overwriting a newer one.
   const lookupAbortRef = useRef<AbortController | null>(null);
   const lookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -124,6 +124,15 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     ]);
   };
 
+  // Tracks whether the removed unit was the one selected for the initial
+  // batch, OR sat before it in the array (which shifts every later index
+  // down by one). Either way the previous batchUnitIndex no longer safely
+  // identifies the same unit it did before removal — checking only
+  // "did the index fall out of range" misses the case where it stays
+  // numerically valid but now silently points at a *different* unit,
+  // which would write the initial stock batch against the wrong
+  // ProductUnit on submit. Resetting to 0 forces the merchant to
+  // consciously re-pick instead.
   const handleRemoveUnit = (index: number) => {
     if (units.length <= 1) {
       toast.error("يجب الإبقاء على وحدة قياس واحدة على الأقل.");
@@ -131,7 +140,8 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     }
     const updated = units.filter((_, i) => i !== index);
     setUnits(updated);
-    if (batchUnitIndex >= updated.length) {
+
+    if (index <= batchUnitIndex) {
       setBatchUnitIndex(0);
     }
   };
@@ -142,24 +152,26 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setUnits(updated);
   };
 
-  // [FIX] `targetUnitIndex` is now an explicit, required parameter instead
-  // of implicitly reading `activeUnitForScan` from state. `activeUnitForScan`
-  // is only ever updated when the CAMERA scanner is opened
-  // (`setActiveUnitForScan(idx)` in the onClick below) — it is never
-  // touched when a barcode is typed manually into a specific unit's input.
-  // Previously, typing a barcode into e.g. unit #2 while `activeUnitForScan`
-  // still held a stale value of 0 (from a previous camera scan, or its
-  // initial default) could silently apply the catalog's suggested image to
-  // unit #1 instead of the unit actually being edited.
+  // `targetUnitIndex` is an explicit, required parameter rather than
+  // implicitly reading `activeUnitForScan` from state — that state is only
+  // ever updated when the camera scanner is opened, never when a barcode
+  // is typed manually into a specific unit's input, so relying on it here
+  // could silently apply the catalog's suggested image to the wrong unit.
   //
-  // [FIX] Debounced (300ms) and cancels any in-flight request before
-  // starting a new one — every keystroke no longer fires its own
-  // uncancelled fetch.
+  // Debounced (300ms) and cancels any in-flight request before starting a
+  // new one, so a fast keystroke can't have its response overwritten by a
+  // slower, now-stale one that lands later.
   const lookupBarcodeInCatalog = (barcodeVal: string, targetUnitIndex: number) => {
     if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
 
     const cleanBarcode = barcodeVal.trim();
     if (!cleanBarcode) {
+      // Clear any stale catalog banner when the barcode field this lookup
+      // was tracking is emptied out — otherwise catalogInfo could keep
+      // showing a match for a barcode no longer present in the form at
+      // all (e.g. a match was found, then the barcode was deleted to type
+      // a different one).
+      setCatalogInfo(null);
       return;
     }
 
@@ -205,12 +217,24 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     }, 300);
   };
 
+  // [CRITICAL] Never auto-sets barcodeSource on a camera scan result.
+  // schema.prisma's v3.1 note is explicit that this exact shortcut must
+  // never happen: "a silent default of GS1 would make an unreviewed
+  // barcode eligible for the shared catalog by accident... must be set
+  // explicitly by the merchant... never guessed." Scanning a barcode with
+  // the camera only reads a number — it says nothing about whether that
+  // number is a real, factory-printed GS1/EAN code or an internal sticker
+  // the merchant wrote themselves. This behaves exactly like manual entry:
+  // the scanned value fills the barcode field only, and barcodeSource
+  // stays whatever the merchant explicitly picks from the dropdown below —
+  // matching T3's acceptance criterion ("barcodeSource is only ever set
+  // via explicit merchant confirmation") for BOTH entry paths, not just
+  // manual typing.
   const handleBarcodeScanResult = (scannedBarcode: string) => {
     const updated = [...units];
     updated[activeUnitForScan] = {
       ...updated[activeUnitForScan],
       barcode: scannedBarcode,
-      barcodeSource: "GS1",
     };
     setUnits(updated);
     lookupBarcodeInCatalog(scannedBarcode, activeUnitForScan);
@@ -533,9 +557,9 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                             value={unit.barcode}
                             onChange={(e) => {
                               handleUnitChange(idx, "barcode", e.target.value);
-                              // [FIX] Pass `idx` explicitly — the unit
-                              // being typed into right now, not whatever
-                              // `activeUnitForScan` last happened to be.
+                              // Pass `idx` explicitly — the unit being
+                              // typed into right now, not whatever
+                              // activeUnitForScan last happened to be.
                               lookupBarcodeInCatalog(e.target.value, idx);
                             }}
                             className="h-8 text-xs font-mono"
@@ -679,6 +703,13 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       {/* Shared Catalog Correction Report Modal */}
       {catalogInfo && (
         <CatalogReportModal
+          // [FIX] `key={catalogInfo.id}` forces React to fully unmount and
+          // remount this component whenever a DIFFERENT catalog entry is
+          // matched (e.g. scanning a new barcode after cancelling a draft
+          // report for a previous one) — see CatalogReportModal.tsx's own
+          // comment for why this replaces an earlier useEffect-based reset
+          // that triggered React's setState-in-effect warning.
+          key={catalogInfo.id}
           open={reportModalOpen}
           onOpenChange={setReportModalOpen}
           catalogEntryId={catalogInfo.id}

@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FileUp, CheckCircle, RefreshCw, UploadCloud, XCircle, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
+import { formatMoney } from "@/lib/utils/money";
 
 interface CsvImportModalProps {
   open: boolean;
@@ -15,10 +16,14 @@ interface CsvImportModalProps {
   onSuccess: () => void;
 }
 
-// NOTE: field names mirror NewProductImportData / PriceUpdateImportData /
-// RejectedRowData in lib/inventory/csv-parser.ts exactly — this is exactly
-// what /api/inventory/import/preview returns and what
-// /api/inventory/import/commit expects back unmodified.
+// [FIX] Field names now match NewProductImportData / PriceUpdateImportData
+// in lib/inventory/csv-parser.ts exactly — this is exactly what
+// /api/inventory/import/preview actually returns as of that file's
+// currency-safety fix (priceUSD/currentPriceUSD/newPriceUSD do not exist
+// anywhere in the schema or this codebase since v3.1; see T1 acceptance
+// criteria). The previous version's stale field names caused a guaranteed
+// runtime crash (`.toFixed()` on `undefined`) the moment either tab
+// rendered — this is what actually broke, not a cosmetic mismatch.
 interface NewProductRow {
   lineNumber: number;
   barcode?: string;
@@ -26,7 +31,9 @@ interface NewProductRow {
   category?: string;
   unitName: string;
   conversionFactor: number;
-  priceUSD: number;
+  priceWholesale: number;
+  priceRetail?: number;
+  pricingCurrency?: "SYP" | "USD";
   batchNumber?: string;
   quantity?: number;
   expiryDate?: string;
@@ -37,8 +44,9 @@ interface PriceUpdateRow {
   barcode: string;
   productName: string;
   unitName: string;
-  currentPriceUSD: number;
-  newPriceUSD: number;
+  currentPriceWholesale: number;
+  newPriceWholesale: number;
+  pricingCurrency: "SYP" | "USD";
   unitId: string;
 }
 
@@ -60,12 +68,17 @@ interface PreviewData {
   rejectedRows: RejectedRow[];
 }
 
-// Matches CommitCsvImportResult in lib/inventory/csv-parser.ts
+// [FIX] Added `failedPriceUpdates` — matches CommitCsvImportResult in
+// lib/inventory/csv-parser.ts after its per-row error-isolation fix.
+// Without this, a real (non-"skipped") price-update failure was silently
+// invisible to `hasPartialFailure` below, even though the server's
+// `hasFailures` flag correctly reported it.
 interface CommitResult {
   createdProductsCount: number;
   updatedPricesCount: number;
   skippedPriceUpdates: number;
   failedNewProducts: { lineNumber: number; name: string; barcode?: string; reason: string }[];
+  failedPriceUpdates: { lineNumber: number; barcode: string; unitName: string; reason: string }[];
 }
 
 export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModalProps) {
@@ -73,12 +86,6 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
   const [preview, setPreview] = useState<PreviewData | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [loadingCommit, setLoadingCommit] = useState(false);
-  // commitCsvImport() catches a per-row barcode collision (P2002) instead
-  // of aborting the whole import, and separately reports a price update
-  // whose unitId didn't resolve to a real tenant-owned ProductUnit as
-  // `skippedPriceUpdates` rather than failing outright. commitResult holds
-  // that response so both kinds of partial failure can be rendered instead
-  // of closing blindly on a false "fully successful" assumption.
   const [commitResult, setCommitResult] = useState<CommitResult | null>(null);
 
   const resetAll = () => {
@@ -87,8 +94,6 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
     setCommitResult(null);
   };
 
-  // Returns to the file-picker step without closing the dialog — lets the
-  // merchant fix their CSV and retry without losing their place.
   const resetToFilePicker = () => {
     setFile(null);
     setPreview(null);
@@ -169,10 +174,6 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
 
       onSuccess();
 
-      // Only auto-close when nothing failed AND nothing was skipped. If
-      // hasFailures is true (server now checks both failedNewProducts and
-      // skippedPriceUpdates), keep the dialog open and show exactly what
-      // didn't go through — closing immediately would hide that entirely.
       if (data.hasFailures) {
         setCommitResult(data.result);
         toast.warning(data.message || "تم الاستيراد جزئياً مع بعض الأخطاء.");
@@ -190,8 +191,12 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
   const canCommit =
     !!preview && (preview.newProducts.length > 0 || preview.priceUpdates.length > 0);
 
+  // [FIX] Now also triggers on failedPriceUpdates — see interface comment.
   const hasPartialFailure =
-    !!commitResult && (commitResult.failedNewProducts.length > 0 || commitResult.skippedPriceUpdates > 0);
+    !!commitResult &&
+    (commitResult.failedNewProducts.length > 0 ||
+      commitResult.skippedPriceUpdates > 0 ||
+      commitResult.failedPriceUpdates.length > 0);
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
@@ -207,9 +212,6 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
         </DialogHeader>
 
         <div className="space-y-5 py-2">
-          {/* Post-commit partial-failure panel — takes priority over
-              everything else so neither a failed product nor a skipped
-              price update is ever missed. */}
           {hasPartialFailure && commitResult && (
             <div className="p-4 rounded-xl border border-amber-300 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/20 space-y-3">
               <div className="flex items-center gap-2">
@@ -220,6 +222,8 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                     ` تعذّر إنشاء ${commitResult.failedNewProducts.length} منتج.`}
                   {commitResult.skippedPriceUpdates > 0 &&
                     ` تم تجاهل ${commitResult.skippedPriceUpdates} تحديث سعر (الوحدة غير موجودة).`}
+                  {commitResult.failedPriceUpdates.length > 0 &&
+                    ` تعذّر تنفيذ ${commitResult.failedPriceUpdates.length} تحديث سعر بسبب خطأ غير متوقع.`}
                 </span>
               </div>
 
@@ -228,12 +232,33 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                   <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">منتجات لم يتم إنشاؤها:</p>
                   {commitResult.failedNewProducts.map((row) => (
                     <div
-                      key={row.lineNumber}
+                      key={`np-${row.lineNumber}`}
                       className="p-2.5 bg-white dark:bg-zinc-900 rounded-lg border border-amber-200 dark:border-amber-900/50 text-xs"
                     >
                       <span className="font-semibold text-zinc-900 dark:text-zinc-100">
                         السطر {row.lineNumber} — {row.name}
                         {row.barcode ? ` (${row.barcode})` : ""}:
+                      </span>{" "}
+                      <span className="text-amber-700 dark:text-amber-400">{row.reason}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* [FIX] New — renders failedPriceUpdates the same way
+                  failedNewProducts is rendered above. Previously these
+                  rows existed on the server response but were never shown
+                  anywhere in this modal. */}
+              {commitResult.failedPriceUpdates.length > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">تحديثات أسعار فشلت:</p>
+                  {commitResult.failedPriceUpdates.map((row) => (
+                    <div
+                      key={`pu-${row.lineNumber}`}
+                      className="p-2.5 bg-white dark:bg-zinc-900 rounded-lg border border-amber-200 dark:border-amber-900/50 text-xs"
+                    >
+                      <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                        السطر {row.lineNumber} — {row.unitName} ({row.barcode}):
                       </span>{" "}
                       <span className="text-amber-700 dark:text-amber-400">{row.reason}</span>
                     </div>
@@ -267,8 +292,14 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                 <p className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
                   اختر ملف CSV من جهازك
                 </p>
+                {/* [FIX] "السعر (USD)" removed from the hint — priceWholesale
+                    is denominated in whichever pricingCurrency the row
+                    specifies (SYP by default if omitted, never assumed
+                    USD). The old wording directly encouraged the exact
+                    currency-mixup csv-parser.ts's own currency-safety
+                    logic exists to prevent. */}
                 <p className="text-xs text-zinc-400 mt-1 mb-3">
-                  يدعم أعمدة: الباركود، اسم المنتج، التصنيف، الوحدة، معامل التحويل، السعر (USD)، رقم الدفعة، الكمية، تاريخ الانتهاء (YYYY-MM-DD).
+                  يدعم أعمدة: الباركود، اسم المنتج، التصنيف، الوحدة، معامل التحويل، السعر، العملة (SYP أو USD، اختياري)، رقم الدفعة، الكمية، تاريخ الانتهاء (YYYY-MM-DD).
                 </p>
                 <input
                   type="file"
@@ -388,8 +419,13 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                                   {row.expiryDate ? ` · ينتهي ${row.expiryDate}` : ""}
                                 </p>
                               </div>
+                              {/* [FIX] priceUSD → priceWholesale, rendered
+                                  via the shared money formatter in whichever
+                                  currency this row actually specified
+                                  (defaulting to SYP, matching the schema's
+                                  own default) — never a hardcoded "$". */}
                               <div className="font-mono font-bold text-emerald-700 dark:text-emerald-400 shrink-0">
-                                ${row.priceUSD.toFixed(2)}
+                                {formatMoney(row.priceWholesale, row.pricingCurrency ?? "SYP")}
                               </div>
                             </div>
                           ))}
@@ -415,10 +451,20 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                                   {row.unitName} · باركود {row.barcode}
                                 </p>
                               </div>
+                              {/* [FIX] currentPriceUSD/newPriceUSD →
+                                  currentPriceWholesale/newPriceWholesale,
+                                  formatted in the unit's actual
+                                  pricingCurrency (always present on this
+                                  row per csv-parser.ts's currency-safety
+                                  fix — never assumed/hardcoded). */}
                               <div className="text-left font-mono text-xs shrink-0">
-                                <span className="text-zinc-400 line-through">${row.currentPriceUSD.toFixed(2)}</span>
+                                <span className="text-zinc-400 line-through">
+                                  {formatMoney(row.currentPriceWholesale, row.pricingCurrency)}
+                                </span>
                                 <span className="mx-1 text-zinc-400">→</span>
-                                <span className="font-bold text-blue-700 dark:text-blue-400">${row.newPriceUSD.toFixed(2)}</span>
+                                <span className="font-bold text-blue-700 dark:text-blue-400">
+                                  {formatMoney(row.newPriceWholesale, row.pricingCurrency)}
+                                </span>
                               </div>
                             </div>
                           ))}
@@ -451,9 +497,6 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
           <Button type="button" variant="outline" onClick={() => handleClose(false)}>
             {hasPartialFailure ? "تم" : "إلغاء"}
           </Button>
-          {/* This is the confirmation step the T3 spec requires: nothing
-              from the preview above is written to the database until the
-              merchant explicitly presses this button. */}
           {!hasPartialFailure && (
             <Button
               type="button"

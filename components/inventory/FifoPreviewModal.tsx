@@ -47,34 +47,39 @@ interface FifoPreviewModalProps {
   preselectedProductId?: string;
 }
 
+const DEFAULT_REQUESTED_QTY = 5;
+
 export function FifoPreviewModal({ open, onOpenChange, products, preselectedProductId }: FifoPreviewModalProps) {
   const [productId, setProductId] = useState<string>("");
   const [unitId, setUnitId] = useState<string>("");
-  const [requestedQty, setRequestedQty] = useState<number>(5);
+  const [requestedQty, setRequestedQty] = useState<number>(DEFAULT_REQUESTED_QTY);
   const [loading, setLoading] = useState<boolean>(false);
   const [resolution, setResolution] = useState<FifoResolution | null>(null);
 
-  // FIX: replaces two `useEffect` blocks that called `setState` directly
-  // in their body — a documented anti-pattern (see React's "You Might Not
-  // Need An Effect") because it forces an extra render pass after the one
-  // that already ran. Both were really just "derive/reset this state when
-  // some prop or other state changed," which React's own docs recommend
-  // handling by adjusting state DURING render, guarded by comparing
-  // against a stored previous value — not inside a separate effect.
+  // #1: productId resets to preselectedProductId (or the first product)
+  // whenever preselectedProductId changes — e.g. the merchant clicked
+  // "FIFO" on a different product row while this modal was already
+  // mounted.
   //
-  // #1: productId should reset to preselectedProductId (or the first
-  // product) whenever preselectedProductId changes — e.g. the merchant
-  // clicked "FIFO" on a different product row while this modal was
-  // already mounted.
+  // [FIX] Now also clears `resolution` and resets `requestedQty` to the
+  // default in the SAME adjustment. Previously only the manual dropdown
+  // onChange handlers cleared `resolution` — switching products via the
+  // row button (which goes through THIS block, not those onChange
+  // handlers) left the PREVIOUS product's allocation result visibly
+  // displayed under the new product's selectors until the merchant
+  // manually re-ran the preview, which could read as a real (but wrong)
+  // FIFO result for the newly selected product.
   const [prevPreselectedProductId, setPrevPreselectedProductId] = useState(preselectedProductId);
   if (preselectedProductId !== prevPreselectedProductId) {
     setPrevPreselectedProductId(preselectedProductId);
     setProductId(preselectedProductId || products[0]?.id || "");
+    setResolution(null);
+    setRequestedQty(DEFAULT_REQUESTED_QTY);
   }
 
   const selectedProduct = products.find((p) => p.id === productId);
 
-  // #2: unitId should reset to the selected product's first unit whenever
+  // #2: unitId resets to the selected product's first unit whenever
   // productId changes (either from #1 above, or the merchant picking a
   // different product from the dropdown).
   const [prevProductId, setPrevProductId] = useState(productId);
@@ -226,7 +231,12 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
                             الدفعة #{alloc.batchNumber}
                           </p>
                           <p className="text-zinc-500">
-                            تاريخ الصلاحية: {alloc.expiryDate ? new Date(alloc.expiryDate).toLocaleDateString("ar-EG") : "غير محدد"}
+                            {/* [FIX] ar-EG → ar-SY: platform-wide locale
+                                convention per the spec (Intl.NumberFormat
+                                'ar-SY' for currency) — this was the one
+                                spot in the reviewed components using a
+                                different Arabic locale. */}
+                            تاريخ الصلاحية: {alloc.expiryDate ? new Date(alloc.expiryDate).toLocaleDateString("ar-SY") : "غير محدد"}
                           </p>
                         </div>
                         <div className="text-left font-mono">

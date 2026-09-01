@@ -17,6 +17,25 @@ import {
 // general "Cloud storage upload handler for compressed receipt/product
 // images" rather than a receipt-only route.
 //
+// [FIX] LOCKOUT ENFORCEMENT MUST HAPPEN HERE, PER-TYPE, NOT ONLY IN
+// MIDDLEWARE. This path is listed in the middleware's
+// WRITE_ALLOWED_WHEN_LOCKED_PREFIXES allowlist — deliberately, because a
+// PENDING tenant has a chicken-and-egg problem: they need to upload their
+// FIRST subscription receipt (T6) precisely while still locked out. The
+// middleware can only see the URL path, not the FormData body, so it has
+// no way to tell a receipt upload apart from a product-image upload at
+// that layer — allowing the path necessarily allows BOTH `type` values
+// through middleware. Without a second, type-aware check here, a
+// PENDING/EXPIRED tenant could keep uploading product images (T3) to cloud
+// storage indefinitely even though POST /api/inventory/products (the only
+// place those images could ever attach to a real product) is correctly
+// blocked elsewhere. The practical damage is limited to orphaned storage
+// cost (no Product/ProductUnit row can ever reference the image while
+// locked), not a data-isolation or security breach, but the endpoint
+// should not silently accept work it can never make use of. Receipts
+// (`type: "receipt"`) remain allowed regardless of subscriptionStatus —
+// that is the entire reason this path is in the middleware allowlist.
+//
 // ROLE GATE: ADMIN only. Both real call sites are ADMIN-only actions —
 // creating a catalog product (T3 Scope, products/route.ts POST) and
 // submitting a subscription payment (T6) are both merchant-admin
@@ -50,6 +69,27 @@ export async function POST(req: Request) {
     const file = formData.get("file");
     const kindInput = (formData.get("type") as string | null) || "product";
     const kind: "products" | "receipts" = kindInput === "receipt" ? "receipts" : "products";
+
+    // [FIX] Type-aware lockout check. A receipt upload (`kind === "receipts"`)
+    // is exactly the escape hatch a PENDING/EXPIRED tenant needs to submit
+    // their subscription payment (T6) — never blocked here regardless of
+    // subscriptionStatus. A product-image upload (`kind === "products"`) is
+    // blocked identically to POST /api/inventory/products itself: EXPIRED
+    // and PENDING are locked out the same way (see T2's middleware note —
+    // a tenant awaiting first approval has no more write access than one
+    // whose subscription lapsed).
+    if (
+      kind === "products" &&
+      (session.user.subscriptionStatus === "EXPIRED" || session.user.subscriptionStatus === "PENDING")
+    ) {
+      return NextResponse.json(
+        {
+          error: "SUBSCRIPTION_LOCKED",
+          message: "اشتراكك منتهي أو معلق. لا يمكنك رفع صور منتجات جديدة.",
+        },
+        { status: 403 }
+      );
+    }
 
     if (!(file instanceof File)) {
       return NextResponse.json(
@@ -104,11 +144,6 @@ export async function POST(req: Request) {
   } catch (error) {
     console.error("Error uploading file to storage:", error);
 
-    // A missing/misconfigured env var (see lib/storage.ts's
-    // assertStorageEnv) surfaces here as a thrown Error with a specific
-    // message — worth distinguishing from a generic failure so a
-    // misconfigured .env doesn't get mistaken for a transient server error
-    // during testing.
     const message =
       error instanceof Error && error.message.startsWith("Cloud storage is not configured")
         ? error.message
