@@ -13,13 +13,12 @@ import {
   CheckCircle2,
   Printer,
   PlusCircle,
-  Database,
   CloudOff,
   User,
   Calendar,
-  Layers,
 } from "lucide-react";
 import type { OfflineInvoice, SelectedCustomer, CartLineItem } from "@/lib/offline";
+import { formatMoney, compareMoney, multiplyMoney } from "@/lib/utils/money";
 
 interface CheckoutSuccessModalProps {
   open: boolean;
@@ -50,11 +49,14 @@ export function CheckoutSuccessModal({
     SYRIATEL_CASH: "سيرياتيل كاش (Syriatel)",
     BANK_TRANSFER: "تحويل بنكي / مكتب",
     OTHER: "وسيلة أخرى",
-    DEBT: "على الحساب بالكامل (دين)",
   };
 
-  const currentMethod = invoice.paymentMethod ?? "CASH";
-  const paymentLabel = paymentMethodLabels[currentMethod] || currentMethod;
+  const currentMethod = invoice.paymentMethod;
+  const paymentLabel = currentMethod
+    ? paymentMethodLabels[currentMethod] || currentMethod
+    : "على الحساب بالكامل (دين)";
+
+  const isDebtPresent = compareMoney(invoice.debtAmountUSD, 0) > 0;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -67,7 +69,8 @@ export function CheckoutSuccessModal({
             تم حفظ الفاتورة محلياً بنجاح
           </DialogTitle>
           <DialogDescription className="text-center text-xs text-zinc-500">
-            تم تسجيل الفاتورة في قاعدة بيانات المتصفح (Dexie) وحفظها في طابور المزامنة المحلي.
+            تم تسجيل الفاتورة في قاعدة بيانات المتصفح (Dexie) وحفظها في طابور
+            المزامنة المحلي.
           </DialogDescription>
         </DialogHeader>
 
@@ -78,26 +81,38 @@ export function CheckoutSuccessModal({
             <span>حالة الفاتورة: محفوظة محلياً — بانتظار المزامنة (PENDING)</span>
           </div>
           <p className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed">
-            ⚠️ تنبيه للكاشير: هذه الفاتورة <strong>مخزنة على هذا الجهاز فقط</strong> حالياً. ستتم المزامنة التلقائية مع السيرفر المركزي فور توفر اتصال بالإنترنت (T4c).
+            ⚠️ تنبيه للكاشير: هذه الفاتورة{" "}
+            <strong>مخزنة على هذا الجهاز فقط</strong> حالياً. ستتم المزامنة
+            التلقائية مع السيرفر المركزي فور توفر اتصال بالإنترنت (T4c).
           </p>
         </div>
 
         {/* Invoice Summary Printable Card */}
-        <div id="printable-receipt" className="rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 space-y-3 dark:border-zinc-800 dark:bg-zinc-900/60 text-xs">
+        <div
+          id="printable-receipt"
+          className="rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 space-y-3 dark:border-zinc-800 dark:bg-zinc-900/60 text-xs"
+        >
           {/* Top metadata */}
           <div className="grid grid-cols-2 gap-2 border-b border-zinc-200 pb-2.5 dark:border-zinc-800">
             <div>
-              <span className="text-[10px] text-zinc-400 block">رقم الفاتورة المحلي (UUID)</span>
+              <span className="text-[10px] text-zinc-400 block">
+                رقم الفاتورة المحلي (UUID)
+              </span>
               <span className="font-mono text-[11px] font-bold text-zinc-800 dark:text-zinc-200 truncate block">
                 {invoice.offlineId}
               </span>
             </div>
 
             <div className="text-left">
-              <span className="text-[10px] text-zinc-400 block">التاريخ والوقت</span>
+              <span className="text-[10px] text-zinc-400 block">
+                التاريخ والوقت
+              </span>
               <span className="text-[11px] text-zinc-600 dark:text-zinc-400 flex items-center justify-end gap-1">
                 <Calendar className="h-3 w-3" />
-                {new Date(invoice.createdAt).toLocaleTimeString("ar-SY", { hour: "2-digit", minute: "2-digit" })}
+                {new Date(invoice.createdAt).toLocaleTimeString("ar-SY", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
               </span>
             </div>
 
@@ -110,7 +125,9 @@ export function CheckoutSuccessModal({
             </div>
 
             <div className="text-left">
-              <span className="text-[10px] text-zinc-400 block">طريقة السداد</span>
+              <span className="text-[10px] text-zinc-400 block">
+                طريقة السداد
+              </span>
               <Badge variant="outline" className="text-[10px] font-semibold">
                 {paymentLabel}
               </Badge>
@@ -125,30 +142,42 @@ export function CheckoutSuccessModal({
               <span className="col-span-4 text-left">الإجمالي</span>
             </div>
 
-            {items.map((item, idx) => (
-              <div key={idx} className="grid grid-cols-12 text-xs py-1 border-b border-zinc-100 dark:border-zinc-850">
-                <div className="col-span-6 truncate">
-                  <p className="font-semibold text-zinc-800 dark:text-zinc-200">{item.product.name}</p>
-                  <p className="text-[10px] text-zinc-400">{item.unitName}</p>
+            {items.map((item, idx) => {
+              const lineUSD = multiplyMoney(item.unitPriceUSD, item.quantity);
+              return (
+                <div
+                  key={idx}
+                  className="grid grid-cols-12 text-xs py-1 border-b border-zinc-100 dark:border-zinc-850"
+                >
+                  <div className="col-span-6 truncate">
+                    <p className="font-semibold text-zinc-800 dark:text-zinc-200">
+                      {item.product.name}
+                    </p>
+                    <p className="text-[10px] text-zinc-400">{item.unitName}</p>
+                  </div>
+                  <span className="col-span-2 text-center font-mono">
+                    {item.quantity}
+                  </span>
+                  <div className="col-span-4 text-left font-bold text-zinc-800 dark:text-zinc-200 font-mono">
+                    ${formatMoney(lineUSD, "USD")}
+                  </div>
                 </div>
-                <span className="col-span-2 text-center font-mono">{item.quantity}</span>
-                <div className="col-span-4 text-left font-bold text-zinc-800 dark:text-zinc-200">
-                  ${(item.unitPriceUSD * item.quantity).toFixed(2)}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {/* Financial Totals */}
           <div className="space-y-1 pt-2 border-t border-zinc-200 dark:border-zinc-800">
             <div className="flex justify-between text-xs font-bold">
-              <span className="text-zinc-600 dark:text-zinc-400">إجمالي الفاتورة:</span>
+              <span className="text-zinc-600 dark:text-zinc-400">
+                إجمالي الفاتورة:
+              </span>
               <div className="text-left">
-                <span className="text-emerald-700 dark:text-emerald-400 font-extrabold ml-2">
-                  ${Number(invoice.totalUSD).toFixed(2)}
+                <span className="text-emerald-700 dark:text-emerald-400 font-extrabold ml-2 font-mono">
+                  ${formatMoney(invoice.totalUSD, "USD")}
                 </span>
                 <span className="text-purple-600 dark:text-purple-400 text-[11px]">
-                  ({Math.round(Number(invoice.totalSYP)).toLocaleString("ar-SY")} ل.س)
+                  ({formatMoney(invoice.totalSYP, "SYP")} ل.س)
                 </span>
               </div>
             </div>
@@ -156,21 +185,23 @@ export function CheckoutSuccessModal({
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">سعر الصرف المعتمد:</span>
               <span className="font-mono text-zinc-600 dark:text-zinc-400">
-                {Number(invoice.exchangeRateUsed).toLocaleString("ar-SY")} ل.س / $
+                {formatMoney(invoice.exchangeRateUsed, "SYP")} ل.س / $
               </span>
             </div>
 
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">المبلغ المدفوع:</span>
-              <span className="font-bold text-emerald-600">
-                ${Number(invoice.paidAmountUSD).toFixed(2)}
+              <span className="font-bold text-emerald-600 font-mono">
+                ${formatMoney(invoice.paidAmountUSD, "USD")}
               </span>
             </div>
 
-            {Number(invoice.debtAmountUSD) > 0 && (
+            {isDebtPresent && (
               <div className="flex justify-between text-xs font-bold text-red-600 dark:text-red-400">
                 <span>المتبقي على الحساب (دين):</span>
-                <span>${Number(invoice.debtAmountUSD).toFixed(2)}</span>
+                <span className="font-mono">
+                  ${formatMoney(invoice.debtAmountUSD, "USD")}
+                </span>
               </div>
             )}
           </div>

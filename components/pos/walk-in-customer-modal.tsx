@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback, type FormEvent } from "react";
 import {
   Dialog,
   DialogContent,
@@ -13,11 +13,23 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
-import { Search, UserPlus, Users, UserCheck, Phone, Store, AlertCircle } from "lucide-react";
+import {
+  Search,
+  UserPlus,
+  Users,
+  UserCheck,
+  Phone,
+  Store,
+  AlertCircle,
+  AlertTriangle,
+  Check,
+} from "lucide-react";
 import {
   getOfflineCustomers,
   createOfflineWalkInCustomer,
+  findMatchingCustomerByPhone,
   type SelectedCustomer,
+  type DuplicatePhoneMatch,
 } from "@/lib/offline";
 
 interface WalkInCustomerModalProps {
@@ -25,6 +37,7 @@ interface WalkInCustomerModalProps {
   onOpenChange: (open: boolean) => void;
   selectedCustomer: SelectedCustomer | null;
   onSelectCustomer: (customer: SelectedCustomer | null) => void;
+  tenantId?: string;
 }
 
 export function WalkInCustomerModal({
@@ -32,6 +45,7 @@ export function WalkInCustomerModal({
   onOpenChange,
   selectedCustomer,
   onSelectCustomer,
+  tenantId,
 }: WalkInCustomerModalProps) {
   const [tab, setTab] = useState<"existing" | "new">("existing");
   const [searchQuery, setSearchQuery] = useState("");
@@ -45,26 +59,111 @@ export function WalkInCustomerModal({
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // [v3.4] Soft Duplicate-Phone Check state
+  const [duplicateMatch, setDuplicateMatch] = useState<DuplicatePhoneMatch | null>(null);
+  const [ignoredDuplicatePhone, setIgnoredDuplicatePhone] = useState<string | null>(null);
+  const [isCheckingPhone, setIsCheckingPhone] = useState(false);
+  const phoneDebounceRef = useRef<NodeJS.Timeout | null>(null);
+
+  const loadCustomers = useCallback(
+    async (query: string) => {
+      setLoading(true);
+      try {
+        const list = await getOfflineCustomers(tenantId, query);
+        setCustomers(list);
+      } catch (err) {
+        console.error("Failed to load customers from Dexie:", err);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [tenantId]
+  );
+
   useEffect(() => {
     if (open) {
-      loadCustomers(searchQuery);
-      setFormError(null);
+      void loadCustomers(searchQuery);
     }
-  }, [open, searchQuery]);
+  }, [open, searchQuery, loadCustomers]);
 
-  async function loadCustomers(query: string) {
-    setLoading(true);
-    try {
-      const list = await getOfflineCustomers(query);
-      setCustomers(list);
-    } catch (err) {
-      console.error("Failed to load customers from Dexie:", err);
-    } finally {
-      setLoading(false);
+  // [FIX] Clears any pending debounced phone-check timer on unmount (e.g.
+  // the modal's parent unmounts while the 250ms debounce from the last
+  // keystroke is still pending) — without this, the timer's callback can
+  // still fire after unmount and call setDuplicateMatch/setIsCheckingPhone
+  // on a component that's gone, producing a React "state update on an
+  // unmounted component" warning (and, in edge cases, a leaked timer).
+  useEffect(() => {
+    return () => {
+      if (phoneDebounceRef.current) {
+        clearTimeout(phoneDebounceRef.current);
+      }
+    };
+  }, []);
+
+  function handleDialogOpenChange(nextOpen: boolean) {
+    if (!nextOpen) {
+      setFormError(null);
+      setDuplicateMatch(null);
+      setIgnoredDuplicatePhone(null);
     }
+    onOpenChange(nextOpen);
   }
 
-  async function handleCreateWalkIn(e: React.FormEvent) {
+  // Soft duplicate-phone check on phone input change
+  function handlePhoneChange(newPhone: string) {
+    setPhone(newPhone);
+    setDuplicateMatch(null);
+
+    if (phoneDebounceRef.current) {
+      clearTimeout(phoneDebounceRef.current);
+    }
+
+    const trimmed = newPhone.trim();
+    if (!trimmed || trimmed.length < 4 || trimmed === ignoredDuplicatePhone) {
+      return;
+    }
+
+    phoneDebounceRef.current = setTimeout(async () => {
+      setIsCheckingPhone(true);
+      try {
+        const match = await findMatchingCustomerByPhone(tenantId, trimmed);
+        if (match && match.customer.phone === trimmed) {
+          setDuplicateMatch(match);
+        }
+      } catch (err) {
+        console.error("Duplicate phone check failed:", err);
+      } finally {
+        setIsCheckingPhone(false);
+      }
+    }, 250);
+  }
+
+  // Cashier accepts the duplicate match (default action)
+  function handleAcceptDuplicate() {
+    if (!duplicateMatch) return;
+    onSelectCustomer(duplicateMatch.customer);
+    setName("");
+    setPhone("");
+    setShopName("");
+    setDuplicateMatch(null);
+    onOpenChange(false);
+  }
+
+  // Cashier chooses to proceed with new customer despite duplicate phone
+  function handleIgnoreDuplicate() {
+    if (duplicateMatch?.customer.phone) {
+      setIgnoredDuplicatePhone(duplicateMatch.customer.phone);
+    }
+    setDuplicateMatch(null);
+  }
+
+  // [FIX] `React.FormEvent` -> imported `FormEvent` type. The file never
+  // imports `React` as a namespace (only named hooks), so referencing the
+  // `React.*` namespace directly for a type can fail to compile depending
+  // on tsconfig's `esModuleInterop`/global JSX type settings. Importing
+  // the type by name avoids depending on an ambient `React` namespace
+  // being available at all.
+  async function handleCreateWalkIn(e: FormEvent) {
     e.preventDefault();
     if (!name.trim()) {
       setFormError("يرجى إدخال اسم الزبون.");
@@ -75,7 +174,7 @@ export function WalkInCustomerModal({
     setFormError(null);
 
     try {
-      const newCustomer = await createOfflineWalkInCustomer({
+      const newCustomer = await createOfflineWalkInCustomer(tenantId, {
         name: name.trim(),
         phone: phone.trim() || undefined,
         shopName: shopName.trim() || undefined,
@@ -85,16 +184,32 @@ export function WalkInCustomerModal({
       setName("");
       setPhone("");
       setShopName("");
+      setDuplicateMatch(null);
+      setIgnoredDuplicatePhone(null);
       onOpenChange(false);
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : "فشل إنشاء الزبون محلياً");
+      setFormError(
+        err instanceof Error ? err.message : "فشل إنشاء الزبون محلياً"
+      );
     } finally {
       setIsSubmitting(false);
     }
   }
 
+  const isSystemSelected =
+    !selectedCustomer ||
+    selectedCustomer.type === "SYSTEM" ||
+    selectedCustomer.isSystemGenerated;
+
+  // [FIX] The tab badge previously showed `customers.length` (which
+  // includes the system-generated "زبون نقدي عام" row), while the list
+  // below it filters that row out — the count and what's actually shown
+  // disagreed by one. Computed once here and reused in both places so
+  // they can never drift apart again.
+  const realCustomers = customers.filter((c) => !c.isSystemGenerated);
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
       <DialogContent className="sm:max-w-lg" dir="rtl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-lg font-bold text-zinc-900 dark:text-zinc-100">
@@ -102,15 +217,20 @@ export function WalkInCustomerModal({
             تحديد أو تسجيل الزبون
           </DialogTitle>
           <DialogDescription className="text-xs text-zinc-500">
-            اختر زبوناً مسجلاً من الذاكرة المحلية أو سجل زبوناً نقدياً / مؤقتاً جديداً فوراً بدون مغادرة البيع.
+            اختر زبوناً مسجلاً من الذاكرة المحلية أو سجل زبوناً نقدياً / مؤقتاً
+            جديداً فوراً بدون مغادرة نقطة البيع.
           </DialogDescription>
         </DialogHeader>
 
-        <Tabs value={tab} onValueChange={(v) => setTab(v as "existing" | "new")} className="mt-2">
+        <Tabs
+          value={tab}
+          onValueChange={(v) => setTab(v as "existing" | "new")}
+          className="mt-2"
+        >
           <TabsList className="grid w-full grid-cols-2">
             <TabsTrigger value="existing" className="text-xs">
               <Users className="ml-1.5 h-3.5 w-3.5" />
-              الزبائن المسجلون ({customers.length})
+              الزبائن المسجلون ({realCustomers.length})
             </TabsTrigger>
             <TabsTrigger value="new" className="text-xs">
               <UserPlus className="ml-1.5 h-3.5 w-3.5" />
@@ -118,31 +238,34 @@ export function WalkInCustomerModal({
             </TabsTrigger>
           </TabsList>
 
-          {/* TAB 1: Existing Customers & Cash Walk-in */}
+          {/* TAB 1: Existing Customers & Cash Walk-in Shortcut */}
           <TabsContent value="existing" className="space-y-3 mt-3">
-            {/* Quick General Walk-in Cash Option */}
+            {/* Quick One-Tap Cash Walk-in Option ("زبون نقدي") */}
             <div
               onClick={() => {
                 onSelectCustomer(null);
                 onOpenChange(false);
               }}
-              className={`cursor-pointer rounded-xl border p-3 transition-all flex items-center justify-between ${
-                !selectedCustomer
-                  ? "border-emerald-600 bg-emerald-50/70 dark:bg-emerald-950/40 text-emerald-900 dark:text-emerald-200"
+              className={`cursor-pointer rounded-xl border p-3 transition-all flex items-center justify-between ${isSystemSelected
+                  ? "border-emerald-600 bg-emerald-50/80 dark:bg-emerald-950/50 text-emerald-900 dark:text-emerald-100 font-semibold shadow-xs"
                   : "border-zinc-200 bg-zinc-50/50 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
-              }`}
+                }`}
             >
               <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-300">
                   <UserCheck className="h-4 w-4" />
                 </div>
                 <div>
-                  <p className="text-xs font-bold">زبون نقدي عام (بدون تسجيل حساب)</p>
-                  <p className="text-[11px] text-zinc-500">مناسب للمبيعات النقدية الفورية المباشرة</p>
+                  <p className="text-xs font-bold">زبون نقدي عام (زبون نقدي)</p>
+                  <p className="text-[11px] text-zinc-500">
+                    اختصار بنقرة واحدة للمبيعات النقدية الفورية المباشرة (سداد 100% كاش)
+                  </p>
                 </div>
               </div>
-              {!selectedCustomer && (
-                <Badge className="bg-emerald-600 text-[10px]">محدد حالياً</Badge>
+              {isSystemSelected && (
+                <Badge className="bg-emerald-600 text-white text-[10px]">
+                  محدد حالياً
+                </Badge>
               )}
             </div>
 
@@ -160,13 +283,15 @@ export function WalkInCustomerModal({
             {/* Customers List */}
             <div className="max-h-60 overflow-y-auto space-y-2 pr-0.5">
               {loading ? (
-                <p className="text-center py-4 text-xs text-zinc-400">جاري قراءة البيانات المحلية...</p>
-              ) : customers.length === 0 ? (
+                <p className="text-center py-4 text-xs text-zinc-400">
+                  جاري قراءة البيانات المحلية...
+                </p>
+              ) : realCustomers.length === 0 ? (
                 <div className="text-center py-6 text-xs text-zinc-400">
                   لا يوجد زبائن يطابقون البحث في الذاكرة المحلية.
                 </div>
               ) : (
-                customers.map((c) => {
+                realCustomers.map((c) => {
                   const isSelected = selectedCustomer?.id === c.id;
                   return (
                     <div
@@ -175,11 +300,10 @@ export function WalkInCustomerModal({
                         onSelectCustomer(c);
                         onOpenChange(false);
                       }}
-                      className={`cursor-pointer rounded-lg border p-2.5 transition-all flex items-center justify-between ${
-                        isSelected
+                      className={`cursor-pointer rounded-lg border p-2.5 transition-all flex items-center justify-between ${isSelected
                           ? "border-emerald-600 bg-emerald-50/60 dark:bg-emerald-950/40"
                           : "border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
-                      }`}
+                        }`}
                     >
                       <div className="space-y-0.5">
                         <div className="flex items-center gap-2">
@@ -187,7 +311,10 @@ export function WalkInCustomerModal({
                             {c.name}
                           </span>
                           {c.type === "WALK_IN" && (
-                            <Badge variant="outline" className="text-[10px] text-amber-600 border-amber-300 bg-amber-50 dark:bg-amber-950/50">
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] text-amber-600 border-amber-300 bg-amber-50 dark:bg-amber-950/50"
+                            >
                               محلي جديد
                             </Badge>
                           )}
@@ -209,15 +336,20 @@ export function WalkInCustomerModal({
                       </div>
 
                       <div className="text-left">
-                        {c.balanceDebtUSD !== undefined && c.balanceDebtUSD > 0 ? (
+                        {c.balanceDebtUSD !== undefined &&
+                          c.balanceDebtUSD > 0 ? (
                           <div className="text-right">
-                            <span className="text-[10px] text-zinc-400 block">الدين الحالي</span>
+                            <span className="text-[10px] text-zinc-400 block">
+                              الدين الحالي
+                            </span>
                             <span className="text-xs font-bold text-red-600 dark:text-red-400">
                               ${c.balanceDebtUSD.toFixed(2)}
                             </span>
                           </div>
                         ) : (
-                          <span className="text-[11px] text-emerald-600">لا يوجد ديون</span>
+                          <span className="text-[11px] text-emerald-600">
+                            لا يوجد ديون
+                          </span>
                         )}
                       </div>
                     </div>
@@ -227,7 +359,7 @@ export function WalkInCustomerModal({
             </div>
           </TabsContent>
 
-          {/* TAB 2: Inline Walk-in Creation */}
+          {/* TAB 2: Inline Walk-in Creation with Soft Duplicate Check */}
           <TabsContent value="new" className="mt-3">
             <form onSubmit={handleCreateWalkIn} className="space-y-3">
               {formError && (
@@ -253,17 +385,63 @@ export function WalkInCustomerModal({
               </div>
 
               <div className="space-y-1">
-                <Label htmlFor="cust-phone" className="text-xs font-semibold">
-                  رقم الهاتف (اختياري)
+                <Label htmlFor="cust-phone" className="text-xs font-semibold flex items-center justify-between">
+                  <span>رقم الهاتف (اختياري)</span>
+                  {isCheckingPhone && (
+                    <span className="text-[10px] text-zinc-400 font-normal">
+                      جاري التحقق من الرقم...
+                    </span>
+                  )}
                 </Label>
                 <Input
                   id="cust-phone"
                   placeholder="مثال: 0991234567"
                   value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
+                  onChange={(e) => handlePhoneChange(e.target.value)}
                   className="text-xs"
                 />
               </div>
+
+              {/* [v3.4] Soft Duplicate-Phone Prompt */}
+              {duplicateMatch && (
+                <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/60 text-xs space-y-2 animate-in fade-in-50 duration-200">
+                  <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200">
+                    <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-bold">
+                        في زبون مسجّل بنفس الرقم: {duplicateMatch.customer.name}
+                        {duplicateMatch.customer.shopName
+                          ? ` (${duplicateMatch.customer.shopName})`
+                          : ""}
+                      </p>
+                      <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-0.5">
+                        تستخدمه ولا تنشئ زبون جديد؟
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 pt-1 border-t border-amber-200 dark:border-amber-900/80">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleIgnoreDuplicate}
+                      className="text-xs h-7 text-amber-800 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900/50"
+                    >
+                      إنشاء زبون جديد بهذا الرقم
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={handleAcceptDuplicate}
+                      className="text-xs h-7 bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1 shadow-xs"
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                      استخدام الزبون الحالي (المسجّل)
+                    </Button>
+                  </div>
+                </div>
+              )}
 
               <div className="space-y-1">
                 <Label htmlFor="cust-shop" className="text-xs font-semibold">
@@ -279,7 +457,8 @@ export function WalkInCustomerModal({
               </div>
 
               <div className="rounded-lg bg-zinc-50 p-2.5 text-[11px] text-zinc-500 border border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800">
-                💡 سيتم حفظ الزبون محلياً في قاعدة بيانات المتصفح وإرفاقه فوراً بهذه الفاتورة مع توليد معرف UUID فريد.
+                💡 سيتم حفظ الزبون محلياً في قاعدة بيانات المتصفح وإرفاقه فوراً
+                بهذه الفاتورة مع توليد معرف UUID فريد.
               </div>
 
               <div className="flex justify-end gap-2 pt-2">
