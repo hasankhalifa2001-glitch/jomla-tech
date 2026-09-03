@@ -24,6 +24,7 @@ import {
 import {
   calculateCartTotals,
   resolveUnitPriceUSD,
+  isSystemCashCustomer,
   type CartLineItem,
   type SelectedCustomer,
 } from "@/lib/offline";
@@ -91,8 +92,17 @@ export function CartPanel({
     return map;
   }, [totals.lineItems]);
 
-  const isSystemCustomer =
-    !customer || customer.type === "SYSTEM" || customer.isSystemGenerated;
+  const isSystemCustomer = isSystemCashCustomer(customer);
+  const customerLabel = isSystemCustomer
+    ? customer?.name || "زبون نقدي عام"
+    : customer
+      ? customer.name
+      : "لم يتم اختيار زبون";
+  const customerSubLabel = customer?.shopName ||
+    customer?.phone ||
+    (isSystemCustomer
+      ? "مبيعات نقدية مباشرة (مسموح بالدفع الكامل فقط)"
+      : "يجب اختيار زبون حقيقي للبيع على الحساب أو الدفع الجزئي");
 
   return (
     <div
@@ -116,7 +126,7 @@ export function CartPanel({
             <div className="flex flex-col truncate">
               <div className="flex items-center gap-1.5">
                 <span className="text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate">
-                  {customer ? customer.name : "زبون نقدي عام"}
+                  {customerLabel}
                 </span>
                 {customer?.type === "WALK_IN" && (
                   <Badge
@@ -136,9 +146,7 @@ export function CartPanel({
                 )}
               </div>
               <span className="text-[10px] text-zinc-500 truncate">
-                {customer?.shopName ||
-                  customer?.phone ||
-                  "مبيعات نقدية مباشرة (مسموح بالدفع الكامل فقط)"}
+                {customerSubLabel}
               </span>
             </div>
           </div>

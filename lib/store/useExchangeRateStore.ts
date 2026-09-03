@@ -30,7 +30,23 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
     setExchangeRate: (rate, tenantId) => {
         set({ dailyExchangeRate: rate, error: null });
         if (rate !== null && rate > 0) {
-            void setCachedDailyExchangeRate(rate, tenantId);
+            // [FIX — unhandled rejection] `setCachedDailyExchangeRate` now
+            // throws MoneyError for an invalid/non-positive rate instead of
+            // silently no-op'ing (see lib/utils/money.ts's fail-loud
+            // philosophy). The `rate > 0` guard above means this call
+            // shouldn't reject in practice today, but a bare `void` on a
+            // Promise that CAN reject leaves an unhandled rejection if that
+            // guard is ever loosened or bypassed by a future call site.
+            // This is the same "best-effort background cache write, don't
+            // let it break the caller" pattern already used for the
+            // session-sync call in updateExchangeRate below: the in-memory
+            // `dailyExchangeRate` set just above is already this device's
+            // source of truth, so a cache-write failure here is logged,
+            // never surfaced as a blocking error, and never rolls back the
+            // state that was already set.
+            setCachedDailyExchangeRate(rate, tenantId).catch((err) => {
+                console.error("Failed to cache daily exchange rate locally:", err);
+            });
         }
     },
     updateExchangeRate: async (newRate: number, tenantId?: string, syncSession?: SessionUpdateFn) => {
@@ -58,7 +74,20 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => ({
             }
 
             set({ dailyExchangeRate: newRate, isUpdating: false, error: null });
-            void setCachedDailyExchangeRate(newRate, tenantId);
+
+            // [FIX — unhandled rejection, same reasoning as setExchangeRate
+            // above] `newRate` is already validated positive above, so this
+            // shouldn't reject today — but it's now a throwing function, and
+            // a bare `void` on it is fragile the same way. Caught and
+            // logged rather than surfaced: the server write (the actual
+            // source of truth) already succeeded by this point, so a local
+            // cache-write failure must never flip this call's overall
+            // result to `false` or overwrite the success state set above.
+            try {
+                await setCachedDailyExchangeRate(newRate, tenantId);
+            } catch (cacheErr) {
+                console.error("Failed to cache daily exchange rate locally:", cacheErr);
+            }
 
             // FIX: keep this device's JWT/session in sync with the DB value
             // that was just written, using the trigger mechanism auth.ts's

@@ -102,6 +102,27 @@ export interface DuplicatePhoneMatch {
   source: "CACHED" | "OFFLINE" | "ONLINE";
 }
 
+export function isSystemCashCustomer(customer?: SelectedCustomer | null): boolean {
+  if (!customer) return false;
+  return customer.type === "SYSTEM" || !!customer.isSystemGenerated;
+}
+
+export function normalizeCustomerPhone(phone: string): string {
+  return phone.trim().replace(/\s+/g, "");
+}
+
+function cachedCustomerToSelected(c: CachedCustomer): SelectedCustomer {
+  return {
+    type: c.isSystemGenerated ? "SYSTEM" : "EXISTING",
+    id: c.id,
+    name: c.name,
+    phone: c.phone,
+    shopName: c.shopName,
+    balanceDebtUSD: toDecimal(c.cachedBalanceDebtUSD).toNumber(),
+    isSystemGenerated: c.isSystemGenerated,
+  };
+}
+
 // Used by READ paths only — see the tenant-scoping policy note above.
 function resolveTenantId(tenantId?: string): string {
   return tenantId && tenantId.trim() ? tenantId.trim() : DEFAULT_TENANT_CACHE_KEY;
@@ -178,6 +199,28 @@ export function resolveUnitPriceUSD(
   return serializeMoney(rawPrice);
 }
 
+/**
+ * Resolves billed wholesale (always) and optional retail (display-only) in USD.
+ * Uses the same currency conversion path as the catalog so SYP units are never
+ * written into the cart as if they were already USD.
+ */
+export function resolveCartLinePrices(
+  unit: CachedProductUnit,
+  product: CachedProduct,
+  exchangeRate?: MoneyInput | null
+): { unitPriceUSD: string; priceRetailUSD?: string } {
+  const unitPriceUSD = resolveUnitPriceUSD(unit, product, exchangeRate);
+  if (unit.priceRetail === undefined || unit.priceRetail === null || unit.priceRetail === "") {
+    return { unitPriceUSD };
+  }
+  const priceRetailUSD = resolveUnitPriceUSD(
+    { ...unit, priceWholesale: unit.priceRetail },
+    product,
+    exchangeRate
+  );
+  return { unitPriceUSD, priceRetailUSD };
+}
+
 export async function getOfflineProducts(
   tenantId?: string,
   query?: string
@@ -230,15 +273,7 @@ export async function getOfflineCustomers(
   ]);
 
   const all: SelectedCustomer[] = [
-    ...cachedList.map((c) => ({
-      type: (c.isSystemGenerated ? "SYSTEM" : "EXISTING") as SelectedCustomer["type"],
-      id: c.id,
-      name: c.name,
-      phone: c.phone,
-      shopName: c.shopName,
-      balanceDebtUSD: toDecimal(c.cachedBalanceDebtUSD).toNumber(),
-      isSystemGenerated: c.isSystemGenerated,
-    })),
+    ...cachedList.map(cachedCustomerToSelected),
     ...offlineList.map((c) => ({
       type: "WALK_IN" as const,
       id: c.offlineId,
@@ -268,7 +303,8 @@ export async function findMatchingCustomerByPhone(
   phone?: string
 ): Promise<DuplicatePhoneMatch | null> {
   if (!phone || !phone.trim()) return null;
-  const cleanPhone = phone.trim();
+  const cleanPhone = normalizeCustomerPhone(phone);
+  if (!cleanPhone) return null;
   const scopedTenantId = resolveTenantId(tenantId);
 
   if (isOfflineDbSupported()) {
@@ -277,20 +313,12 @@ export async function findMatchingCustomerByPhone(
     const cachedMatch = await db.cachedCustomers
       .where("tenantId")
       .equals(scopedTenantId)
-      .filter((c) => !!c.phone && c.phone.trim() === cleanPhone)
+      .filter((c) => !!c.phone && normalizeCustomerPhone(c.phone) === cleanPhone)
       .first();
 
     if (cachedMatch) {
       return {
-        customer: {
-          type: cachedMatch.isSystemGenerated ? "SYSTEM" : "EXISTING",
-          id: cachedMatch.id,
-          name: cachedMatch.name,
-          phone: cachedMatch.phone,
-          shopName: cachedMatch.shopName,
-          balanceDebtUSD: toDecimal(cachedMatch.cachedBalanceDebtUSD).toNumber(),
-          isSystemGenerated: cachedMatch.isSystemGenerated,
-        },
+        customer: cachedCustomerToSelected(cachedMatch),
         source: "CACHED",
       };
     }
@@ -298,7 +326,7 @@ export async function findMatchingCustomerByPhone(
     const offlineMatch = await db.offlineCustomers
       .where("tenantId")
       .equals(scopedTenantId)
-      .filter((c) => !!c.phone && c.phone.trim() === cleanPhone)
+      .filter((c) => !!c.phone && normalizeCustomerPhone(c.phone) === cleanPhone)
       .first();
 
     if (offlineMatch) {
@@ -349,6 +377,22 @@ export async function findMatchingCustomerByPhone(
   }
 
   return null;
+}
+
+export async function getSystemCashCustomer(
+  tenantId?: string
+): Promise<SelectedCustomer | null> {
+  const scopedTenantId = resolveTenantId(tenantId);
+  if (!isOfflineDbSupported()) return null;
+
+  const db = getOfflineDb();
+  const match = await db.cachedCustomers
+    .where("tenantId")
+    .equals(scopedTenantId)
+    .filter((c) => !!c.isSystemGenerated)
+    .first();
+
+  return match ? cachedCustomerToSelected(match) : null;
 }
 
 export async function createOfflineWalkInCustomer(
@@ -413,15 +457,22 @@ export async function submitOfflineSale(
     throw new Error("لا يمكن إتمام البيع بدون تحديد سعر الصرف اليومي.");
   }
 
-  if (!payload.customer) {
-    throw new Error("يجب اختيار زبون (نقدي أو حقيقي) قبل إتمام عملية البيع.");
+  const hasDebt = compareMoney(payload.debtAmountUSD, 0) > 0;
+  let customer = payload.customer ?? null;
+
+  if (hasDebt && (!customer || isSystemCashCustomer(customer))) {
+    throw new Error("البيع على الحساب أو الدفع الجزئي يتطلب اختيار أو تسجيل زبون حقيقي.");
   }
 
-  const isSystemGeneratedCashCustomer =
-    payload.customer.type === "SYSTEM" || payload.customer.isSystemGenerated;
-
-  if (compareMoney(payload.debtAmountUSD, 0) > 0 && isSystemGeneratedCashCustomer) {
-    throw new Error("البيع على الحساب أو الدفع الجزئي يتطلب اختيار أو تسجيل زبون حقيقي.");
+  if (!customer || isSystemCashCustomer(customer)) {
+    const system =
+      customer && customer.id ? customer : await getSystemCashCustomer(scopedTenantId);
+    if (!system || !system.id) {
+      throw new Error(
+        "لا يوجد زبون نقدي نظامي في الذاكرة المحلية. يرجى مزامنة بيانات الزبائن أو تحميل البيانات التجريبية."
+      );
+    }
+    customer = system;
   }
 
   const expectedDebt = subtractMoney(payload.totalUSD, payload.paidAmountUSD);
@@ -445,9 +496,9 @@ export async function submitOfflineSale(
     unitPriceUSD: item.unitPriceUSD,
   }));
 
-  const isWalkIn = payload.customer.type === "WALK_IN";
-  const customerId = !isWalkIn ? payload.customer.id : undefined;
-  const offlineCustomerId = isWalkIn ? payload.customer.id : undefined;
+  const isWalkIn = customer.type === "WALK_IN";
+  const customerId = !isWalkIn ? customer.id : undefined;
+  const offlineCustomerId = isWalkIn ? customer.id : undefined;
 
   const invoiceRecord = createOfflineInvoiceRecord({
     tenantId: scopedTenantId,

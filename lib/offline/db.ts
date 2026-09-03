@@ -236,7 +236,7 @@ export class OfflineDatabase extends Dexie {
 let offlineDbInstance: OfflineDatabase | null = null;
 
 export function getOfflineDb(): OfflineDatabase {
-  if (typeof window === "undefined") {
+  if (typeof indexedDB === "undefined") {
     throw new Error("Offline database is only available in the browser.");
   }
   if (!offlineDbInstance) {
@@ -246,7 +246,23 @@ export function getOfflineDb(): OfflineDatabase {
 }
 
 export function isOfflineDbSupported(): boolean {
-  return typeof window !== "undefined" && typeof indexedDB !== "undefined";
+  return typeof indexedDB !== "undefined";
+}
+
+/** Closes and deletes the Dexie instance so tests can start from an empty DB. */
+export async function resetOfflineDbForTests(): Promise<void> {
+  if (offlineDbInstance) {
+    offlineDbInstance.close();
+    offlineDbInstance = null;
+  }
+  if (typeof indexedDB === "undefined") return;
+
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.deleteDatabase("JomlaTechOffline");
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error("Failed to delete offline DB"));
+    request.onblocked = () => resolve();
+  });
 }
 
 export function createOfflineInvoiceRecord(data: {

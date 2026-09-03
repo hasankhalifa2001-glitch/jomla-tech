@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-imports */
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import { CredentialsSignin } from "next-auth";
@@ -198,7 +199,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         signIn: "/login",
     },
     callbacks: {
-        async jwt({ token, user, trigger, session }) {
+        async jwt({ token, user, trigger }) {
             if (user) {
                 token.id = user.id;
                 token.role = user.role;
@@ -210,17 +211,38 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                 token.isPlatformAdmin = user.isPlatformAdmin;
             }
 
-            // Allows the client to call `update({ dailyExchangeRate })` or
-            // `update({ subscriptionStatus })` after a PATCH to the DB, so
-            // THIS session's token reflects the change immediately without
-            // a full re-login. Other active sessions on other devices are
-            // unaffected until they call update() themselves.
-            if (trigger === "update" && session) {
-                if (session.dailyExchangeRate !== undefined) {
-                    token.dailyExchangeRate = session.dailyExchangeRate;
-                }
-                if (session.subscriptionStatus !== undefined) {
-                    token.subscriptionStatus = session.subscriptionStatus;
+            // [FIX — SECURITY CRITICAL] Previously trusted a client-supplied
+            // `session.subscriptionStatus` / `session.dailyExchangeRate`
+            // verbatim on `trigger === "update"`. `update()` is callable
+            // directly from the browser (including from devtools) by ANY
+            // signed-in session — a CASHIER on a PENDING or EXPIRED tenant
+            // could call `update({ subscriptionStatus: "ACTIVE" })` and
+            // write that value straight into their own token, with zero
+            // server-side verification. Because subscriptionStatus is
+            // exactly the field T2's middleware and T4c's /api/sync gate
+            // writes on, that was a full lockout bypass — a client could
+            // unlock its own tenant.
+            //
+            // `update()` is now treated as a signal to REFRESH from the
+            // database, never as a payload to write verbatim. Whatever the
+            // client passes into `session` on the update call is ignored
+            // entirely for these two fields; the current, authoritative
+            // values are re-read from Tenant via the token's own tenantId
+            // (never from anything the client supplied) and written back.
+            // This preserves the original UX goal (an admin editing the
+            // exchange rate, or a super-admin approving a subscription,
+            // still reflects on THIS session immediately after calling
+            // `update()`) without trusting the client for the value itself.
+            if (trigger === "update" && token.tenantId) {
+                const tenant = await prisma.tenant.findUnique({
+                    where: { id: token.tenantId as string },
+                    select: { subscriptionStatus: true, dailyExchangeRate: true },
+                });
+                if (tenant) {
+                    token.subscriptionStatus = tenant.subscriptionStatus;
+                    token.dailyExchangeRate = tenant.dailyExchangeRate
+                        ? Number(tenant.dailyExchangeRate)
+                        : null;
                 }
             }
 

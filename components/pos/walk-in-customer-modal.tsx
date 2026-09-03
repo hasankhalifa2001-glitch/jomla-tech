@@ -28,6 +28,9 @@ import {
   getOfflineCustomers,
   createOfflineWalkInCustomer,
   findMatchingCustomerByPhone,
+  getSystemCashCustomer,
+  isSystemCashCustomer,
+  normalizeCustomerPhone,
   type SelectedCustomer,
   type DuplicatePhoneMatch,
 } from "@/lib/offline";
@@ -38,6 +41,7 @@ interface WalkInCustomerModalProps {
   selectedCustomer: SelectedCustomer | null;
   onSelectCustomer: (customer: SelectedCustomer | null) => void;
   tenantId?: string;
+  allowSystemCustomer?: boolean;
 }
 
 export function WalkInCustomerModal({
@@ -46,6 +50,7 @@ export function WalkInCustomerModal({
   selectedCustomer,
   onSelectCustomer,
   tenantId,
+  allowSystemCustomer = true,
 }: WalkInCustomerModalProps) {
   const [tab, setTab] = useState<"existing" | "new">("existing");
   const [searchQuery, setSearchQuery] = useState("");
@@ -65,6 +70,18 @@ export function WalkInCustomerModal({
   const [isCheckingPhone, setIsCheckingPhone] = useState(false);
   const phoneDebounceRef = useRef<NodeJS.Timeout | null>(null);
 
+  // [FIX] Centralized helper so every close/success path clears the same
+  // way — a bare `clearTimeout` call site can't accidentally forget to
+  // also null out the ref (leaving a stale, already-fired timer handle
+  // behind), and any future call site added later gets the same guarantee
+  // for free instead of having to remember both steps itself.
+  const clearPhoneDebounce = useCallback(() => {
+    if (phoneDebounceRef.current) {
+      clearTimeout(phoneDebounceRef.current);
+      phoneDebounceRef.current = null;
+    }
+  }, []);
+
   const loadCustomers = useCallback(
     async (query: string) => {
       setLoading(true);
@@ -80,10 +97,34 @@ export function WalkInCustomerModal({
     [tenantId]
   );
 
+  // [FIX] `loadCustomers` is async and calls `setLoading(true)` as its very
+  // first statement — that runs SYNCHRONOUSLY (before any `await`), which
+  // means calling it directly here executes a setState call synchronously
+  // within this effect's body. React flags that ("Calling setState
+  // synchronously within an effect can trigger cascading renders") because
+  // an effect is meant to either update an external system or subscribe to
+  // one and setState from ITS callback — not setState directly, inline,
+  // during the effect's own execution. Deferring via `setTimeout(0)` moves
+  // the call into a macrotask callback (an "external system" callback, in
+  // the same sense a subscription callback would be), which is the pattern
+  // React's effect model expects, and gives the same next-tick behavior
+  // without changing when the fetch actually happens from the user's
+  // perspective. The `cleared` guard prevents a call to `loadCustomers` (and
+  // therefore setState) after the effect has already been cleaned up — e.g.
+  // `open`/`searchQuery` changing again, or the modal unmounting, before the
+  // deferred callback fires.
   useEffect(() => {
-    if (open) {
-      void loadCustomers(searchQuery);
-    }
+    if (!open) return;
+    let cleared = false;
+    const timeoutId = setTimeout(() => {
+      if (!cleared) {
+        void loadCustomers(searchQuery);
+      }
+    }, 0);
+    return () => {
+      cleared = true;
+      clearTimeout(timeoutId);
+    };
   }, [open, searchQuery, loadCustomers]);
 
   // [FIX] Clears any pending debounced phone-check timer on unmount (e.g.
@@ -94,14 +135,20 @@ export function WalkInCustomerModal({
   // unmounted component" warning (and, in edge cases, a leaked timer).
   useEffect(() => {
     return () => {
-      if (phoneDebounceRef.current) {
-        clearTimeout(phoneDebounceRef.current);
-      }
+      clearPhoneDebounce();
     };
-  }, []);
+  }, [clearPhoneDebounce]);
 
+  // [FIX] Covers the dialog-chrome close path (X button, outside click,
+  // Escape) — the ONLY path that actually routes through this wrapper.
+  // Success paths below (handleCreateWalkIn, handleAcceptDuplicate) call
+  // the `onOpenChange` prop directly rather than this wrapper, so each of
+  // those also clears the timer itself — see the [FIX] notes there. All
+  // three call sites are necessary; none of them is redundant with the
+  // others.
   function handleDialogOpenChange(nextOpen: boolean) {
     if (!nextOpen) {
+      clearPhoneDebounce();
       setFormError(null);
       setDuplicateMatch(null);
       setIgnoredDuplicatePhone(null);
@@ -114,12 +161,15 @@ export function WalkInCustomerModal({
     setPhone(newPhone);
     setDuplicateMatch(null);
 
-    if (phoneDebounceRef.current) {
-      clearTimeout(phoneDebounceRef.current);
-    }
+    clearPhoneDebounce();
 
     const trimmed = newPhone.trim();
-    if (!trimmed || trimmed.length < 4 || trimmed === ignoredDuplicatePhone) {
+    if (
+      !trimmed ||
+      trimmed.length < 4 ||
+      (ignoredDuplicatePhone &&
+        normalizeCustomerPhone(trimmed) === normalizeCustomerPhone(ignoredDuplicatePhone))
+    ) {
       return;
     }
 
@@ -127,7 +177,11 @@ export function WalkInCustomerModal({
       setIsCheckingPhone(true);
       try {
         const match = await findMatchingCustomerByPhone(tenantId, trimmed);
-        if (match && match.customer.phone === trimmed) {
+        if (
+          match &&
+          match.customer.phone &&
+          normalizeCustomerPhone(match.customer.phone) === normalizeCustomerPhone(trimmed)
+        ) {
           setDuplicateMatch(match);
         }
       } catch (err) {
@@ -141,6 +195,13 @@ export function WalkInCustomerModal({
   // Cashier accepts the duplicate match (default action)
   function handleAcceptDuplicate() {
     if (!duplicateMatch) return;
+    // [FIX] This path closes the modal via the `onOpenChange` prop
+    // directly (below), not via handleDialogOpenChange — so it must clear
+    // the debounce timer itself. Without this, a keystroke-triggered timer
+    // queued just before the cashier clicked "استخدام الزبون الحالي" can
+    // still fire ~250ms later and call setDuplicateMatch on a modal that's
+    // already closed and reset.
+    clearPhoneDebounce();
     onSelectCustomer(duplicateMatch.customer);
     setName("");
     setPhone("");
@@ -170,15 +231,37 @@ export function WalkInCustomerModal({
       return;
     }
 
+    if (duplicateMatch) {
+      return;
+    }
+
     setIsSubmitting(true);
     setFormError(null);
 
     try {
+      const trimmedPhone = phone.trim();
+      if (
+        trimmedPhone &&
+        normalizeCustomerPhone(trimmedPhone) !==
+        (ignoredDuplicatePhone ? normalizeCustomerPhone(ignoredDuplicatePhone) : "")
+      ) {
+        const match = await findMatchingCustomerByPhone(tenantId, trimmedPhone);
+        if (match) {
+          setDuplicateMatch(match);
+          setIsSubmitting(false);
+          return;
+        }
+      }
       const newCustomer = await createOfflineWalkInCustomer(tenantId, {
         name: name.trim(),
         phone: phone.trim() || undefined,
         shopName: shopName.trim() || undefined,
       });
+
+      // [FIX] Same reasoning as handleAcceptDuplicate above — this path
+      // also closes via the `onOpenChange` prop directly, bypassing
+      // handleDialogOpenChange, so it must clear the timer itself here.
+      clearPhoneDebounce();
 
       onSelectCustomer(newCustomer);
       setName("");
@@ -196,10 +279,24 @@ export function WalkInCustomerModal({
     }
   }
 
-  const isSystemSelected =
-    !selectedCustomer ||
-    selectedCustomer.type === "SYSTEM" ||
-    selectedCustomer.isSystemGenerated;
+  const isSystemSelected = isSystemCashCustomer(selectedCustomer);
+
+  async function handleSelectCashCustomer() {
+    if (!allowSystemCustomer) return;
+    const fromList = customers.find((c) => isSystemCashCustomer(c));
+    const system = fromList ?? (await getSystemCashCustomer(tenantId));
+    if (!system) {
+      setFormError(
+        "لا يوجد زبون نقدي نظامي في الذاكرة المحلية. يرجى مزامنة بيانات الزبائن أو تحميل البيانات التجريبية."
+      );
+      return;
+    }
+    // [FIX] Same reasoning as the other direct onOpenChange(false) call
+    // sites — this path bypasses handleDialogOpenChange too.
+    clearPhoneDebounce();
+    onSelectCustomer(system);
+    onOpenChange(false);
+  }
 
   // [FIX] The tab badge previously showed `customers.length` (which
   // includes the system-generated "زبون نقدي عام" row), while the list
@@ -222,6 +319,13 @@ export function WalkInCustomerModal({
           </DialogDescription>
         </DialogHeader>
 
+        {formError && tab === "existing" && (
+          <div className="flex items-center gap-2 rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/50 dark:text-red-300 border border-red-200">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span>{formError}</span>
+          </div>
+        )}
+
         <Tabs
           value={tab}
           onValueChange={(v) => setTab(v as "existing" | "new")}
@@ -243,12 +347,13 @@ export function WalkInCustomerModal({
             {/* Quick One-Tap Cash Walk-in Option ("زبون نقدي") */}
             <div
               onClick={() => {
-                onSelectCustomer(null);
-                onOpenChange(false);
+                void handleSelectCashCustomer();
               }}
-              className={`cursor-pointer rounded-xl border p-3 transition-all flex items-center justify-between ${isSystemSelected
-                  ? "border-emerald-600 bg-emerald-50/80 dark:bg-emerald-950/50 text-emerald-900 dark:text-emerald-100 font-semibold shadow-xs"
-                  : "border-zinc-200 bg-zinc-50/50 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
+              className={`rounded-xl border p-3 transition-all flex items-center justify-between ${!allowSystemCustomer
+                  ? "cursor-not-allowed opacity-50 border-zinc-200 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-900/50"
+                  : isSystemSelected
+                    ? "cursor-pointer border-emerald-600 bg-emerald-50/80 dark:bg-emerald-950/50 text-emerald-900 dark:text-emerald-100 font-semibold shadow-xs"
+                    : "cursor-pointer border-zinc-200 bg-zinc-50/50 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
                 }`}
             >
               <div className="flex items-center gap-3">
@@ -258,11 +363,13 @@ export function WalkInCustomerModal({
                 <div>
                   <p className="text-xs font-bold">زبون نقدي عام (زبون نقدي)</p>
                   <p className="text-[11px] text-zinc-500">
-                    اختصار بنقرة واحدة للمبيعات النقدية الفورية المباشرة (سداد 100% كاش)
+                    {allowSystemCustomer
+                      ? "اختصار بنقرة واحدة للمبيعات النقدية الفورية المباشرة (سداد 100% كاش)"
+                      : "غير متاح مع البيع على الحساب أو الدفع الجزئي — اختر زبوناً حقيقياً أو سجّل زبوناً جديداً"}
                   </p>
                 </div>
               </div>
-              {isSystemSelected && (
+              {isSystemSelected && allowSystemCustomer && (
                 <Badge className="bg-emerald-600 text-white text-[10px]">
                   محدد حالياً
                 </Badge>
@@ -297,12 +404,15 @@ export function WalkInCustomerModal({
                     <div
                       key={c.id}
                       onClick={() => {
+                        // [FIX] Same reasoning as the other direct
+                        // onOpenChange(false) call sites in this file.
+                        clearPhoneDebounce();
                         onSelectCustomer(c);
                         onOpenChange(false);
                       }}
                       className={`cursor-pointer rounded-lg border p-2.5 transition-all flex items-center justify-between ${isSelected
-                          ? "border-emerald-600 bg-emerald-50/60 dark:bg-emerald-950/40"
-                          : "border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+                        ? "border-emerald-600 bg-emerald-50/60 dark:bg-emerald-950/40"
+                        : "border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
                         }`}
                     >
                       <div className="space-y-0.5">
@@ -466,7 +576,14 @@ export function WalkInCustomerModal({
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() => onOpenChange(false)}
+                  onClick={() => {
+                    // [FIX] Same debounce-timer leak as the other close
+                    // paths — this button also calls the `onOpenChange`
+                    // prop directly, bypassing handleDialogOpenChange, so
+                    // a pending phone-check timer must be cleared here too.
+                    clearPhoneDebounce();
+                    onOpenChange(false);
+                  }}
                   className="text-xs"
                 >
                   إلغاء
@@ -474,10 +591,14 @@ export function WalkInCustomerModal({
                 <Button
                   type="submit"
                   size="sm"
-                  disabled={isSubmitting || !name.trim()}
+                  disabled={isSubmitting || !name.trim() || !!duplicateMatch || isCheckingPhone}
                   className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold"
                 >
-                  {isSubmitting ? "جاري الحفظ..." : "حفظ واختيار الزبون"}
+                  {isSubmitting
+                    ? "جاري الحفظ..."
+                    : duplicateMatch
+                      ? "اختر استخدام الزبون المسجّل أو إنشاء زبون جديد"
+                      : "حفظ واختيار الزبون"}
                 </Button>
               </div>
             </form>

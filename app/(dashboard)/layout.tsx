@@ -1,18 +1,31 @@
+import { auth } from "@/auth";
 import { SessionProvider } from "@/components/providers/session-provider";
 import { ExchangeRateInitializer } from "@/components/dashboard/exchange-rate-initializer";
+import { SyncWorkerInitializer } from "@/components/dashboard/sync-worker-initializer";
 import { SubscriptionBanner } from "@/components/dashboard/subscription-banner";
 import { DashboardSidebar } from "@/components/dashboard/sidebar";
 import { DashboardTopBar } from "@/components/dashboard/top-bar";
 import { Toaster } from "@/components/ui/sonner";
 
-export default function DashboardLayout({
+export default async function DashboardLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  // [FIX] Fetched server-side and passed into SessionProvider instead of
+  // letting every client child (ExchangeRateInitializer,
+  // SyncWorkerInitializer, SubscriptionBanner — all via useSession())
+  // start from an `undefined` session and fetch it themselves after
+  // mount. Without this, the sync worker's "within 5 seconds of
+  // reconnection" requirement (T4c) and the lockout banner's correctness
+  // (T2) both had to wait on an extra client-side session round trip
+  // before they had any real data to act on.
+  const session = await auth();
+
   return (
-    <SessionProvider>
+    <SessionProvider session={session}>
       <ExchangeRateInitializer />
+      <SyncWorkerInitializer />
       <div className="flex h-screen w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900">
         {/* RTL Collapsible Navigation Sidebar */}
         <DashboardSidebar />

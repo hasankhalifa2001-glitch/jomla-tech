@@ -7,6 +7,28 @@ export interface FifoRequest {
   unitId: string;
   requestedQty: number;
   mode?: "PREVIEW" | "COMMIT";
+  /**
+   * [ADDED] Post-lock batch quantities, keyed by ProductBatch.id, when the
+   * CALLER has already locked every batch this invoice could touch — across
+   * ALL of its line items/products — in a single `ORDER BY id ASC` query
+   * (see `lockBatchesForFifoAllocations` below). When provided in COMMIT
+   * mode, this function uses these values directly instead of issuing its
+   * own internal lock query.
+   *
+   * WHY THIS MATTERS: a sale invoice can contain line items for more than
+   * one product. If each product's candidate batches were locked via their
+   * own separate `SELECT ... FOR UPDATE ORDER BY id ASC` call (one raw
+   * query per product, issued sequentially as this function was called once
+   * per line item), each individual query is internally ordered, but the
+   * INVOICE AS A WHOLE does not acquire its full set of row locks via one
+   * consistent global order — it acquires them via several independent SQL
+   * statements. Two concurrent invoices selling the same two products in
+   * opposite line-item order could still deadlock against each other in
+   * that scheme, since Postgres has no way to know the two separate
+   * statements from one transaction are related. Passing a single,
+   * pre-locked map computed up front for the whole invoice closes that gap.
+   */
+  preLockedQuantities?: Map<string, number>;
 }
 
 export interface FifoAllocationItem {
@@ -58,6 +80,78 @@ interface BatchRecord {
 }
 
 /**
+ * [ADDED] Locks every ProductBatch row that COULD be touched by FIFO
+ * allocation across a whole invoice's line items — spanning every distinct
+ * product on that invoice, not just one — in a SINGLE `SELECT ... FOR
+ * UPDATE ORDER BY id ASC` query, via the one sanctioned raw-query path.
+ *
+ * This must be called ONCE per invoice-processing transaction, BEFORE any
+ * per-line-item call to `resolveFifoAllocation(mode: "COMMIT")`, with every
+ * distinct `productId` the invoice sells. Its result is then passed into
+ * each `resolveFifoAllocation` call via `preLockedQuantities`, so every row
+ * lock the transaction takes on `ProductBatch` — regardless of which line
+ * item "owns" that batch — is acquired by this one query, in one
+ * consistent ascending order. That is what actually prevents cross-invoice
+ * deadlocks when two invoices sell overlapping products in different
+ * order; locking product-by-product (even if each product's own lock query
+ * is internally sorted) does not provide that guarantee on its own.
+ *
+ * Returns a Map<batchId, quantity> of POST-lock quantities. A batch that
+ * had `quantity <= 0` at the pre-lock read (and was therefore never a
+ * candidate) is simply absent from the map — callers must treat a missing
+ * id as 0, exactly as `resolveFifoAllocation` already does internally.
+ */
+export async function lockBatchesForFifoAllocations(
+  tx: PrismaTx,
+  tenantId: string,
+  productIds: string[]
+): Promise<Map<string, number>> {
+  if (!tenantId || !tenantId.trim()) {
+    throw new Error(
+      "Tenant isolation error: tenantId is required to lock batches for FIFO allocation."
+    );
+  }
+
+  const uniqueProductIds = [...new Set(productIds.filter(Boolean))];
+  if (uniqueProductIds.length === 0) {
+    return new Map();
+  }
+
+  // Pre-lock read: candidate batches across EVERY product this invoice
+  // sells, gathered in one pass — mirrors resolveFifoAllocation's own
+  // step 2, just widened from one product to the invoice's full set.
+  const candidateBatches = await tx.productBatch.findMany({
+    where: {
+      tenantId,
+      productId: { in: uniqueProductIds },
+      quantity: { gt: 0 },
+    },
+    select: { id: true },
+  });
+
+  if (candidateBatches.length === 0) {
+    return new Map();
+  }
+
+  const candidateIds = candidateBatches.map((b) => b.id).sort();
+
+  const lockedRows = await tenantScopedRawQuery<Array<{ id: string; quantity: unknown }>>(
+    tx,
+    tenantId,
+    (tenantCondition) => Prisma.sql`
+      SELECT id, quantity
+      FROM "ProductBatch"
+      WHERE id IN (${Prisma.join(candidateIds)})
+        AND ${tenantCondition}
+      ORDER BY id ASC
+      FOR UPDATE
+    `
+  );
+
+  return new Map(lockedRows.map((row) => [row.id, Number(row.quantity)]));
+}
+
+/**
  * Shared Pure FIFO Allocation Resolver
  *
  * Rules:
@@ -69,40 +163,44 @@ interface BatchRecord {
  *   ordering: ORDER BY id ASC on multi-batch FOR UPDATE locks to prevent
  *   deadlocks).
  *
- * [FIX — critical race condition] The previous version of this function,
- * in COMMIT mode, acquired `SELECT id ... FOR UPDATE` locks on the
- * candidate batches but only ever selected `id` in that query — it kept
- * using the `quantity` values read earlier via the pre-lock `findMany`
- * call for every allocation decision below. That defeats the entire
- * purpose of taking the lock: a transaction that had to WAIT for this
- * lock (because a concurrent transaction was mid-commit against the same
- * batch) resumes holding data from BEFORE that other transaction
- * committed — it has no way to see what actually changed. Two concurrent
- * syncs could both "see" the same last unit of stock as available and
- * both allocate it, directly violating T4c's acceptance criterion ("Two
- * devices' sync requests both drawing from a batch's last units never
- * both succeed").
+ * [FIX — critical race condition, earlier revision] In COMMIT mode, this
+ * function locks candidate batches and then uses the POST-lock quantity
+ * for every allocation decision — never the pre-lock `findMany` values,
+ * which could be stale by the time the lock is actually granted.
  *
- * Fixed by having the locking query also SELECT `quantity`, and
- * overwriting every locked batch's in-memory `quantity` with that
- * POST-lock value before any allocation math runs. The pre-lock
- * `findMany` read is now used only to decide which rows are worth
- * locking in the first place (a cheap first pass) — never as the source
- * of truth for how much is actually available.
+ * [ADDED — cross-item lock ordering] COMMIT mode now accepts an optional
+ * `preLockedQuantities` map (see `lockBatchesForFifoAllocations` above).
+ * When the caller supplies it (because it already locked every batch for
+ * the WHOLE invoice, across every product, in one query), this function
+ * uses that map directly and skips its own internal lock query entirely —
+ * critical, because issuing a second, separate lock query per line item
+ * would defeat the single-global-order guarantee the caller just
+ * established. When `preLockedQuantities` is omitted, this function falls
+ * back to its previous behavior: locking only THIS product's candidates in
+ * their own `ORDER BY id ASC` query. That fallback remains safe for a
+ * single-product COMMIT call in isolation, but MUST NOT be relied on for
+ * more than one product within the same transaction — doing so reintroduces
+ * exactly the cross-invoice deadlock risk this parameter exists to close.
  *
- * Known accepted limitation (not the race this fix targets): a batch
- * that had `quantity <= 0` at the time of the initial `findMany` — and
- * was therefore excluded from `candidateBatches` by the `quantity: { gt:
- * 0 } }` filter — is not picked up even if it was concurrently restocked
- * (e.g. by a void) between that read and the lock. FIFO here resolves
- * against a consistent snapshot of "candidates as of read time," not a
- * fully re-scanned view after locking.
+ * Known accepted limitation (unchanged): a batch that had `quantity <= 0`
+ * at the time of the initial `findMany` — and was therefore excluded from
+ * `candidateBatches` by the `quantity: { gt: 0 } }` filter — is not picked
+ * up even if it was concurrently restocked (e.g. by a void) between that
+ * read and the lock. FIFO here resolves against a consistent snapshot of
+ * "candidates as of read time," not a fully re-scanned view after locking.
  */
 export async function resolveFifoAllocation(
   tx: PrismaTx,
   params: FifoRequest
 ): Promise<FifoResolution> {
-  const { tenantId, productId, unitId, requestedQty, mode = "PREVIEW" } = params;
+  const {
+    tenantId,
+    productId,
+    unitId,
+    requestedQty,
+    mode = "PREVIEW",
+    preLockedQuantities,
+  } = params;
 
   if (requestedQty <= 0) {
     throw new Error("الكمية المطلوبة يجب أن تكون أكبر من الصفر.");
@@ -152,9 +250,9 @@ export async function resolveFifoAllocation(
 
   // 2. Fetch candidate batches for this product with quantity > 0.
   // [NOTE] In COMMIT mode this is a PRE-LOCK read. Its `quantity` values
-  // are only a starting point used to decide which rows to lock — see
-  // step 3, where they are overwritten with POST-lock values before any
-  // allocation math runs.
+  // are only a starting point used to decide which rows are relevant —
+  // see step 3, where they are overwritten with POST-lock values before
+  // any allocation math runs.
   const candidateBatches = (await tx.productBatch.findMany({
     where: {
       tenantId,
@@ -166,35 +264,47 @@ export async function resolveFifoAllocation(
     },
   })) as unknown as BatchRecord[];
 
-  // 3. COMMIT mode: acquire FOR UPDATE locks on candidate batches in
-  // deterministic `ORDER BY id ASC` order (prevents cross-transaction
-  // deadlocks) AND re-read `quantity` for those exact rows in the same
-  // locked query — then use ONLY these post-lock values from here on.
+  // 3. COMMIT mode: resolve authoritative post-lock quantities.
   if (mode === "COMMIT" && candidateBatches.length > 0) {
-    const candidateIds = candidateBatches.map((b) => b.id).sort();
+    let freshQuantityById: Map<string, number>;
 
-    const lockedRows = await tenantScopedRawQuery<Array<{ id: string; quantity: unknown }>>(
-      tx,
-      tenantId,
-      (tenantCondition) => Prisma.sql`
-        SELECT id, quantity
-        FROM "ProductBatch"
-        WHERE id IN (${Prisma.join(candidateIds)})
-          AND ${tenantCondition}
-        ORDER BY id ASC
-        FOR UPDATE
-      `
-    );
+    if (preLockedQuantities) {
+      // See the ADDED note on `preLockedQuantities` above and on
+      // `lockBatchesForFifoAllocations` — the caller already locked every
+      // batch this invoice could touch, across every line item, in one
+      // ORDER BY id ASC query. Use those values directly; do NOT issue a
+      // second lock query here.
+      freshQuantityById = preLockedQuantities;
+    } else {
+      // Fallback: no invoice-wide pre-lock was supplied. Safe ONLY for a
+      // single-product COMMIT call in isolation within its transaction —
+      // see the function-level doc comment for why this must not be used
+      // for more than one product in the same transaction.
+      const candidateIds = candidateBatches.map((b) => b.id).sort();
 
-    const freshQuantityById = new Map<string, number>(
-      lockedRows.map((row) => [row.id, Number(row.quantity)])
-    );
+      const lockedRows = await tenantScopedRawQuery<Array<{ id: string; quantity: unknown }>>(
+        tx,
+        tenantId,
+        (tenantCondition) => Prisma.sql`
+          SELECT id, quantity
+          FROM "ProductBatch"
+          WHERE id IN (${Prisma.join(candidateIds)})
+            AND ${tenantCondition}
+          ORDER BY id ASC
+          FOR UPDATE
+        `
+      );
+
+      freshQuantityById = new Map(lockedRows.map((row) => [row.id, Number(row.quantity)]));
+    }
 
     for (const batch of candidateBatches) {
       const fresh = freshQuantityById.get(batch.id);
       // A candidate missing from the locked result set (e.g. deleted
-      // between step 2 and the lock) is treated as unavailable rather
-      // than trusting its stale pre-lock quantity.
+      // between step 2 and the lock, or simply never included in a
+      // caller-supplied preLockedQuantities map because it had
+      // quantity <= 0 at that map's own pre-lock read) is treated as
+      // unavailable rather than trusting its stale pre-lock quantity.
       batch.quantity = fresh !== undefined ? fresh : 0;
     }
   }

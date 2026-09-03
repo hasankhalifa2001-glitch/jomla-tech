@@ -15,10 +15,23 @@
  * that mismatch could leak one tenant's exchange rate into another tenant's
  * session on a shared device. There is no longer any code path that returns
  * a rate belonging to a tenant other than the one asked for.
+ * [FIX — fail-loud, not fail-silent] setCachedDailyExchangeRate previously
+ * validated its input with `if (... ) { return; }` — an invalid or
+ * non-positive rate was silently discarded, with no error, no log entry,
+ * and no signal to the caller that the write never happened. That
+ * contradicts money.ts's own stated philosophy ("a silently-wrong number
+ * is strictly worse than a thrown error"): a caller (e.g. the top-bar rate
+ * input, or a future scheduled sync job) could reasonably assume the write
+ * succeeded and move on, leaving the cashier checking out against a stale
+ * or missing rate with no indication why. The function now takes the same
+ * `MoneyInput` shape every other money.ts-adjacent function takes, routes
+ * it through `toDecimal()`, and throws `MoneyError` for anything invalid
+ * or non-positive — callers must handle the rejection explicitly instead
+ * of the failure disappearing.
  */
 
 import { getOfflineDb, isOfflineDbSupported } from "./db";
-import { serializeMoney, toDecimal } from "../utils/money";
+import { serializeMoney, toDecimal, MoneyError, type MoneyInput } from "../utils/money";
 
 export const DEFAULT_TENANT_CACHE_KEY = "global_tenant";
 
@@ -52,17 +65,27 @@ export async function getCachedDailyExchangeRate(tenantId?: string): Promise<num
 /**
  * Writes or updates the cached daily exchange rate in Dexie, for a specific
  * tenant (or the sentinel key if no tenantId is available).
+ *
+ * Throws MoneyError — does not silently no-op — if `rate` is not a valid,
+ * finite, positive monetary value. The Dexie write itself (a genuine I/O
+ * failure) is still caught and logged rather than thrown, matching the
+ * read side's behavior; only input *validation* is fail-loud here, since
+ * that failure is a caller bug worth surfacing immediately, not a runtime
+ * condition the caller is expected to already handle.
  */
 export async function setCachedDailyExchangeRate(
-  rate: number,
+  rate: MoneyInput,
   tenantId?: string
 ): Promise<void> {
   if (!isOfflineDbSupported()) {
     return;
   }
 
-  if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
-    return;
+  const decimalRate = toDecimal(rate); // throws MoneyError for non-finite/invalid input
+  if (decimalRate.isZero() || decimalRate.isNegative()) {
+    throw new MoneyError(
+      `Invalid daily exchange rate (${decimalRate.toString()}): must be a positive value.`
+    );
   }
 
   const key = tenantId || DEFAULT_TENANT_CACHE_KEY;
@@ -71,7 +94,7 @@ export async function setCachedDailyExchangeRate(
     const db = getOfflineDb();
     await db.cachedTenantSettings.put({
       tenantId: key,
-      dailyExchangeRate: serializeMoney(rate),
+      dailyExchangeRate: serializeMoney(decimalRate),
       cachedAt: new Date(),
     });
   } catch (error) {

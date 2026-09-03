@@ -26,6 +26,7 @@ import {
   UserPlus,
 } from "lucide-react";
 import type { SelectedCustomer, PaymentMethod } from "@/lib/offline";
+import { isSystemCashCustomer } from "@/lib/offline";
 import {
   subtractMoney,
   convertCurrency,
@@ -44,6 +45,7 @@ interface PaymentModalProps {
   totalUSD: MoneyInput;
   exchangeRate: number;
   selectedCustomer: SelectedCustomer | null;
+  onPaymentModeChange?: (mode: PaymentMode) => void;
   onOpenCustomerModal: () => void;
   onConfirmCheckout: (paymentData: {
     paidAmountUSD: string;
@@ -71,6 +73,7 @@ export function PaymentModal({
   totalUSD,
   exchangeRate,
   selectedCustomer,
+  onPaymentModeChange,
   onOpenCustomerModal,
   onConfirmCheckout,
 }: PaymentModalProps) {
@@ -80,6 +83,22 @@ export function PaymentModal({
   const [paidSYPInput, setPaidSYPInput] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // [FIX — close-during-submit] Every dialog close path in this file
+  // (Cancel button, the confirm button's own submit handler) now routes
+  // through this single guarded wrapper instead of the raw `onOpenChange`
+  // prop. `onConfirmCheckout` is async — it writes the invoice to Dexie —
+  // and while it's in flight the cashier can still dismiss the dialog via
+  // the X button, an outside click, or Escape, none of which went through
+  // the (disabled) Cancel button's guard. Previously that closed the
+  // dialog visually while the write kept running invisibly in the
+  // background: if it then succeeded, the cashier — who believed they'd
+  // cancelled — would have an invoice they never confirmed seeing.
+  // Blocking every close path during `isSubmitting` closes that gap.
+  function guardedOnOpenChange(next: boolean) {
+    if (isSubmitting) return;
+    onOpenChange(next);
+  }
 
   // [FIX — fail-loud, not fail-silent] Previously this (and every other
   // computed value below) was wrapped in `try { ... } catch { return
@@ -115,10 +134,30 @@ export function PaymentModal({
     }
   }, [totalUSDValue, exchangeRate]);
 
-  // Reset/Initialize values when opened
+  // [FIX — setState-in-effect] `totalUSDValue`/`safeTotalSYP` are already
+  // computed synchronously above (they're plain `useMemo`s, not state), so
+  // this effect's body was calling six `setState` functions back-to-back,
+  // directly and synchronously, the moment the effect ran — exactly the
+  // pattern React flags ("Calling setState synchronously within an effect
+  // can trigger cascading renders"). An effect is meant to synchronize
+  // with an external system or react to one via a callback, not fire a
+  // batch of setState calls as its own first action. Deferring via
+  // `setTimeout(0)` moves the calls into a macrotask callback — the same
+  // fix already applied to the equivalent reset effect in
+  // walk-in-customer-modal.tsx — which satisfies React's effect model
+  // without changing when initialization actually happens from the
+  // cashier's perspective (still "as soon as the modal opens"). The
+  // `cleared` guard stops the deferred callback from touching state after
+  // this effect has already been cleaned up — e.g. `open` flips again, or
+  // the modal unmounts, before the timeout fires.
   useEffect(() => {
-    if (open && totalUSDValue !== null) {
+    if (!open || totalUSDValue === null) return;
+
+    let cleared = false;
+    const timeoutId = setTimeout(() => {
+      if (cleared) return;
       setMode("FULL_CASH");
+      onPaymentModeChange?.("FULL_CASH");
       setSelectedRail("CASH");
       setPaidUSDInput(totalUSDValue);
       if (safeTotalSYP) {
@@ -128,7 +167,12 @@ export function PaymentModal({
       }
       setErrorMessage(null);
       setIsSubmitting(false);
-    }
+    }, 0);
+
+    return () => {
+      cleared = true;
+      clearTimeout(timeoutId);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -136,6 +180,7 @@ export function PaymentModal({
   function handleModeChange(newMode: PaymentMode) {
     if (totalUSDValue === null) return;
     setMode(newMode);
+    onPaymentModeChange?.(newMode);
     setErrorMessage(null);
 
     if (newMode === "FULL_CASH") {
@@ -158,6 +203,10 @@ export function PaymentModal({
         setPaidUSDInput("0.0000");
         setPaidSYPInput("0");
       }
+    }
+
+    if (newMode !== "FULL_CASH" && (!selectedCustomer || isSystemCashCustomer(selectedCustomer))) {
+      onOpenCustomerModal();
     }
   }
 
@@ -262,13 +311,10 @@ export function PaymentModal({
     }
   }, [computedDebtUSD, exchangeRate]);
 
-  const isSystemCustomer =
-    !selectedCustomer ||
-    selectedCustomer.type === "SYSTEM" ||
-    selectedCustomer.isSystemGenerated;
-
+  const isSystemCustomer = isSystemCashCustomer(selectedCustomer);
+  const hasCustomer = !!selectedCustomer;
   const isDebtBlockedBySystemCustomer =
-    compareMoney(computedDebtUSD, 0) > 0 && isSystemCustomer;
+    compareMoney(computedDebtUSD, 0) > 0 && (!hasCustomer || isSystemCustomer);
 
   const canConfirm =
     totalUSDValue !== null &&
@@ -324,7 +370,10 @@ export function PaymentModal({
 
   // [ADDED] Fail-loud blocking state: if the invoice total itself could
   // not be computed, this modal does not present a payment form at all —
-  // there is nothing trustworthy to build one on top of.
+  // there is nothing trustworthy to build one on top of. No submission
+  // can happen from this state, so it uses the raw `onOpenChange` prop
+  // directly rather than `guardedOnOpenChange` — there is nothing for the
+  // guard to protect against here.
   if (open && totalUSDValue === null) {
     return (
       <Dialog open={open} onOpenChange={onOpenChange}>
@@ -349,7 +398,7 @@ export function PaymentModal({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={guardedOnOpenChange}>
       <DialogContent className="sm:max-w-xl" dir="rtl">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between text-lg font-bold text-zinc-900 dark:text-zinc-100">
@@ -377,15 +426,15 @@ export function PaymentModal({
         {/* Customer Header Info */}
         <div
           className={`flex items-center justify-between rounded-xl p-3 border transition-colors ${isDebtBlockedBySystemCustomer
-              ? "bg-red-50/80 border-red-300 dark:bg-red-950/40 dark:border-red-800"
-              : "bg-zinc-50 border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800"
+            ? "bg-red-50/80 border-red-300 dark:bg-red-950/40 dark:border-red-800"
+            : "bg-zinc-50 border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800"
             }`}
         >
           <div className="flex items-center gap-2.5">
             <div
               className={`flex h-8 w-8 items-center justify-center rounded-lg ${isSystemCustomer
-                  ? "bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300"
-                  : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+                ? "bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300"
+                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
                 }`}
             >
               {isSystemCustomer ? (
@@ -399,9 +448,11 @@ export function PaymentModal({
                 الزبون المرفق بالفاتورة
               </span>
               <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200">
-                {selectedCustomer && !isSystemCustomer
-                  ? selectedCustomer.name
-                  : "زبون نقدي عام (مبيعات نقدية فقط)"}
+                {isSystemCustomer
+                  ? "زبون نقدي عام (مبيعات نقدية فقط)"
+                  : selectedCustomer
+                    ? selectedCustomer.name
+                    : "لم يتم اختيار زبون"}
               </span>
             </div>
           </div>
@@ -412,8 +463,8 @@ export function PaymentModal({
             size="sm"
             onClick={onOpenCustomerModal}
             className={`text-xs h-8 gap-1 font-semibold ${isDebtBlockedBySystemCustomer
-                ? "bg-red-600 hover:bg-red-700 text-white border-red-600"
-                : ""
+              ? "bg-red-600 hover:bg-red-700 text-white border-red-600"
+              : ""
               }`}
           >
             <UserPlus className="h-3.5 w-3.5" />
@@ -426,7 +477,7 @@ export function PaymentModal({
           <div className="rounded-xl border border-red-300 bg-red-50/90 p-3 dark:border-red-900 dark:bg-red-950/60 text-xs space-y-1.5 animate-in fade-in-50">
             <div className="flex items-center gap-2 text-red-800 dark:text-red-200 font-bold">
               <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
-              <span>لا يمكن تسجيل دين على حساب "زبون نقدي عام"</span>
+              <span>لا يمكن تسجيل دين على حساب &quot;زبون نقدي عام&quot;</span>
             </div>
             <p className="text-[11px] text-red-700 dark:text-red-300 leading-relaxed">
               عمليات البيع الآجل (على الحساب أو الدفع الجزئي) تتطلب تحديد زبون
@@ -468,8 +519,8 @@ export function PaymentModal({
               variant={mode === "FULL_CASH" ? "default" : "outline"}
               onClick={() => handleModeChange("FULL_CASH")}
               className={`h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_CASH"
-                  ? "bg-emerald-600 hover:bg-emerald-700 text-white"
-                  : ""
+                ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                : ""
                 }`}
             >
               <div className="flex items-center gap-1">
@@ -486,8 +537,8 @@ export function PaymentModal({
               variant={mode === "FULL_DEBT" ? "default" : "outline"}
               onClick={() => handleModeChange("FULL_DEBT")}
               className={`h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_DEBT"
-                  ? "bg-red-600 hover:bg-red-700 text-white"
-                  : ""
+                ? "bg-red-600 hover:bg-red-700 text-white"
+                : ""
                 }`}
             >
               <div className="flex items-center gap-1">
@@ -502,8 +553,8 @@ export function PaymentModal({
               variant={mode === "PARTIAL" ? "default" : "outline"}
               onClick={() => handleModeChange("PARTIAL")}
               className={`h-11 flex-col gap-0.5 text-xs font-bold ${mode === "PARTIAL"
-                  ? "bg-blue-600 hover:bg-blue-700 text-white"
-                  : ""
+                ? "bg-blue-600 hover:bg-blue-700 text-white"
+                : ""
                 }`}
             >
               <div className="flex items-center gap-1">
@@ -591,8 +642,8 @@ export function PaymentModal({
                     key={rail.id}
                     onClick={() => setSelectedRail(rail.id)}
                     className={`cursor-pointer rounded-lg border p-2 text-center transition-all ${isSelected
-                        ? "border-emerald-600 bg-emerald-50/70 text-emerald-900 dark:bg-emerald-950/50 dark:text-emerald-200 font-bold shadow-xs"
-                        : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:bg-zinc-850 text-zinc-700 dark:text-zinc-300"
+                      ? "border-emerald-600 bg-emerald-50/70 text-emerald-900 dark:bg-emerald-950/50 dark:text-emerald-200 font-bold shadow-xs"
+                      : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:bg-zinc-850 text-zinc-700 dark:text-zinc-300"
                       }`}
                   >
                     <Icon className="mx-auto h-4 w-4 mb-1 text-emerald-600 dark:text-emerald-400" />
@@ -613,7 +664,7 @@ export function PaymentModal({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => onOpenChange(false)}
+            onClick={() => guardedOnOpenChange(false)}
             disabled={isSubmitting}
             className="text-xs"
           >
@@ -626,8 +677,8 @@ export function PaymentModal({
             onClick={handleConfirm}
             disabled={isSubmitting || !canConfirm}
             className={`text-xs font-bold px-5 ${!canConfirm
-                ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
-                : "bg-emerald-600 hover:bg-emerald-700 text-white"
+              ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
+              : "bg-emerald-600 hover:bg-emerald-700 text-white"
               }`}
           >
             {isSubmitting
