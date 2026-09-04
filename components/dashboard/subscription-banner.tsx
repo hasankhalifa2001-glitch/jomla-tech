@@ -7,22 +7,6 @@ import Link from "next/link";
 import { AlertTriangle, Clock, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-// FIX: closes the session-staleness gap flagged in the middleware review.
-// The merchant's JWT only reflects subscriptionStatus as of login (or the
-// last explicit update() call) — a Super-Admin approval elsewhere never
-// pushes to this session on its own. Two mechanisms below:
-//   1. Manual "تحقق من الحالة" button — fetches the tenant's live status
-//      and, if it changed, syncs the session via update() so the rest of
-//      the app (middleware, other components reading useSession()) picks
-//      it up without a full re-login.
-//   2. Lightweight polling while PENDING specifically (not EXPIRED — that
-//      always requires a manual renewal action anyway, so polling adds no
-//      value there) so a merchant who leaves this tab open sees the
-//      lockout clear on its own once approved.
-//
-// NOTE: this assumes a GET /api/tenant/status endpoint returning
-// { subscriptionStatus }. If that route doesn't exist yet, it needs to be
-// added — this component can't check the DB directly from the client.
 const PENDING_POLL_INTERVAL_MS = 30_000;
 
 export function SubscriptionBanner() {
@@ -68,7 +52,7 @@ export function SubscriptionBanner() {
 
     if (status === "EXPIRED") {
         return (
-            <div className="flex flex-wrap items-center justify-between gap-3 bg-red-600 px-4 py-2.5 text-white shadow-sm">
+            <div className="flex flex-col items-stretch gap-2 bg-red-600 px-4 py-2.5 text-white shadow-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
                 <div className="flex items-center gap-2.5 text-sm font-medium">
                     <AlertTriangle className="h-5 w-5 shrink-0" />
                     <span>
@@ -79,7 +63,7 @@ export function SubscriptionBanner() {
                     size="sm"
                     variant="secondary"
                     asChild
-                    className="h-8 bg-white text-red-700 hover:bg-zinc-100 text-xs font-semibold"
+                    className="h-8 w-full shrink-0 bg-white text-red-700 hover:bg-zinc-100 text-xs font-semibold sm:w-auto"
                 >
                     <Link href="/settings/billing">تجديد الاشتراك الآن</Link>
                 </Button>
@@ -88,18 +72,18 @@ export function SubscriptionBanner() {
     }
 
     return (
-        <div className="flex items-center justify-between gap-3 bg-amber-500 px-4 py-2.5 text-slate-950 shadow-sm">
+        <div className="flex flex-col items-stretch gap-2 bg-amber-500 px-4 py-2.5 text-slate-950 shadow-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
             <div className="flex items-center gap-2 text-sm font-medium">
                 <Clock className="h-5 w-5 shrink-0" />
                 <span>طلب تمديد الاشتراك قيد المراجعه والتحقق من الإيصال المرفق.</span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
                 <Button
                     size="sm"
                     variant="ghost"
                     onClick={checkStatus}
                     disabled={isChecking}
-                    className="h-8 text-slate-950 hover:bg-amber-600 text-xs font-semibold gap-1.5"
+                    className="h-8 flex-1 text-slate-950 hover:bg-amber-600 text-xs font-semibold gap-1.5 sm:flex-none"
                 >
                     <RefreshCw className={`h-3.5 w-3.5 ${isChecking ? "animate-spin" : ""}`} />
                     تحقق من الحالة
@@ -108,7 +92,7 @@ export function SubscriptionBanner() {
                     size="sm"
                     variant="outline"
                     asChild
-                    className="h-8 border-slate-900 bg-transparent text-slate-950 hover:bg-amber-600 text-xs font-semibold"
+                    className="h-8 flex-1 border-slate-900 bg-transparent text-slate-950 hover:bg-amber-600 text-xs font-semibold sm:flex-none"
                 >
                     <Link href="/settings/billing">عرض الإيصالات</Link>
                 </Button>

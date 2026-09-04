@@ -1,4 +1,5 @@
 import type { NextAuthConfig } from "next-auth";
+import { applySessionFromToken } from "@/lib/auth/session-callback";
 
 // Edge-safe config: NO providers with real logic, NO Prisma, NO bcrypt,
 // NO Upstash. This is the only version of the auth config that gets
@@ -22,15 +23,28 @@ export const authConfig = {
         strategy: "jwt",
     },
     callbacks: {
-        // No jwt/session callbacks here. The middleware only ever reads
-        // req.auth (i.e. the JWT already on the request) — it doesn't
-        // need to re-derive or refresh any claims, since token
-        // population happens in auth.ts's jwt() callback at sign-in
-        // time, and update()-triggered refreshes (re-reading
-        // subscriptionStatus/dailyExchangeRate from Tenant) are also
-        // handled there, not in middleware. Keeping these callbacks out
-        // of authConfig means NextAuth(authConfig) in middleware.ts just
-        // passes the token through unchanged, which is exactly the
-        // behavior we want here.
+        // [FIX — CRITICAL] Previously left empty on the assumption that
+        // "the middleware only ever reads req.auth (the JWT already on the
+        // request)" — that's true of the underlying token, but req.auth is
+        // NOT the raw token, it's whatever this callback below produces.
+        // NextAuth(authConfig) inside middleware.ts is a separate instance
+        // from the one built in auth.ts and does NOT inherit auth.ts's
+        // callbacks. Without a session() callback here, req.auth.user in
+        // middleware silently fell back to the default `{ name, email,
+        // image }` shape — every check reading role/tenantId/
+        // subscriptionStatus/isPlatformAdmin was comparing against
+        // `undefined` and always taking the "unlocked" branch. See
+        // lib/auth/session-callback.ts for the full explanation.
+        //
+        // No jwt() callback is needed here — this instance never receives
+        // `trigger: "update"` calls (those originate client-side against
+        // the Node instance in auth.ts) and never needs to populate a token
+        // from a fresh sign-in (that only happens through auth.ts's
+        // Credentials provider). It only ever needs to read a token that
+        // was already fully populated elsewhere and shape it into a
+        // session object.
+        async session({ session, token }) {
+            return applySessionFromToken(session, token);
+        },
     },
 } satisfies NextAuthConfig;

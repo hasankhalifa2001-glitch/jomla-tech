@@ -7,7 +7,7 @@ import { prisma } from "@/lib/db";
 import type { DefaultSession } from "next-auth";
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
-import { authConfig } from "@/auth.config";
+import { applySessionFromToken } from "@/lib/auth/session-callback";
 
 declare module "next-auth" {
     interface User {
@@ -116,7 +116,6 @@ const loginRatelimit =
         : null;
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
-    ...authConfig,
     providers: [
         Credentials({
             name: "credentials",
@@ -132,19 +131,6 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                 const email = String(credentials.email).toLowerCase().trim();
                 const password = String(credentials.password);
 
-                // FIX (rate-limit scope): keyed on email + a best-effort IP,
-                // not email alone. Email-only keying means anyone who knows
-                // (or guesses — this project's seed convention is literally
-                // admin@<slug>.com) a target's email can lock THEM out for
-                // everyone by deliberately failing 5 times from anywhere,
-                // repeatedly, with no cost to the attacker. Combining with
-                // IP means an attacker can still hammer a single victim from
-                // one IP, but can no longer indefinitely deny that specific
-                // account to its real owner from an unrelated IP. This is a
-                // mitigation, not a complete fix — a distributed attacker
-                // rotating IPs can still target one email; a second layer
-                // (e.g. a CAPTCHA after N failures, independent of IP) is
-                // recommended before this ships to production.
                 const ip =
                     request?.headers?.get("x-forwarded-for")?.split(",")[0]?.trim() ||
                     "unknown";
@@ -161,11 +147,6 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                     include: { tenant: true },
                 });
 
-                // FIX (timing side-channel): always run a bcrypt comparison
-                // on this path — against the dummy hash when there's no real
-                // user/hash to check against — instead of returning
-                // immediately. Keeps "no such user" and "wrong password"
-                // taking roughly the same wall-clock time.
                 if (!user || !user.passwordHash || !user.isActive) {
                     await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
                     return null;
@@ -194,6 +175,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             },
         }),
     ],
+    session: {
+        strategy: "jwt",
+    },
+    pages: {
+        signIn: "/login",
+    },
     callbacks: {
         async jwt({ token, user, trigger }) {
             if (user) {
@@ -207,28 +194,15 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                 token.isPlatformAdmin = user.isPlatformAdmin;
             }
 
-            // [FIX — SECURITY CRITICAL] Previously trusted a client-supplied
-            // `session.subscriptionStatus` / `session.dailyExchangeRate`
-            // verbatim on `trigger === "update"`. `update()` is callable
-            // directly from the browser (including from devtools) by ANY
-            // signed-in session — a CASHIER on a PENDING or EXPIRED tenant
-            // could call `update({ subscriptionStatus: "ACTIVE" })` and
-            // write that value straight into their own token, with zero
-            // server-side verification. Because subscriptionStatus is
-            // exactly the field T2's middleware and T4c's /api/sync gate
-            // writes on, that was a full lockout bypass — a client could
-            // unlock its own tenant.
-            //
-            // `update()` is now treated as a signal to REFRESH from the
-            // database, never as a payload to write verbatim. Whatever the
-            // client passes into `session` on the update call is ignored
-            // entirely for these two fields; the current, authoritative
-            // values are re-read from Tenant via the token's own tenantId
-            // (never from anything the client supplied) and written back.
-            // This preserves the original UX goal (an admin editing the
-            // exchange rate, or a super-admin approving a subscription,
-            // still reflects on THIS session immediately after calling
-            // `update()`) without trusting the client for the value itself.
+            // [FIX — SECURITY CRITICAL] `update()` is treated as a signal to
+            // REFRESH from the database, never as a payload to write
+            // verbatim — a client calling update({ subscriptionStatus:
+            // "ACTIVE" }) directly must never be able to write that value
+            // into its own token. Whatever the client passes into `session`
+            // on the update call is ignored entirely for these two fields;
+            // the current, authoritative values are re-read from Tenant via
+            // the token's own tenantId (never from anything the client
+            // supplied) and written back.
             if (trigger === "update" && token.tenantId) {
                 const tenant = await prisma.tenant.findUnique({
                     where: { id: token.tenantId as string },
@@ -244,25 +218,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 
             return token;
         },
+        // [FIX] Now delegates to the same applySessionFromToken() that
+        // auth.config.ts uses for the Edge/middleware instance, so the two
+        // can never drift out of sync with each other again the way the
+        // middleware instance silently did before this fix.
         async session({ session, token }) {
-            if (token && session.user) {
-                session.user.id = token.id as string;
-                session.user.role = (token.role as "ADMIN" | "CASHIER") || "CASHIER";
-                session.user.tenantId = token.tenantId as string;
-                session.user.tenantSlug = (token.tenantSlug as string) || "";
-                session.user.tenantName = (token.tenantName as string) || "";
-                session.user.dailyExchangeRate = (token.dailyExchangeRate as number | null) ?? null;
-                // Fail-closed: if this field is ever missing/falsy on the
-                // token, treat the tenant as locked (EXPIRED) rather than
-                // fully active. A token glitch must never silently unlock a
-                // suspended tenant's write access.
-                session.user.subscriptionStatus =
-                    (token.subscriptionStatus as "ACTIVE" | "EXPIRED" | "PENDING") || "EXPIRED";
-                // Default false so a missing/stale token never grants
-                // platform-admin access.
-                session.user.isPlatformAdmin = (token.isPlatformAdmin as boolean) ?? false;
-            }
-            return session;
+            return applySessionFromToken(session, token);
         },
     },
     secret: requireAuthSecret(),

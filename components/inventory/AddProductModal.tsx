@@ -857,6 +857,21 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
               primary action (Next / Save) last in DOM order so it sits at
               the bottom of the sheet — closest to a thumb holding the
               phone. Reverts to a compact inline row at sm: and up.
+
+              [FIX] Each of the "Next" and "Save" buttons is given a
+              distinct, stable `key` ("next-btn" vs "submit-btn"). Without
+              this, React treats them as the *same* element across a
+              step 2 -> step 3 transition (same position in the tree, same
+              parent) and reuses the existing <button> DOM node, merely
+              flipping its `type` attribute from "button" to "submit".
+              That mutation can land mid-click: the browser dispatches the
+              click against a node that was type="button" when pressed but
+              has become type="submit" by the time it checks what to do
+              with the event, firing an unwanted form submit on the
+              step 2 -> 3 transition. Distinct keys force React to unmount
+              the old node and mount a fresh one instead of morphing it in
+              place, so a "Next" click can never be reinterpreted as a
+              "Submit" click.
             */}
             <DialogFooter className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pt-1">
               <Button
@@ -871,6 +886,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
               <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
                 {step > 1 && (
                   <Button
+                    key="back-btn"
                     type="button"
                     variant="outline"
                     onClick={goBack}
@@ -882,6 +898,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                 )}
                 {step < 3 ? (
                   <Button
+                    key="next-btn"
                     type="button"
                     onClick={goNext}
                     className="w-full sm:w-auto h-11 sm:h-9 bg-emerald-600 hover:bg-emerald-700 text-white"
@@ -890,6 +907,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                   </Button>
                 ) : (
                   <Button
+                    key="submit-btn"
                     type="submit"
                     disabled={loading}
                     className="w-full sm:w-auto h-11 sm:h-9 bg-emerald-600 hover:bg-emerald-700 text-white"
