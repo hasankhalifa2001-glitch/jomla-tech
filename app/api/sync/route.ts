@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { Prisma, InvoiceStatus, type PaymentMethod } from "@prisma/client";
 import { auth } from "@/auth";
-// eslint-disable-next-line no-restricted-imports -- raw PrismaClient required:
 // resolveFifoAllocation() and tenantScopedRawQuery() are both typed to accept
 // exactly `Prisma.TransactionClient` (see fifo.ts's own header comment on
 // why it deliberately does NOT accept the Client Extension's dynamic
@@ -13,6 +12,7 @@ import { auth } from "@/auth";
 // where/data clause below instead of relying on the extension. This route
 // IS on lib/db.ts's documented raw-client allowlist — see that file's
 // header comment.
+// eslint-disable-next-line no-restricted-imports
 import { prisma } from "@/lib/db";
 import { tenantScopedRawQuery } from "@/lib/db/tenant-scope";
 import { resolveFifoAllocation, lockBatchesForFifoAllocations } from "@/lib/inventory/fifo";

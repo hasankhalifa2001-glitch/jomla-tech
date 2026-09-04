@@ -65,11 +65,11 @@ function pendingTable<T extends { tenantId: string; status: string; id?: number 
 }
 
 function saleSectionOfSyncRoute(src: string): string {
-  const idx = src.indexOf("await lockEligibleBatches");
+  const idx = src.indexOf("await lockBatchesForFifoAllocations");
   const fifoIdx = src.indexOf("await resolveFifoAllocation(tx");
   expect(idx).toBeGreaterThan(-1);
   expect(fifoIdx).toBeGreaterThan(-1);
-  return src.slice(idx, src.indexOf("PASS 3: Payment Pass"));
+  return src.slice(idx, src.indexOf("PASS 3 — Payments"));
 }
 
 describe("T4c Acceptance Tests — Idempotent Background Sync Engine", () => {
@@ -482,7 +482,7 @@ describe("T4c /api/sync implementation review (v3.4 nested writes, v3.5 batch lo
   );
 
   it("locks eligible batches with FOR UPDATE ORDER BY id ASC before resolveFifoAllocation", () => {
-    const saleLock = routeSrc.indexOf("await lockEligibleBatches");
+    const saleLock = routeSrc.indexOf("await lockBatchesForFifoAllocations");
     const fifoCall = routeSrc.indexOf("await resolveFifoAllocation(tx");
     expect(saleLock).toBeGreaterThan(-1);
     expect(fifoCall).toBeGreaterThan(saleLock);
@@ -504,15 +504,15 @@ describe("T4c /api/sync implementation review (v3.4 nested writes, v3.5 batch lo
 
   it("calls resolveFifoAllocation once per line item in COMMIT mode after the lock", () => {
     const sale = saleSectionOfSyncRoute(routeSrc);
-    expect(sale.indexOf("FOR UPDATE") === -1 || sale.includes("lockEligibleBatches")).toBe(true);
+    expect(sale.indexOf("FOR UPDATE") === -1 || sale.includes("lockBatchesForFifoAllocations")).toBe(true);
     expect(sale).toMatch(/mode:\s*"COMMIT"/);
-    const fifoMatches = sale.match(/resolveFifoAllocation\(/g) || [];
+    const fifoMatches = sale.match(/await\s+resolveFifoAllocation\(/g) || [];
     expect(fifoMatches.length).toBe(1);
   });
 
   it("creates a sale-time CustomerPayment only when paidAmountUSD > 0, and skips it on existing invoices", () => {
     expect(routeSrc).toMatch(/compareMoney\(paidUSD, 0\) > 0/);
-    expect(routeSrc).toMatch(/existingInvoice/);
+    expect(routeSrc).toMatch(/const existing = await tx\.invoice\.findFirst/);
     expect(routeSrc).toMatch(/invoiceId: invoice\.id/);
     expect(routeSrc).toMatch(/invoiceId: null/);
   });
@@ -520,6 +520,6 @@ describe("T4c /api/sync implementation review (v3.4 nested writes, v3.5 batch lo
   it("rejects system-generated customer debt and copies voidReason onto the reversing row", () => {
     expect(routeSrc).toMatch(/isSystemGenerated && compareMoney\(debtUSD, 0\) > 0/);
     expect(routeSrc).toMatch(/voidReason: inv\.voidReason/);
-    expect(routeSrc).toMatch(/status: "VOIDED"/);
+    expect(routeSrc).toMatch(/status: InvoiceStatus\.VOIDED/);
   });
 });

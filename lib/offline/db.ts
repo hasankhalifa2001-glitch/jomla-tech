@@ -367,11 +367,15 @@ export function createOfflineVoidRecord(data: {
     quantity: number;
     unitPriceUSD: MoneyInput;
   }>;
-  originalTotalUSD: MoneyInput;
-  originalTotalSYP: MoneyInput;
+  originalTotalUSD?: MoneyInput;
+  originalTotalSYP?: MoneyInput;
+  totalUSD?: MoneyInput;
+  totalSYP?: MoneyInput;
   exchangeRateUsed: MoneyInput;
-  originalPaidAmountUSD: MoneyInput;
-  originalDebtAmountUSD: MoneyInput;
+  originalPaidAmountUSD?: MoneyInput;
+  originalDebtAmountUSD?: MoneyInput;
+  paidAmountUSD?: MoneyInput;
+  debtAmountUSD?: MoneyInput;
   createdAt?: Date;
   status?: OfflineSyncStatus;
   failureReason?: string;
@@ -410,6 +414,27 @@ export function createOfflineVoidRecord(data: {
     throw new Error("exchangeRateUsed must be strictly greater than 0.");
   }
 
+  const totalUSD =
+    data.originalTotalUSD !== undefined
+      ? subtractMoney("0", data.originalTotalUSD)
+      : serializeMoney(data.totalUSD ?? "0");
+  const totalSYP =
+    data.originalTotalSYP !== undefined
+      ? subtractMoney("0", data.originalTotalSYP)
+      : serializeMoney(data.totalSYP ?? "0");
+  const paidUSD =
+    data.originalPaidAmountUSD !== undefined
+      ? subtractMoney("0", data.originalPaidAmountUSD)
+      : data.paidAmountUSD !== undefined
+      ? serializeMoney(data.paidAmountUSD)
+      : "0.0000";
+  const debtUSD =
+    data.originalDebtAmountUSD !== undefined
+      ? subtractMoney("0", data.originalDebtAmountUSD)
+      : data.debtAmountUSD !== undefined
+      ? serializeMoney(data.debtAmountUSD)
+      : "0.0000";
+
   return {
     tenantId: data.tenantId,
     offlineId: data.offlineId || generateOfflineId(),
@@ -421,11 +446,11 @@ export function createOfflineVoidRecord(data: {
       quantity: item.quantity,
       unitPriceUSD: serializeMoney(item.unitPriceUSD),
     })),
-    totalUSD: subtractMoney("0", data.originalTotalUSD),
-    totalSYP: subtractMoney("0", data.originalTotalSYP),
+    totalUSD,
+    totalSYP,
     exchangeRateUsed: rateUsed,
-    paidAmountUSD: subtractMoney("0", data.originalPaidAmountUSD),
-    debtAmountUSD: subtractMoney("0", data.originalDebtAmountUSD),
+    paidAmountUSD: paidUSD,
+    debtAmountUSD: debtUSD,
     paymentMethod: undefined,
     voidsOfflineInvoiceId: data.voidsOfflineInvoiceId,
     voidReason: data.voidReason,

@@ -107,6 +107,9 @@ export async function uploadFileToStorage(params: UploadFileParams): Promise<str
     const client = getSupabaseClient();
     const bucket = process.env.SUPABASE_BUCKET_NAME as string;
 
+    console.log("DEBUG upload:", { bucket: JSON.stringify(bucket), key: params.key }); // ← مؤقت
+
+
     const { error } = await client.storage
         .from(bucket)
         .upload(params.key, params.buffer, {

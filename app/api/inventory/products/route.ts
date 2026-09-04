@@ -310,13 +310,20 @@ export async function POST(req: Request) {
 
     const { name, category, isPublic, units, initialBatch } = validation.data;
 
-    // PUBLISHING GATE RULE: block isPublic = true unless priceRetail and imageUrl are both filled in on at least one unit.
+    // PUBLISHING GATE RULE: [FIX] block isPublic = true unless imageUrl is
+    // filled in on at least one unit. `priceWholesale` is already required
+    // and strictly positive on every unit (see unitSchema above), so a
+    // real, charge-able price is guaranteed by construction and never
+    // needs to be re-checked here. `priceRetail` is a separate, optional
+    // "suggested resale price" hint shown to a buying retailer on the
+    // storefront (see ProductUnit.priceRetail in schema.prisma) — it is
+    // NEVER itself charged on any sale, POS or storefront alike, and must
+    // not be a precondition for publishing: a wholesaler listing plain
+    // wholesale-priced cartons with no suggested retail number attached
+    // must be able to.
     if (isPublic) {
       const isPublishable = units.some(
         (u) =>
-          u.priceRetail !== undefined &&
-          u.priceRetail !== null &&
-          u.priceRetail > 0 &&
           u.imageUrl !== undefined &&
           u.imageUrl !== null &&
           u.imageUrl.trim().length > 0
@@ -325,7 +332,7 @@ export async function POST(req: Request) {
         return NextResponse.json(
           {
             error: "PUBLISH_GATE_BLOCKED",
-            message: "لا يمكن نشر المنتج في المتجر إلا بعد تحديد سعر التجزئة وصورة للمنتج على الأقل.",
+            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة صورة للمنتج على الأقل.",
           },
           { status: 400 }
         );

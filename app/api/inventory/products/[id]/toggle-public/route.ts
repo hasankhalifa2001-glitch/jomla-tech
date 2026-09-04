@@ -61,13 +61,18 @@ export async function PATCH(
 
     const nextIsPublic = !existingProduct.isPublic;
 
-    // PUBLISHING GATE RULE: block isPublic = true unless priceRetail and imageUrl are both filled in on at least one unit.
+    // PUBLISHING GATE RULE: [FIX] same relaxation as the POST route —
+    // imageUrl only. `priceWholesale` is already required and strictly
+    // positive on every unit at creation time, so a real, charge-able
+    // price is guaranteed to exist by the time a product can even reach
+    // this toggle. `priceRetail` stays optional and is never a publishing
+    // requirement — it's a display-only suggested resale price for the
+    // storefront buyer, never itself charged, so a merchant publishing at
+    // plain wholesale price with no suggested retail number must be able
+    // to.
     if (nextIsPublic) {
       const isPublishable = existingProduct.units.some(
         (u) =>
-          u.priceRetail !== null &&
-          u.priceRetail !== undefined &&
-          Number(u.priceRetail) > 0 &&
           u.imageUrl !== null &&
           u.imageUrl !== undefined &&
           u.imageUrl.trim().length > 0
@@ -77,7 +82,7 @@ export async function PATCH(
         return NextResponse.json(
           {
             error: "PUBLISH_GATE_BLOCKED",
-            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة سعر التجزئة وصورة المنتج على الأقل.",
+            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة صورة للمنتج على الأقل.",
           },
           { status: 400 }
         );

@@ -28,17 +28,20 @@ export default function BillingSettingsPage() {
     try {
       const formData = new FormData();
       formData.append("file", receiptFile);
+      formData.append("type", "receipt"); // يحدد النوع فيتخطى قفل الاشتراك
 
-      const res = await fetch("/api/upload/receipt", {
+      const res = await fetch("/api/upload/receipt", { // تأكد هاد هو المسار الفعلي
         method: "POST",
         body: formData,
       });
 
-      if (res.ok) {
+      const data = await res.json().catch(() => null);
+
+      if (res.ok && data?.success) {
         toast.success("تم إرسال إيصال الدفع بنجاح. سيتم مراجعة الطلب وتفعيل الاشتراك في أقرب وقت.");
         setReceiptFile(null);
       } else {
-        toast.error("حدث خطأ أثناء رفع الإيصال.");
+        toast.error(data?.message || "حدث خطأ أثناء رفع الإيصال.");
       }
     } catch (err) {
       console.error(err);
