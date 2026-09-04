@@ -1,5 +1,13 @@
-import { auth } from "@/auth";
+import NextAuth from "next-auth";
 import { NextResponse } from "next/server";
+import { authConfig } from "@/auth.config";
+
+// Edge-safe: uses ONLY authConfig (no providers, no Prisma, no bcrypt,
+// no Upstash), instead of importing `auth` from "@/auth" — that import
+// would pull the full config (and everything it imports) into this
+// file's bundle, which is what pushed the middleware Edge Function past
+// Vercel's 1 MB Hobby-plan limit.
+const { auth } = NextAuth(authConfig);
 
 const DASHBOARD_PATH_PREFIXES = [
     "/dashboard", "/pos", "/inventory", "/ledger", "/orders", "/settings", "/account-locked",

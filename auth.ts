@@ -7,6 +7,7 @@ import { prisma } from "@/lib/db";
 import type { DefaultSession } from "next-auth";
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
+import { authConfig } from "@/auth.config";
 
 declare module "next-auth" {
     interface User {
@@ -115,6 +116,7 @@ const loginRatelimit =
         : null;
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
+    ...authConfig,
     providers: [
         Credentials({
             name: "credentials",
@@ -192,12 +194,6 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             },
         }),
     ],
-    session: {
-        strategy: "jwt",
-    },
-    pages: {
-        signIn: "/login",
-    },
     callbacks: {
         async jwt({ token, user, trigger }) {
             if (user) {
