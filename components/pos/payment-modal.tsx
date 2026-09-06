@@ -42,14 +42,27 @@ export type PaymentMode = "FULL_CASH" | "FULL_DEBT" | "PARTIAL";
 interface PaymentModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  totalUSD: MoneyInput;
+  // [v3.6] AUTHORITATIVE — the field every validation and the confirm
+  // action itself are built on. Always a valid numeric string once the
+  // cart has items (CartTotalsResult.totalSYP is never null).
+  totalSYP: MoneyInput;
+  // [v3.6] Accepted for interface compatibility with callers that already
+  // pass the cart's derived USD figure (e.g. pos-layout.tsx), but
+  // deliberately NOT read anywhere below. This modal derives its own USD
+  // display value from `totalSYP` + `exchangeRate` internally (see
+  // `safeTotalUSD`) — the same "never trust a second, independently-
+  // supplied number for the same amount" principle pos-service.ts and
+  // db.ts already apply (see the removed USD cross-check note in
+  // pos-service.ts). Accepting-but-ignoring it here means a caller can't
+  // accidentally feed this modal a USD figure that drifted from totalSYP.
+  totalUSD?: MoneyInput | null;
   exchangeRate: number;
   selectedCustomer: SelectedCustomer | null;
   onPaymentModeChange?: (mode: PaymentMode) => void;
   onOpenCustomerModal: () => void;
   onConfirmCheckout: (paymentData: {
-    paidAmountUSD: string;
-    debtAmountUSD: string;
+    paidAmountSYP: string;
+    debtAmountSYP: string;
     paymentMethod?: PaymentMethod;
   }) => Promise<void>;
 }
@@ -70,7 +83,7 @@ const PAYMENT_RAILS: {
 export function PaymentModal({
   open,
   onOpenChange,
-  totalUSD,
+  totalSYP,
   exchangeRate,
   selectedCustomer,
   onPaymentModeChange,
@@ -79,8 +92,8 @@ export function PaymentModal({
 }: PaymentModalProps) {
   const [mode, setMode] = useState<PaymentMode>("FULL_CASH");
   const [selectedRail, setSelectedRail] = useState<PaymentMethod>("CASH");
-  const [paidUSDInput, setPaidUSDInput] = useState<string>("");
   const [paidSYPInput, setPaidSYPInput] = useState<string>("");
+  const [paidUSDInput, setPaidUSDInput] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -100,41 +113,38 @@ export function PaymentModal({
     onOpenChange(next);
   }
 
-  // [FIX — fail-loud, not fail-silent] Previously this (and every other
-  // computed value below) was wrapped in `try { ... } catch { return
-  // "0.0000"; }`. That directly contradicts lib/utils/money.ts's own
-  // stated philosophy ("a silently-wrong number is strictly worse than a
-  // thrown error") — a genuinely malformed `totalUSD` reaching this modal
-  // (a real upstream bug) would have silently rendered "$0.00" and let the
-  // cashier attempt to check out a free sale, instead of surfacing the
-  // problem. `totalUSDValue` is now `null` on error instead of a fake
-  // zero, and the component renders a blocking error state (see below)
-  // rather than a payment form built on an untrustworthy number.
-  const totalUSDValue = useMemo(() => {
+  // [v3.6] FIX — this used to be `totalUSDValue`, serializing the
+  // (formerly authoritative) `totalUSD` prop. SYP is now the authoritative
+  // figure (schema.prisma / pos-service.ts / db.ts), so this modal's
+  // "can't build a trustworthy payment form" fail-loud guard now lives on
+  // `totalSYP` instead. A genuinely malformed `totalSYP` reaching this
+  // modal is a real upstream bug and must be surfaced (see the blocking
+  // error state below), never silently treated as "0".
+  const totalSYPValue = useMemo(() => {
     try {
-      return serializeMoney(totalUSD);
+      return serializeMoney(totalSYP);
     } catch {
       return null;
     }
-  }, [totalUSD]);
+  }, [totalSYP]);
 
-  // Unlike totalUSDValue above, a `null` SYP equivalent is a legitimate,
-  // already-communicated state ("غير متاح" in the UI below) — it just
-  // means no exchange rate is cached yet, not a computation error. USD
-  // remains the source of truth throughout this modal regardless, so this
-  // one is fine to keep as a soft fallback.
-  const safeTotalSYP = useMemo(() => {
+  // [v3.6] FIX — this used to be `safeTotalSYP`, converting FROM the
+  // authoritative USD figure. Now derives USD (display-only, may
+  // legitimately be `null` when no exchange rate is cached yet — same
+  // "غير متاح" UI treatment as before, just on the other currency) FROM
+  // the authoritative `totalSYPValue`.
+  const safeTotalUSD = useMemo(() => {
     try {
-      if (exchangeRate > 0 && totalUSDValue !== null) {
-        return convertCurrency(totalUSDValue, exchangeRate, "USD", "SYP");
+      if (exchangeRate > 0 && totalSYPValue !== null) {
+        return convertCurrency(totalSYPValue, exchangeRate, "SYP", "USD");
       }
       return null;
     } catch {
       return null;
     }
-  }, [totalUSDValue, exchangeRate]);
+  }, [totalSYPValue, exchangeRate]);
 
-  // [FIX — setState-in-effect] `totalUSDValue`/`safeTotalSYP` are already
+  // [FIX — setState-in-effect] `totalSYPValue`/`safeTotalUSD` are already
   // computed synchronously above (they're plain `useMemo`s, not state), so
   // this effect's body was calling six `setState` functions back-to-back,
   // directly and synchronously, the moment the effect ran — exactly the
@@ -151,7 +161,7 @@ export function PaymentModal({
   // this effect has already been cleaned up — e.g. `open` flips again, or
   // the modal unmounts, before the timeout fires.
   useEffect(() => {
-    if (!open || totalUSDValue === null) return;
+    if (!open || totalSYPValue === null) return;
 
     let cleared = false;
     const timeoutId = setTimeout(() => {
@@ -159,11 +169,11 @@ export function PaymentModal({
       setMode("FULL_CASH");
       onPaymentModeChange?.("FULL_CASH");
       setSelectedRail("CASH");
-      setPaidUSDInput(totalUSDValue);
-      if (safeTotalSYP) {
-        setPaidSYPInput(toDecimal(safeTotalSYP).toFixed(0));
+      setPaidSYPInput(toDecimal(totalSYPValue).toFixed(0));
+      if (safeTotalUSD) {
+        setPaidUSDInput(safeTotalUSD);
       } else {
-        setPaidSYPInput("");
+        setPaidUSDInput("");
       }
       setErrorMessage(null);
       setIsSubmitting(false);
@@ -178,30 +188,30 @@ export function PaymentModal({
 
   // Handle Mode Change
   function handleModeChange(newMode: PaymentMode) {
-    if (totalUSDValue === null) return;
+    if (totalSYPValue === null) return;
     setMode(newMode);
     onPaymentModeChange?.(newMode);
     setErrorMessage(null);
 
     if (newMode === "FULL_CASH") {
-      setPaidUSDInput(totalUSDValue);
-      if (safeTotalSYP) {
-        setPaidSYPInput(toDecimal(safeTotalSYP).toFixed(0));
+      setPaidSYPInput(toDecimal(totalSYPValue).toFixed(0));
+      if (safeTotalUSD) {
+        setPaidUSDInput(safeTotalUSD);
       }
     } else if (newMode === "FULL_DEBT") {
-      setPaidUSDInput("0.0000");
       setPaidSYPInput("0");
+      setPaidUSDInput("0.0000");
     } else if (newMode === "PARTIAL") {
       try {
-        const halfUSD = toDecimal(totalUSDValue).dividedBy(2).toFixed(4);
-        setPaidUSDInput(halfUSD);
+        const halfSYP = toDecimal(totalSYPValue).dividedBy(2).toFixed(0);
+        setPaidSYPInput(halfSYP);
         if (exchangeRate > 0) {
-          const halfSYP = convertCurrency(halfUSD, exchangeRate, "USD", "SYP");
-          setPaidSYPInput(toDecimal(halfSYP).toFixed(0));
+          const halfUSD = convertCurrency(halfSYP, exchangeRate, "SYP", "USD");
+          setPaidUSDInput(halfUSD);
         }
       } catch {
-        setPaidUSDInput("0.0000");
         setPaidSYPInput("0");
+        setPaidUSDInput("0.0000");
       }
     }
 
@@ -210,20 +220,8 @@ export function PaymentModal({
     }
   }
 
-  function handlePaidUSDChange(val: string) {
-    setPaidUSDInput(val);
-    try {
-      if (val.trim() && !isNaN(Number(val)) && Number(val) >= 0 && exchangeRate > 0) {
-        const syp = convertCurrency(val.trim(), exchangeRate, "USD", "SYP");
-        setPaidSYPInput(toDecimal(syp).toFixed(0));
-      } else {
-        setPaidSYPInput("");
-      }
-    } catch {
-      setPaidSYPInput("");
-    }
-  }
-
+  // [v3.6] Primary editing handler — SYP is the field the cashier's typed
+  // amount is trusted from.
   function handlePaidSYPChange(val: string) {
     setPaidSYPInput(val);
     try {
@@ -238,86 +236,102 @@ export function PaymentModal({
     }
   }
 
+  // Secondary/convenience handler — editing the USD field back-fills SYP,
+  // but SYP (via handlePaidSYPChange / paidSYPInput) remains what's
+  // actually validated and submitted below.
+  function handlePaidUSDChange(val: string) {
+    setPaidUSDInput(val);
+    try {
+      if (val.trim() && !isNaN(Number(val)) && Number(val) >= 0 && exchangeRate > 0) {
+        const syp = convertCurrency(val.trim(), exchangeRate, "USD", "SYP");
+        setPaidSYPInput(toDecimal(syp).toFixed(0));
+      } else {
+        setPaidSYPInput("");
+      }
+    } catch {
+      setPaidSYPInput("");
+    }
+  }
+
   // [FIX — critical] `paidInputParsed` is the RAW parsed value of what the
   // cashier actually typed — `null` if it isn't a valid number at all.
-  // Previously, a partial-payment amount greater than the invoice total
-  // was silently CLAMPED down to the total for the value that got saved
-  // (`computedPaidUSD`), while the on-screen input field kept showing
-  // whatever the cashier had typed. That meant the confirmed invoice could
-  // record a different `paidAmountUSD` than the number the cashier saw
-  // and approved — a real accounting discrepancy, not just a UI quirk.
-  // There is no more clamping anywhere in this file: an out-of-range or
+  // There is no clamping anywhere in this file: an out-of-range or
   // invalid amount is surfaced as a blocking validation error instead
   // (see `paidValidationError` below), and the confirm button is disabled
-  // until it's fixed. What's on screen and what gets saved are now
-  // guaranteed to be the same value.
+  // until it's fixed. What's on screen and what gets saved are guaranteed
+  // to be the same value.
+  //
+  // [v3.6] Now parses `paidSYPInput` (authoritative) instead of
+  // `paidUSDInput`.
   const paidInputParsed = useMemo(() => {
-    if (mode === "FULL_CASH") return totalUSDValue;
+    if (mode === "FULL_CASH") return totalSYPValue;
     if (mode === "FULL_DEBT") return "0.0000";
-    if (!paidUSDInput.trim()) return "0.0000";
+    if (!paidSYPInput.trim()) return "0.0000";
     try {
-      return serializeMoney(paidUSDInput.trim());
+      return serializeMoney(paidSYPInput.trim());
     } catch {
       return null;
     }
-  }, [mode, paidUSDInput, totalUSDValue]);
+  }, [mode, paidSYPInput, totalSYPValue]);
 
   const paidValidationError = useMemo(() => {
-    if (mode !== "PARTIAL" || totalUSDValue === null) return null;
+    if (mode !== "PARTIAL" || totalSYPValue === null) return null;
     if (paidInputParsed === null) {
       return "المبلغ المدخل غير صالح — يرجى إدخال رقم صحيح.";
     }
     if (compareMoney(paidInputParsed, 0) < 0) {
       return "لا يمكن أن يكون المبلغ المدفوع أقل من صفر.";
     }
-    if (compareMoney(paidInputParsed, totalUSDValue) > 0) {
-      return `المبلغ المدخل ($${formatMoney(paidInputParsed, "USD")}) أكبر من إجمالي الفاتورة ($${formatMoney(totalUSDValue, "USD")}) — يرجى تصحيح المبلغ.`;
+    if (compareMoney(paidInputParsed, totalSYPValue) > 0) {
+      return `المبلغ المدخل (${formatMoney(paidInputParsed, "SYP")} ل.س) أكبر من إجمالي الفاتورة (${formatMoney(totalSYPValue, "SYP")} ل.س) — يرجى تصحيح المبلغ.`;
     }
     return null;
-  }, [mode, paidInputParsed, totalUSDValue]);
+  }, [mode, paidInputParsed, totalSYPValue]);
 
   // Only ever equals what's on screen — never silently adjusted.
-  const computedPaidUSD = paidInputParsed ?? "0.0000";
+  const computedPaidSYP = paidInputParsed ?? "0.0000";
 
-  const computedDebtUSD = useMemo(() => {
-    if (totalUSDValue === null || paidValidationError) return "0.0000";
+  const computedDebtSYP = useMemo(() => {
+    if (totalSYPValue === null || paidValidationError) return "0.0000";
     try {
-      const debt = subtractMoney(totalUSDValue, computedPaidUSD);
+      const debt = subtractMoney(totalSYPValue, computedPaidSYP);
       return compareMoney(debt, 0) > 0 ? debt : "0.0000";
     } catch {
       return "0.0000";
     }
-  }, [totalUSDValue, computedPaidUSD, paidValidationError]);
+  }, [totalSYPValue, computedPaidSYP, paidValidationError]);
 
-  const computedPaidSYP = useMemo(() => {
+  // Derived/display-only — may be null with no cached rate. Never sent to
+  // onConfirmCheckout.
+  const computedPaidUSD = useMemo(() => {
     try {
       if (exchangeRate > 0) {
-        return convertCurrency(computedPaidUSD, exchangeRate, "USD", "SYP");
+        return convertCurrency(computedPaidSYP, exchangeRate, "SYP", "USD");
       }
       return null;
     } catch {
       return null;
     }
-  }, [computedPaidUSD, exchangeRate]);
+  }, [computedPaidSYP, exchangeRate]);
 
-  const computedDebtSYP = useMemo(() => {
+  const computedDebtUSD = useMemo(() => {
     try {
       if (exchangeRate > 0) {
-        return convertCurrency(computedDebtUSD, exchangeRate, "USD", "SYP");
+        return convertCurrency(computedDebtSYP, exchangeRate, "SYP", "USD");
       }
       return null;
     } catch {
       return null;
     }
-  }, [computedDebtUSD, exchangeRate]);
+  }, [computedDebtSYP, exchangeRate]);
 
   const isSystemCustomer = isSystemCashCustomer(selectedCustomer);
   const hasCustomer = !!selectedCustomer;
   const isDebtBlockedBySystemCustomer =
-    compareMoney(computedDebtUSD, 0) > 0 && (!hasCustomer || isSystemCustomer);
+    compareMoney(computedDebtSYP, 0) > 0 && (!hasCustomer || isSystemCustomer);
 
   const canConfirm =
-    totalUSDValue !== null &&
+    totalSYPValue !== null &&
     !paidValidationError &&
     !isDebtBlockedBySystemCustomer &&
     exchangeRate > 0;
@@ -325,7 +339,7 @@ export function PaymentModal({
   async function handleConfirm() {
     setErrorMessage(null);
 
-    if (totalUSDValue === null) {
+    if (totalSYPValue === null) {
       // Should be unreachable — the form is replaced by the blocking
       // error state below when this is null — but guarded here too since
       // this is the function that actually commits a sale.
@@ -350,14 +364,17 @@ export function PaymentModal({
       return;
     }
 
-    const hasPaidAmount = compareMoney(computedPaidUSD, 0) > 0;
+    const hasPaidAmount = compareMoney(computedPaidSYP, 0) > 0;
     const effectivePaymentMethod = hasPaidAmount ? selectedRail : undefined;
 
     setIsSubmitting(true);
     try {
+      // [v3.6] Sends only the SYP-authoritative fields — matches
+      // OfflineSalePayload (pos-service.ts), which no longer accepts
+      // totalUSD/paidAmountUSD/debtAmountUSD at all.
       await onConfirmCheckout({
-        paidAmountUSD: computedPaidUSD,
-        debtAmountUSD: computedDebtUSD,
+        paidAmountSYP: computedPaidSYP,
+        debtAmountSYP: computedDebtSYP,
         paymentMethod: effectivePaymentMethod,
       });
     } catch (err: unknown) {
@@ -374,7 +391,7 @@ export function PaymentModal({
   // can happen from this state, so it uses the raw `onOpenChange` prop
   // directly rather than `guardedOnOpenChange` — there is nothing for the
   // guard to protect against here.
-  if (open && totalUSDValue === null) {
+  if (open && totalSYPValue === null) {
     return (
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-md" dir="rtl">
@@ -399,14 +416,33 @@ export function PaymentModal({
 
   return (
     <Dialog open={open} onOpenChange={guardedOnOpenChange}>
-      <DialogContent className="sm:max-w-xl" dir="rtl">
+      {/*
+        [FIX — mobile overflow] `sm:max-w-xl` only caps the width from the
+        `sm` breakpoint up; below that shadcn's default Dialog width is a
+        fixed inset from the viewport edges, which is fine. Added
+        `max-h-[90vh] overflow-y-auto` because this dialog's content
+        (title + customer row + totals + 3 mode buttons + rail grid +
+        footer) is tall enough to exceed the viewport height on a short
+        phone screen in landscape or with the on-screen keyboard open —
+        without a scroll container the footer confirm button could end up
+        pushed off-screen and unreachable.
+      */}
+      <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto" dir="rtl">
         <DialogHeader>
-          <DialogTitle className="flex items-center justify-between text-lg font-bold text-zinc-900 dark:text-zinc-100">
+          {/*
+            [FIX — mobile overflow] The title text ("إتمام الدفع واختيار
+            وسيلة التحصيل") plus the exchange-rate Badge used to share one
+            `justify-between` row. On a ~320-375px phone, after dialog
+            padding, that combination doesn't reliably fit on one line —
+            stacked here below `sm`, side-by-side from `sm` up where
+            there's room.
+          */}
+          <DialogTitle className="flex flex-col items-start gap-1.5 sm:flex-row sm:items-center sm:justify-between text-lg font-bold text-zinc-900 dark:text-zinc-100">
             <span className="flex items-center gap-2">
-              <Receipt className="h-5 w-5 text-emerald-600" />
+              <Receipt className="h-5 w-5 text-emerald-600 shrink-0" />
               إتمام الدفع واختيار وسيلة التحصيل
             </span>
-            <Badge variant="outline" className="text-xs">
+            <Badge variant="outline" className="text-xs shrink-0">
               سعر الصرف: {formatMoney(exchangeRate, "SYP")} ل.س
             </Badge>
           </DialogTitle>
@@ -423,16 +459,26 @@ export function PaymentModal({
           </div>
         )}
 
-        {/* Customer Header Info */}
+        {/*
+          Customer Header Info.
+          [FIX — mobile overflow] Neither side of this row could shrink or
+          truncate before: a long registered customer name on the left
+          and a long button label ("اختر زبوناً للدين") on the right, both
+          sitting in a plain `justify-between` flex row, could together
+          exceed a narrow dialog's width with nothing able to give way.
+          `flex-wrap` lets the button drop to its own line if needed, and
+          `min-w-0` + `truncate` on the name block lets a long customer
+          name shorten instead of forcing an overflow.
+        */}
         <div
-          className={`flex items-center justify-between rounded-xl p-3 border transition-colors ${isDebtBlockedBySystemCustomer
+          className={`flex flex-wrap items-center justify-between gap-2 rounded-xl p-3 border transition-colors ${isDebtBlockedBySystemCustomer
             ? "bg-red-50/80 border-red-300 dark:bg-red-950/40 dark:border-red-800"
             : "bg-zinc-50 border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800"
             }`}
         >
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
             <div
-              className={`flex h-8 w-8 items-center justify-center rounded-lg ${isSystemCustomer
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${isSystemCustomer
                 ? "bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300"
                 : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
                 }`}
@@ -443,11 +489,11 @@ export function PaymentModal({
                 <UserCheck className="h-4 w-4" />
               )}
             </div>
-            <div>
+            <div className="min-w-0">
               <span className="text-[10px] text-zinc-400 block">
                 الزبون المرفق بالفاتورة
               </span>
-              <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200">
+              <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200 block truncate">
                 {isSystemCustomer
                   ? "زبون نقدي عام (مبيعات نقدية فقط)"
                   : selectedCustomer
@@ -462,7 +508,7 @@ export function PaymentModal({
             variant="outline"
             size="sm"
             onClick={onOpenCustomerModal}
-            className={`text-xs h-8 gap-1 font-semibold ${isDebtBlockedBySystemCustomer
+            className={`text-xs h-8 gap-1 font-semibold shrink-0 ${isDebtBlockedBySystemCustomer
               ? "bg-red-600 hover:bg-red-700 text-white border-red-600"
               : ""
               }`}
@@ -487,23 +533,35 @@ export function PaymentModal({
           </div>
         )}
 
-        {/* Total Overview Cards */}
+        {/*
+          Total Overview Cards.
+          [v3.6] FIX — SYP is now the primary/authoritative card (was the
+          "المعادل" secondary card before); USD is now the derived,
+          possibly-unavailable secondary card (was the primary "إجمالي
+          الفاتورة بالدولار" card before).
+          [FIX — mobile overflow] Large SYP totals (6-7 digits + "ل.س")
+          at `text-xl font-extrabold` could get tight inside a ~150px-wide
+          card on a 320px phone. Stepped the size down to `text-lg` below
+          `sm` and back up to `text-xl` from `sm` up, and allowed the
+          figure to wrap onto a second line (`break-words`) instead of
+          silently overflowing its card on the narrowest screens.
+        */}
         <div className="grid grid-cols-2 gap-3 text-center">
           <div className="rounded-xl bg-emerald-50/70 p-2.5 border border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-900">
             <span className="text-[11px] text-emerald-800 dark:text-emerald-300 font-semibold block">
-              إجمالي الفاتورة بالدولار
+              إجمالي الفاتورة بالليرة السورية
             </span>
-            <span className="text-xl font-extrabold text-emerald-700 dark:text-emerald-400">
-              ${formatMoney(totalUSDValue as string, "USD")}
+            <span className="text-lg sm:text-xl font-extrabold text-emerald-700 dark:text-emerald-400 wrap-break-word">
+              {formatMoney(totalSYPValue as string, "SYP")} ل.س
             </span>
           </div>
 
           <div className="rounded-xl bg-purple-50/70 p-2.5 border border-purple-200 dark:bg-purple-950/30 dark:border-purple-900">
             <span className="text-[11px] text-purple-800 dark:text-purple-300 font-semibold block">
-              المعادل بالليرة السورية
+              المعادل بالدولار
             </span>
-            <span className="text-xl font-extrabold text-purple-700 dark:text-purple-400">
-              {safeTotalSYP ? `${formatMoney(safeTotalSYP, "SYP")} ل.س` : "غير متاح"}
+            <span className="text-lg sm:text-xl font-extrabold text-purple-700 dark:text-purple-400 wrap-break-word">
+              {safeTotalUSD ? `$${formatMoney(safeTotalUSD, "USD")}` : "غير متاح"}
             </span>
           </div>
         </div>
@@ -513,12 +571,24 @@ export function PaymentModal({
           <Label className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
             نوع السداد
           </Label>
-          <div className="grid grid-cols-3 gap-2">
+          {/*
+            [FIX — mobile clipping] Three Arabic labels — including
+            "على الحساب (دين)" — plus an amount line, squeezed into
+            `grid-cols-3` at a fixed `h-11`, is workable on a tablet/
+            desktop-width dialog but too tight on a 320-375px phone: the
+            label can wrap inside a height that wasn't sized for two
+            lines, clipping it. Stacked to one column below `sm` (each
+            button becomes a full-width row with plenty of room) and back
+            to three columns from `sm` up. `min-h-11` (was `h-11`) lets a
+            button grow if its content ever needs a touch more vertical
+            space, without shrinking below a comfortable tap target.
+          */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             <Button
               type="button"
               variant={mode === "FULL_CASH" ? "default" : "outline"}
               onClick={() => handleModeChange("FULL_CASH")}
-              className={`h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_CASH"
+              className={`min-h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_CASH"
                 ? "bg-emerald-600 hover:bg-emerald-700 text-white"
                 : ""
                 }`}
@@ -528,7 +598,7 @@ export function PaymentModal({
                 <span>نقدي بالكامل</span>
               </div>
               <span className="text-[10px] opacity-80">
-                ${formatMoney(totalUSDValue as string, "USD")}
+                {formatMoney(totalSYPValue as string, "SYP")} ل.س
               </span>
             </Button>
 
@@ -536,7 +606,7 @@ export function PaymentModal({
               type="button"
               variant={mode === "FULL_DEBT" ? "default" : "outline"}
               onClick={() => handleModeChange("FULL_DEBT")}
-              className={`h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_DEBT"
+              className={`min-h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_DEBT"
                 ? "bg-red-600 hover:bg-red-700 text-white"
                 : ""
                 }`}
@@ -545,14 +615,14 @@ export function PaymentModal({
                 <CreditCard className="h-3.5 w-3.5" />
                 <span>على الحساب (دين)</span>
               </div>
-              <span className="text-[10px] opacity-80">0$ مدفوع</span>
+              <span className="text-[10px] opacity-80">0 ل.س مدفوع</span>
             </Button>
 
             <Button
               type="button"
               variant={mode === "PARTIAL" ? "default" : "outline"}
               onClick={() => handleModeChange("PARTIAL")}
-              className={`h-11 flex-col gap-0.5 text-xs font-bold ${mode === "PARTIAL"
+              className={`min-h-11 flex-col gap-0.5 text-xs font-bold ${mode === "PARTIAL"
                 ? "bg-blue-600 hover:bg-blue-700 text-white"
                 : ""
                 }`}
@@ -575,22 +645,7 @@ export function PaymentModal({
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <span className="text-[10px] text-zinc-500 mb-1 block">
-                  المبلغ بالدولار ($)
-                </span>
-                <Input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  value={paidUSDInput}
-                  onChange={(e) => handlePaidUSDChange(e.target.value)}
-                  className={`text-xs font-bold text-center bg-white dark:bg-zinc-900 font-mono ${paidValidationError ? "border-red-400 focus-visible:ring-red-400" : ""
-                    }`}
-                />
-              </div>
-
-              <div>
-                <span className="text-[10px] text-zinc-500 mb-1 block">
-                  المعادل بالليرة (ل.س)
+                  المبلغ بالليرة (ل.س)
                 </span>
                 <Input
                   type="number"
@@ -598,6 +653,21 @@ export function PaymentModal({
                   min="0"
                   value={paidSYPInput}
                   onChange={(e) => handlePaidSYPChange(e.target.value)}
+                  className={`text-xs font-bold text-center bg-white dark:bg-zinc-900 font-mono ${paidValidationError ? "border-red-400 focus-visible:ring-red-400" : ""
+                    }`}
+                />
+              </div>
+
+              <div>
+                <span className="text-[10px] text-zinc-500 mb-1 block">
+                  المعادل بالدولار ($)
+                </span>
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={paidUSDInput}
+                  onChange={(e) => handlePaidUSDChange(e.target.value)}
                   className="text-xs font-bold text-center bg-white dark:bg-zinc-900 font-mono"
                 />
               </div>
@@ -613,15 +683,22 @@ export function PaymentModal({
               </div>
             )}
 
-            {/* Calculated Breakdown */}
-            <div className="flex items-center justify-between text-xs pt-1 border-t border-blue-100 dark:border-blue-900">
+            {/*
+              Calculated Breakdown.
+              [FIX — mobile overflow] Was a single `justify-between` row
+              with a long label on one side and a long, two-currency
+              figure ("270,000 ل.س (≈ $2.00)") on the other — the exact
+              combination most likely to overflow a narrow dialog. Allowed
+              wrapping and let the figure take its own line under the
+              label when space is tight, instead of forcing one line.
+            */}
+            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-xs pt-1 border-t border-blue-100 dark:border-blue-900">
               <span className="text-zinc-600 dark:text-zinc-400">
                 المتبقي على الحساب (دين):
               </span>
               <span className="font-bold text-red-600 dark:text-red-400 font-mono">
-                ${formatMoney(computedDebtUSD, "USD")} (
-                {computedDebtSYP ? `${formatMoney(computedDebtSYP, "SYP")} ل.س` : ""}
-                )
+                {formatMoney(computedDebtSYP, "SYP")} ل.س
+                {computedDebtUSD ? ` (≈ $${formatMoney(computedDebtUSD, "USD")})` : ""}
               </span>
             </div>
           </div>
@@ -658,15 +735,25 @@ export function PaymentModal({
           </div>
         )}
 
-        {/* Final Confirmation Buttons */}
-        <div className="flex justify-end gap-2 pt-2 border-t border-zinc-200 dark:border-zinc-800">
+        {/*
+          Final Confirmation Buttons.
+          [FIX — mobile overflow] Two buttons in a plain `justify-end` row
+          don't wrap or shrink — the confirm button's label changes
+          dynamically ("اختر زبوناً لإتمام الدين", "تأكيد وحفظ الفاتورة
+          محلياً") and some of those strings are long enough that, next to
+          the Cancel button, the pair can exceed a narrow dialog's width
+          with no fallback. Stacked full-width (confirm on top, since
+          it's the primary action) below `sm`, back to a compact
+          right-aligned row from `sm` up.
+        */}
+        <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-2 border-t border-zinc-200 dark:border-zinc-800">
           <Button
             type="button"
             variant="outline"
             size="sm"
             onClick={() => guardedOnOpenChange(false)}
             disabled={isSubmitting}
-            className="text-xs"
+            className="text-xs w-full sm:w-auto"
           >
             إلغاء
           </Button>
@@ -676,7 +763,7 @@ export function PaymentModal({
             size="sm"
             onClick={handleConfirm}
             disabled={isSubmitting || !canConfirm}
-            className={`text-xs font-bold px-5 ${!canConfirm
+            className={`text-xs font-bold px-5 w-full sm:w-auto ${!canConfirm
               ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
               : "bg-emerald-600 hover:bg-emerald-700 text-white"
               }`}

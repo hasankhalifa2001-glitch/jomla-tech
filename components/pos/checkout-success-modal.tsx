@@ -56,7 +56,11 @@ export function CheckoutSuccessModal({
     ? paymentMethodLabels[currentMethod] || currentMethod
     : "على الحساب بالكامل (دين)";
 
-  const isDebtPresent = compareMoney(invoice.debtAmountUSD, 0) > 0;
+  // [v3.6] FIX — was checking debtAmountUSD (derived/informational).
+  // debtAmountSYP is the authoritative field on OfflineInvoice
+  // (pos-service.ts / db.ts) — the check that actually decides whether
+  // any debt exists must run on it, not on the USD figure derived from it.
+  const isDebtPresent = compareMoney(invoice.debtAmountSYP, 0) > 0;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -143,7 +147,21 @@ export function CheckoutSuccessModal({
             </div>
 
             {items.map((item, idx) => {
-              const lineUSD = multiplyMoney(item.unitPriceUSD, item.quantity);
+              // [v3.6] FIX — was `multiplyMoney(item.unitPriceUSD, ...)`.
+              // item.unitPriceUSD is `string | null` on CartLineItem
+              // (pos-service.ts) — it is only ever null when the item was
+              // added to the cart with no exchange rate cached yet. Calling
+              // multiplyMoney on `null` throws a MoneyError inside
+              // money.ts's toDecimal(), which would have crashed this
+              // entire modal the moment such an item appeared in a
+              // completed sale. item.unitPriceSYP is the always-present,
+              // authoritative field and is used for the actual line total;
+              // the USD figure is now a guarded, optional secondary value.
+              const lineSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
+              const lineUSD =
+                item.unitPriceUSD !== null
+                  ? multiplyMoney(item.unitPriceUSD, item.quantity)
+                  : null;
               return (
                 <div
                   key={idx}
@@ -158,15 +176,31 @@ export function CheckoutSuccessModal({
                   <span className="col-span-2 text-center font-mono">
                     {item.quantity}
                   </span>
-                  <div className="col-span-4 text-left font-bold text-zinc-800 dark:text-zinc-200 font-mono">
-                    ${formatMoney(lineUSD, "USD")}
+                  <div className="col-span-4 text-left font-mono">
+                    <p className="font-bold text-zinc-800 dark:text-zinc-200">
+                      {formatMoney(lineSYP, "SYP")} ل.س
+                    </p>
+                    {lineUSD !== null && (
+                      <p className="text-[10px] text-purple-600 dark:text-purple-400 font-semibold">
+                        ≈ ${formatMoney(lineUSD, "USD")}
+                      </p>
+                    )}
                   </div>
                 </div>
               );
             })}
           </div>
 
-          {/* Financial Totals */}
+          {/*
+            Financial Totals.
+            [v3.6] FIX — every row below used to show the USD figure as
+            the large/primary value (totalUSD, paidAmountUSD,
+            debtAmountUSD), with SYP either absent or a small secondary
+            note. All persisted OfflineInvoice fields' SYP counterparts
+            are authoritative and always present (db.ts derives USD from
+            them, never the reverse) — SYP is now the primary figure on
+            every row, USD the secondary "≈" one.
+          */}
           <div className="space-y-1 pt-2 border-t border-zinc-200 dark:border-zinc-800">
             <div className="flex justify-between text-xs font-bold">
               <span className="text-zinc-600 dark:text-zinc-400">
@@ -174,10 +208,10 @@ export function CheckoutSuccessModal({
               </span>
               <div className="text-left">
                 <span className="text-emerald-700 dark:text-emerald-400 font-extrabold ml-2 font-mono">
-                  ${formatMoney(invoice.totalUSD, "USD")}
+                  {formatMoney(invoice.totalSYP, "SYP")} ل.س
                 </span>
                 <span className="text-purple-600 dark:text-purple-400 text-[11px]">
-                  ({formatMoney(invoice.totalSYP, "SYP")} ل.س)
+                  (≈ ${formatMoney(invoice.totalUSD, "USD")})
                 </span>
               </div>
             </div>
@@ -191,17 +225,27 @@ export function CheckoutSuccessModal({
 
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">المبلغ المدفوع:</span>
-              <span className="font-bold text-emerald-600 font-mono">
-                ${formatMoney(invoice.paidAmountUSD, "USD")}
-              </span>
+              <div className="text-left">
+                <span className="font-bold text-emerald-600 font-mono">
+                  {formatMoney(invoice.paidAmountSYP, "SYP")} ل.س
+                </span>
+                <span className="text-purple-600 dark:text-purple-400 text-[10px] mr-1">
+                  (≈ ${formatMoney(invoice.paidAmountUSD, "USD")})
+                </span>
+              </div>
             </div>
 
             {isDebtPresent && (
               <div className="flex justify-between text-xs font-bold text-red-600 dark:text-red-400">
                 <span>المتبقي على الحساب (دين):</span>
-                <span className="font-mono">
-                  ${formatMoney(invoice.debtAmountUSD, "USD")}
-                </span>
+                <div className="text-left">
+                  <span className="font-mono">
+                    {formatMoney(invoice.debtAmountSYP, "SYP")} ل.س
+                  </span>
+                  <span className="text-[10px] font-semibold mr-1 opacity-80">
+                    (≈ ${formatMoney(invoice.debtAmountUSD, "USD")})
+                  </span>
+                </div>
               </div>
             )}
           </div>

@@ -8,6 +8,7 @@ import {
   getOfflineProducts,
   submitOfflineSale,
   seedSampleOfflineData,
+  syncProductsFromServer,
   getOfflineInvoicesList,
   calculateCartTotals,
   getSystemCashCustomer,
@@ -37,6 +38,7 @@ import { Button } from "@/components/ui/button";
 import {
   Layers,
   Sparkles,
+  RefreshCw,
   CloudOff,
   Keyboard,
   DollarSign,
@@ -60,6 +62,7 @@ export function PosLayout() {
   const [isLoadingProducts, setIsLoadingProducts] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [pendingInvoicesCount, setPendingInvoicesCount] = useState(0);
+  const [isSyncingProducts, setIsSyncingProducts] = useState(false);
 
   // Cart & Customer states
   const [cartItems, setCartItems] = useState<CartLineItem[]>([]);
@@ -170,28 +173,72 @@ export function PosLayout() {
     if (!isDbReady) return;
 
     const requestId = ++productsRequestIdRef.current;
-    setIsLoadingProducts(true);
 
-    getOfflineProducts(tenantId, searchQuery)
-      .then((prods) => {
+    // [FIX — React "setState synchronously within an effect" warning]
+    // Wrapped in an inner async function instead of calling
+    // setIsLoadingProducts(true) directly as the first statement of the
+    // effect body. React (and the Next.js dev overlay) flags a setState
+    // call that runs synchronously in an effect's body as a potential
+    // cascading-render risk — not a bug, but a best-practice nudge.
+    // Moving the setState calls inside `run()` doesn't change the
+    // request-id race-guard logic at all (see productsRequestIdRef
+    // comment above); it only changes WHEN, relative to React's own
+    // render/commit cycle, the state updates are scheduled.
+    async function run() {
+      setIsLoadingProducts(true);
+      try {
+        const prods = await getOfflineProducts(tenantId, searchQuery);
         // Only the most recently issued request is allowed to write to
         // state — an older, slower-resolving request for a previous
         // keystroke is discarded here even if it resolves later.
         if (productsRequestIdRef.current === requestId) {
           setProducts(prods);
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         if (productsRequestIdRef.current === requestId) {
           console.error("Failed to load POS products:", err);
         }
-      })
-      .finally(() => {
+      } finally {
         if (productsRequestIdRef.current === requestId) {
           setIsLoadingProducts(false);
         }
-      });
+      }
+    }
+
+    void run();
   }, [isDbReady, searchQuery, tenantId]);
+
+  // 1d. Opportunistic initial product sync from the server (Postgres ->
+  // Dexie). Fires once per tenant/DB-ready change, independent of
+  // searchQuery. This closes the gap where `cachedProducts` previously had
+  // no path to ever receive a tenant's REAL catalog — only
+  // `seedSampleOfflineData`'s hardcoded demo products ever wrote to it.
+  //
+  // Deliberately silent on failure (offline, fetch error): this must never
+  // block or interrupt a cashier who may be legitimately offline and
+  // relying on whatever was cached during the last successful sync. See
+  // lib/offline/product-sync.ts for the "OFFLINE"/"FETCH_FAILED" reasons
+  // this swallows here — the manual "مزامنة المنتجات" button below is the
+  // path that surfaces those to the user instead.
+  useEffect(() => {
+    if (!isDbReady || !tenantId) return;
+    let isMounted = true;
+
+    syncProductsFromServer(tenantId).then((result) => {
+      if (!isMounted || !result.success) return;
+      // Re-run the same read the search effect (1c) uses, so newly-synced
+      // products appear immediately without requiring the cashier to
+      // retype their search query.
+      getOfflineProducts(tenantId, searchQuery).then((prods) => {
+        if (isMounted) setProducts(prods);
+      });
+    });
+
+    return () => {
+      isMounted = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDbReady, tenantId]);
 
   // Cart Totals calculation strictly through decimal.js
   const cartTotals = useMemo(() => {
@@ -238,14 +285,29 @@ export function PosLayout() {
   ]);
 
   // 3. Cart Management Operations
+  //
+  // [v3.6] FIX — this handler previously only captured `unitPriceUSD` from
+  // resolveCartLinePrices() and never stored `unitPriceSYP` on the cart
+  // line at all, even though CartLineItem (pos-service.ts) has required
+  // `unitPriceSYP: string` since the v3.6 re-anchoring. That omission
+  // meant every cart line was missing the ONE field calculateCartTotals()
+  // actually multiplies by quantity — adding anything to the cart would
+  // have thrown inside money.ts's toDecimal() the moment totals were
+  // computed. Both prices (SYP authoritative, USD derived/nullable) are
+  // now captured and stored, matching resolveCartLinePrices()'s real
+  // return shape.
   function handleAddToCart(product: PosProductItem, unit: CachedProductUnit) {
     const cartItemId = `${product.id}-${unit.id}`;
 
-    let unitPriceUSD: string;
-    let priceRetailUSD: string | undefined;
+    let unitPriceSYP: string;
+    let unitPriceUSD: string | null;
+    let priceRetailSYP: string | undefined;
+    let priceRetailUSD: string | null | undefined;
     try {
       const prices = resolveCartLinePrices(unit, product, dailyExchangeRate);
+      unitPriceSYP = prices.unitPriceSYP;
       unitPriceUSD = prices.unitPriceUSD;
+      priceRetailSYP = prices.priceRetailSYP;
       priceRetailUSD = prices.priceRetailUSD;
     } catch (err) {
       toast.error(
@@ -274,7 +336,9 @@ export function PosLayout() {
         unitName: unit.unitName,
         conversionFactor: unit.conversionFactor,
         quantity: 1,
+        unitPriceSYP,
         unitPriceUSD,
+        priceRetailSYP,
         priceRetailUSD,
       };
       return [...prev, newItem];
@@ -305,6 +369,11 @@ export function PosLayout() {
     );
   }
 
+  // [v3.6] FIX — same omission as handleAddToCart above: this rebuilt the
+  // cart line's price fields on a unit change but only ever wrote
+  // `unitPriceUSD`, silently dropping `unitPriceSYP` on the item that
+  // changed. Now updates all four price fields returned by
+  // resolveCartLinePrices().
   function handleChangeUnit(cartId: string, newUnitId: string) {
     setCartItems((prev) =>
       prev.map((item) => {
@@ -323,7 +392,9 @@ export function PosLayout() {
                 unitId: selectedUnit.id,
                 unitName: selectedUnit.unitName,
                 conversionFactor: selectedUnit.conversionFactor,
+                unitPriceSYP: prices.unitPriceSYP,
                 unitPriceUSD: prices.unitPriceUSD,
+                priceRetailSYP: prices.priceRetailSYP,
                 priceRetailUSD: prices.priceRetailUSD,
               };
             } catch (err) {
@@ -351,9 +422,25 @@ export function PosLayout() {
   }
 
   // 4. Offline Checkout Submission
+  //
+  // [v3.6] FIX — this previously took `paidAmountUSD`/`debtAmountUSD` from
+  // the payment step and forwarded `totalUSD`/`paidAmountUSD`/
+  // `debtAmountUSD` straight into submitOfflineSale()'s payload. None of
+  // those fields exist on OfflineSalePayload anymore (pos-service.ts):
+  // the payload now only accepts the SYP-authoritative fields
+  // (totalSYP/paidAmountSYP/debtAmountSYP) and derives USD itself inside
+  // createOfflineInvoiceRecord. This now takes paidAmountSYP/debtAmountSYP
+  // from the payment step and forwards only the SYP fields.
+  //
+  // NOTE: this requires payment-modal.tsx's own onConfirmCheckout callback
+  // to be updated to compute and pass `paidAmountSYP`/`debtAmountSYP`
+  // (leading its own payment UI with SYP, same as everywhere else) instead
+  // of the old USD amounts — that file wasn't included here, so it needs
+  // the matching change on its side for this to compile and work end to
+  // end.
   async function handleConfirmCheckout(paymentData: {
-    paidAmountUSD: string;
-    debtAmountUSD: string;
+    paidAmountSYP: string;
+    debtAmountSYP: string;
     paymentMethod?: PaymentMethod;
   }) {
     if (!dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0) {
@@ -367,17 +454,16 @@ export function PosLayout() {
         : await getSystemCashCustomer(tenantId);
     }
 
-    const { totalUSD, totalSYP } = calculateCartTotals(cartItems, dailyExchangeRate);
+    const { totalSYP } = calculateCartTotals(cartItems, dailyExchangeRate);
 
     // Save offline invoice strictly into Dexie
     const savedInvoice = await submitOfflineSale(tenantId, {
       customer,
       items: cartItems,
-      totalUSD,
-      totalSYP: totalSYP ?? "0",
+      totalSYP,
       exchangeRateUsed: serializeMoney(dailyExchangeRate),
-      paidAmountUSD: paymentData.paidAmountUSD,
-      debtAmountUSD: paymentData.debtAmountUSD,
+      paidAmountSYP: paymentData.paidAmountSYP,
+      debtAmountSYP: paymentData.debtAmountSYP,
       paymentMethod: paymentData.paymentMethod,
     });
 
@@ -453,57 +539,163 @@ export function PosLayout() {
     }
   }
 
+  // Manual product sync (server -> Dexie). Unlike the opportunistic effect
+  // above (1d), this surfaces success/failure to the cashier/admin
+  // explicitly — meant to be used right after adding/editing a product in
+  // Inventory, when the person wants it usable in the POS immediately
+  // instead of waiting for the next POS mount.
+  async function handleSyncProducts() {
+    if (!tenantId) {
+      toast.error("لا يمكن مزامنة الأصناف دون تحديد هوية المتجر (تسجيل الدخول مطلوب).");
+      return;
+    }
+
+    setIsSyncingProducts(true);
+    try {
+      const result = await syncProductsFromServer(tenantId);
+      if (result.success) {
+        const prods = await getOfflineProducts(tenantId, searchQuery);
+        setProducts(prods);
+        toast.success(`تمت مزامنة ${result.count} صنف من السيرفر بنجاح.`);
+      } else if (result.reason === "OFFLINE") {
+        toast.error("لا يوجد اتصال بالإنترنت — تعذّرت مزامنة الأصناف.");
+      } else {
+        toast.error("حدث خطأ أثناء مزامنة الأصناف من السيرفر.");
+      }
+    } finally {
+      setIsSyncingProducts(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-[calc(100vh-8.5rem)] space-y-3 relative" dir="rtl">
-      {/* Top POS Action & Status Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900 shadow-xs shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <Badge
-              variant="outline"
-              className="gap-1.5 px-2.5 py-1 text-xs border-emerald-300 bg-emerald-50 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800 font-semibold"
-            >
-              <Layers className="h-3.5 w-3.5 text-emerald-600" />
-              <span>قاعدة Dexie: {isDbReady ? "جاهزة ✓" : "جاري التهيئة..."}</span>
-            </Badge>
+      {/*
+        Top POS Action & Status Bar — reworked for density on mobile.
 
-            <Badge
-              variant="outline"
-              className="gap-1.5 px-2.5 py-1 text-xs border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800 font-semibold"
-            >
-              <CloudOff className="h-3.5 w-3.5 text-amber-600" />
-              <span>فواتير بانتظار المزامنة: {pendingInvoicesCount}</span>
-            </Badge>
+        Design changes vs. the previous version:
+        1. "قاعدة Dexie: جاهزة" is no longer a permanent text badge — it's
+           a small status dot with a tooltip. It rarely changes state
+           during a shift, so it doesn't deserve constant label-width.
+        2. The "فواتير بانتظار المزامنة" badge only renders when the count
+           is > 0. A "0" badge told the cashier nothing and cost a full
+           badge's width on every screen size.
+        3. The exchange-rate badge drops its "سعر الصرف:" label below the
+           sm breakpoint — the number + icon is enough once you already
+           know what the badge is for.
+        4. "مزامنة الأصناف" and "تهيئة بيانات تجريبية" collapse to
+           icon-only buttons below lg (with a title tooltip) and expand to
+           full labeled buttons on lg+, where there's room. These are
+           secondary/admin actions — they shouldn't compete with the
+           primary search-and-sell flow for mobile width.
+        5. Hover states on secondary buttons switched from
+           emerald-tinted to neutral zinc, so emerald reads consistently
+           as "this is the important/primary action" (exchange-rate
+           badge, sync spinner icon, mobile checkout bar) rather than
+           being sprinkled across every interactive element.
+      */}
+      <div className="flex items-center justify-between gap-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 sm:p-3 dark:border-zinc-800 dark:bg-zinc-900 shadow-xs shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${isDbReady ? "bg-emerald-500" : "bg-zinc-300 animate-pulse"
+                }`}
+              title={isDbReady ? "قاعدة البيانات المحلية جاهزة" : "جاري تهيئة قاعدة البيانات..."}
+            />
+            {pendingInvoicesCount > 0 && (
+              <Badge
+                variant="outline"
+                className="gap-1 px-2 py-0.5 text-[11px] border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800 font-semibold whitespace-nowrap"
+              >
+                <CloudOff className="h-3 w-3 text-amber-600" />
+                <span>{pendingInvoicesCount} بانتظار المزامنة</span>
+              </Badge>
+            )}
           </div>
 
-          <div className="hidden md:flex items-center gap-1.5 text-[11px] text-zinc-500 mr-2">
+          <div className="hidden lg:flex items-center gap-1.5 text-[11px] text-zinc-500 mr-1 shrink-0">
             <Keyboard className="h-3.5 w-3.5 text-zinc-400" />
             <span>
-              اختصارات: <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">F2</kbd> بحث • <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">F4</kbd> زبون • <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">F9</kbd> دفع
+              اختصارات:{" "}
+              <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">
+                F2
+              </kbd>{" "}
+              بحث •{" "}
+              <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">
+                F4
+              </kbd>{" "}
+              زبون •{" "}
+              <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">
+                F9
+              </kbd>{" "}
+              دفع
             </span>
           </div>
         </div>
 
-        {/* Right side controls (Exchange Rate & Seeder) */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           {dailyExchangeRate && compareMoney(dailyExchangeRate, 0) > 0 ? (
-            <Badge className="bg-emerald-600 text-white gap-1 text-xs px-2.5 py-1 font-semibold">
+            <Badge className="bg-emerald-600 text-white gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap">
               <DollarSign className="h-3.5 w-3.5" />
-              <span>سعر الصرف: {formatMoney(dailyExchangeRate, "SYP")} ل.س / $</span>
+              <span className="hidden sm:inline">سعر الصرف: </span>
+              <span>{formatMoney(dailyExchangeRate, "SYP")} ل.س</span>
             </Badge>
           ) : (
-            <Badge variant="destructive" className="gap-1 text-xs px-2.5 py-1 font-semibold">
+            <Badge
+              variant="destructive"
+              className="gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap"
+            >
               <AlertTriangle className="h-3.5 w-3.5" />
-              <span>سعر الصرف غير محدد! (البيع موقوف)</span>
+              <span className="hidden sm:inline">سعر الصرف غير محدد!</span>
+              <span className="sm:hidden">لا يوجد سعر صرف</span>
             </Badge>
           )}
 
+          {/* Sync products — icon-only under lg, labeled button on lg+ */}
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={handleSyncProducts}
+            disabled={isSyncingProducts}
+            className="h-8 w-8 lg:hidden text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
+            title="مزامنة الأصناف من السيرفر"
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 text-emerald-600 ${isSyncingProducts ? "animate-spin" : ""}`}
+            />
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleSyncProducts}
+            disabled={isSyncingProducts}
+            className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
+            title="سحب أحدث الأصناف من السيرفر إلى الذاكرة المحلية"
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 text-emerald-600 ${isSyncingProducts ? "animate-spin" : ""}`}
+            />
+            <span>{isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}</span>
+          </Button>
+
+          {/* Seed demo data — icon-only under lg, labeled button on lg+ */}
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={handleSeedDemoData}
+            className="h-8 w-8 lg:hidden text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
+            title="تهيئة بيانات تجريبية"
+          >
+            <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
+          </Button>
           <Button
             type="button"
             variant="outline"
             size="sm"
             onClick={handleSeedDemoData}
-            className="text-xs h-8 gap-1.5 text-zinc-600 hover:text-emerald-700 hover:border-emerald-400"
+            className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
             title="تحميل أصناف وزبائن تجريبية في Dexie للاختبار بدون اتصال"
           >
             <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
@@ -512,8 +704,21 @@ export function PosLayout() {
         </div>
       </div>
 
-      {/* Main Split Layout: Desktop 2-column, Mobile 1-column */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 flex-1 overflow-hidden pb-16 lg:pb-0">
+      {/*
+        Main Split Layout: Desktop 2-column, Mobile 1-column.
+
+        [FIX — bottom-nav clearance] `pb-16` (64px) matched the OLD
+        floating cart bar's footprint (bottom-3 + h-13 ≈ 64px). Now that
+        the bar sits higher (see below, to clear the app shell's bottom
+        tab bar), the scrollable content needs more bottom clearance too
+        — otherwise the catalog's last row of products would still sit
+        directly under the floating bar even though the bar itself moved.
+        Bumped to `pb-36` (144px), sized to the new bar position
+        (bottom-20 ≈ 80px) + its own height (h-13 ≈ 52px) + a small
+        margin. Re-check this alongside the bottom-nav height once you
+        can give me the exact value (see note below).
+      */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 flex-1 overflow-hidden pb-36 lg:pb-0">
         {/* RIGHT SIDE (60%-65% width on desktop, 100% on mobile): Product Catalog */}
         <div className="col-span-1 lg:col-span-7 xl:col-span-8 flex flex-col overflow-hidden">
           <ProductCatalog
@@ -545,8 +750,29 @@ export function PosLayout() {
         </div>
       </div>
 
-      {/* Mobile Floating Bottom Bar (Trigger for Cart Drawer) */}
-      <div className="lg:hidden fixed bottom-3 inset-x-3 z-30">
+      {/*
+        Mobile Floating Bottom Bar (Trigger for Cart Drawer).
+
+        [FIX — hidden behind app shell bottom nav] This was previously
+        `bottom-3` — the same fixed viewport-bottom zone the app shell's
+        own bottom tab bar (سلة/مخزون/دفتر الديون/نقطة البيع/الرئيسية)
+        occupies. Both are independently `fixed`, so they overlapped: the
+        tab bar rendered on top, making this button invisible and
+        unreachable on mobile even though it was present in the DOM.
+
+        Moved to `bottom-20` (80px) so it sits ABOVE the tab bar instead
+        of raising z-index — raising z-index alone would still visually
+        stack this bar on top of the tab bar rather than clearing it.
+
+        NOTE: `bottom-20` is an estimate based on the tab bar's visible
+        height in the screenshot, not a measured constant. Once you can
+        give me the tab bar component (or just its rendered height from
+        DevTools → Computed), I'll replace this with an exact value —
+        ideally read from a shared constant/CSS variable the tab bar
+        itself exports, so the two can never drift out of sync again if
+        the tab bar's height ever changes.
+      */}
+      <div className="lg:hidden fixed bottom-20 inset-x-3 z-30">
         <Button
           type="button"
           onClick={() => setIsMobileCartOpen(true)}
@@ -569,14 +795,23 @@ export function PosLayout() {
             </div>
           </div>
 
+          {/*
+            [v3.6] FIX — SYP is now the primary/large figure and USD the
+            secondary/derived one, matching the schema's re-anchoring
+            (previously this was inverted: USD large/primary, SYP small).
+            Also guards against `cartTotals.totalUSD` being `null` (no
+            exchange rate cached yet) — the old code called
+            formatMoney(cartTotals.totalUSD, "USD") unconditionally, which
+            throws a MoneyError on null instead of just hiding the USD line.
+          */}
           <div className="flex items-center gap-2">
             <div className="text-left">
               <p className="text-xs font-extrabold font-mono">
-                ${formatMoney(cartTotals.totalUSD, "USD")}
+                {formatMoney(cartTotals.totalSYP, "SYP")} ل.س
               </p>
-              {cartTotals.totalSYP && (
+              {cartTotals.totalUSD !== null && (
                 <p className="text-[10px] text-emerald-200">
-                  {formatMoney(cartTotals.totalSYP, "SYP")} ل.س
+                  ≈ ${formatMoney(cartTotals.totalUSD, "USD")}
                 </p>
               )}
             </div>
@@ -630,7 +865,16 @@ export function PosLayout() {
         allowSystemCustomer={allowSystemCustomer}
       />
 
-      {/* Checkout & Payment Rail Selection Modal */}
+      {/*
+        Checkout & Payment Rail Selection Modal.
+        [v3.6] Now passes `totalSYP` (authoritative) alongside `totalUSD`
+        (derived, may be null) so payment-modal.tsx can lead its own UI
+        with SYP the same way the rest of the app does. That file isn't
+        shown here, so its `totalSYP`/`totalUSD` props and its
+        onConfirmCheckout payload shape (paidAmountSYP/debtAmountSYP,
+        matching handleConfirmCheckout below) need the corresponding
+        update on its side.
+      */}
       <PaymentModal
         open={isPaymentModalOpen}
         onOpenChange={(open) => {
@@ -644,6 +888,7 @@ export function PosLayout() {
             }
           }
         }}
+        totalSYP={cartTotals.totalSYP}
         totalUSD={cartTotals.totalUSD}
         exchangeRate={dailyExchangeRate || 0}
         selectedCustomer={selectedCustomer}

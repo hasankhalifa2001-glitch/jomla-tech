@@ -12,6 +12,28 @@ import bcrypt from "bcryptjs";
 const prisma = new PrismaClient();
 
 // ============================================================================
+// [v3.6] CURRENCY RE-ANCHORING — SYP is now authoritative, USD informational.
+// See the currency re-anchoring note at the top of schema.prisma for the
+// full rationale. In THIS file specifically: every product below is still
+// priced in USD at the ProductUnit level (pricingCurrency: "USD") — that's
+// unaffected by this change, it's a per-product merchant choice. What
+// changes is how a SALE gets recorded: `unitPriceSYP`, `totalSYP`,
+// `paidAmountSYP`, and `debtAmountSYP` are now the fields every downstream
+// validation/ledger calculation reads first. The USD fields are still
+// written (never dropped — they're real columns, and useful for merchant
+// reference), but they're derived from the SYP side conceptually, not the
+// other way around, from this revision forward.
+//
+// `usdToSyp` below is the one place in this seed file that performs that
+// conversion — every call site computes its SYP figure through it rather
+// than inlining `x * exchangeRateUsed` by hand, so there's one spot to fix
+// if the direction of this conversion is ever revisited again.
+// ============================================================================
+function usdToSyp(usdAmount: number, exchangeRate: number): number {
+    return usdAmount * exchangeRate;
+}
+
+// ============================================================================
 // NESTED-WRITE COMPLIANCE (v3.4 Tenant Isolation rule): every write to a
 // tenant-scoped model in this file is its own top-level `tx.<model>.<method>`
 // call, never a nested `create`/`update` buried inside another model's
@@ -102,11 +124,18 @@ async function createInvoiceAtomic(
         userId: string;
         customerId: string;
         status: InvoiceStatus;
+        // [v3.6] totalSYP is authoritative; totalUSD is informational
+        // (still stored, still real — just no longer what validation or
+        // the ledger reads first). See the file-header note above.
         totalUSD: number;
         totalSYP: number;
         exchangeRateUsed: number;
+        // [v3.6] paidAmountSYP / debtAmountSYP are NEW required fields —
+        // the v3.5 version of this file only carried the USD pair.
         paidAmountUSD: number;
+        paidAmountSYP: number;
         debtAmountUSD: number;
+        debtAmountSYP: number;
         isPaid: boolean;
         voidsInvoiceId?: string;
         items: Array<{
@@ -115,6 +144,9 @@ async function createInvoiceAtomic(
             batchId: string;
             quantity: number;
             unitPriceUSD: number;
+            // [v3.6] NEW required field — authoritative per-line price;
+            // unitPriceUSD stays as the informational figure.
+            unitPriceSYP: number;
         }>;
         // Batch quantity deltas applied atomically alongside the invoice —
         // positive to restore stock (a void), negative to deduct it (a
@@ -128,10 +160,12 @@ async function createInvoiceAtomic(
         // explicit `SELECT ... FOR UPDATE ORDER BY id ASC` step before any
         // of this logic is reused for T4c's real sync endpoint.
         batchAdjustments: Array<{ batchId: string; delta: number }>;
-        // Optional — present exactly when paidAmountUSD > 0, matching
+        // Optional — present exactly when paidAmountSYP > 0, matching
         // T4c's rule that a synced invoice with a nonzero sale-time
         // payment always gets exactly one CustomerPayment with invoiceId
         // set to this invoice's id, created in the same transaction.
+        // [v3.6] The trigger condition was paidAmountUSD > 0 through v3.5
+        // — see the currency re-anchoring note at the top of this file.
         payment?: {
             amountUSD: number;
             amountSYP: number;
@@ -151,7 +185,9 @@ async function createInvoiceAtomic(
             totalSYP: args.totalSYP,
             exchangeRateUsed: args.exchangeRateUsed,
             paidAmountUSD: args.paidAmountUSD,
+            paidAmountSYP: args.paidAmountSYP,
             debtAmountUSD: args.debtAmountUSD,
+            debtAmountSYP: args.debtAmountSYP,
             isPaid: args.isPaid,
             voidsInvoiceId: args.voidsInvoiceId,
         },
@@ -167,6 +203,7 @@ async function createInvoiceAtomic(
                 batchId: item.batchId,
                 quantity: item.quantity,
                 unitPriceUSD: item.unitPriceUSD,
+                unitPriceSYP: item.unitPriceSYP,
             },
         });
     }
@@ -379,12 +416,19 @@ async function main() {
     // standing — not voided — so the ledger view has a real outstanding
     // debt to show.
     //
-    // paidAmountUSD > 0 here (20) has its matching sale-time
-    // CustomerPayment created in the SAME transaction, with invoiceId
-    // pointing at this invoice — this is the exact invariant T4c's sync
-    // logic and T4e's debt-doubling guard depend on ("a synced invoice
-    // with paidAmountUSD > 0 always has exactly one corresponding
+    // [v3.6] debtAmountSYP (not debtAmountUSD) is now the authoritative
+    // figure the ledger/T4c validation reads — computed here via
+    // usdToSyp() from the same USD figures this seed has always used to
+    // author the numbers by hand, since that's the more readable way to
+    // write seed data, not because USD is authoritative anymore.
+    //
+    // paidAmountSYP > 0 here has its matching sale-time CustomerPayment
+    // created in the SAME transaction, with invoiceId pointing at this
+    // invoice — this is the exact invariant T4c's sync logic and T4e's
+    // debt-doubling guard depend on ("a synced invoice with a nonzero
+    // sale-time payment always has exactly one corresponding
     // CustomerPayment row").
+    const rate1 = 15000;
     await prisma.$transaction((tx) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
@@ -392,10 +436,12 @@ async function main() {
             customerId: customer.id,
             status: InvoiceStatus.COMPLETED,
             totalUSD: 40,
-            totalSYP: 40 * 15000,
-            exchangeRateUsed: 15000,
+            totalSYP: usdToSyp(40, rate1),
+            exchangeRateUsed: rate1,
             paidAmountUSD: 20,
+            paidAmountSYP: usdToSyp(20, rate1),
             debtAmountUSD: 20,
+            debtAmountSYP: usdToSyp(20, rate1),
             isPaid: false,
             items: [
                 {
@@ -404,13 +450,14 @@ async function main() {
                     batchId: riceBatch.id,
                     quantity: 2,
                     unitPriceUSD: 20,
+                    unitPriceSYP: usdToSyp(20, rate1),
                 },
             ],
             batchAdjustments: [{ batchId: riceBatch.id, delta: -2 }],
             payment: {
                 amountUSD: 20,
-                amountSYP: 20 * 15000,
-                exchangeRate: 15000,
+                amountSYP: usdToSyp(20, rate1),
+                exchangeRate: rate1,
                 paymentMethod: PaymentMethod.CASH,
                 receiptNo: "RCPT-0001",
             },
@@ -426,8 +473,8 @@ async function main() {
             tenantId: tenantAlBaraka.id,
             customerId: customer.id,
             amountUSD: 10,
-            amountSYP: 10 * 15000,
-            exchangeRate: 15000,
+            amountSYP: usdToSyp(10, rate1),
+            exchangeRate: rate1,
             paymentMethod: PaymentMethod.CASH,
             receiptNo: "RCPT-0002",
         },
@@ -440,7 +487,7 @@ async function main() {
     // CustomerPayment instead, not this mechanism.
     //
     // Demonstrates the full append-only reversal end to end: the original
-    // COMPLETED invoice is never edited (its own isPaid/debtAmountUSD stay
+    // COMPLETED invoice is never edited (its own isPaid/debtAmountSYP stay
     // exactly as created below, forever), a new VOIDED invoice with
     // negated totals AND negated item quantities points back at it via
     // voidsInvoiceId, and the batch quantity is restored by that same
@@ -453,10 +500,12 @@ async function main() {
             customerId: customer.id,
             status: InvoiceStatus.COMPLETED,
             totalUSD: 20,
-            totalSYP: 20 * 15000,
-            exchangeRateUsed: 15000,
+            totalSYP: usdToSyp(20, rate1),
+            exchangeRateUsed: rate1,
             paidAmountUSD: 0,
+            paidAmountSYP: 0,
             debtAmountUSD: 20,
+            debtAmountSYP: usdToSyp(20, rate1),
             isPaid: false,
             items: [
                 {
@@ -465,29 +514,31 @@ async function main() {
                     batchId: riceBatch.id,
                     quantity: 1,
                     unitPriceUSD: 20,
+                    unitPriceSYP: usdToSyp(20, rate1),
                 },
             ],
             batchAdjustments: [{ batchId: riceBatch.id, delta: -1 }],
-            // paidAmountUSD is 0 here — fully on credit — so no `payment`
+            // paidAmountSYP is 0 here — fully on credit — so no `payment`
             // is passed, correctly producing zero CustomerPayment rows for
             // this invoice, per the same T4c invariant referenced above.
         })
     );
 
     // The reversing VOIDED invoice. isPaid is set to `true` here
-    // deliberately, even though debtAmountUSD is nonzero (-20) — this is
-    // NOT the same meaning `isPaid` carries on a normal sale. On a VOIDED
-    // row, the negative debtAmountUSD represents a CREDIT owed back to
-    // the customer via the physical stock return, not an amount this
+    // deliberately, even though debtAmountSYP is nonzero (negative) — this
+    // is NOT the same meaning `isPaid` carries on a normal sale. On a
+    // VOIDED row, the negative debtAmountSYP represents a CREDIT owed back
+    // to the customer via the physical stock return, not an amount this
     // platform is still waiting to collect FROM them — there is no
     // outstanding collection action on this row, which is what isPaid is
     // actually signaling here. The original invoiceToVoid above keeps its
-    // own isPaid: false / debtAmountUSD: 20 completely untouched, exactly
-    // as the append-only rule requires; only the SUM() across both rows
-    // (in T4e's ledger formula) is what nets out to what the customer
-    // actually owes after the return. If this distinction ever proves
-    // confusing in practice, revisit whether `isPaid` belongs on a VOIDED
-    // row at all rather than being derived/ignored for that status.
+    // own isPaid: false / debtAmountSYP: usdToSyp(20, rate1) completely
+    // untouched, exactly as the append-only rule requires; only the SUM()
+    // across both rows (in T4e's ledger formula, now over debtAmountSYP)
+    // is what nets out to what the customer actually owes after the
+    // return. If this distinction ever proves confusing in practice,
+    // revisit whether `isPaid` belongs on a VOIDED row at all rather than
+    // being derived/ignored for that status.
     await prisma.$transaction((tx) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
@@ -496,10 +547,12 @@ async function main() {
             status: InvoiceStatus.VOIDED,
             voidsInvoiceId: invoiceToVoid.id,
             totalUSD: -20,
-            totalSYP: -20 * 15000,
-            exchangeRateUsed: 15000,
+            totalSYP: usdToSyp(-20, rate1),
+            exchangeRateUsed: rate1,
             paidAmountUSD: 0,
+            paidAmountSYP: 0,
             debtAmountUSD: -20,
+            debtAmountSYP: usdToSyp(-20, rate1),
             isPaid: true,
             items: [
                 {
@@ -508,6 +561,7 @@ async function main() {
                     batchId: riceBatch.id,
                     quantity: -1, // mirrors invoiceToVoid's item, negated
                     unitPriceUSD: 20,
+                    unitPriceSYP: usdToSyp(20, rate1),
                 },
             ],
             // The physical stock return itself — restores the batch by the
@@ -522,9 +576,10 @@ async function main() {
 
     // Invoice 3: a fully-paid cash sale against the tenant's seeded
     // system customer — exercises T4b's one-tap "زبون نقدي" flow.
-    // paidAmountUSD == totalUSD and debtAmountUSD == 0, satisfying the
+    // paidAmountSYP == totalSYP and debtAmountSYP == 0, satisfying the
     // application-level rule that the system-generated customer may only
-    // be referenced by a zero-debt invoice.
+    // be referenced by a zero-debt invoice (debtAmountSYP = 0 as of
+    // [v3.6] — was debtAmountUSD = 0 through v3.5).
     await prisma.$transaction((tx) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
@@ -532,10 +587,12 @@ async function main() {
             customerId: systemCustomerAlBaraka,
             status: InvoiceStatus.COMPLETED,
             totalUSD: 18.5,
-            totalSYP: 18.5 * 15000,
-            exchangeRateUsed: 15000,
+            totalSYP: usdToSyp(18.5, rate1),
+            exchangeRateUsed: rate1,
             paidAmountUSD: 18.5,
+            paidAmountSYP: usdToSyp(18.5, rate1),
             debtAmountUSD: 0,
+            debtAmountSYP: 0,
             isPaid: true,
             items: [
                 {
@@ -544,13 +601,14 @@ async function main() {
                     batchId: oilBatch.id,
                     quantity: 1,
                     unitPriceUSD: 18.5,
+                    unitPriceSYP: usdToSyp(18.5, rate1),
                 },
             ],
             batchAdjustments: [{ batchId: oilBatch.id, delta: -1 }],
             payment: {
                 amountUSD: 18.5,
-                amountSYP: 18.5 * 15000,
-                exchangeRate: 15000,
+                amountSYP: usdToSyp(18.5, rate1),
+                exchangeRate: rate1,
                 paymentMethod: PaymentMethod.CASH,
                 receiptNo: "RCPT-0003",
             },

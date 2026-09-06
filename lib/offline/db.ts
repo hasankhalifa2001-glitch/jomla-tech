@@ -1,7 +1,14 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /* db.ts */
 import Dexie, { type Table } from "dexie";
 import { generateOfflineId } from "./id";
-import { serializeMoney, compareMoney, subtractMoney, type MoneyInput } from "../utils/money";
+import {
+  serializeMoney,
+  compareMoney,
+  subtractMoney,
+  convertCurrency,
+  type MoneyInput,
+} from "../utils/money";
 
 export type OfflineSyncStatus = "PENDING" | "SYNCED" | "FAILED";
 
@@ -12,10 +19,31 @@ export type PaymentMethod =
   | "BANK_TRANSFER"
   | "OTHER";
 
+// ============================================================================
+// [v3.6] CURRENCY RE-ANCHORING — mirrors schema.prisma's Invoice/
+// CustomerPayment/InvoiceItem models. SYP is now the authoritative currency
+// on every offline financial record below. USD fields are retained purely
+// as a derived, informational figure (still computed via the record's own
+// frozen exchangeRateUsed/exchangeRate, just no longer load-bearing) —
+// never validated against, never gates any action, and — critically —
+// NEVER independently supplied by a caller anymore. Every factory function
+// below computes the USD fields itself via convertCurrency from the SYP
+// figure it was actually given, so there is no longer any way for a
+// caller-supplied USD number to drift from the SYP number it's supposed to
+// mirror. (Through v3.5 this file took both totalUSD/totalSYP etc. as
+// caller-supplied inputs and trusted them independently — that's what let
+// pos-service.ts's old cross-check "expectedTotalSYP === totalSYP" fail
+// silently in the wrong direction; see pos-service.ts for the removed
+// check.)
+// ============================================================================
+
 export interface OfflineInvoiceItem {
   productId: string;
   unitId: string;
   quantity: number;
+  // [v3.6] AUTHORITATIVE.
+  unitPriceSYP: string;
+  // [v3.6] Derived/informational — unitPriceSYP ÷ exchangeRateUsed.
   unitPriceUSD: string;
 }
 
@@ -26,10 +54,18 @@ export interface OfflineInvoice {
   customerId?: string;
   offlineCustomerId?: string;
   items: OfflineInvoiceItem[];
-  totalUSD: string;
+  // [v3.6] AUTHORITATIVE.
   totalSYP: string;
+  // [v3.6] Derived/informational.
+  totalUSD: string;
   exchangeRateUsed: string;
+  // [v3.6] AUTHORITATIVE.
+  paidAmountSYP: string;
+  // [v3.6] Derived/informational.
   paidAmountUSD: string;
+  // [v3.6] AUTHORITATIVE.
+  debtAmountSYP: string;
+  // [v3.6] Derived/informational.
   debtAmountUSD: string;
   paymentMethod?: PaymentMethod;
   voidsOfflineInvoiceId?: string;
@@ -45,8 +81,12 @@ export interface OfflinePayment {
   offlineId: string;
   customerId?: string;
   offlineCustomerId?: string;
-  amountUSD: string;
+  // [v3.6] AUTHORITATIVE. (Schema-wise nothing changed here — both fields
+  // already existed side by side — only which one is treated as the
+  // source of truth changed, same as CustomerPayment in schema.prisma.)
   amountSYP: string;
+  // [v3.6] Derived/informational.
+  amountUSD: string;
   exchangeRate: string;
   paymentMethod: PaymentMethod;
   receiptNo?: string;
@@ -109,7 +149,16 @@ export interface CachedCustomer {
   name: string;
   phone?: string;
   shopName?: string;
-  cachedBalanceDebtUSD: string;
+  // [v3.6] AUTHORITATIVE. NEW field — did not exist before v3.6, since
+  // through v3.5 USD was the only balance figure cached client-side.
+  cachedBalanceDebtSYP: string;
+  // [v3.6] Derived/informational, and now optional — this is a
+  // client-side display cache, not something computed fresh here (a
+  // customer's accumulated debt spans many invoices at many different
+  // historical rates, so there's no single rate this file could use to
+  // derive it accurately). Populated from whatever the server/sync last
+  // reported.
+  cachedBalanceDebtUSD?: string;
   isSystemGenerated?: boolean;
 }
 
@@ -230,6 +279,106 @@ export class OfflineDatabase extends Dexie {
           );
         }
       });
+
+    // [v3.6] SYP CURRENCY RE-ANCHORING MIGRATION.
+    // No index changes needed (SYP fields aren't indexed), so the
+    // `.stores()` call below is identical to v4 — this version exists
+    // purely to run the `.upgrade()` backfill.
+    this.version(5)
+      .stores({
+        offlineInvoices: "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+        offlinePayments: "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+        offlineCustomers: "++id, &offlineId, tenantId, status, createdAt",
+        cachedTenantSettings: "tenantId, cachedAt",
+        cachedProducts: "id, tenantId, name",
+        cachedCustomers: "id, tenantId, name, phone, isSystemGenerated",
+      })
+      .upgrade(async (tx) => {
+        // offlineInvoices: each row already carries its own frozen
+        // exchangeRateUsed, so backfilling unitPriceSYP/paidAmountSYP/
+        // debtAmountSYP from the existing USD fields + that rate is an
+        // EXACT reconstruction, not an approximation.
+        const invoices = await tx.table("offlineInvoices").toArray();
+        for (const inv of invoices as Array<Record<string, any>>) {
+          if (
+            inv.paidAmountSYP !== undefined &&
+            inv.debtAmountSYP !== undefined &&
+            (inv.items || []).every((it: Record<string, any>) => it.unitPriceSYP !== undefined)
+          ) {
+            continue; // already migrated
+          }
+
+          const rate = inv.exchangeRateUsed;
+          if (!rate || compareMoney(rate, 0) <= 0) {
+            console.warn(
+              `[OfflineDatabase v5 migration] offlineInvoices row id=${inv.id} has no valid ` +
+              `exchangeRateUsed — cannot backfill paidAmountSYP/debtAmountSYP/unitPriceSYP. ` +
+              `This row will fail validation on its next sync attempt until manually reconciled.`
+            );
+            continue;
+          }
+
+          const updatedItems = (inv.items || []).map((item: Record<string, any>) => ({
+            ...item,
+            unitPriceSYP:
+              item.unitPriceSYP ?? convertCurrency(item.unitPriceUSD, rate, "USD", "SYP"),
+          }));
+
+          await tx.table("offlineInvoices").update(inv.id, {
+            items: updatedItems,
+            paidAmountSYP:
+              inv.paidAmountSYP ?? convertCurrency(inv.paidAmountUSD, rate, "USD", "SYP"),
+            debtAmountSYP:
+              inv.debtAmountSYP ?? convertCurrency(inv.debtAmountUSD, rate, "USD", "SYP"),
+          });
+        }
+
+        // cachedCustomers: this cache has no per-record exchange rate of
+        // its own — a customer's accumulated debt spans many invoices,
+        // each at a different historical rate — so converting the old
+        // cachedBalanceDebtUSD using TODAY's cached rate is only an
+        // approximation. That's acceptable ONLY because this field is a
+        // client-side display cache, never authoritative (the real
+        // balance is always recomputed server-side). Logged loudly per
+        // row, same "don't guess silently" pattern as the v4 migration
+        // above, so it's never mistaken for an exact figure.
+        const settingsRows = await tx.table("cachedTenantSettings").toArray();
+        const rateByTenant = new Map<string, string>(
+          settingsRows.map((r: Record<string, any>) => [r.tenantId, r.dailyExchangeRate])
+        );
+
+        const customers = await tx.table("cachedCustomers").toArray();
+        for (const cust of customers as Array<Record<string, any>>) {
+          if (cust.cachedBalanceDebtSYP !== undefined) continue;
+
+          const rate = rateByTenant.get(cust.tenantId);
+          if (!rate || compareMoney(rate, 0) <= 0) {
+            console.warn(
+              `[OfflineDatabase v5 migration] cachedCustomers row id=${cust.id} (tenant=` +
+              `${cust.tenantId}) has no cached exchange rate to convert from — ` +
+              `cachedBalanceDebtSYP set to "0.0000" as a placeholder. This is a display-only ` +
+              `cache; it will be corrected on the next online customer sync.`
+            );
+            await tx.table("cachedCustomers").update(cust.id, { cachedBalanceDebtSYP: "0.0000" });
+            continue;
+          }
+
+          console.warn(
+            `[OfflineDatabase v5 migration] cachedCustomers row id=${cust.id}: approximating ` +
+            `cachedBalanceDebtSYP from cachedBalanceDebtUSD using TODAY's cached rate (${rate}), ` +
+            `not the historical rate(s) that balance actually accrued at. Display-only; will ` +
+            `be corrected on the next online customer sync.`
+          );
+          await tx.table("cachedCustomers").update(cust.id, {
+            cachedBalanceDebtSYP: convertCurrency(
+              cust.cachedBalanceDebtUSD ?? "0",
+              rate,
+              "USD",
+              "SYP"
+            ),
+          });
+        }
+      });
   }
 }
 
@@ -274,13 +423,12 @@ export function createOfflineInvoiceRecord(data: {
     productId: string;
     unitId: string;
     quantity: number;
-    unitPriceUSD: MoneyInput;
+    unitPriceSYP: MoneyInput;
   }>;
-  totalUSD: MoneyInput;
   totalSYP: MoneyInput;
   exchangeRateUsed: MoneyInput;
-  paidAmountUSD: MoneyInput;
-  debtAmountUSD: MoneyInput;
+  paidAmountSYP: MoneyInput;
+  debtAmountSYP: MoneyInput;
   paymentMethod?: PaymentMethod;
   createdAt?: Date;
   status?: OfflineSyncStatus;
@@ -309,27 +457,42 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("Every line item on a sale must have a strictly positive quantity.");
   }
 
-  const paidUSD = serializeMoney(data.paidAmountUSD);
-  if (compareMoney(paidUSD, 0) > 0 && !data.paymentMethod) {
-    throw new Error("paymentMethod is required whenever paidAmountUSD > 0.");
-  }
-  if (compareMoney(paidUSD, 0) === 0 && data.paymentMethod) {
-    throw new Error(
-      "paymentMethod must not be set on a fully-on-credit sale (paidAmountUSD === 0)."
-    );
-  }
-
-  const debtUSD = serializeMoney(data.debtAmountUSD);
-  if (compareMoney(debtUSD, 0) < 0) {
-    throw new Error(
-      "debtAmountUSD must not be negative on a plain sale — negative debt is only valid on a void record."
-    );
-  }
-
   const rateUsed = serializeMoney(data.exchangeRateUsed);
   if (compareMoney(rateUsed, 0) <= 0) {
     throw new Error("exchangeRateUsed must be strictly greater than 0.");
   }
+
+  // [v3.6] AUTHORITATIVE checks now run on the SYP fields — mirrors
+  // schema.prisma: "debtAmountSYP ≈ totalSYP − paidAmountSYP is the
+  // authoritative validation at sync; the USD-side equivalent is checked
+  // only as a sanity/display signal and never fails a sync on its own."
+  const paidSYP = serializeMoney(data.paidAmountSYP);
+  if (compareMoney(paidSYP, 0) > 0 && !data.paymentMethod) {
+    throw new Error("paymentMethod is required whenever paidAmountSYP > 0.");
+  }
+  if (compareMoney(paidSYP, 0) === 0 && data.paymentMethod) {
+    throw new Error(
+      "paymentMethod must not be set on a fully-on-credit sale (paidAmountSYP === 0)."
+    );
+  }
+
+  const debtSYP = serializeMoney(data.debtAmountSYP);
+  if (compareMoney(debtSYP, 0) < 0) {
+    throw new Error(
+      "debtAmountSYP must not be negative on a plain sale — negative debt is only valid on a void record."
+    );
+  }
+
+  const totalSYP = serializeMoney(data.totalSYP);
+
+  // [v3.6] USD is derived HERE, from the SYP figures actually supplied,
+  // via the same frozen exchangeRateUsed — never taken as a separate
+  // caller-supplied input. This is what makes a totalUSD/totalSYP
+  // mismatch structurally impossible, rather than something a separate
+  // cross-check has to catch after the fact.
+  const totalUSD = convertCurrency(totalSYP, rateUsed, "SYP", "USD");
+  const paidAmountUSD = convertCurrency(paidSYP, rateUsed, "SYP", "USD");
+  const debtAmountUSD = convertCurrency(debtSYP, rateUsed, "SYP", "USD");
 
   return {
     tenantId: data.tenantId,
@@ -340,13 +503,16 @@ export function createOfflineInvoiceRecord(data: {
       productId: item.productId,
       unitId: item.unitId,
       quantity: item.quantity,
-      unitPriceUSD: serializeMoney(item.unitPriceUSD),
+      unitPriceSYP: serializeMoney(item.unitPriceSYP),
+      unitPriceUSD: convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD"),
     })),
-    totalUSD: serializeMoney(data.totalUSD),
-    totalSYP: serializeMoney(data.totalSYP),
+    totalSYP,
+    totalUSD,
     exchangeRateUsed: rateUsed,
-    paidAmountUSD: paidUSD,
-    debtAmountUSD: debtUSD,
+    paidAmountSYP: paidSYP,
+    paidAmountUSD,
+    debtAmountSYP: debtSYP,
+    debtAmountUSD,
     paymentMethod: data.paymentMethod,
     createdAt: data.createdAt || new Date(),
     status: data.status || "PENDING",
@@ -365,17 +531,15 @@ export function createOfflineVoidRecord(data: {
     productId: string;
     unitId: string;
     quantity: number;
-    unitPriceUSD: MoneyInput;
+    unitPriceSYP: MoneyInput;
   }>;
-  originalTotalUSD?: MoneyInput;
   originalTotalSYP?: MoneyInput;
-  totalUSD?: MoneyInput;
   totalSYP?: MoneyInput;
   exchangeRateUsed: MoneyInput;
-  originalPaidAmountUSD?: MoneyInput;
-  originalDebtAmountUSD?: MoneyInput;
-  paidAmountUSD?: MoneyInput;
-  debtAmountUSD?: MoneyInput;
+  originalPaidAmountSYP?: MoneyInput;
+  originalDebtAmountSYP?: MoneyInput;
+  paidAmountSYP?: MoneyInput;
+  debtAmountSYP?: MoneyInput;
   createdAt?: Date;
   status?: OfflineSyncStatus;
   failureReason?: string;
@@ -414,26 +578,27 @@ export function createOfflineVoidRecord(data: {
     throw new Error("exchangeRateUsed must be strictly greater than 0.");
   }
 
-  const totalUSD =
-    data.originalTotalUSD !== undefined
-      ? subtractMoney("0", data.originalTotalUSD)
-      : serializeMoney(data.totalUSD ?? "0");
   const totalSYP =
     data.originalTotalSYP !== undefined
       ? subtractMoney("0", data.originalTotalSYP)
       : serializeMoney(data.totalSYP ?? "0");
-  const paidUSD =
-    data.originalPaidAmountUSD !== undefined
-      ? subtractMoney("0", data.originalPaidAmountUSD)
-      : data.paidAmountUSD !== undefined
-      ? serializeMoney(data.paidAmountUSD)
-      : "0.0000";
-  const debtUSD =
-    data.originalDebtAmountUSD !== undefined
-      ? subtractMoney("0", data.originalDebtAmountUSD)
-      : data.debtAmountUSD !== undefined
-      ? serializeMoney(data.debtAmountUSD)
-      : "0.0000";
+  const paidSYP =
+    data.originalPaidAmountSYP !== undefined
+      ? subtractMoney("0", data.originalPaidAmountSYP)
+      : data.paidAmountSYP !== undefined
+        ? serializeMoney(data.paidAmountSYP)
+        : "0.0000";
+  const debtSYP =
+    data.originalDebtAmountSYP !== undefined
+      ? subtractMoney("0", data.originalDebtAmountSYP)
+      : data.debtAmountSYP !== undefined
+        ? serializeMoney(data.debtAmountSYP)
+        : "0.0000";
+
+  // [v3.6] Derived, same as the sale factory above.
+  const totalUSD = convertCurrency(totalSYP, rateUsed, "SYP", "USD");
+  const paidAmountUSD = convertCurrency(paidSYP, rateUsed, "SYP", "USD");
+  const debtAmountUSD = convertCurrency(debtSYP, rateUsed, "SYP", "USD");
 
   return {
     tenantId: data.tenantId,
@@ -444,13 +609,16 @@ export function createOfflineVoidRecord(data: {
       productId: item.productId,
       unitId: item.unitId,
       quantity: item.quantity,
-      unitPriceUSD: serializeMoney(item.unitPriceUSD),
+      unitPriceSYP: serializeMoney(item.unitPriceSYP),
+      unitPriceUSD: convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD"),
     })),
-    totalUSD,
     totalSYP,
+    totalUSD,
     exchangeRateUsed: rateUsed,
-    paidAmountUSD: paidUSD,
-    debtAmountUSD: debtUSD,
+    paidAmountSYP: paidSYP,
+    paidAmountUSD,
+    debtAmountSYP: debtSYP,
+    debtAmountUSD,
     paymentMethod: undefined,
     voidsOfflineInvoiceId: data.voidsOfflineInvoiceId,
     voidReason: data.voidReason,
@@ -465,7 +633,6 @@ export function createOfflinePaymentRecord(data: {
   offlineId?: string;
   customerId?: string;
   offlineCustomerId?: string;
-  amountUSD: MoneyInput;
   amountSYP: MoneyInput;
   exchangeRate: MoneyInput;
   paymentMethod: PaymentMethod;
@@ -489,22 +656,28 @@ export function createOfflinePaymentRecord(data: {
     );
   }
 
-  const amountUSD = serializeMoney(data.amountUSD);
-  // [FIX] A logged repayment of zero or negative amount has no valid
-  // meaning — matches this file's own "fail fast with a clear reason"
-  // pattern applied everywhere else.
-  if (compareMoney(amountUSD, 0) <= 0) {
-    throw new Error("amountUSD must be strictly greater than 0 for a payment record.");
+  const rate = serializeMoney(data.exchangeRate);
+  if (compareMoney(rate, 0) <= 0) {
+    throw new Error("exchangeRate must be strictly greater than 0.");
   }
+
+  // [v3.6] AUTHORITATIVE check now runs on amountSYP, not amountUSD.
+  const amountSYP = serializeMoney(data.amountSYP);
+  if (compareMoney(amountSYP, 0) <= 0) {
+    throw new Error("amountSYP must be strictly greater than 0 for a payment record.");
+  }
+
+  // [v3.6] Derived, never independently supplied.
+  const amountUSD = convertCurrency(amountSYP, rate, "SYP", "USD");
 
   return {
     tenantId: data.tenantId,
     offlineId: data.offlineId || generateOfflineId(),
     customerId: data.customerId,
     offlineCustomerId: data.offlineCustomerId,
+    amountSYP,
     amountUSD,
-    amountSYP: serializeMoney(data.amountSYP),
-    exchangeRate: serializeMoney(data.exchangeRate),
+    exchangeRate: rate,
     paymentMethod: data.paymentMethod,
     receiptNo: data.receiptNo,
     notes: data.notes,
@@ -573,6 +746,13 @@ export function createCachedProductRecord(data: {
     tenantId: data.tenantId,
     name: data.name,
     category: data.category,
+    // NOTE: pricingCurrency here is unrelated to which currency is
+    // AUTHORITATIVE for the ledger (SYP, per v3.6) — it's the merchant's
+    // own per-unit pricing choice (schema.prisma: "Two different products
+    // can sit in two different currencies at the same time... zero
+    // coupling"). Both stay valid; resolveUnitPriceSYP/resolveUnitPriceUSD
+    // in pos-service.ts convert whichever currency a unit is priced in
+    // into the ledger's SYP-primary figures at cart time.
     units: data.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
@@ -595,7 +775,8 @@ export function createCachedCustomerRecord(data: {
   name: string;
   phone?: string;
   shopName?: string;
-  cachedBalanceDebtUSD: MoneyInput;
+  cachedBalanceDebtSYP: MoneyInput;
+  cachedBalanceDebtUSD?: MoneyInput;
   isSystemGenerated?: boolean;
 }): CachedCustomer {
   if (!data.tenantId || !data.tenantId.trim()) {
@@ -608,7 +789,11 @@ export function createCachedCustomerRecord(data: {
     name: data.name,
     phone: data.phone,
     shopName: data.shopName,
-    cachedBalanceDebtUSD: serializeMoney(data.cachedBalanceDebtUSD),
+    cachedBalanceDebtSYP: serializeMoney(data.cachedBalanceDebtSYP),
+    cachedBalanceDebtUSD:
+      data.cachedBalanceDebtUSD !== undefined
+        ? serializeMoney(data.cachedBalanceDebtUSD)
+        : undefined,
     isSystemGenerated: data.isSystemGenerated,
   };
 }

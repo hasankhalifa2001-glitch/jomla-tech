@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import {
   calculateCartTotals,
-  resolveUnitPriceUSD,
+  resolveUnitPriceSYP,
   isSystemCashCustomer,
   type CartLineItem,
   type SelectedCustomer,
@@ -44,18 +44,18 @@ interface CartPanelProps {
   isMobileDrawer?: boolean;
 }
 
-// [FIX — same bug class as ProductCatalog.tsx] Resolves a unit's price the
-// same way everywhere in the POS: through resolveUnitPriceUSD, which
-// branches on pricingCurrency instead of assuming every stored
-// priceWholesale is already USD. Returns null (instead of throwing) when
-// a SYP-priced unit has no valid cached exchange rate to convert with.
+// [v3.6] FIX — same currency-primacy flip as ProductCatalog.tsx. Was
+// resolveUnitPriceUSD (USD-primary); now resolveUnitPriceSYP so the unit
+// switcher below shows the same authoritative price the cart/invoice
+// actually bills. Returns null (instead of throwing) when a USD-priced
+// unit has no valid cached exchange rate to convert into SYP with.
 function resolvePriceOrNull(
   unit: CartLineItem["product"]["units"][number],
   product: CartLineItem["product"],
   exchangeRate: number | null
 ): string | null {
   try {
-    return resolveUnitPriceUSD(unit, product, exchangeRate);
+    return resolveUnitPriceSYP(unit, product, exchangeRate);
   } catch {
     return null;
   }
@@ -83,11 +83,14 @@ export function CartPanel({
     exchangeRate === null || compareMoney(exchangeRate, 0) <= 0;
   const isCartEmpty = items.length === 0;
 
-  // Map item IDs to their calculated line totals for fast lookup
+  // [v3.6] Map item IDs to their calculated line totals for fast lookup.
+  // `syp` is authoritative (never null); `usd` is derived/display-only
+  // and may be null with no cached rate — flipped from the pre-v3.6 shape
+  // where `usd` was assumed always present and `syp` was the nullable one.
   const lineTotalsMap = useMemo(() => {
-    const map = new Map<string, { usd: string; syp: string | null }>();
+    const map = new Map<string, { syp: string; usd: string | null }>();
     for (const lt of totals.lineItems) {
-      map.set(lt.id, { usd: lt.lineTotalUSD, syp: lt.lineTotalSYP });
+      map.set(lt.id, { syp: lt.lineTotalSYP, usd: lt.lineTotalUSD });
     }
     return map;
   }, [totals.lineItems]);
@@ -107,8 +110,8 @@ export function CartPanel({
   return (
     <div
       className={`flex flex-col h-full bg-white dark:bg-zinc-900 overflow-hidden ${isMobileDrawer
-          ? "rounded-t-2xl"
-          : "rounded-2xl border border-zinc-200 dark:border-zinc-800 shadow-xs"
+        ? "rounded-t-2xl"
+        : "rounded-2xl border border-zinc-200 dark:border-zinc-800 shadow-xs"
         }`}
     >
       {/* 1. Header with Active Customer Information */}
@@ -117,8 +120,8 @@ export function CartPanel({
           <div className="flex items-center gap-2.5 overflow-hidden">
             <div
               className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${isSystemCustomer
-                  ? "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                  : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+                ? "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
                 }`}
             >
               <User className="h-4 w-4" />
@@ -181,9 +184,12 @@ export function CartPanel({
           </div>
         ) : (
           items.map((item) => {
+            // [v3.6] `syp` is authoritative (never null); `usd` may be
+            // null. The old default `{ usd: "0.0000", syp: null }` is
+            // flipped accordingly.
             const lineTotal = lineTotalsMap.get(item.id) || {
-              usd: "0.0000",
-              syp: null,
+              syp: "0.0000",
+              usd: null,
             };
 
             return (
@@ -197,14 +203,24 @@ export function CartPanel({
                     <p className="text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate">
                       {item.product.name}
                     </p>
+                    {/*
+                      [v3.6] FIX — was reading item.unitPriceUSD /
+                      item.priceRetailUSD as the primary, always-present
+                      price. Both are now nullable derived fields on
+                      CartLineItem (pos-service.ts); the always-present,
+                      authoritative fields are unitPriceSYP /
+                      priceRetailSYP. Reading the old fields here would
+                      call formatMoney(null, "USD") and throw the moment
+                      no exchange rate was cached when the item was added.
+                    */}
                     <div className="flex items-center gap-2 text-[10px] text-zinc-400">
                       <span className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">
-                        سعر الجملة: ${formatMoney(item.unitPriceUSD, "USD")}
+                        سعر الجملة: {formatMoney(item.unitPriceSYP, "SYP")} ل.س
                       </span>
-                      {item.priceRetailUSD && (
+                      {item.priceRetailSYP && (
                         <span className="flex items-center gap-0.5 text-zinc-400 line-through decoration-zinc-300">
                           <Tag className="h-2.5 w-2.5" />
-                          مفرد: ${formatMoney(item.priceRetailUSD, "USD")}
+                          مفرد: {formatMoney(item.priceRetailSYP, "SYP")} ل.س
                         </span>
                       )}
                     </div>
@@ -215,91 +231,119 @@ export function CartPanel({
                     variant="ghost"
                     size="icon"
                     onClick={() => onRemoveItem(item.id)}
-                    className="h-7 w-7 text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 shrink-0"
+                    // [FIX — touch target] 32px on mobile (down to the
+                    // original 28px from `sm:` up) to keep this a
+                    // comfortable, deliberate tap — it's a destructive
+                    // action sitting right next to the product name.
+                    className="h-8 w-8 sm:h-7 sm:w-7 text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 shrink-0"
                     title="حذف من السلة"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </Button>
                 </div>
 
-                {/* Bottom Row: Unit Selector, Quantity Stepper, and Calculated Line Totals */}
-                <div className="flex items-center justify-between gap-2 pt-1 border-t border-zinc-100 dark:border-zinc-800">
-                  {/* Unit Selector */}
-                  <div className="w-28 shrink-0">
-                    <Select
-                      value={item.unitId}
-                      onValueChange={(newUnitId) =>
-                        onChangeUnit(item.id, newUnitId)
-                      }
-                    >
-                      <SelectTrigger className="h-7 text-[11px] px-2 bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700">
-                        <SelectValue placeholder="الوحدة" />
-                      </SelectTrigger>
-                      <SelectContent dir="rtl">
-                        {item.product.units?.map((u) => {
-                          // [FIX] Was `serializeMoney(u.priceWholesale ?? "0")`
-                          // — the exact same currency-blind bug as
-                          // ProductCatalog.tsx's price cards. A SYP-priced
-                          // unit's price here would have been shown as if
-                          // it were USD, off by orders of magnitude.
-                          const unitPriceUSD = resolvePriceOrNull(u, item.product, exchangeRate);
-                          return (
-                            <SelectItem
-                              key={u.id}
-                              value={u.id}
-                              className="text-xs"
-                            >
-                              {u.unitName}{" "}
-                              {unitPriceUSD !== null
-                                ? `($${formatMoney(unitPriceUSD, "USD")})`
-                                : "(يتطلب سعر الصرف)"}
-                            </SelectItem>
-                          );
-                        })}
-                      </SelectContent>
-                    </Select>
-                  </div>
+                {/*
+                  [FIX — mobile/narrow-column overflow] The previous
+                  markup put the unit Select (fixed w-28), the quantity
+                  stepper, and the line totals all in ONE row. That row's
+                  own minimum width (~310-320px) is right at, or over,
+                  the actual available width in both places this
+                  component renders: the desktop cart column (~35-40% of
+                  a laptop screen) and the mobile drawer (full phone
+                  width minus padding) — on a 320-360px-wide phone,
+                  common for budget Android devices, that row would
+                  genuinely overflow or crush its own contents.
 
-                  {/* Quantity Stepper */}
-                  <div className="flex items-center rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800">
-                    <button
-                      type="button"
-                      onClick={() => onUpdateQuantity(item.id, -1)}
-                      className="flex h-7 w-7 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                      title="إنقاص الكمية"
-                    >
-                      <Minus className="h-3 w-3" />
-                    </button>
-                    <input
-                      type="number"
-                      min="1"
-                      value={item.quantity}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
-                        if (!isNaN(val) && val >= 1) {
-                          onSetQuantity(item.id, val);
+                  Split into two independent rows:
+                  - Row 1: unit selector (flex-1, can shrink/truncate) +
+                    quantity stepper (shrink-0) — the two things the
+                    cashier actively interacts with.
+                  - Row 2: line totals, right-aligned — informational,
+                    doesn't need to share horizontal space with anything.
+                  Each row's own minimum width is now comfortably under
+                  300px, so this holds up at any realistic container
+                  width this component is used at.
+                */}
+                <div className="pt-1 border-t border-zinc-100 dark:border-zinc-800 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    {/* Unit Selector */}
+                    <div className="flex-1 min-w-0">
+                      <Select
+                        value={item.unitId}
+                        onValueChange={(newUnitId) =>
+                          onChangeUnit(item.id, newUnitId)
                         }
-                      }}
-                      className="h-7 w-10 text-center font-bold text-xs bg-transparent border-0 focus:outline-none"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => onUpdateQuantity(item.id, 1)}
-                      className="flex h-7 w-7 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                      title="زيادة الكمية"
-                    >
-                      <Plus className="h-3 w-3" />
-                    </button>
+                      >
+                        <SelectTrigger className="h-8 sm:h-7 text-[11px] px-2 bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700">
+                          <SelectValue placeholder="الوحدة" />
+                        </SelectTrigger>
+                        <SelectContent dir="rtl">
+                          {item.product.units?.map((u) => {
+                            const unitPriceSYP = resolvePriceOrNull(u, item.product, exchangeRate);
+                            return (
+                              <SelectItem
+                                key={u.id}
+                                value={u.id}
+                                className="text-xs"
+                              >
+                                {u.unitName}{" "}
+                                {unitPriceSYP !== null
+                                  ? `(${formatMoney(unitPriceSYP, "SYP")} ل.س)`
+                                  : "(يتطلب سعر الصرف)"}
+                              </SelectItem>
+                            );
+                          })}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    {/* Quantity Stepper — 32px targets on mobile, 28px from sm: up */}
+                    <div className="flex items-center rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => onUpdateQuantity(item.id, -1)}
+                        className="flex h-8 w-8 sm:h-7 sm:w-7 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                        title="إنقاص الكمية"
+                      >
+                        <Minus className="h-3 w-3" />
+                      </button>
+                      <input
+                        type="number"
+                        min="1"
+                        value={item.quantity}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          if (!isNaN(val) && val >= 1) {
+                            onSetQuantity(item.id, val);
+                          }
+                        }}
+                        className="h-8 sm:h-7 w-9 text-center font-bold text-xs bg-transparent border-0 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => onUpdateQuantity(item.id, 1)}
+                        className="flex h-8 w-8 sm:h-7 sm:w-7 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                        title="زيادة الكمية"
+                      >
+                        <Plus className="h-3 w-3" />
+                      </button>
+                    </div>
                   </div>
 
-                  {/* Line Total USD & SYP */}
-                  <div className="text-left shrink-0">
+                  {/*
+                    [v3.6] FIX — SYP is now the primary/large line total
+                    (was USD before); USD is the secondary "≈" derived
+                    figure and only rendered when not null (was inverted
+                    before: USD assumed always present, SYP guarded by a
+                    null check).
+                  */}
+                  <div className="flex items-baseline justify-end gap-2">
                     <p className="text-xs font-extrabold text-emerald-600 dark:text-emerald-400">
-                      ${formatMoney(lineTotal.usd, "USD")}
+                      {formatMoney(lineTotal.syp, "SYP")} ل.س
                     </p>
-                    {lineTotal.syp !== null && (
+                    {lineTotal.usd !== null && (
                       <p className="text-[10px] text-purple-600 dark:text-purple-400 font-semibold">
-                        {formatMoney(lineTotal.syp, "SYP")} ل.س
+                        ≈ ${formatMoney(lineTotal.usd, "USD")}
                       </p>
                     )}
                   </div>
@@ -337,22 +381,31 @@ export function CartPanel({
             </span>
           </div>
 
+          {/*
+            [v3.6] FIX — SYP is now the primary "المجموع الإجمالي" row
+            (was labeled "(USD)" and driven by totals.totalUSD before);
+            USD is now the "المعادل" secondary row and correctly guards
+            against totals.totalUSD being null (was inverted before: the
+            old code guarded totals.totalSYP as if IT were the nullable
+            one, when totalUSD — the field it displayed unconditionally —
+            is actually the one that can be null).
+          */}
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
-              المجموع الإجمالي (USD):
+              المجموع الإجمالي (SYP):
             </span>
             <span className="text-lg font-extrabold text-emerald-600 dark:text-emerald-400">
-              ${formatMoney(totals.totalUSD, "USD")}
+              {formatMoney(totals.totalSYP, "SYP")} ل.س
             </span>
           </div>
 
           <div className="flex items-center justify-between pt-1 border-t border-zinc-100 dark:border-zinc-800">
             <span className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
-              المعادل بالليرة السورية:
+              المعادل بالدولار:
             </span>
             <span className="text-base font-extrabold text-purple-600 dark:text-purple-400">
-              {totals.totalSYP !== null
-                ? `${formatMoney(totals.totalSYP, "SYP")} ل.س`
+              {totals.totalUSD !== null
+                ? `$${formatMoney(totals.totalUSD, "USD")}`
                 : "غير متاح (لا يوجد سعر صرف)"}
             </span>
           </div>
@@ -378,8 +431,8 @@ export function CartPanel({
             disabled={isCartEmpty || isRateMissing}
             onClick={onOpenPaymentModal}
             className={`flex-1 h-11 text-xs font-bold shadow-md rounded-xl transition-all ${isRateMissing
-                ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
-                : "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20"
+              ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
+              : "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20"
               }`}
           >
             <div className="flex items-center justify-between w-full px-1">
@@ -391,7 +444,7 @@ export function CartPanel({
               </span>
               {!isRateMissing && !isCartEmpty && (
                 <span className="text-xs font-mono font-extrabold bg-emerald-700/50 px-2 py-0.5 rounded-lg">
-                  ${formatMoney(totals.totalUSD, "USD")}
+                  {formatMoney(totals.totalSYP, "SYP")} ل.س
                 </span>
               )}
             </div>

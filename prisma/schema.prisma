@@ -53,7 +53,12 @@ datasource db {
 // violation. T4c's existing design (Invoice + InvoiceItem written as
 // separate top-level calls inside one $transaction) already follows this
 // rule — it should be the template every later task copies, not a T4-only
-// pattern.
+// pattern. [v3.7] B2BOrderRequest's approval flow (below) follows the exact
+// same template: approving an order writes Invoice + InvoiceItem(s) +
+// (if applicable) a new Customer, each as its own top-level call inside one
+// $transaction, then a final top-level update on B2BOrderRequest itself
+// setting resultingInvoiceId/status — never a nested write chained off any
+// of those creates.
 //
 // PHASE 2 (hardening, before scaling past the pilot merchant set): real
 // Postgres RLS. Requires, per tenant-scoped table below:
@@ -73,6 +78,69 @@ datasource db {
 // an automated cross-tenant integration test suite (T7) is the compensating
 // control, not code review alone. [v3.4] That T7 suite must cover nested-
 // write bypass attempts specifically, not just direct-query isolation.
+// [v3.7] B2BOrderRequest and B2BOrderRequestItem are tenant-scoped models
+// like any other and must be included in that T7 suite and in the Phase 2
+// RLS rollout — they carry no special exemption.
+// ============================================================================
+
+// ============================================================================
+// [v3.6] CURRENCY RE-ANCHORING NOTE — reverses the v3.0 USD-anchor decision.
+//
+// Through v3.5, USD was the authoritative currency for every financial
+// record (Invoice.totalUSD/paidAmountUSD/debtAmountUSD, CustomerPayment.
+// amountUSD) — SYP was tracked alongside purely as a courtesy display
+// conversion, frozen per-transaction via exchangeRateUsed/exchangeRate. The
+// stated reason was inflation-hedging: a USD-denominated debt holds its
+// value regardless of what happens to the Lira between the sale and
+// repayment.
+//
+// As of v3.6, that's reversed: SYP is now the authoritative currency for
+// every financial record below. USD is retained on every model purely as a
+// derived, informational figure (still computed via the same frozen
+// exchangeRateUsed/exchangeRate, just no longer load-bearing). This is a
+// deliberate trade-off, not an oversight — a SYP-denominated debt can lose
+// real value to inflation between sale and repayment, same risk the v3.0
+// design existed to avoid. It was made because this platform serves one
+// market (Syria) whose merchants think, price, and settle in Lira day to
+// day, and forcing USD-primary bookkeeping fought that reality rather than
+// serving it.
+//
+// Concretely, this means:
+//   - Invoice.totalSYP / paidAmountSYP / debtAmountSYP are the fields every
+//     validation, ledger balance, and business rule reads and writes
+//     first. totalUSD / paidAmountUSD / debtAmountUSD are derived
+//     (SYP ÷ exchangeRateUsed) and shown for merchant reference only —
+//     never validated against, never gate any action.
+//   - CustomerPayment.amountSYP is authoritative; amountUSD is derived the
+//     same way via exchangeRate.
+//   - InvoiceItem.unitPriceSYP is authoritative; unitPriceUSD is derived.
+//   - Subscription.amountUSD is UNCHANGED and intentionally stays USD —
+//     that's the platform's own SaaS revenue from the merchant, a separate
+//     business decision from how a merchant tracks their own customers'
+//     debt.
+//   - No `settlementCurrency`-style per-tenant configurability was
+//     introduced (that flexible approach was considered and rejected back
+//     in v3.4 for unrelated reasons). This re-anchoring is uniform and
+//     unconditional across every tenant, since the platform targets one
+//     market rather than needing per-tenant currency choice.
+// ============================================================================
+
+// ============================================================================
+// [v3.7] FOUR GAPS CLOSED IN THIS REVISION (see accompanying notes at each
+// model below for the full reasoning):
+//   1. B2BOrderRequest / B2BOrderRequestItem — a B2B storefront submission
+//      (T5) has no User session and no committed stock allocation yet, so it
+//      cannot be represented as an Invoice/InvoiceItem row (both fields are
+//      required-non-null there). A dedicated pre-invoice holding model closes
+//      this without weakening Invoice's existing guarantees.
+//   2. CustomerMergeLog — T4e requires the customer-merge action to be
+//      logged for audit purposes; no model previously captured that.
+//   3. Subscription.tier / Subscription.referenceCode — T6 requires tier
+//      selection and a unique payment reference code; neither field existed.
+//   4. ProductUnit.isActive — T3 needs a way to retire a single packaging
+//      unit without hard-deleting it (which would collide with the
+//      ProductBatch Restrict/Cascade interaction, the same class of problem
+//      already documented for Tenant/Customer above).
 // ============================================================================
 
 enum UserRole {
@@ -124,6 +192,12 @@ enum PaymentMethod {
 // rate is only used (a) for display of the *other* currency as a courtesy
 // conversion, and (b) frozen per-sale into Invoice.exchangeRateUsed so the
 // debt ledger keeps working exactly as originally designed.
+//
+// [v3.6] Note this enum's default was already SYP before the currency
+// re-anchoring above — most products already flowed through this pipeline
+// correctly. The re-anchoring mainly changes how a USD-priced unit's sale
+// gets recorded (converted INTO SYP for the authoritative fields), the
+// reverse of the old direction.
 enum PricingCurrency {
   USD
   SYP
@@ -151,6 +225,17 @@ enum ReportStatus {
   DISMISSED
 }
 
+// [v3.7] ADDITION — see the B2BOrderRequest note below for the full
+// reasoning. Deliberately mirrors InvoiceStatus's PENDING_REVIEW naming for
+// conceptual continuity, but is its own enum: a B2BOrderRequest never
+// reaches COMPLETED or VOIDED itself — once APPROVED it hands off to a real
+// Invoice row, which then carries its own independent lifecycle.
+enum B2BOrderStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
 // [v3.5] LIFECYCLE NOTE: Tenant rows are never hard-deleted anywhere in this
 // system — subscriptionStatus (ACTIVE | EXPIRED | PENDING) plus expiresAt is
 // the sole lockout mechanism (T2/T6), and no API route, admin action, or
@@ -176,15 +261,18 @@ model Tenant {
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
 
-  users            User[]
-  products         Product[]
-  productUnits     ProductUnit[]
-  productBatches   ProductBatch[]
-  customers        Customer[]
-  invoices         Invoice[]
-  invoiceItems     InvoiceItem[]
-  customerPayments CustomerPayment[]
-  subscriptions    Subscription[]
+  users             User[]
+  products          Product[]
+  productUnits      ProductUnit[]
+  productBatches    ProductBatch[]
+  customers         Customer[]
+  invoices          Invoice[]
+  invoiceItems      InvoiceItem[]
+  customerPayments  CustomerPayment[]
+  subscriptions     Subscription[]
+  // [v3.7] ADDITION — see B2BOrderRequest / CustomerMergeLog notes below.
+  b2bOrderRequests  B2BOrderRequest[]
+  customerMergeLogs CustomerMergeLog[]
 
   // [v3.3, corrected] The tenant's single "Walk-in Cash Customer," seeded
   // at onboarding (T2). A plain 1:1 relation via a nullable scalar FK is
@@ -200,8 +288,9 @@ model Tenant {
   // as a fast filter flag, carrying no uniqueness enforcement itself.
   // @unique here additionally prevents the same Customer row from ever
   // being wired up as the system customer for more than one Tenant.
-  systemCustomerId String?   @unique
-  systemCustomer   Customer? @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
+  systemCustomerId     String?               @unique
+  systemCustomer       Customer?             @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
+  b2bOrderRequestItems B2BOrderRequestItem[]
 }
 
 model User {
@@ -222,6 +311,13 @@ model User {
   tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
 
+  // [v3.7] ADDITION — the admin who approved/rejected a B2B order request,
+  // and the admin who performed a customer merge. Restrict, same reasoning
+  // as Invoice.user: deactivating a User must never silently erase which
+  // admin took a given action.
+  reviewedB2BOrderRequests B2BOrderRequest[]
+  customerMergeLogs        CustomerMergeLog[]
+
   @@index([tenantId])
 }
 
@@ -237,10 +333,13 @@ model Product {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  units        ProductUnit[]
-  batches      ProductBatch[]
-  invoiceItems InvoiceItem[]
+  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  units                ProductUnit[]
+  batches              ProductBatch[]
+  invoiceItems         InvoiceItem[]
+  // [v3.7] ADDITION — see B2BOrderRequestItem below. Restrict on that side,
+  // so this array is purely informational/navigational here.
+  b2bOrderRequestItems B2BOrderRequestItem[]
 
   @@index([tenantId])
   @@index([tenantId, isPublic])
@@ -281,6 +380,21 @@ model ProductUnit {
   priceRetail     Decimal?        @db.Decimal(18, 4)
   // ---------------------------------------------------------------------
 
+  // [v3.7] ADDITION (gap #4). Soft-delete flag, same reasoning as
+  // Product.isActive above, added at the ProductUnit level specifically
+  // because a single packaging variant (e.g. "كرتونة" for one product)
+  // can need retiring independently of its parent Product or its sibling
+  // units (e.g. "قطعة" for the same product staying on sale). A hard
+  // DELETE here was never viable: ProductBatch.unit is onDelete: Cascade
+  // from ProductUnit, but ProductBatch rows with sales history are
+  // protected from deletion by InvoiceItem.batch's onDelete: Restrict —
+  // the exact same Cascade/Restrict collision already documented for
+  // Tenant/Customer above, just one level deeper in the graph. Deactivate
+  // instead; a deactivated unit is simply hidden from POS/storefront
+  // "add" pickers going forward while every historical InvoiceItem/
+  // ProductBatch referencing it stays fully intact.
+  isActive Boolean @default(true)
+
   // Storefront product photo. Nullable at the DB level (an internal,
   // POS-only product never needs one) but enforced as REQUIRED at the
   // application layer before `Product.isPublic` may be set true — same
@@ -297,10 +411,12 @@ model ProductUnit {
   // in?" at the moment of entry, never guessed from the digit pattern.
   barcodeSource BarcodeSource?
 
-  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  product      Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
-  batches      ProductBatch[]
-  invoiceItems InvoiceItem[]
+  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product              Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
+  batches              ProductBatch[]
+  invoiceItems         InvoiceItem[]
+  // [v3.7] ADDITION — see B2BOrderRequestItem below.
+  b2bOrderRequestItems B2BOrderRequestItem[]
 
   // Barcodes are a global standard — two different tenants can legitimately
   // sell the same imported item under the same barcode. Uniqueness is
@@ -310,6 +426,9 @@ model ProductUnit {
   @@unique([tenantId, barcode])
   @@index([tenantId])
   @@index([productId])
+  // [v3.7] ADDITION — supports the POS/storefront "active units only" list
+  // query without a full per-product scan.
+  @@index([tenantId, isActive])
 }
 
 model ProductBatch {
@@ -348,6 +467,11 @@ model ProductBatch {
   // same two batches in opposite order can deadlock; Postgres aborts one
   // of them with an error rather than resolving it gracefully. This is
   // enforced in `lib/inventory/fifo.ts`, not at the schema level.
+  //
+  // [v3.7] Same lock-ordering rule applies when a B2B order approval
+  // (B2BOrderRequest → Invoice) resolves FIFO allocation across batches —
+  // it uses the exact same `resolveFifoAllocation` function and the exact
+  // same lock-acquisition path as T4c, not a parallel implementation.
   createdAt   DateTime  @default(now())
 
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -381,10 +505,12 @@ model Customer {
   // identity-irrelevant cash sales, so the cashier isn't forced to collect
   // a name/phone for a simple cash transaction. APPLICATION-LEVEL RULE
   // (not a DB constraint): an Invoice may reference a customer with
-  // isSystemGenerated = true ONLY when that invoice's debtAmountUSD = 0.
-  // Any invoice carrying a nonzero debt — full or partial — MUST reference
-  // a real Customer row with name + phone, because the whole point of
-  // recording a customer here is knowing who owes the money back.
+  // isSystemGenerated = true ONLY when that invoice's debtAmountSYP = 0.
+  // [v3.6] Was debtAmountUSD = 0 through v3.5 — see the currency
+  // re-anchoring note at the top of this file. Any invoice carrying a
+  // nonzero debt — full or partial — MUST reference a real Customer row
+  // with name + phone, because the whole point of recording a customer
+  // here is knowing who owes the money back.
   //
   // "At most one per tenant" is NOT enforced by this field or any index on
   // it — a composite index/unique on (tenantId, isSystemGenerated) would be
@@ -423,13 +549,24 @@ model Customer {
   // express.
   offlineId String? @unique
 
-  // Deliberately no balanceDebtUSD column here — net debt is always
-  // computed on-the-fly as SUM(Invoice.debtAmountUSD) - SUM(CustomerPayment.amountUSD)
-  // to avoid a stored balance drifting from the transaction history.
+  // Deliberately no stored balance column here — net debt is always
+  // computed on-the-fly, never cached, to avoid a stored balance drifting
+  // from the transaction history.
+  // [v3.6] SUM(Invoice.debtAmountSYP) - SUM(CustomerPayment.amountSYP WHERE
+  // invoiceId IS NULL) — was the USD equivalent of this formula through
+  // v3.5; see the currency re-anchoring note at the top of this file.
 
   tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
   payments CustomerPayment[]
+
+  // [v3.7] ADDITION — see CustomerMergeLog and B2BOrderRequest below.
+  // Two distinctly-named relations to CustomerMergeLog are required
+  // because this model can appear on either side of a merge (as the
+  // surviving row or as the one merged away) within the same log table.
+  mergesAsSurvivor          CustomerMergeLog[] @relation("MergeSurviving")
+  mergesAsMerged            CustomerMergeLog[] @relation("MergeMerged")
+  matchedByB2BOrderRequests B2BOrderRequest[]
 
   @@index([tenantId])
   @@index([offlineId])
@@ -563,10 +700,24 @@ model Invoice {
   tenantId         String
   userId           String
   customerId       String
-  totalUSD         Decimal       @db.Decimal(18, 4)
+  // [v3.6] AUTHORITATIVE as of this revision — see the currency
+  // re-anchoring note at the top of this file. Every validation, the
+  // ledger balance, and every business rule below reads/writes this field
+  // first.
   totalSYP         Decimal       @db.Decimal(18, 4)
+  // [v3.6] Informational only from this revision forward — derived as
+  // totalSYP ÷ exchangeRateUsed at write time. Kept for merchant reference
+  // and historical continuity; never validated against, never gates any
+  // action. Was the authoritative field through v3.5.
+  totalUSD         Decimal       @db.Decimal(18, 4)
   exchangeRateUsed Decimal       @db.Decimal(18, 4)
+  // [v3.6] AUTHORITATIVE. New in this revision.
+  paidAmountSYP    Decimal       @db.Decimal(18, 4)
+  // [v3.6] Informational only — derived (paidAmountSYP ÷ exchangeRateUsed).
   paidAmountUSD    Decimal       @db.Decimal(18, 4)
+  // [v3.6] AUTHORITATIVE. New in this revision.
+  debtAmountSYP    Decimal       @db.Decimal(18, 4)
+  // [v3.6] Informational only — derived (debtAmountSYP ÷ exchangeRateUsed).
   debtAmountUSD    Decimal       @db.Decimal(18, 4)
   isPaid           Boolean       @default(false)
   status           InvoiceStatus @default(COMPLETED)
@@ -581,22 +732,36 @@ model Invoice {
   //
   // Unaffected by the v3.1 pricing change: whatever currency/price a
   // ProductUnit is set in, the SALE ITSELF still resolves to a single
-  // exchangeRateUsed per invoice, and InvoiceItem.unitPriceUSD is still
-  // always stored in USD (converted at sync time from priceWholesale in
-  // whichever pricingCurrency it was set in). totalSYP ≈ totalUSD ×
-  // exchangeRateUsed still holds and is still validated at sync exactly
-  // as in v3.0 — nothing in T4c's validation logic changes.
+  // exchangeRateUsed per invoice, and InvoiceItem.unitPriceSYP is still
+  // always stored in SYP (converted at sync time from priceWholesale in
+  // whichever pricingCurrency it was set in — [v3.6] was unitPriceUSD/USD
+  // through v3.5, see the currency re-anchoring note at the top of this
+  // file). [v3.6] `debtAmountSYP ≈ totalSYP − paidAmountSYP` is the
+  // authoritative validation at sync (T4c); the USD-side equivalent
+  // (`totalUSD ≈ totalSYP ÷ exchangeRateUsed`) is checked only as a
+  // sanity/display consistency signal and never fails a sync on its own.
+  // Through v3.5 this was the reverse: `totalSYP ≈ totalUSD ×
+  // exchangeRateUsed` was the authoritative check.
   //
   // [v3.3] customerId may point at a tenant's isSystemGenerated customer
-  // ONLY when debtAmountUSD = 0 for this row — enforced at the API layer
-  // when an invoice is created/synced, not by a DB constraint (a DB-level
-  // CHECK spanning two tables isn't practical here). Every other invoice
-  // must reference a real, identified Customer.
+  // ONLY when debtAmountSYP = 0 for this row ([v3.6] was debtAmountUSD = 0
+  // through v3.5) — enforced at the API layer when an invoice is
+  // created/synced, not by a DB constraint (a DB-level CHECK spanning two
+  // tables isn't practical here). Every other invoice must reference a
+  // real, identified Customer.
   //
   // DELIBERATELY NO `paymentMethod` COLUMN HERE (T4 decision): the method
-  // used for the amount paid at sale time (paidAmountUSD) is NOT stored on
+  // used for the amount paid at sale time (paidAmountSYP) is NOT stored on
   // Invoice directly. Instead, /api/sync inserts a matching CustomerPayment
   // row.
+  //
+  // [v3.7] A B2B order approval (T5) writes this row through the EXACT
+  // SAME path as a POS sale or an /api/sync invoice — userId is the
+  // approving ADMIN (not any account belonging to the retailer, who never
+  // has one), and every InvoiceItem's batchId is resolved via
+  // resolveFifoAllocation at approval time, not at order-submission time.
+  // See the B2BOrderRequest model below for why the order itself cannot be
+  // represented as an Invoice row until that approval happens.
 
   // A void/refund is its own Invoice row with status VOIDED, whose amounts
   // reverse the original. This field is set ONLY on that reversing row,
@@ -626,9 +791,15 @@ model Invoice {
   items    InvoiceItem[]
 
   // The sale-time payment CustomerPayment.invoiceId (below) points back
-  // at, if paidAmountUSD > 0 on this invoice. Nullable/optional because a
-  // fully-on-credit invoice (paidAmountUSD = 0) has none.
+  // at, if paidAmountSYP > 0 on this invoice. Nullable/optional because a
+  // fully-on-credit invoice (paidAmountSYP = 0) has none.
   payment CustomerPayment?
+
+  // [v3.7] ADDITION — reverse side of B2BOrderRequest.resultingInvoiceId.
+  // Optional/nullable because the overwhelming majority of invoices come
+  // from the POS (T4b), not a B2B approval — this is populated only on
+  // the invoice a B2B order approval produced.
+  b2bOrderRequest B2BOrderRequest?
 
   @@index([tenantId])
   @@index([customerId])
@@ -670,11 +841,17 @@ model InvoiceItem {
   // NESTED WRITES note at the top of this file for why.
   batchId      String
   quantity     Decimal @db.Decimal(18, 4)
-  // Always USD regardless of the ProductUnit's pricingCurrency at sale
-  // time — converted server-side at sync (T4c) using that invoice's own
-  // exchangeRateUsed if the unit's priceWholesale was set in SYP. This is
-  // what keeps every historical invoice comparable regardless of what
-  // currency a product happened to be priced in on the day it was sold.
+  // [v3.6] AUTHORITATIVE as of this revision — see the currency
+  // re-anchoring note at the top of this file. Always SYP regardless of
+  // the ProductUnit's pricingCurrency at sale time — converted server-side
+  // at sync (T4c) using that invoice's own exchangeRateUsed if the unit's
+  // priceWholesale was set in USD. This is what keeps every historical
+  // invoice comparable regardless of what currency a product happened to
+  // be priced in on the day it was sold.
+  unitPriceSYP Decimal @db.Decimal(18, 4)
+  // [v3.6] Informational only — derived (unitPriceSYP ÷ exchangeRateUsed)
+  // at the same sync step. Was the authoritative field (always USD,
+  // converted from SYP) through v3.5.
   unitPriceUSD Decimal @db.Decimal(18, 4)
 
   tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -697,8 +874,14 @@ model CustomerPayment {
   id            String        @id @default(cuid())
   tenantId      String
   customerId    String
-  amountUSD     Decimal       @db.Decimal(18, 4)
+  // [v3.6] AUTHORITATIVE as of this revision — see the currency
+  // re-anchoring note at the top of this file. No schema change was
+  // needed for this model: both currency fields already existed side by
+  // side; only which one is treated as the source of truth changed.
   amountSYP     Decimal       @db.Decimal(18, 4)
+  // [v3.6] Informational only from this revision forward — derived
+  // (amountSYP ÷ exchangeRate). Was the authoritative field through v3.5.
+  amountUSD     Decimal       @db.Decimal(18, 4)
   exchangeRate  Decimal       @db.Decimal(18, 4)
   paymentMethod PaymentMethod
   receiptNo     String?
@@ -713,15 +896,17 @@ model CustomerPayment {
   // sale time (auto-created by /api/sync alongside a new Invoice, per T4c)
   // from an independent repayment logged later against existing debt.
   //
-  // Invoice.debtAmountUSD is ALREADY computed as totalUSD - paidAmountUSD
+  // Invoice.debtAmountSYP is ALREADY computed as totalSYP - paidAmountSYP
   // — i.e., a sale-time payment is already reflected in that number. If
   // the ledger's balance formula (T4e) also subtracted every
   // CustomerPayment row unconditionally, a sale-time payment would be
-  // subtracted TWICE: once implicitly (inside debtAmountUSD) and once
-  // explicitly (summing CustomerPayment.amountUSD). This column is what
+  // subtracted TWICE: once implicitly (inside debtAmountSYP) and once
+  // explicitly (summing CustomerPayment.amountSYP). This column is what
   // lets the ledger tell the two kinds of row apart:
-  //   SUM(Invoice.debtAmountUSD)
-  //     - SUM(CustomerPayment.amountUSD WHERE invoiceId IS NULL)
+  //   SUM(Invoice.debtAmountSYP)
+  //     - SUM(CustomerPayment.amountSYP WHERE invoiceId IS NULL)
+  // [v3.6] This formula summed debtAmountUSD/amountUSD through v3.5 — see
+  // the currency re-anchoring note at the top of this file.
   //
   // @unique also gives a DB-level guarantee that at most one
   // CustomerPayment can ever be linked to a given invoice.
@@ -743,11 +928,32 @@ model CustomerPayment {
   @@index([offlineId])
 }
 
+// [v3.6] Deliberately UNCHANGED by the currency re-anchoring above.
+// amountUSD here is the platform's own SaaS revenue from the merchant —
+// a separate business decision from how a merchant tracks their own
+// customers' debt (which is what got re-anchored to SYP). Revisit only if
+// that separate decision changes too.
 model Subscription {
   id              String                   @id @default(cuid())
   tenantId        String
+  // [v3.7] ADDITION (gap #3). T6 names "tier options" as part of merchant
+  // checkout but no field previously captured which tier was selected.
+  // Kept as a plain String rather than an enum deliberately: the specific
+  // tier lineup (and its pricing) is a commercial decision expected to
+  // change independently of the schema, and an enum change requires a
+  // migration on every deploy whereas a String does not. Validated at the
+  // application layer against whatever the current tier list is.
+  tier            String
   receiptImageURL String?
   amountUSD       Decimal                  @db.Decimal(18, 4)
+  // [v3.7] ADDITION (gap #3). T6 names a "unique Payment Reference Code"
+  // the merchant is shown at checkout and writes on their manual transfer,
+  // which the Super-Admin then matches against the incoming payment when
+  // reviewing the receipt. @unique both prevents two different
+  // Subscription rows from accidentally sharing a code and gives the
+  // admin dashboard a direct lookup path instead of a manual scan through
+  // pending receipts.
+  referenceCode   String                   @unique
   status          SubscriptionRecordStatus @default(PENDING_APPROVAL)
   expiresAt       DateTime?
   createdAt       DateTime                 @default(now())
@@ -757,4 +963,166 @@ model Subscription {
 
   @@index([tenantId, status])
   @@index([status])
+}
+
+// [v3.7] ADDITION (gap #1). Represents a B2B storefront order (T5) from
+// the moment a retailer submits it until a wholesaler ADMIN approves or
+// rejects it. This is deliberately a SEPARATE model from Invoice, not an
+// Invoice row created early with status PENDING_REVIEW, for two concrete
+// schema-level reasons:
+//
+//   1. Invoice.userId is required-non-null, referencing a real User who
+//      created the sale. A B2B storefront submission has no User session
+//      at all — the retailer submitting it is a member of the public, not
+//      an authenticated account on this platform. There is no honest value
+//      to put in that column at submission time.
+//   2. InvoiceItem.batchId is required-non-null, because every InvoiceItem
+//      that exists must be traceable to the exact physical batch its stock
+//      came from — that traceability is what makes a void's stock reversal
+//      correct. But T5 explicitly commits inventory only at APPROVAL time,
+//      not at submission time (a pending order must never reserve or
+//      decrement stock that a wholesaler might reject hours later). Until
+//      approval, there is no batch allocation to record.
+//
+// Forcing either column to accept a placeholder value (a synthetic "system"
+// User, a fabricated batchId) would create exactly the kind of "untested,
+// undefined-feeling" edge case this spec already explicitly avoids doing
+// for Tenant hard-deletes elsewhere (see the Tenant Lifecycle & Deletion
+// Policy note above) — so a dedicated pre-invoice holding model is used
+// instead. On approval, the ADMIN who approves becomes Invoice.userId, and
+// resolveFifoAllocation runs for the first time (via the identical
+// lock-ordering and Preview/Commit-sharing rules as T4c) to assign real
+// batchIds — at which point a real Invoice + InvoiceItem(s) are written via
+// the standard top-level-calls-in-one-$transaction pattern, and this row is
+// updated (its own top-level call) to APPROVED with resultingInvoiceId set.
+//
+// A rejection never creates any Invoice row at all — it only updates this
+// row's own status and rejectionReason, leaving inventory untouched.
+model B2BOrderRequest {
+  id               String         @id @default(cuid())
+  tenantId         String
+  // The submitting retailer's own details, captured directly on this row
+  // rather than requiring a pre-existing Customer — most first-time B2B
+  // submitters have never bought from this tenant before and have no
+  // Customer row yet. If approval finds or creates a matching real
+  // Customer, that relationship is recorded on the resulting Invoice
+  // (Invoice.customerId), not retrofitted onto this row.
+  retailerName     String
+  retailerPhone    String
+  retailerShopName String?
+  status           B2BOrderStatus @default(PENDING_REVIEW)
+  // Populated only when status = REJECTED — mirrors the free-text
+  // reasoning pattern already used for Invoice.voidReason.
+  rejectionReason  String?
+
+  // [v3.7] Optional convenience link: if the submitting phone already
+  // matches an existing real Customer for this tenant, the approval
+  // screen can show that match to the admin before deciding whether to
+  // reuse it or create a new Customer row — same soft-duplicate spirit as
+  // T4b's walk-in customer check, just surfaced earlier in this flow.
+  // SetNull (not Restrict): this is a hint, not a financial record: if the
+  // matched Customer is ever deactivated, this order request should not
+  // be blocked from anything as a result.
+  matchedCustomerId String?
+  matchedCustomer   Customer? @relation(fields: [matchedCustomerId], references: [id], onDelete: SetNull)
+
+  // Set only once, at the moment of approval — see the model-level note
+  // above for why this cannot simply be an Invoice row from the start.
+  // @unique guarantees an order request can only ever produce one
+  // Invoice, mirroring Invoice.voidsInvoiceId's "at most once" pattern.
+  resultingInvoiceId String?  @unique
+  resultingInvoice   Invoice? @relation(fields: [resultingInvoiceId], references: [id], onDelete: Restrict)
+
+  // Which ADMIN approved or rejected this, and when — required for the
+  // wholesaler's own accountability trail, same reasoning as
+  // CustomerMergeLog capturing "by which admin" below. Nullable because a
+  // freshly submitted, still-PENDING_REVIEW row has neither yet.
+  reviewedByUserId String?
+  reviewedByUser   User?     @relation(fields: [reviewedByUserId], references: [id], onDelete: Restrict)
+  reviewedAt       DateTime?
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items  B2BOrderRequestItem[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  // [v3.7] Supports T5's per-phone abuse guard directly: "how many
+  // PENDING_REVIEW order requests already exist for this phone at this
+  // tenant?" without a full table scan — the complementary check to the
+  // per-IP @upstash/ratelimit guard, served at the database layer rather
+  // than the rate-limiter's own store.
+  @@index([tenantId, retailerPhone, status])
+}
+
+// [v3.7] ADDITION (gap #1, continued). A single requested line item on a
+// still-pending B2B order. Deliberately holds NO batchId (see the
+// B2BOrderRequest model-level note for why) — only a snapshot of what was
+// requested and at what price, taken at submission time.
+model B2BOrderRequestItem {
+  id                      String          @id @default(cuid())
+  tenantId                String
+  orderRequestId          String
+  productId               String
+  unitId                  String
+  quantity                Decimal         @db.Decimal(18, 4)
+  // Snapshot of ProductUnit.priceWholesale / pricingCurrency AT THE MOMENT
+  // OF SUBMISSION. A merchant may edit priceWholesale on the live
+  // ProductUnit row at any time — including in the window between a
+  // retailer submitting this order and an admin reviewing it — so the
+  // review screen must show what the retailer actually saw and agreed to,
+  // not whatever the price happens to be right now. On approval, THIS
+  // snapshot (not the live ProductUnit price) is what gets written into
+  // the resulting InvoiceItem.unitPriceSYP/unitPriceUSD.
+  priceWholesaleSnapshot  Decimal         @db.Decimal(18, 4)
+  pricingCurrencySnapshot PricingCurrency
+
+  tenant       Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orderRequest B2BOrderRequest @relation(fields: [orderRequestId], references: [id], onDelete: Cascade)
+  // Restrict, not Cascade: same reasoning as InvoiceItem.product/unit —
+  // a still-pending or already-approved order request referencing a
+  // product must never have that reference silently erased by a product
+  // deletion. Products are soft-deleted (isActive = false) instead.
+  product      Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  unit         ProductUnit     @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([orderRequestId])
+}
+
+// [v3.7] ADDITION (gap #2). T4e requires that a duplicate-customer merge
+// be "logged (which two customer IDs, by which admin, when) for audit
+// purposes, append-only" — no prior model captured this. Deliberately
+// separate from Customer itself (not, say, a `mergedIntoId` column on
+// Customer) so that a merge remains a first-class, queryable event in its
+// own right, and so a customer could theoretically be merged away and
+// still leave a clean audit row behind even though the Customer row
+// itself is never hard-deleted (only deactivated) regardless.
+model CustomerMergeLog {
+  id                  String   @id @default(cuid())
+  tenantId            String
+  // The Customer row that remains active and now owns every re-pointed
+  // Invoice/CustomerPayment row.
+  survivingCustomerId String
+  // The Customer row that was merged away and deactivated
+  // (isActive = false) as part of this same operation.
+  mergedCustomerId    String
+  performedByUserId   String
+  createdAt           DateTime @default(now())
+
+  tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // survivingCustomer/mergedCustomer/performedByUser are Restrict: this log
+  // is itself a financial-audit record and must never be silently orphaned
+  // by a later, unrelated data change — consistent with every other
+  // financial-record Restrict pattern in this schema (Invoice.customer,
+  // CustomerPayment.customer). tenant still cascades, like every other
+  // tenant-scoped model in this file.
+  survivingCustomer Customer @relation("MergeSurviving", fields: [survivingCustomerId], references: [id], onDelete: Restrict)
+  mergedCustomer    Customer @relation("MergeMerged", fields: [mergedCustomerId], references: [id], onDelete: Restrict)
+  performedByUser   User     @relation(fields: [performedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([survivingCustomerId])
+  @@index([mergedCustomerId])
 }

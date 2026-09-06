@@ -148,6 +148,11 @@ export function divideMoney(a: MoneyInput, b: MoneyInput): string {
  * conversion would produce a plausible-looking number in the wrong
  * currency (e.g. "18.5" shown where "277500" was meant), which is far
  * harder to catch than an explicit failure.
+ *
+ * Direction-agnostic by design: this function does not encode which
+ * currency is "authoritative" (that's a v3.6 business-logic decision made
+ * at the call site — see Invoice/CustomerPayment/InvoiceItem in
+ * schema.prisma), it just converts whichever direction is asked for.
  */
 export function convertCurrency(
   amount: MoneyInput,
@@ -193,10 +198,25 @@ export function compareMoney(a: MoneyInput, b: MoneyInput): number {
  * grouping/decimal separators follow the same convention as the rest of
  * the Arabic-first UI instead of a hand-rolled, locale-unaware comma
  * formatter. Defaults to 2 decimals for USD, 0 for SYP.
+ *
+ * [v3.6] Default `currency` changed from "USD" to "SYP". Through v3.5, USD
+ * was the authoritative currency everywhere, so defaulting an
+ * unspecified call to USD matched the rest of the system. As of v3.6, SYP
+ * is authoritative on Invoice/CustomerPayment/InvoiceItem — leaving the
+ * old "USD" default in place would mean any call site that forgot to pass
+ * `currency` explicitly (old code not yet migrated, or a new call site
+ * that omits it by mistake) silently formats a SYP amount as if it were
+ * USD, with no error and no visual sign anything is wrong beyond the
+ * number itself. Defaulting to "SYP" now matches the new authoritative
+ * currency, so an unspecified call fails toward the currency that's
+ * actually correct almost everywhere in the app today. This does NOT
+ * change behavior for any call site that already passes `currency`
+ * explicitly (which every call site should — treat the default as a
+ * safety net, not a reason to omit the argument).
  */
 export function formatMoney(
   amount: MoneyInput,
-  currency: "USD" | "SYP" = "USD",
+  currency: "USD" | "SYP" = "SYP",
   decimals?: number
 ): string {
   const dec = toDecimal(amount);

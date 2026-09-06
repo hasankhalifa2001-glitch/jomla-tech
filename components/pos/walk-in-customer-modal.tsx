@@ -34,6 +34,7 @@ import {
   type SelectedCustomer,
   type DuplicatePhoneMatch,
 } from "@/lib/offline";
+import { formatMoney } from "@/lib/utils/money";
 
 interface WalkInCustomerModalProps {
   open: boolean;
@@ -350,10 +351,10 @@ export function WalkInCustomerModal({
                 void handleSelectCashCustomer();
               }}
               className={`rounded-xl border p-3 transition-all flex items-center justify-between ${!allowSystemCustomer
-                  ? "cursor-not-allowed opacity-50 border-zinc-200 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-900/50"
-                  : isSystemSelected
-                    ? "cursor-pointer border-emerald-600 bg-emerald-50/80 dark:bg-emerald-950/50 text-emerald-900 dark:text-emerald-100 font-semibold shadow-xs"
-                    : "cursor-pointer border-zinc-200 bg-zinc-50/50 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
+                ? "cursor-not-allowed opacity-50 border-zinc-200 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-900/50"
+                : isSystemSelected
+                  ? "cursor-pointer border-emerald-600 bg-emerald-50/80 dark:bg-emerald-950/50 text-emerald-900 dark:text-emerald-100 font-semibold shadow-xs"
+                  : "cursor-pointer border-zinc-200 bg-zinc-50/50 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
                 }`}
             >
               <div className="flex items-center gap-3">
@@ -445,16 +446,33 @@ export function WalkInCustomerModal({
                         </div>
                       </div>
 
+                      {/*
+                        [v3.6] FIX — was checking/displaying
+                        `c.balanceDebtUSD` only, via raw `.toFixed(2)`
+                        (bypassing formatMoney entirely, inconsistent with
+                        every other money display in the app). SelectedCustomer's
+                        `balanceDebtSYP` is the authoritative field
+                        (pos-service.ts) — the debt/no-debt decision and
+                        the primary figure shown must be based on it.
+                        balanceDebtUSD (when present) is now a guarded,
+                        secondary "≈" figure only, matching the pattern
+                        used everywhere else in the POS UI.
+                      */}
                       <div className="text-left">
-                        {c.balanceDebtUSD !== undefined &&
-                          c.balanceDebtUSD > 0 ? (
+                        {c.balanceDebtSYP !== undefined &&
+                          c.balanceDebtSYP > 0 ? (
                           <div className="text-right">
                             <span className="text-[10px] text-zinc-400 block">
                               الدين الحالي
                             </span>
-                            <span className="text-xs font-bold text-red-600 dark:text-red-400">
-                              ${c.balanceDebtUSD.toFixed(2)}
+                            <span className="text-xs font-bold text-red-600 dark:text-red-400 font-mono">
+                              {formatMoney(c.balanceDebtSYP, "SYP")} ل.س
                             </span>
+                            {c.balanceDebtUSD !== undefined && (
+                              <span className="text-[10px] text-red-400 dark:text-red-500 block">
+                                ≈ ${c.balanceDebtUSD.toFixed(2)}
+                              </span>
+                            )}
                           </div>
                         ) : (
                           <span className="text-[11px] text-emerald-600">

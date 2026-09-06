@@ -16,8 +16,13 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import type { PosProductItem, CachedProductUnit } from "@/lib/offline";
-import { resolveUnitPriceUSD } from "@/lib/offline";
-import { formatMoney, convertCurrency, compareMoney } from "@/lib/utils/money";
+import {
+  resolveUnitPriceSYP,
+  resolveUnitPriceUSD,
+  breakdownStockByUnits,
+  formatStockBreakdown,
+} from "@/lib/offline";
+import { formatMoney } from "@/lib/utils/money";
 
 interface ProductCatalogProps {
   products: PosProductItem[];
@@ -30,31 +35,24 @@ interface ProductCatalogProps {
   searchInputRef: React.RefObject<HTMLInputElement | null>;
 }
 
-// [FIX — critical] Previously every price shown in this component came
-// from `serializeMoney(unit.priceWholesale ?? "0")` directly — treating
-// the raw stored number as USD regardless of `unit.pricingCurrency`. For
-// any SYP-priced unit (e.g. the seeded "طحين سميد" product, priced at
-// 18000 SYP) this displayed "$18000.00" — a currency mix-up off by
-// several orders of magnitude, then compounded further by re-converting
-// that already-wrong "USD" figure back into SYP for the secondary
-// display line. `resolveUnitPriceUSD` (lib/offline/pos-service.ts) is the
-// single function in this codebase that correctly branches on
-// `pricingCurrency` and converts SYP -> USD using the cached exchange
-// rate — every price shown here now goes through it instead of
-// duplicating that logic (incorrectly) inline.
-//
-// `resolveUnitPriceUSD` throws when a SYP-priced unit has no valid cached
-// exchange rate to convert with (fail-loud, per lib/utils/money.ts's
-// philosophy) — this wrapper catches that specific, expected case and
-// returns `null` so the UI can show "يتطلب سعر الصرف" instead of crashing
-// the whole product grid over one unpriced-in-USD item.
-function resolvePriceOrNull(
+// [v3.6] FIX — this used to resolve and display USD as the primary price
+// for every unit via resolveUnitPriceUSD, treating USD as authoritative.
+// SYP is now authoritative (schema.prisma / pos-service.ts): every price
+// shown here goes through resolveUnitPriceSYP first. A SYP-priced unit
+// resolves with NO exchange rate needed at all (the reverse of the
+// pre-v3.6 direction, where a SYP-priced unit was the one that needed a
+// rate to show its USD-primary price). A USD-priced unit still needs a
+// cached rate to convert INTO SYP — `resolveUnitPriceSYP` throws in that
+// case (fail-loud, per lib/utils/money.ts), and this wrapper catches that
+// specific, expected case and returns `null` so the UI can show "يتطلب
+// سعر الصرف" instead of crashing the whole product grid over one item.
+function resolveSYPOrNull(
   unit: CachedProductUnit,
   product: PosProductItem,
   exchangeRate: number | null
 ): string | null {
   try {
-    return resolveUnitPriceUSD(unit, product, exchangeRate);
+    return resolveUnitPriceSYP(unit, product, exchangeRate);
   } catch {
     return null;
   }
@@ -95,8 +93,6 @@ export function ProductCatalog({
       }
     }
   }
-
-  const hasRate = exchangeRate !== null && compareMoney(exchangeRate, 0) > 0;
 
   return (
     <div className="flex flex-col h-full space-y-3">
@@ -173,35 +169,56 @@ export function ProductCatalog({
             )}
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 pb-2">
+          // [FIX — responsive grid] The catalog only ever occupies
+          // col-span-7/12 (lg) or col-span-8/12 (xl) of the page grid —
+          // its real width is much narrower than the viewport breakpoint
+          // that triggers each column count. The old
+          // `sm:grid-cols-2 xl:grid-cols-3` jumped straight from 2 to 3
+          // columns at the `xl` viewport breakpoint even though the
+          // catalog's own container is still fairly narrow there. Added
+          // an explicit `lg:grid-cols-2` (container is at its narrowest
+          // relative width right when `lg` first applies) and a
+          // `2xl:grid-cols-4` step for when the container is genuinely
+          // wide enough to hold a 4th column comfortably.
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3 pb-2">
             {products.map((product) => {
               const defaultUnit = product.units?.[0];
+              // [v3.6] Primary — SYP, authoritative, never requires a rate
+              // for a SYP-priced unit.
+              const wholesalePriceSYP = defaultUnit
+                ? resolveSYPOrNull(defaultUnit, product, exchangeRate)
+                : null;
+              // [v3.6] Secondary — USD, derived/display-only. Never
+              // throws (resolveUnitPriceUSD returns null on a missing
+              // rate instead), so no try/catch wrapper is needed here.
               const wholesalePriceUSD = defaultUnit
-                ? resolvePriceOrNull(defaultUnit, product, exchangeRate)
+                ? resolveUnitPriceUSD(defaultUnit, product, exchangeRate)
                 : null;
 
-              // [FIX] priceRetail is stored in the SAME pricingCurrency as
-              // priceWholesale on that unit — it was previously displayed
-              // via a raw serializeMoney too, which had the identical bug
-              // for any SYP-priced unit's retail price. Reused
-              // resolveUnitPriceUSD by temporarily substituting
-              // priceRetail as the "wholesale" value being resolved, since
-              // the currency-resolution logic is identical for either
-              // field — only the DB write path treats them differently,
-              // not the currency math.
-              const retailPriceUSD =
+              // priceRetail is stored in the SAME pricingCurrency as
+              // priceWholesale on that unit — resolved the same way, by
+              // temporarily substituting priceRetail as the "wholesale"
+              // value being resolved (the currency-resolution logic is
+              // identical for either field; only the DB write path
+              // treats them differently, not the currency math).
+              const retailPriceSYP =
                 defaultUnit?.priceRetail !== undefined
-                  ? resolvePriceOrNull(
+                  ? resolveSYPOrNull(
                     { ...defaultUnit, priceWholesale: defaultUnit.priceRetail },
                     product,
                     exchangeRate
                   )
                   : null;
 
-              const convertedSYP =
-                hasRate && exchangeRate && wholesalePriceUSD !== null
-                  ? convertCurrency(wholesalePriceUSD, exchangeRate, "USD", "SYP")
-                  : null;
+              // [FIX] `totalCachedStock` is now correctly computed in the
+              // product's base unit (pos-service.ts). Rendered here as a
+              // multi-unit breakdown ("5 كرتونة و5 قطعة") instead of a
+              // raw base-unit number ("65"), which is unreadable for the
+              // merchant and doesn't match how they think about their own
+              // shelves.
+              const stockLabel = formatStockBreakdown(
+                breakdownStockByUnits(product.totalCachedStock, product.units || [])
+              );
 
               return (
                 <Card
@@ -221,37 +238,54 @@ export function ProductCatalog({
                           title="مستوى المخزون المخزن محلياً (معلوماتي فقط ولا يقيد البيع)"
                         >
                           <Info className="h-2.5 w-2.5 ml-1 text-zinc-400" />
-                          المخزون: {product.totalCachedStock}
+                          المخزون: {stockLabel}
                         </Badge>
                       </div>
 
-                      {/* Primary Wholesale Price Indicator */}
-                      <div className="flex items-baseline flex-wrap gap-x-2 gap-y-0.5">
-                        {wholesalePriceUSD !== null ? (
-                          <>
-                            <span className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 font-mono">
-                              ${formatMoney(wholesalePriceUSD, "USD")}
-                            </span>
-                            {convertedSYP !== null && (
-                              <span className="text-[11px] font-semibold text-purple-600 dark:text-purple-400">
-                                ≈ {formatMoney(convertedSYP, "SYP")} ل.س
+                      {/*
+                        [FIX — layout bug] The previous markup put the
+                        retail strikethrough price INSIDE the same
+                        `flex-wrap` row as the SYP/USD prices, positioned
+                        with `mr-auto`. `margin-auto` on a wrapped flex
+                        item doesn't reliably push to the row's end once
+                        wrapping actually kicks in (long product names /
+                        narrow cards), so the retail price could land
+                        directly after the USD price instead of visually
+                        separated. Split into two independent flex
+                        containers with `justify-between`: the primary
+                        price block on the "start" side, retail price
+                        pinned to the "end" side — position is guaranteed
+                        regardless of how the primary block wraps.
+                      */}
+                      <div className="flex items-baseline justify-between gap-2">
+                        <div className="flex items-baseline flex-wrap gap-x-2 gap-y-0.5 min-w-0">
+                          {wholesalePriceSYP !== null ? (
+                            <>
+                              <span className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 font-mono">
+                                {formatMoney(wholesalePriceSYP, "SYP")} ل.س
                               </span>
-                            )}
-                            {retailPriceUSD !== null && (
-                              <span className="text-[10px] text-zinc-400 line-through decoration-zinc-300 flex items-center gap-0.5 mr-auto">
-                                <Tag className="h-2.5 w-2.5" />
-                                مفرد: ${formatMoney(retailPriceUSD, "USD")}
-                              </span>
-                            )}
-                          </>
-                        ) : (
-                          <Badge
-                            variant="outline"
-                            className="text-[10px] gap-1 text-amber-700 border-amber-300 bg-amber-50 dark:bg-amber-950/50 dark:text-amber-300"
-                          >
-                            <AlertTriangle className="h-3 w-3" />
-                            يتطلب تحديد سعر الصرف اليومي
-                          </Badge>
+                              {wholesalePriceUSD !== null && (
+                                <span className="text-[11px] font-semibold text-purple-600 dark:text-purple-400">
+                                  ≈ ${formatMoney(wholesalePriceUSD, "USD")}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] gap-1 text-amber-700 border-amber-300 bg-amber-50 dark:bg-amber-950/50 dark:text-amber-300"
+                            >
+                              <AlertTriangle className="h-3 w-3" />
+                              يتطلب تحديد سعر الصرف اليومي
+                            </Badge>
+                          )}
+                        </div>
+
+                        {wholesalePriceSYP !== null && retailPriceSYP !== null && (
+                          <span className="shrink-0 text-[10px] text-zinc-400 line-through decoration-zinc-300 flex items-center gap-0.5">
+                            <Tag className="h-2.5 w-2.5" />
+                            مفرد: {formatMoney(retailPriceSYP, "SYP")} ل.س
+                          </span>
                         )}
                       </div>
                     </div>
@@ -263,8 +297,8 @@ export function ProductCatalog({
                       </span>
                       <div className="flex flex-wrap gap-1.5">
                         {product.units?.map((unit) => {
-                          const unitPriceUSD = resolvePriceOrNull(unit, product, exchangeRate);
-                          const isDisabled = unitPriceUSD === null;
+                          const unitPriceSYP = resolveSYPOrNull(unit, product, exchangeRate);
+                          const isDisabled = unitPriceSYP === null;
                           return (
                             <button
                               key={unit.id}
@@ -278,16 +312,21 @@ export function ProductCatalog({
                                   ? "لا يمكن إضافة هذه الوحدة بدون تحديد سعر الصرف اليومي أولاً"
                                   : undefined
                               }
-                              className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-right text-[11px] font-medium transition-all ${isDisabled
-                                  ? "border-zinc-200 bg-zinc-100 text-zinc-400 cursor-not-allowed dark:border-zinc-800 dark:bg-zinc-800/50 dark:text-zinc-600"
-                                  : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:border-emerald-600 hover:bg-emerald-50 hover:text-emerald-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-emerald-950/60 dark:hover:text-emerald-300"
+                              // [FIX — touch target] py-1.5 on mobile
+                              // (dropping to the original py-1 from `sm:`
+                              // up) so these buttons stay comfortably
+                              // tappable with a thumb on a phone without
+                              // making them bulkier on desktop/mouse use.
+                              className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 sm:py-1 text-right text-[11px] font-medium transition-all ${isDisabled
+                                ? "border-zinc-200 bg-zinc-100 text-zinc-400 cursor-not-allowed dark:border-zinc-800 dark:bg-zinc-800/50 dark:text-zinc-600"
+                                : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:border-emerald-600 hover:bg-emerald-50 hover:text-emerald-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-emerald-950/60 dark:hover:text-emerald-300"
                                 }`}
                             >
                               <Plus className={`h-3 w-3 shrink-0 ${isDisabled ? "text-zinc-400" : "text-emerald-600"}`} />
                               <span className="font-semibold">{unit.unitName}</span>
                               <span className="text-[10px] font-mono opacity-80">
-                                {unitPriceUSD !== null
-                                  ? `($${formatMoney(unitPriceUSD, "USD")})`
+                                {unitPriceSYP !== null
+                                  ? `(${formatMoney(unitPriceSYP, "SYP")} ل.س)`
                                   : "(يتطلب سعر الصرف)"}
                               </span>
                             </button>
