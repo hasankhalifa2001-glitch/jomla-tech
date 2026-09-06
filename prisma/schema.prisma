@@ -143,6 +143,34 @@ datasource db {
 //      already documented for Tenant/Customer above).
 // ============================================================================
 
+// ============================================================================
+// [v3.8] THREE GAPS CLOSED IN THIS REVISION:
+//   1. Double-approval race condition on B2BOrderRequest. Nothing previously
+//      stopped two concurrent approval attempts on the SAME still-pending
+//      order (a double-click, two open tabs, a retried request) from both
+//      reading status = PENDING_REVIEW, both running resolveFifoAllocation,
+//      and both writing a real Invoice — decrementing ProductBatch.quantity
+//      TWICE for one order. resultingInvoiceId's @unique constraint only
+//      catches this at the very last step (linking the SECOND invoice back
+//      to the order), by which point the double stock deduction and the
+//      orphaned extra Invoice have already happened. FIX (application-layer,
+//      no schema change needed): the approval handler's FIRST write, inside
+//      the same $transaction as everything else, must be a conditional
+//      update — `UPDATE "B2BOrderRequest" SET status = 'APPROVED' WHERE id =
+//      $1 AND status = 'PENDING_REVIEW'` — and the handler must check that
+//      exactly one row was affected before proceeding to resolveFifoAllocation
+//      or any Invoice/InvoiceItem write. Zero rows affected means another
+//      request already claimed this order; abort immediately with no side
+//      effects. This mirrors the void-of-void prohibition's own combination
+//      of a DB-level constraint (resultingInvoiceId's @unique) plus an
+//      explicit application-level guard that catches the problem BEFORE the
+//      unique constraint would, not instead of it. See T5 and T7.
+//   2. CustomerMergeLog.mergedCustomerId lacked a uniqueness guarantee — see
+//      the model below.
+//   3. B2B order approval's payment fields were previously undocumented. See
+//      the Invoice model note below for the resolved decision.
+// ============================================================================
+
 enum UserRole {
   ADMIN
   CASHIER
@@ -472,6 +500,14 @@ model ProductBatch {
   // (B2BOrderRequest → Invoice) resolves FIFO allocation across batches —
   // it uses the exact same `resolveFifoAllocation` function and the exact
   // same lock-acquisition path as T4c, not a parallel implementation.
+  //
+  // [v3.8] This lock ordering protects against two DIFFERENT order
+  // approvals racing over an overlapping set of batches. It does NOT by
+  // itself protect against the SAME order being approved twice
+  // concurrently — that is a distinct failure mode closed by the
+  // conditional-update guard on B2BOrderRequest.status documented at the
+  // top of this file and on that model below. Both guards are required;
+  // neither substitutes for the other.
   createdAt   DateTime  @default(now())
 
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -510,7 +546,10 @@ model Customer {
   // re-anchoring note at the top of this file. Any invoice carrying a
   // nonzero debt — full or partial — MUST reference a real Customer row
   // with name + phone, because the whole point of recording a customer
-  // here is knowing who owes the money back.
+  // here is knowing who owes the money back. [v3.8] This is precisely why
+  // every B2B-approval Invoice (see the Invoice model note below) must
+  // reference a real Customer, never the system-generated one — a B2B
+  // order is expected to carry debt in the ordinary case.
   //
   // "At most one per tenant" is NOT enforced by this field or any index on
   // it — a composite index/unique on (tenantId, isSystemGenerated) would be
@@ -762,6 +801,25 @@ model Invoice {
   // resolveFifoAllocation at approval time, not at order-submission time.
   // See the B2BOrderRequest model below for why the order itself cannot be
   // represented as an Invoice row until that approval happens.
+  //
+  // [v3.8] PAYMENT-MODE DECISION FOR B2B APPROVAL (previously
+  // undocumented): the approval screen reuses the exact same three-way
+  // payment step already built for the POS (T4b) — نقدي بالكامل / على
+  // الحساب بالكامل / دفع جزئي — rather than inventing a separate payment
+  // model for this one write path. Practically, an online B2B submission
+  // has no cash physically changing hands at the moment of approval the
+  // way a POS sale does, so a wholesaler extending trade credit to a
+  // known retailer is the ordinary case here, not the exception — "على
+  // الحساب بالكامل" (paidAmountSYP = 0, debtAmountSYP = totalSYP) is the
+  // suggested/default selection on this screen. The admin can still mark
+  // the order as paid or partially paid if the retailer already
+  // transferred funds before approval (e.g. a confirmed bank/wallet
+  // transfer) — same PARTIAL/FULL_CASH toggle, same validation, same
+  // CustomerPayment side-effect as T4b, nothing new to build. Because a
+  // B2B invoice is expected to carry debt in the ordinary case, its
+  // customerId must always be a real Customer — never the tenant's
+  // system-generated cash customer (see the note on Customer.
+  // isSystemGenerated above).
 
   // A void/refund is its own Invoice row with status VOIDED, whose amounts
   // reverse the original. This field is set ONLY on that reversing row,
@@ -893,8 +951,9 @@ model CustomerPayment {
   // Same reasoning as Invoice: append-only by design, no updatedAt.
 
   // FIX (critical — double-counting bug): distinguishes a payment made AT
-  // sale time (auto-created by /api/sync alongside a new Invoice, per T4c)
-  // from an independent repayment logged later against existing debt.
+  // sale time (auto-created by /api/sync alongside a new Invoice, per T4c
+  // — or, per [v3.8], alongside a B2B order approval, T5) from an
+  // independent repayment logged later against existing debt.
   //
   // Invoice.debtAmountSYP is ALREADY computed as totalSYP - paidAmountSYP
   // — i.e., a sale-time payment is already reflected in that number. If
@@ -998,6 +1057,25 @@ model Subscription {
 //
 // A rejection never creates any Invoice row at all — it only updates this
 // row's own status and rejectionReason, leaving inventory untouched.
+//
+// [v3.8] CONCURRENCY GUARD (closes a real gap — see the [v3.8] note at the
+// top of this file for the full failure mode this prevents): the approval
+// handler's FIRST write, inside the same $transaction as everything else
+// it does, MUST be:
+//   UPDATE "B2BOrderRequest" SET status = 'APPROVED', ...
+//   WHERE id = $1 AND status = 'PENDING_REVIEW'
+// and the handler must verify exactly one row was affected before calling
+// resolveFifoAllocation or writing any Invoice/InvoiceItem row. Zero rows
+// affected means another concurrent request already claimed this order —
+// abort immediately, no side effects, surface a clear "already
+// reviewed" message rather than a generic error. The existing
+// resultingInvoiceId @unique constraint remains as a second, DB-level
+// backstop — it is not a substitute for this guard, since without this
+// guard the double stock deduction and orphaned extra Invoice would
+// already have happened by the time that constraint is even reached.
+// Rejection follows the identical pattern (`WHERE status = 'PENDING_REVIEW'`
+// before writing REJECTED), since a request already approved must never be
+// rejected out from under it, or vice versa.
 model B2BOrderRequest {
   id               String         @id @default(cuid())
   tenantId         String
@@ -1030,6 +1108,9 @@ model B2BOrderRequest {
   // above for why this cannot simply be an Invoice row from the start.
   // @unique guarantees an order request can only ever produce one
   // Invoice, mirroring Invoice.voidsInvoiceId's "at most once" pattern.
+  // [v3.8] This constraint is a second-line backstop, not the primary
+  // defense against double-approval — see the concurrency guard note
+  // above the model.
   resultingInvoiceId String?  @unique
   resultingInvoice   Invoice? @relation(fields: [resultingInvoiceId], references: [id], onDelete: Restrict)
 
@@ -1107,22 +1188,28 @@ model CustomerMergeLog {
   survivingCustomerId String
   // The Customer row that was merged away and deactivated
   // (isActive = false) as part of this same operation.
-  mergedCustomerId    String
+  //
+  // [v3.8] @unique — a real gap in v3.7: nothing previously stopped the
+  // SAME Customer row from being merged away more than once (e.g. a
+  // retried admin action, or two admins independently merging the same
+  // duplicate into two different survivors). A Customer that has already
+  // been merged away is deactivated and should never be eligible to be
+  // merged again — this constraint makes that a DB-level guarantee
+  // instead of depending solely on the application UI excluding
+  // deactivated customers from the merge picker.
+  mergedCustomerId    String   @unique
   performedByUserId   String
   createdAt           DateTime @default(now())
 
   tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  // survivingCustomer/mergedCustomer/performedByUser are Restrict: this log
-  // is itself a financial-audit record and must never be silently orphaned
-  // by a later, unrelated data change — consistent with every other
-  // financial-record Restrict pattern in this schema (Invoice.customer,
-  // CustomerPayment.customer). tenant still cascades, like every other
-  // tenant-scoped model in this file.
+  // Restrict on both sides: this log is itself a financial-audit record
+  // and must never be silently orphaned by a later, unrelated data
+  // change — consistent with every other financial-record Restrict
+  // pattern in this schema (Invoice.customer, CustomerPayment.customer).
   survivingCustomer Customer @relation("MergeSurviving", fields: [survivingCustomerId], references: [id], onDelete: Restrict)
   mergedCustomer    Customer @relation("MergeMerged", fields: [mergedCustomerId], references: [id], onDelete: Restrict)
   performedByUser   User     @relation(fields: [performedByUserId], references: [id], onDelete: Restrict)
 
   @@index([tenantId])
   @@index([survivingCustomerId])
-  @@index([mergedCustomerId])
 }

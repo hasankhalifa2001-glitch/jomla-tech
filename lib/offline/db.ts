@@ -35,6 +35,18 @@ export type PaymentMethod =
 // pos-service.ts's old cross-check "expectedTotalSYP === totalSYP" fail
 // silently in the wrong direction; see pos-service.ts for the removed
 // check.)
+//
+// [FIX] Both factories below additionally now enforce, at construction
+// time, the same authoritative invariant T1's acceptance criteria names
+// explicitly for the CLIENT FACTORY layer (not just the sync endpoint):
+// "A validation asserting debtAmountSYP equals totalSYP − paidAmountSYP...
+// is the one that actually blocks a malformed invoice from being
+// persisted, at every layer (client factory, sync endpoint)." Previously
+// this file validated paidAmountSYP/debtAmountSYP individually (sign,
+// paymentMethod pairing) but never cross-checked the three against each
+// other — a caller could construct an internally-inconsistent record
+// (e.g. totalSYP=1000, paidAmountSYP=1000, debtAmountSYP=500) that would
+// only be caught later, at sync, instead of at the moment it's created.
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -81,9 +93,16 @@ export interface OfflinePayment {
   offlineId: string;
   customerId?: string;
   offlineCustomerId?: string;
-  // [v3.6] AUTHORITATIVE. (Schema-wise nothing changed here — both fields
-  // already existed side by side — only which one is treated as the
-  // source of truth changed, same as CustomerPayment in schema.prisma.)
+  // [v3.6] AUTHORITATIVE. [UPDATED NOTE] Earlier revisions of this comment
+  // claimed "both fields already existed side by side" for every
+  // pre-v3.6 device, as a reason to skip backfilling this field in the v5
+  // migration below — that claim was never actually verified against real
+  // pre-v3.6 device data (before v3.6, USD was authoritative, so a device
+  // that never wrote amountSYP at all was equally possible). The v5
+  // migration below now backfills this field defensively for exactly that
+  // reason: a no-op if it was already present, a real repair if it
+  // wasn't. Don't assume this field is guaranteed present on data written
+  // before v3.6 without going through that migration.
   amountSYP: string;
   // [v3.6] Derived/informational.
   amountUSD: string;
@@ -123,6 +142,7 @@ export interface CachedProductUnit {
   pricingCurrency?: "USD" | "SYP";
   barcode?: string;
   barcodeSource?: "GS1" | "INTERNAL";
+  isActive?: boolean;
 }
 
 export interface CachedProductBatch {
@@ -140,6 +160,16 @@ export interface CachedProduct {
   category?: string;
   units: CachedProductUnit[];
   batches: CachedProductBatch[];
+  // [NOTE — flagged, not removed] T1's Local Offline Database Schema does
+  // not define a top-level priceWholesale on cachedProducts — pricing is
+  // per-unit only (CachedProductUnit.priceWholesale), since a single
+  // product can have multiple packaging units at different prices/
+  // currencies. This field is kept here only because removing it could
+  // silently break an existing call site outside this file that this
+  // review has no visibility into. Do not read from it for any actual
+  // cart/pricing calculation — always resolve price from the specific
+  // unit being sold (units[i].priceWholesale). Recommend confirming no
+  // call site actually depends on it, then deleting it.
   priceWholesale?: string;
 }
 
@@ -295,12 +325,25 @@ export class OfflineDatabase extends Dexie {
       })
       .upgrade(async (tx) => {
         // offlineInvoices: each row already carries its own frozen
-        // exchangeRateUsed, so backfilling unitPriceSYP/paidAmountSYP/
-        // debtAmountSYP from the existing USD fields + that rate is an
-        // EXACT reconstruction, not an approximation.
+        // exchangeRateUsed, so backfilling totalSYP/unitPriceSYP/
+        // paidAmountSYP/debtAmountSYP from the existing USD fields + that
+        // rate is an EXACT reconstruction, not an approximation.
+        //
+        // [FIX] This block previously backfilled paidAmountSYP,
+        // debtAmountSYP, and each item's unitPriceSYP — but never
+        // totalSYP, even though totalSYP is the single most authoritative
+        // field in the whole system (schema.prisma: "every validation,
+        // the ledger balance, and every business rule reads/writes this
+        // field first"). A pre-v3.6 PENDING invoice migrated by the old
+        // code would end up with totalSYP permanently undefined, and
+        // would fail sync with a confusing NaN-style error instead of
+        // being correctly reconstructed here at migration time. Both the
+        // "already migrated" skip-check and the update payload below now
+        // include totalSYP.
         const invoices = await tx.table("offlineInvoices").toArray();
         for (const inv of invoices as Array<Record<string, any>>) {
           if (
+            inv.totalSYP !== undefined &&
             inv.paidAmountSYP !== undefined &&
             inv.debtAmountSYP !== undefined &&
             (inv.items || []).every((it: Record<string, any>) => it.unitPriceSYP !== undefined)
@@ -312,8 +355,9 @@ export class OfflineDatabase extends Dexie {
           if (!rate || compareMoney(rate, 0) <= 0) {
             console.warn(
               `[OfflineDatabase v5 migration] offlineInvoices row id=${inv.id} has no valid ` +
-              `exchangeRateUsed — cannot backfill paidAmountSYP/debtAmountSYP/unitPriceSYP. ` +
-              `This row will fail validation on its next sync attempt until manually reconciled.`
+              `exchangeRateUsed — cannot backfill totalSYP/paidAmountSYP/debtAmountSYP/` +
+              `unitPriceSYP. This row will fail validation on its next sync attempt until ` +
+              `manually reconciled.`
             );
             continue;
           }
@@ -326,10 +370,47 @@ export class OfflineDatabase extends Dexie {
 
           await tx.table("offlineInvoices").update(inv.id, {
             items: updatedItems,
+            totalSYP: inv.totalSYP ?? convertCurrency(inv.totalUSD, rate, "USD", "SYP"),
             paidAmountSYP:
               inv.paidAmountSYP ?? convertCurrency(inv.paidAmountUSD, rate, "USD", "SYP"),
             debtAmountSYP:
               inv.debtAmountSYP ?? convertCurrency(inv.debtAmountUSD, rate, "USD", "SYP"),
+          });
+        }
+
+        // offlinePayments: same reasoning as offlineInvoices above.
+        // [ADDED] This block was previously missing entirely — the only
+        // justification on file for skipping offlinePayments was the
+        // OfflinePayment.amountSYP comment claiming "both fields already
+        // existed side by side," which was never actually verified
+        // against real pre-v3.6 device data (before v3.6, USD was
+        // authoritative platform-wide, so a device that never wrote
+        // amountSYP at all was equally possible). Added defensively: this
+        // is a no-op (the `??` short-circuits immediately) if amountSYP
+        // was already present on a given row, and a real, necessary
+        // backfill if it wasn't — exactly the same reasoning already
+        // applied to offlineInvoices' totalSYP backfill above. Each
+        // payment carries its own frozen exchangeRate, so this is an
+        // exact reconstruction, not an approximation, same as the
+        // invoices case.
+        const payments = await tx.table("offlinePayments").toArray();
+        for (const pay of payments as Array<Record<string, any>>) {
+          if (pay.amountSYP !== undefined) {
+            continue; // already migrated (or never needed migrating)
+          }
+
+          const rate = pay.exchangeRate;
+          if (!rate || compareMoney(rate, 0) <= 0) {
+            console.warn(
+              `[OfflineDatabase v5 migration] offlinePayments row id=${pay.id} has no valid ` +
+              `exchangeRate — cannot backfill amountSYP. This row will fail validation on ` +
+              `its next sync attempt until manually reconciled.`
+            );
+            continue;
+          }
+
+          await tx.table("offlinePayments").update(pay.id, {
+            amountSYP: convertCurrency(pay.amountUSD, rate, "USD", "SYP"),
           });
         }
 
@@ -485,6 +566,22 @@ export function createOfflineInvoiceRecord(data: {
 
   const totalSYP = serializeMoney(data.totalSYP);
 
+  // [FIX — ADDED] The cross-field invariant T1's acceptance criteria
+  // requires at the client-factory layer specifically, not only at sync:
+  // "A validation asserting debtAmountSYP equals totalSYP − paidAmountSYP
+  // ... is the one that actually blocks a malformed invoice from being
+  // persisted, at every layer (client factory, sync endpoint)." Without
+  // this, a caller could pass mutually-inconsistent totalSYP/paidAmountSYP/
+  // debtAmountSYP and this factory would happily construct the record —
+  // the inconsistency would only surface later, at sync, instead of at
+  // the moment of creation where it's cheapest to catch and easiest to
+  // trace back to whichever cart calculation produced it.
+  if (compareMoney(subtractMoney(totalSYP, paidSYP), debtSYP) !== 0) {
+    throw new Error(
+      "debtAmountSYP must equal totalSYP − paidAmountSYP (SYP is authoritative)."
+    );
+  }
+
   // [v3.6] USD is derived HERE, from the SYP figures actually supplied,
   // via the same frozen exchangeRateUsed — never taken as a separate
   // caller-supplied input. This is what makes a totalUSD/totalSYP
@@ -594,6 +691,18 @@ export function createOfflineVoidRecord(data: {
       : data.debtAmountSYP !== undefined
         ? serializeMoney(data.debtAmountSYP)
         : "0.0000";
+
+  // [FIX — ADDED] Same authoritative cross-field invariant as the sale
+  // factory above, enforced here too — a void row's amounts are just as
+  // capable of being constructed inconsistently (e.g. by a caller passing
+  // originalTotalSYP but a mismatched explicit debtAmountSYP override),
+  // and this is the reversing row a customer's ledger balance depends on
+  // just as much as the original sale.
+  if (compareMoney(subtractMoney(totalSYP, paidSYP), debtSYP) !== 0) {
+    throw new Error(
+      "debtAmountSYP must equal totalSYP − paidAmountSYP on the reversing void row as well."
+    );
+  }
 
   // [v3.6] Derived, same as the sale factory above.
   const totalUSD = convertCurrency(totalSYP, rateUsed, "SYP", "USD");
@@ -733,6 +842,7 @@ export function createCachedProductRecord(data: {
     pricingCurrency?: "USD" | "SYP";
     barcode?: string;
     barcodeSource?: "GS1" | "INTERNAL";
+    isActive?: boolean;
   }>;
   batches: CachedProductBatch[];
   priceWholesale?: MoneyInput;
@@ -762,8 +872,11 @@ export function createCachedProductRecord(data: {
       pricingCurrency: u.pricingCurrency,
       barcode: u.barcode,
       barcodeSource: u.barcodeSource,
+      isActive: u.isActive,
     })),
     batches: data.batches,
+    // [NOTE — see CachedProduct interface above] not part of T1's spec;
+    // kept only for backward compatibility with existing callers.
     priceWholesale:
       data.priceWholesale !== undefined ? serializeMoney(data.priceWholesale) : undefined,
   };

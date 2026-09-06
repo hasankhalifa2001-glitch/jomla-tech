@@ -29,6 +29,37 @@
  * the SYP figure via the cached exchange rate, and are `null` whenever no
  * exchange rate is cached yet — unlike SYP, USD must never throw just
  * because a rate is missing, since it no longer gates anything.
+ *
+ * [FIX] Deactivated-unit enforcement (T3 acceptance criteria: "Deactivating
+ * a ProductUnit (isActive = false) removes it from POS and storefront
+ * pickers immediately, while every past InvoiceItem/ProductBatch
+ * referencing it remains fully readable and unaffected"). Two layers:
+ *   1. getSellableUnits() — the filter a picker UI should build its "add
+ *      to cart" unit list from.
+ *   2. resolveUnitPriceSYP() — a hard stop that throws if asked to price
+ *      a deactivated unit at all, so a caller that forgot to filter (or a
+ *      stale cached copy) can never actually add one to a cart or bill it.
+ *
+ * [FIX — ADDED, review pass] Two additional gaps closed in this revision:
+ *   1. submitOfflineSale() previously validated debtAmountSYP against
+ *      totalSYP/paidAmountSYP, but never validated that totalSYP itself
+ *      matched the actual sum of the cart's line items. A caller (a UI
+ *      bug, stale state, or a directly-constructed payload) could submit
+ *      a totalSYP that was internally consistent with paidAmountSYP/
+ *      debtAmountSYP yet completely disconnected from what the cart
+ *      actually contains. submitOfflineSale now recomputes the expected
+ *      total via the same calculateCartTotals() this file already
+ *      exposes, and rejects any mismatch before ever constructing the
+ *      offline invoice record.
+ *   2. getOfflineCustomers() previously merged cachedCustomers with EVERY
+ *      row in offlineCustomers regardless of sync status. Once T4c's sync
+ *      engine marks a walk-in row SYNCED (after creating/matching a real
+ *      Customer that then lands in cachedCustomers on the next catalog
+ *      refresh), that same customer could appear twice in the picker —
+ *      once as WALK_IN (the now-stale local row) and once as EXISTING
+ *      (the synced server copy). offlineCustomers is now filtered to
+ *      exclude SYNCED rows before merging, so a synced walk-in customer
+ *      is represented exactly once, via its real cachedCustomers copy.
  */
 
 import {
@@ -216,6 +247,17 @@ export function normalizeCustomerPhone(phone: string): string {
   return phone.trim().replace(/\s+/g, "");
 }
 
+// [FIX — ADDED] The filter a picker UI (POS "add to cart" unit selector,
+// the storefront's unit dropdown) should build its list from — a
+// deactivated unit disappears from here immediately, matching T3's
+// acceptance criteria. This is the intended, proactive filtering point;
+// resolveUnitPriceSYP below is the hard backstop for a caller that skips
+// this (e.g. an older UI screen not yet updated, or a stale in-memory
+// reference held from before a re-sync marked a unit inactive).
+export function getSellableUnits(product: CachedProduct): CachedProductUnit[] {
+  return (product.units || []).filter((u) => u.isActive !== false);
+}
+
 function cachedCustomerToSelected(c: CachedCustomer): SelectedCustomer {
   return {
     type: c.isSystemGenerated ? "SYSTEM" : "EXISTING",
@@ -246,6 +288,12 @@ export function calculateCartTotals(
   const hasValidRate = exchangeRate !== null && compareMoney(exchangeRate, 0) > 0;
 
   for (const item of items) {
+    // [NOTE] itemCount sums raw quantities across line items regardless
+    // of each line's own unit — it's a display-only counter ("3 items in
+    // cart"), never a monetary or stock figure, so mixing units here
+    // (e.g. 3 كرتونة + 2 قطعة = 5) is a cosmetic ambiguity at most, not a
+    // correctness bug. Every monetary computation below stays strictly
+    // per-line via unitPriceSYP × quantity, which is unaffected.
     itemCount += item.quantity;
     const lineTotalSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
     lineTotalsSYP.push(lineTotalSYP);
@@ -281,12 +329,29 @@ export function calculateCartTotals(
  * priced in USD (to convert it into SYP) — a unit already priced in SYP
  * resolves with no rate needed at all, the reverse of the pre-v3.6
  * direction.
+ *
+ * `product` is accepted for signature compatibility with callers (and
+ * with resolveUnitPriceUSD/resolveCartLinePrices below) but is no longer
+ * read — see the [FIX] note above the removed fallback.
  */
 export function resolveUnitPriceSYP(
   unit: CachedProductUnit,
   product?: CachedProduct,
   exchangeRate?: MoneyInput | null
 ): string {
+  // [FIX — ADDED] Hard stop for a deactivated unit. T3's acceptance
+  // criteria: "Deactivating a ProductUnit (isActive = false) removes it
+  // from POS and storefront pickers immediately." getSellableUnits()
+  // above is where a picker UI should filter this proactively — this
+  // check is the backstop that makes it impossible to actually price
+  // (and therefore sell) a deactivated unit even if a caller skips that
+  // filter or holds a stale reference from before a re-sync.
+  if (unit.isActive === false) {
+    throw new Error(
+      "لا يمكن بيع هذه الوحدة — تم إيقافها من قبل التاجر. يرجى اختيار وحدة أخرى."
+    );
+  }
+
   if (unit.pricingCurrency !== "SYP" && unit.pricingCurrency !== "USD") {
     throw new Error(
       "لا يمكن تحديد عملة التسعير لهذه الوحدة (SYP أو USD) — يرجى مزامنة بيانات المنتج أو مراجعته."
@@ -302,13 +367,23 @@ export function resolveUnitPriceSYP(
     return convertCurrency(unit.priceWholesale, exchangeRate, "USD", "SYP");
   }
 
-  const rawPrice = unit.priceWholesale ?? product?.priceWholesale;
-  if (rawPrice === undefined || rawPrice === null) {
+  // [FIX — REMOVED silent cross-unit fallback] This used to read
+  // `unit.priceWholesale ?? product?.priceWholesale`. product.priceWholesale
+  // is a single product-level figure that isn't part of any specific
+  // packaging unit — a single product can have very different prices per
+  // unit (e.g. 1.2$ per كيس vs 55$ per شوال كبير in the seeded demo
+  // data). Silently falling back to it whenever THIS unit's own
+  // priceWholesale happened to be missing from the cache could bill a
+  // large packaging unit at its small unit's price (or vice versa) with
+  // no error at all — exactly the kind of silent mispricing the missing-
+  // exchange-rate branch above is deliberately NOT allowed to do. This
+  // now fails loud instead, the same policy applied consistently.
+  if (unit.priceWholesale === undefined || unit.priceWholesale === null) {
     throw new Error(
-      "لا يوجد سعر جملة محدد لهذه الوحدة — لا يمكن إضافتها إلى السلة. الرجاء مراجعة بيانات المنتج."
+      "لا يوجد سعر جملة محدد لهذه الوحدة تحديداً — لا يمكن إضافتها إلى السلة. الرجاء مزامنة بيانات المنتج أو مراجعتها."
     );
   }
-  return serializeMoney(rawPrice);
+  return serializeMoney(unit.priceWholesale);
 }
 
 /**
@@ -317,6 +392,9 @@ export function resolveUnitPriceSYP(
  * [v3.6] Never throws for a missing rate — unlike resolveUnitPriceSYP,
  * USD no longer gates anything, so a missing rate simply means "no USD
  * figure to show yet" (null), not a blocked action.
+ *
+ * Still throws for a deactivated unit — it delegates to
+ * resolveUnitPriceSYP, which is where that hard stop lives.
  */
 export function resolveUnitPriceUSD(
   unit: CachedProductUnit,
@@ -335,6 +413,8 @@ export function resolveUnitPriceUSD(
  * both SYP (authoritative) and USD (derived). Uses the same currency
  * conversion path as the catalog so USD-priced units are never written
  * into the cart as if they were already SYP.
+ *
+ * Throws (via resolveUnitPriceSYP) if `unit` is deactivated.
  */
 export function resolveCartLinePrices(
   unit: CachedProductUnit,
@@ -377,6 +457,14 @@ export async function getOfflineProducts(
     // produced 5 + 5 = 10 instead of the correct 5×12 + 5 = 65. Every
     // batch must be converted to the base unit via its own unit's
     // conversionFactor BEFORE summing.
+    //
+    // [NOTE] This lookup deliberately uses the FULL, unfiltered p.units
+    // list (including deactivated ones) — a batch recorded under a unit
+    // that's since been deactivated still physically exists and must
+    // still count toward total stock; only NEW sales against that unit
+    // are blocked (see getSellableUnits/resolveUnitPriceSYP above). Total
+    // stock accuracy and "can this unit still be sold" are independent
+    // questions.
     const unitById = new Map(p.units.map((u) => [u.id, u]));
     const totalStock = (p.batches || []).reduce((acc, b) => {
       const unit = unitById.get(b.unitId);
@@ -419,7 +507,20 @@ export async function getOfflineCustomers(
   const db = getOfflineDb();
   const [cachedList, offlineList] = await Promise.all([
     db.cachedCustomers.where("tenantId").equals(scopedTenantId).toArray(),
-    db.offlineCustomers.where("tenantId").equals(scopedTenantId).toArray(),
+    // [FIX — ADDED, review pass] Filter out offlineCustomers rows already
+    // marked SYNCED before merging. Once T4c's sync engine syncs a
+    // walk-in customer, that same person also exists as a real Customer
+    // in cachedCustomers (once the catalog/customer cache next refreshes)
+    // — without this filter, the still-present SYNCED row in
+    // offlineCustomers would surface the same person a second time in
+    // this list (once as WALK_IN, once as EXISTING). A row that failed to
+    // sync (FAILED) or hasn't synced yet (PENDING) still has no
+    // corresponding cachedCustomers row, so those are kept.
+    db.offlineCustomers
+      .where("tenantId")
+      .equals(scopedTenantId)
+      .filter((c) => c.status !== "SYNCED")
+      .toArray(),
   ]);
 
   const all: SelectedCustomer[] = [
@@ -605,6 +706,24 @@ export async function submitOfflineSale(
 
   if (compareMoney(payload.exchangeRateUsed, 0) <= 0) {
     throw new Error("لا يمكن إتمام البيع بدون تحديد سعر الصرف اليومي.");
+  }
+
+  // [FIX — ADDED, review pass] Recompute the expected total directly from
+  // the cart's own line items — via the same calculateCartTotals() this
+  // file already exposes to the UI — and reject any mismatch against the
+  // caller-supplied payload.totalSYP. Without this, the debt/paid/total
+  // cross-check below only verifies the three payload fields are
+  // consistent WITH EACH OTHER; it says nothing about whether totalSYP
+  // actually reflects what's in payload.items. A caller could submit a
+  // totalSYP disconnected from the real cart contents (stale UI state, a
+  // client bug, or a directly-constructed payload) and this function
+  // would previously have accepted it as long as the three SYP fields
+  // agreed among themselves.
+  const computedTotals = calculateCartTotals(payload.items, payload.exchangeRateUsed);
+  if (compareMoney(computedTotals.totalSYP, payload.totalSYP) !== 0) {
+    throw new Error(
+      "إجمالي الفاتورة المرسل لا يطابق مجموع أسعار عناصر السلة الفعلية — يرجى إعادة حساب السلة قبل المتابعة."
+    );
   }
 
   // [v3.6] AUTHORITATIVE check now runs on debtAmountSYP.

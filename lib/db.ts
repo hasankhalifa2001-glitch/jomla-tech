@@ -22,7 +22,10 @@
 //
 //     3. seed.ts — dev-only; separately guarded by its own
 //        `NODE_ENV === "production"` refusal, never runs against a real
-//        tenant's session.
+//        tenant's session. Imports the SAME `prisma` re-exported from this
+//        file (not a separate `new PrismaClient()`), so it shares this
+//        client's singleton/logging configuration like every other
+//        legitimate consumer of the raw client.
 //
 //     4. Platform Super-Admin routes gated by `isPlatformAdmin` (T6), which
 //        legitimately operate across tenants by design (e.g. the
@@ -48,7 +51,10 @@
 //        produces a type (`DynamicClientExtensionThis<...>`) that is NOT
 //        structurally assignable to `Prisma.TransactionClient` — passing it
 //        into such a helper fails to compile, not just redundant. Current
-//        members of this category:
+//        members of this category (also whole-file exempted in
+//        eslint.config.mjs's no-restricted-imports override, since every
+//        query in these files legitimately needs the raw/transaction
+//        client, not just one lookup line):
 //          - app/api/sync/route.ts (T4c) — see that route's own header
 //            comment for the full reasoning and the manual-tenantId
 //            discipline it requires on every query/write in the file.
@@ -61,18 +67,45 @@
 //        helper with an existing member above under the same structural
 //        constraint — not merely because getTenantDb() felt inconvenient.
 //
+//     6. [ADDED] The public storefront's initial tenant-by-slug lookup ONLY
+//        — app/(store)/[tenantSlug]/**'s and app/api/store/**'s very first
+//        query, resolving the incoming `tenantSlug` route param to a real
+//        Tenant row (and, for orders, that lookup's immediate use to attach
+//        the correct tenantId to the new B2BOrderRequest). Same structural
+//        reasoning as category 1 (register): a public visitor arrives with
+//        no session and no tenantId — the slug IS the only identifier
+//        available, and resolving it is necessarily an unscoped lookup by
+//        definition.
+//
+//        UNLIKE categories 1–5, this is deliberately NOT a whole-file
+//        exemption in eslint.config.mjs. A storefront route file also
+//        contains every subsequent query for that tenant's public
+//        Products/ProductUnits/ProductBatches — and those queries, once the
+//        tenantId is known, MUST go through getTenantDb(tenantId) like any
+//        other tenant-scoped read. This is a public, unauthenticated,
+//        Internet-facing surface where a cross-tenant data leak (one
+//        merchant's competitor seeing their storefront's soon-to-be-fixed
+//        query accidentally return another tenant's rows) is maximally
+//        visible and maximally embarrassing — so only the single slug
+//        lookup line is exempted, via an inline
+//        `eslint-disable-next-line no-restricted-imports` comment with a
+//        one-line justification, at that exact call site. Every other line
+//        in the same file is linted normally and must use getTenantDb().
+//
 //   Importing `prisma` anywhere else is almost certainly a bug — if you're
-//   inside an authenticated request handler outside the five categories
+//   inside an authenticated request handler outside the six categories
 //   above, you should be using getTenantDb(session.user.tenantId) instead.
 //
-//   [OUTSTANDING] No ESLint rule yet restricts *who* may import `prisma`
-//   from this file to the categories above — until one exists, this
-//   allowlist is enforced by code review and by the inline
-//   `eslint-disable-next-line no-restricted-imports` comment (with
-//   reasoning) required at every legitimate import site. Adding a real
-//   `no-restricted-imports` rule scoped to this export, configured with
-//   this same allowlist, is a launch-blocking item alongside the raw-query
-//   and nested-write rules already enforced for lib/db/tenant-scope.ts.
+//   ENFORCEMENT: a `no-restricted-imports` ESLint rule restricts *who* may
+//   import `prisma` from this file — see eslint.config.mjs. Categories 1–5
+//   above are whole-file exemptions in that config (their files have no
+//   legitimate tenant-scoped-only lines). Category 6 is NOT a file
+//   exemption — it relies on the inline-disable-plus-justification
+//   convention instead, exactly as this header used to describe as an
+//   "outstanding" idea before the rule existed; now that the rule is real,
+//   this is the one category that still depends on that per-line discipline
+//   rather than a config-level allowlist, precisely because it's the one
+//   category where a whole-file exemption would be unsafe.
 // ============================================================================
 
 export { getTenantDb, tenantScopedRawQuery } from "./db/tenant-scope";

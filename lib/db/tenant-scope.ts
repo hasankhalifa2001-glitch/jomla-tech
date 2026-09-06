@@ -40,20 +40,39 @@
  * any name (including `prisma`) — doing so hands out an unscoped client to any
  * caller and defeats every guarantee below.
  *
- * [FIX] Corrected claim: lib/db.ts is the public entry point for
- * getTenantDb()/tenantScopedRawQuery(), but lib/db.ts ALSO re-exports
- * `rawPrisma` under the name `prisma`, deliberately, for the small set of
- * routes that must run before any tenant/session context exists
- * (registration, seed.ts, isPlatformAdmin-gated super-admin routes — see
- * lib/db.ts's own header comment). That export is intentional, not a leak,
- * but it means the true safety boundary is NOT "only two names are
- * exported from lib/db.ts" — it's "an ESLint no-restricted-imports rule
- * must restrict who is allowed to import the `prisma` name from lib/db.ts
- * to that specific allowlist." That rule is not yet implemented; until it
- * is, an unscoped `import { prisma } from "@/lib/db"` compiles cleanly
- * from anywhere in the codebase with no automated guardrail. Treat adding
- * that ESLint rule as an outstanding launch-blocking item alongside the
- * raw-query and nested-write rules above, not as already covered by them.
+ * lib/db.ts is the public entry point for getTenantDb()/tenantScopedRawQuery(),
+ * and it ALSO re-exports `rawPrisma` under the name `prisma`, deliberately, for
+ * the small, documented allowlist of call sites that must run before any
+ * tenant/session context exists (registration, seed.ts, isPlatformAdmin-gated
+ * super-admin routes, the T4c/fifo-preview shared-helper category, and the
+ * narrow storefront tenant-by-slug lookup — see lib/db.ts's own header
+ * comment for the full, current allowlist). That export is intentional, not
+ * a leak — the actual safety boundary is the `no-restricted-imports` ESLint
+ * rule (see eslint.config.mjs) restricting who is allowed to import the
+ * `prisma` name from lib/db.ts to that specific allowlist, plus required
+ * inline `eslint-disable-next-line` justification comments at any one-off
+ * exemption site that isn't a whole-file exemption (see eslint.config.mjs's
+ * notes on the storefront category specifically).
+ *
+ * 4. TENANT_SCOPED_MODELS MUST STAY IN SYNC WITH schema.prisma:
+ * [FIX] Every model in schema.prisma that carries a denormalized tenantId
+ * column and a `Tenant` relation is tenant-scoped and MUST appear in the set
+ * below. This previously omitted the three models added in schema.prisma
+ * v3.7 — B2BOrderRequest, B2BOrderRequestItem, and CustomerMergeLog — which
+ * silently meant getTenantDb() never injected tenantId into any query
+ * against them: a call site that forgot to filter by tenantId manually on
+ * one of these three models would have executed completely unscoped, with
+ * no error, no warning, nothing. This directly violated T1's own acceptance
+ * criterion: "Every tenant-scoped Prisma model — including B2BOrderRequest,
+ * B2BOrderRequestItem, and CustomerMergeLog — is covered by the tenant-scope
+ * extension; a query missing tenant context throws rather than executing
+ * unscoped." All three are now included below.
+ *
+ * Deliberately NOT in this set (correct, not an oversight):
+ *   - Tenant itself — it IS the scope, not scoped by it.
+ *   - VerifiedRetailer, ProductCatalogEntry, ProductCatalogEntryReport —
+ *     platform-wide models with no tenantId column at all (see their
+ *     model-level notes in schema.prisma for why).
  * ============================================================================
  */
 
@@ -70,6 +89,10 @@ export const TENANT_SCOPED_MODELS = new Set([
   "InvoiceItem",
   "CustomerPayment",
   "Subscription",
+  // [FIX] v3.7 additions — see the file-header note above.
+  "B2BOrderRequest",
+  "B2BOrderRequestItem",
+  "CustomerMergeLog",
 ]);
 
 // Operations that read/target existing rows and must be scoped via `where`.
@@ -97,7 +120,7 @@ const WHERE_SCOPED_WRITE_OPS = new Set([
 /**
  * Executes a tenant-isolated raw query.
  *
- * [FIX] Takes a `buildQuery` callback instead of a flat `sql` fragment. The
+ * Takes a `buildQuery` callback instead of a flat `sql` fragment. The
  * caller receives a ready-made `tenantCondition` fragment (`"tenantId" = $1`)
  * and is responsible for placing it correctly inside their own WHERE clause
  * — this function can't safely guess where in an arbitrary query a bolted-on
@@ -201,5 +224,4 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
 // The raw client is deliberately NOT re-exported from this file under any
 // name. lib/db.ts is the file that intentionally re-exports rawPrisma as
 // `prisma` for a specific, documented allowlist of call sites — see that
-// file's header comment and the note at the top of this file about the
-// still-missing ESLint rule restricting who may import it.
+// file's header comment.

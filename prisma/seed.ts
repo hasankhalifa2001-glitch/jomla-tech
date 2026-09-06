@@ -1,77 +1,27 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import {
-    PrismaClient,
     UserRole,
     TenantSubscriptionStatus,
+    SubscriptionRecordStatus,
     PaymentMethod,
     InvoiceStatus,
     BarcodeSource,
     Prisma,
 } from "@prisma/client";
 import bcrypt from "bcryptjs";
-
-const prisma = new PrismaClient();
+// [FIX] seed.ts lives at prisma/seed.ts, while lib/db.ts lives at the
+// project root's lib/ directory — NOT under prisma/. The previous
+// "./lib/db" import resolved to a nonexistent prisma/lib/db.ts and failed
+// to compile. Corrected to walk up one directory first.
+import { prisma } from "../lib/db";
 
 // ============================================================================
 // [v3.6] CURRENCY RE-ANCHORING — SYP is now authoritative, USD informational.
-// See the currency re-anchoring note at the top of schema.prisma for the
-// full rationale. In THIS file specifically: every product below is still
-// priced in USD at the ProductUnit level (pricingCurrency: "USD") — that's
-// unaffected by this change, it's a per-product merchant choice. What
-// changes is how a SALE gets recorded: `unitPriceSYP`, `totalSYP`,
-// `paidAmountSYP`, and `debtAmountSYP` are now the fields every downstream
-// validation/ledger calculation reads first. The USD fields are still
-// written (never dropped — they're real columns, and useful for merchant
-// reference), but they're derived from the SYP side conceptually, not the
-// other way around, from this revision forward.
-//
-// `usdToSyp` below is the one place in this seed file that performs that
-// conversion — every call site computes its SYP figure through it rather
-// than inlining `x * exchangeRateUsed` by hand, so there's one spot to fix
-// if the direction of this conversion is ever revisited again.
+// (unchanged from previous revision — see file history)
 // ============================================================================
 function usdToSyp(usdAmount: number, exchangeRate: number): number {
     return usdAmount * exchangeRate;
 }
-
-// ============================================================================
-// NESTED-WRITE COMPLIANCE (v3.4 Tenant Isolation rule): every write to a
-// tenant-scoped model in this file is its own top-level `tx.<model>.<method>`
-// call, never a nested `create`/`update` buried inside another model's
-// `data` object — the same rule schema.prisma documents as project-wide,
-// with no exception carved out for seed/dev scripts. The two helpers below
-// (`createProductWithUnit`, `createInvoiceAtomic`) exist specifically so
-// every call site in `main()` gets this for free instead of hand-rolling it
-// per product/invoice. Both helpers take a `Prisma.TransactionClient` (`tx`)
-// and are always invoked from inside `prisma.$transaction(async (tx) => ...)`
-// — mirroring T4c's real /api/sync shape, so this script doubles as a
-// correct usage example, not just seed data.
-//
-// SCOPE OF THAT "usage example" CLAIM — read before copying this into T4c:
-// `createInvoiceAtomic` below correctly demonstrates the NESTED-WRITE rule
-// (every write is a top-level call inside one $transaction) — that part is
-// safe to copy verbatim. It does NOT demonstrate T4c's separate, equally-
-// mandatory BATCH LOCKING rule: its `batchAdjustments` loop calls
-// `tx.productBatch.update({ increment })` directly, with no preceding
-// `SELECT ... FOR UPDATE ORDER BY id ASC`. That's correct here — this
-// script runs single-threaded with no concurrent writers, so there's
-// nothing to lock against — but it means this helper is NOT a template for
-// T4c's real invoice-sync path as-is. When adapting this shape for the
-// actual /api/sync implementation, the deterministic `ORDER BY id ASC`
-// batch lock (documented on ProductBatch in schema.prisma) must be added
-// explicitly before the equivalent update loop; do not assume this
-// function already covers it just because it looks similar.
-//
-// v3.5 FIX — see `ensureSystemCustomer` below: the previous version of this
-// script created the system-generated Customer row and updated
-// `Tenant.systemCustomerId` as two separate, unwrapped `prisma.*` calls —
-// not inside a `$transaction`. That directly violated T2's onboarding rule
-// ("... runs in one transaction ... so there is never a window where the
-// tenant exists without its system customer linked"). A crash between the
-// two calls would have left an orphaned system-generated Customer row with
-// `Tenant.systemCustomerId` still null. Fixed below by wrapping both writes
-// in a single `prisma.$transaction(...)` call, matching the same pattern
-// `createInvoiceAtomic` already used correctly.
-// ============================================================================
 
 async function createProductWithUnit(
     tx: Prisma.TransactionClient,
@@ -86,11 +36,31 @@ async function createProductWithUnit(
             pricingCurrency: "USD" | "SYP";
             priceWholesale: number;
             priceRetail?: number;
+            // [FIX] Was previously missing entirely from this type, even
+            // though schema.prisma enforces (at the application layer)
+            // that isPublic = true on the parent Product is blocked unless
+            // priceRetail AND imageUrl are both present on the unit. This
+            // function had no way to set imageUrl at all, so every
+            // isPublic: true product seeded below was silently violating
+            // that rule — an application-level rule with no DB constraint
+            // to catch it, which is exactly what let it slip through
+            // unnoticed.
+            imageUrl?: string;
             barcode?: string;
             barcodeSource?: BarcodeSource;
         };
     }
 ) {
+    // [FIX] Fail loudly here too, not just rely on remembering to pass
+    // imageUrl correctly at every call site — this is the one place that
+    // actually enforces the publishing gate for seed data, mirroring the
+    // real application-layer rule T3 describes for the live product form.
+    if (args.isPublic && (!args.unit.priceRetail || !args.unit.imageUrl)) {
+        throw new Error(
+            `Cannot seed "${args.name}" with isPublic: true — priceRetail and imageUrl are both required before a product may be public.`
+        );
+    }
+
     const product = await tx.product.create({
         data: {
             tenantId: args.tenantId,
@@ -109,6 +79,7 @@ async function createProductWithUnit(
             pricingCurrency: args.unit.pricingCurrency,
             priceWholesale: args.unit.priceWholesale,
             priceRetail: args.unit.priceRetail,
+            imageUrl: args.unit.imageUrl,
             barcode: args.unit.barcode,
             barcodeSource: args.unit.barcodeSource,
         },
@@ -124,14 +95,9 @@ async function createInvoiceAtomic(
         userId: string;
         customerId: string;
         status: InvoiceStatus;
-        // [v3.6] totalSYP is authoritative; totalUSD is informational
-        // (still stored, still real — just no longer what validation or
-        // the ledger reads first). See the file-header note above.
         totalUSD: number;
         totalSYP: number;
         exchangeRateUsed: number;
-        // [v3.6] paidAmountSYP / debtAmountSYP are NEW required fields —
-        // the v3.5 version of this file only carried the USD pair.
         paidAmountUSD: number;
         paidAmountSYP: number;
         debtAmountUSD: number;
@@ -144,28 +110,9 @@ async function createInvoiceAtomic(
             batchId: string;
             quantity: number;
             unitPriceUSD: number;
-            // [v3.6] NEW required field — authoritative per-line price;
-            // unitPriceUSD stays as the informational figure.
             unitPriceSYP: number;
         }>;
-        // Batch quantity deltas applied atomically alongside the invoice —
-        // positive to restore stock (a void), negative to deduct it (a
-        // sale). Kept as an explicit separate list rather than derived
-        // from `items[].quantity` because a void's items are already
-        // negated (see the void example below), and folding both
-        // conventions into one field would be easy to get backwards.
-        //
-        // NOT lock-safe for concurrent writers — see the file-header note
-        // above. Fine for this single-threaded seed script; must gain an
-        // explicit `SELECT ... FOR UPDATE ORDER BY id ASC` step before any
-        // of this logic is reused for T4c's real sync endpoint.
         batchAdjustments: Array<{ batchId: string; delta: number }>;
-        // Optional — present exactly when paidAmountSYP > 0, matching
-        // T4c's rule that a synced invoice with a nonzero sale-time
-        // payment always gets exactly one CustomerPayment with invoiceId
-        // set to this invoice's id, created in the same transaction.
-        // [v3.6] The trigger condition was paidAmountUSD > 0 through v3.5
-        // — see the currency re-anchoring note at the top of this file.
         payment?: {
             amountUSD: number;
             amountSYP: number;
@@ -233,15 +180,13 @@ async function createInvoiceAtomic(
     return invoice;
 }
 
-// v3.5 FIX: both writes (creating the system-generated Customer row and
-// pointing Tenant.systemCustomerId at it) now happen inside a single
-// `prisma.$transaction(...)` call, exactly mirroring T2's own onboarding
-// rule and the pattern `createInvoiceAtomic` already used correctly. Prior
-// to this fix, the two calls were issued directly against the top-level
-// `prisma` client with no transaction wrapper, leaving a real window where
-// a crash between them could orphan a Customer row while
-// `Tenant.systemCustomerId` stayed null — the exact failure mode T2's spec
-// explicitly says must never be possible.
+// v3.5 FIX: both writes happen inside a single prisma.$transaction(...)
+// call. [FIX] `tx` parameter now typed explicitly as Prisma.TransactionClient
+// instead of relying on TypeScript's inferred inline object-literal type —
+// consistent with createProductWithUnit/createInvoiceAtomic above, and
+// safer: an inferred inline type only describes the two methods actually
+// called inside this function today, so it would silently fail to warn if
+// this function were later extended to call a third tx method incorrectly.
 async function ensureSystemCustomer(tenantId: string): Promise<string> {
     const tenant = await prisma.tenant.findUnique({
         where: { id: tenantId },
@@ -252,7 +197,7 @@ async function ensureSystemCustomer(tenantId: string): Promise<string> {
         return tenant.systemCustomerId;
     }
 
-    const systemCustomerId = await prisma.$transaction(async (tx) => {
+    const systemCustomerId = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const sysCustomer = await tx.customer.create({
             data: {
                 tenantId,
@@ -271,11 +216,31 @@ async function ensureSystemCustomer(tenantId: string): Promise<string> {
     return systemCustomerId;
 }
 
+// [FIX — ADDED] Idempotency guard for everything that ISN'T Tenant/User
+// (those already use upsert). Without this, running `npx prisma db seed`
+// twice duplicated every Product, Customer, ProductBatch, and Invoice for
+// a given tenant — silently doubling stock quantities and debt balances,
+// which would corrupt any manual testing or demo relying on a predictable
+// seed state. Deletes only this tenant's non-system-customer, non-auth
+// data, in FK-dependency order (children before parents), then lets the
+// rest of main() recreate everything fresh. isSystemGenerated customer and
+// the Tenant/User rows themselves are deliberately never touched here —
+// they're managed by upsert above and must survive a reseed untouched
+// (Tenant.systemCustomerId's Restrict relation would block deleting the
+// system customer anyway).
+async function resetTenantTransactionalData(tenantId: string): Promise<void> {
+    await prisma.invoiceItem.deleteMany({ where: { tenantId } });
+    await prisma.customerPayment.deleteMany({ where: { tenantId } });
+    await prisma.invoice.deleteMany({ where: { tenantId } });
+    await prisma.productBatch.deleteMany({ where: { tenantId } });
+    await prisma.productUnit.deleteMany({ where: { tenantId } });
+    await prisma.product.deleteMany({ where: { tenantId } });
+    // Excludes the system-generated customer deliberately — see comment
+    // above.
+    await prisma.customer.deleteMany({ where: { tenantId, isSystemGenerated: false } });
+}
+
 async function main() {
-    // GUARD: this script issues upserts with a shared, publicly-known
-    // password ("password123") for every account it touches, including a
-    // platform super-admin. Running it against a real database would be a
-    // full account takeover of every seeded tenant. Refuse outright.
     if (process.env.NODE_ENV === "production") {
         throw new Error(
             "❌ Refusing to run: seed.ts must never execute against a production environment."
@@ -289,11 +254,19 @@ async function main() {
     // ---------------------------------------------------------------------
     // 1. Tenant: Active subscription (al-baraka)
     // ---------------------------------------------------------------------
+    // [FIX — ADDED] expiresAt now set on every tenant whose subscription
+    // has actually moved past PENDING. T6's middleware is documented as
+    // checking expiresAt directly for grace-period/lockout enforcement —
+    // leaving it null on every seeded tenant meant that logic could never
+    // be exercised against seed data at all. al-baraka (ACTIVE) gets a
+    // real future expiry.
+    const albarakaExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days out
     const tenantAlBaraka = await prisma.tenant.upsert({
         where: { slug: "al-baraka" },
         update: {
             dailyExchangeRate: 15000,
             subscriptionStatus: TenantSubscriptionStatus.ACTIVE,
+            expiresAt: albarakaExpiresAt,
         },
         create: {
             name: "مؤسسة البركة لتجارة الجملة",
@@ -301,8 +274,13 @@ async function main() {
             phone: "+963911223344",
             dailyExchangeRate: 15000,
             subscriptionStatus: TenantSubscriptionStatus.ACTIVE,
+            expiresAt: albarakaExpiresAt,
         },
     });
+
+    // [FIX — ADDED] Reset this tenant's transactional data before
+    // recreating it below — see resetTenantTransactionalData's comment.
+    await resetTenantTransactionalData(tenantAlBaraka.id);
 
     const systemCustomerAlBaraka = await ensureSystemCustomer(tenantAlBaraka.id);
 
@@ -332,13 +310,29 @@ async function main() {
         },
     });
 
-    // Product 1: rice, with a batch and expiry — exercises T3's expiry
-    // tracking and FIFO deduction. Barcode is a realistic 13-digit GS1
-    // code under Syria's registered prefix (621), with a correctly
-    // computed EAN-13 check digit — real enough that a check-digit
-    // validation test run against seed data won't spuriously fail.
+    // [FIX — ADDED] An ACTIVE tenant is only meant to reach that status
+    // via a Super-Admin-approved Subscription (T6: "Approving a merchant's
+    // first subscription is also what transitions that merchant's
+    // Tenant.subscriptionStatus from PENDING to ACTIVE"). Nothing
+    // previously created a Subscription row at all, leaving no audit
+    // trail for why al-baraka is ACTIVE and nothing to exercise T6's
+    // Super-Admin approval-history view against.
+    await prisma.subscription.create({
+        data: {
+            tenantId: tenantAlBaraka.id,
+            tier: "STANDARD",
+            amountUSD: 25,
+            referenceCode: "REF-ALBARAKA-0001",
+            status: SubscriptionRecordStatus.ACTIVE,
+            expiresAt: albarakaExpiresAt,
+        },
+    });
+
+    // Product 1: rice, with a batch and expiry.
+    // [FIX] unit.imageUrl now supplied — required because isPublic: true
+    // + priceRetail is set below (see createProductWithUnit's new guard).
     const { product: rice, unit: riceUnit } = await prisma.$transaction(
-        (tx) =>
+        (tx: Prisma.TransactionClient) =>
             createProductWithUnit(tx, {
                 tenantId: tenantAlBaraka.id,
                 name: "أرز مصري ممتاز",
@@ -350,6 +344,7 @@ async function main() {
                     pricingCurrency: "USD",
                     priceWholesale: 20.0,
                     priceRetail: 22.0,
+                    imageUrl: "https://placehold.co/600x400?text=Rice",
                     barcode: "6211234500011",
                     barcodeSource: BarcodeSource.GS1,
                 },
@@ -363,18 +358,14 @@ async function main() {
             unitId: riceUnit.id,
             batchNumber: "BATCH-2026-001",
             quantity: 40,
-            expiryDate: new Date(Date.now() + 20 * 24 * 60 * 60 * 1000), // ~20 days out
+            expiryDate: new Date(Date.now() + 20 * 24 * 60 * 60 * 1000),
         },
     });
 
-    // Product 2: cooking oil. Now carries its own batch (no expiry date
-    // set — demonstrates the legitimate case of a batch with no tracked
-    // expiry, since ProductBatch.expiryDate is nullable) so it can
-    // actually be sold in the cash-customer example below; the original
-    // "no batch needed for seed purposes" note no longer holds once the
-    // seed needs a second real, sellable product.
+    // Product 2: cooking oil.
+    // [FIX] unit.imageUrl now supplied — same reasoning as rice above.
     const { product: oil, unit: oilUnit } = await prisma.$transaction(
-        (tx) =>
+        (tx: Prisma.TransactionClient) =>
             createProductWithUnit(tx, {
                 tenantId: tenantAlBaraka.id,
                 name: "زيت نباتي الصافي",
@@ -386,6 +377,7 @@ async function main() {
                     pricingCurrency: "USD",
                     priceWholesale: 18.5,
                     priceRetail: 20.0,
+                    imageUrl: "https://placehold.co/600x400?text=Cooking+Oil",
                     barcode: "6211234500028",
                     barcodeSource: BarcodeSource.GS1,
                 },
@@ -412,24 +404,9 @@ async function main() {
         },
     });
 
-    // Invoice 1: 2 bags sold, half paid at sale time, half on credit. Left
-    // standing — not voided — so the ledger view has a real outstanding
-    // debt to show.
-    //
-    // [v3.6] debtAmountSYP (not debtAmountUSD) is now the authoritative
-    // figure the ledger/T4c validation reads — computed here via
-    // usdToSyp() from the same USD figures this seed has always used to
-    // author the numbers by hand, since that's the more readable way to
-    // write seed data, not because USD is authoritative anymore.
-    //
-    // paidAmountSYP > 0 here has its matching sale-time CustomerPayment
-    // created in the SAME transaction, with invoiceId pointing at this
-    // invoice — this is the exact invariant T4c's sync logic and T4e's
-    // debt-doubling guard depend on ("a synced invoice with a nonzero
-    // sale-time payment always has exactly one corresponding
-    // CustomerPayment row").
+    // Invoice 1: 2 bags sold, half paid at sale time, half on credit.
     const rate1 = 15000;
-    await prisma.$transaction((tx) =>
+    await prisma.$transaction((tx: Prisma.TransactionClient) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
             userId: adminAlBaraka.id,
@@ -464,10 +441,7 @@ async function main() {
         })
     );
 
-    // A second, independent repayment against the customer's remaining
-    // debt — logged later, unrelated to any specific invoice, so
-    // invoiceId is correctly left unset (null). This is the kind of row
-    // T4e's `WHERE invoiceId IS NULL` filter is actually meant to count.
+    // A second, independent repayment against remaining debt.
     await prisma.customerPayment.create({
         data: {
             tenantId: tenantAlBaraka.id,
@@ -480,20 +454,8 @@ async function main() {
         },
     });
 
-    // Invoice 2: 1 bag sold, then fully voided — a physical stock return
-    // (customer brought back a damaged bag), which is the only kind of
-    // void this platform supports; a pure data-entry mistake with no
-    // physical stock movement is corrected with an offsetting
-    // CustomerPayment instead, not this mechanism.
-    //
-    // Demonstrates the full append-only reversal end to end: the original
-    // COMPLETED invoice is never edited (its own isPaid/debtAmountSYP stay
-    // exactly as created below, forever), a new VOIDED invoice with
-    // negated totals AND negated item quantities points back at it via
-    // voidsInvoiceId, and the batch quantity is restored by that same
-    // negated amount — all three (invoice, item, batch update) atomic in
-    // one transaction, matching T4d's requirement.
-    const invoiceToVoid = await prisma.$transaction((tx) =>
+    // Invoice 2: 1 bag sold, then fully voided.
+    const invoiceToVoid = await prisma.$transaction((tx: Prisma.TransactionClient) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
             userId: adminAlBaraka.id,
@@ -518,28 +480,10 @@ async function main() {
                 },
             ],
             batchAdjustments: [{ batchId: riceBatch.id, delta: -1 }],
-            // paidAmountSYP is 0 here — fully on credit — so no `payment`
-            // is passed, correctly producing zero CustomerPayment rows for
-            // this invoice, per the same T4c invariant referenced above.
         })
     );
 
-    // The reversing VOIDED invoice. isPaid is set to `true` here
-    // deliberately, even though debtAmountSYP is nonzero (negative) — this
-    // is NOT the same meaning `isPaid` carries on a normal sale. On a
-    // VOIDED row, the negative debtAmountSYP represents a CREDIT owed back
-    // to the customer via the physical stock return, not an amount this
-    // platform is still waiting to collect FROM them — there is no
-    // outstanding collection action on this row, which is what isPaid is
-    // actually signaling here. The original invoiceToVoid above keeps its
-    // own isPaid: false / debtAmountSYP: usdToSyp(20, rate1) completely
-    // untouched, exactly as the append-only rule requires; only the SUM()
-    // across both rows (in T4e's ledger formula, now over debtAmountSYP)
-    // is what nets out to what the customer actually owes after the
-    // return. If this distinction ever proves confusing in practice,
-    // revisit whether `isPaid` belongs on a VOIDED row at all rather than
-    // being derived/ignored for that status.
-    await prisma.$transaction((tx) =>
+    await prisma.$transaction((tx: Prisma.TransactionClient) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
             userId: adminAlBaraka.id,
@@ -559,28 +503,18 @@ async function main() {
                     productId: rice.id,
                     unitId: riceUnit.id,
                     batchId: riceBatch.id,
-                    quantity: -1, // mirrors invoiceToVoid's item, negated
+                    quantity: -1,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
                 },
             ],
-            // The physical stock return itself — restores the batch by the
-            // same amount the voided item negated. Positive delta, unlike
-            // a normal sale's negative one; see the field comment on
-            // `batchAdjustments` in createInvoiceAtomic for why this isn't
-            // just derived from the negated item quantity automatically.
             batchAdjustments: [{ batchId: riceBatch.id, delta: 1 }],
         })
     );
     // Net riceBatch.quantity after all of the above: 40 - 2 - 1 + 1 = 38.
 
-    // Invoice 3: a fully-paid cash sale against the tenant's seeded
-    // system customer — exercises T4b's one-tap "زبون نقدي" flow.
-    // paidAmountSYP == totalSYP and debtAmountSYP == 0, satisfying the
-    // application-level rule that the system-generated customer may only
-    // be referenced by a zero-debt invoice (debtAmountSYP = 0 as of
-    // [v3.6] — was debtAmountUSD = 0 through v3.5).
-    await prisma.$transaction((tx) =>
+    // Invoice 3: fully-paid cash sale against the system customer.
+    await prisma.$transaction((tx: Prisma.TransactionClient) =>
         createInvoiceAtomic(tx, {
             tenantId: tenantAlBaraka.id,
             userId: adminAlBaraka.id,
@@ -617,14 +551,18 @@ async function main() {
     // Net oilBatch.quantity after the above: 15 - 1 = 14.
 
     // ---------------------------------------------------------------------
-    // 2. Tenant: Expired subscription (al-noor) — verifies the middleware's
-    // EXPIRED lockout: admin -> /settings/billing, cashier -> /account-locked.
+    // 2. Tenant: Expired subscription (al-noor)
     // ---------------------------------------------------------------------
+    // [FIX — ADDED] expiresAt set in the PAST, consistent with EXPIRED
+    // status — this tenant previously had expiresAt = null despite being
+    // EXPIRED, which cannot exercise a middleware that actually checks
+    // `expiresAt < now()` rather than status alone.
     const tenantAlNoor = await prisma.tenant.upsert({
         where: { slug: "al-noor" },
         update: {
             dailyExchangeRate: 14800,
             subscriptionStatus: TenantSubscriptionStatus.EXPIRED,
+            expiresAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000), // 5 days ago
         },
         create: {
             name: "شركة النور للمواد الغذائية",
@@ -632,9 +570,11 @@ async function main() {
             phone: "+963955667788",
             dailyExchangeRate: 14800,
             subscriptionStatus: TenantSubscriptionStatus.EXPIRED,
+            expiresAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
         },
     });
 
+    await resetTenantTransactionalData(tenantAlNoor.id);
     await ensureSystemCustomer(tenantAlNoor.id);
 
     await prisma.user.upsert({
@@ -664,12 +604,11 @@ async function main() {
     });
 
     // ---------------------------------------------------------------------
-    // 3. Tenant: Pending subscription (al-fajr) — a merchant who just
-    // registered and hasn't been approved yet. Verifies the middleware's
-    // PENDING lockout path specifically, which is otherwise identical in
-    // code to EXPIRED but was previously untested by this seed: admin ->
-    // /settings/billing, cashier -> /account-locked.
+    // 3. Tenant: Pending subscription (al-fajr)
     // ---------------------------------------------------------------------
+    // expiresAt intentionally left null: a PENDING tenant has never had a
+    // subscription approved yet, so there is no expiry to set — this is
+    // the one case where null remains correct, not an oversight.
     const tenantAlFajr = await prisma.tenant.upsert({
         where: { slug: "al-fajr" },
         update: {
@@ -683,6 +622,7 @@ async function main() {
         },
     });
 
+    await resetTenantTransactionalData(tenantAlFajr.id);
     await ensureSystemCustomer(tenantAlFajr.id);
 
     await prisma.user.upsert({
@@ -711,19 +651,22 @@ async function main() {
         },
     });
 
+    // [FIX — ADDED] al-fajr is PENDING, meaning it's awaiting exactly the
+    // kind of first-approval Subscription row T6's Super-Admin dashboard
+    // is meant to review. Without one, that dashboard's "pending requests
+    // table" has nothing to display against seed data.
+    await prisma.subscription.create({
+        data: {
+            tenantId: tenantAlFajr.id,
+            tier: "STANDARD",
+            amountUSD: 25,
+            referenceCode: "REF-ALFAJR-0001",
+            status: SubscriptionRecordStatus.PENDING_APPROVAL,
+        },
+    });
+
     // ---------------------------------------------------------------------
-    // 4. Platform Super-Admin — the only account that can reach /admin/*
-    // (T6's subscription approval dashboard, including approving al-fajr's
-    // pending request above). Still belongs to a tenant record
-    // (User.tenantId is a required FK), so a dedicated internal "platform"
-    // tenant keeps it from being confused with a real merchant.
-    //
-    // v3.5: this pattern — a placeholder, non-merchant Tenant existing
-    // solely to satisfy User.tenantId's required-FK constraint for
-    // platform-level accounts — is now documented as the canonical
-    // approach in the spec (see "Platform Identity" under T6). The actual
-    // authorization check for every /admin/* route is
-    // `User.isPlatformAdmin === true`, never this tenant's id or slug.
+    // 4. Platform Super-Admin
     // ---------------------------------------------------------------------
     const platformTenant = await prisma.tenant.upsert({
         where: { slug: "platform-internal" },
