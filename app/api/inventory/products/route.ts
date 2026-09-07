@@ -10,6 +10,16 @@ import { auth } from "@/auth";
 // Client Extension rather than depending on every `where`/`data` clause in
 // this file being hand-written correctly forever.
 import { getTenantDb } from "@/lib/db/tenant-scope";
+import {
+  assertTenantWritable,
+  SubscriptionLockedError,
+  subscriptionLockedResponse,
+} from "@/lib/auth/tenant";
+import {
+  assertRolePermission,
+  ForbiddenRoleError,
+  forbiddenRoleResponse,
+} from "@/lib/auth/role-matrix";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
@@ -276,22 +286,10 @@ export async function POST(req: Request) {
 
     // ADMIN-only: creating a catalog product is a pricing/catalog decision,
     // not a day-to-day operational task a cashier performs.
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "إضافة منتجات جديدة متاحة لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    assertRolePermission(session.user.role, "inventory:mutate");
 
-    // [v3.5] Locked out identically for EXPIRED and PENDING — a tenant
-    // awaiting first Super-Admin approval has no more write access than one
-    // whose subscription has lapsed.
-    if (session.user.subscriptionStatus === "EXPIRED" || session.user.subscriptionStatus === "PENDING") {
-      return NextResponse.json(
-        { error: "SUBSCRIPTION_LOCKED", message: "اشتراكك منتهي أو معلق. لا يمكنك إضافة منتجات جديدة." },
-        { status: 403 }
-      );
-    }
+    // Security boundary: check fresh subscription status in DB
+    await assertTenantWritable(session.user.tenantId);
 
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
@@ -500,6 +498,12 @@ export async function POST(req: Request) {
       message: "تم إنشاء المنتج بنجاح.",
     });
   } catch (error) {
+    if (error instanceof ForbiddenRoleError) {
+      return forbiddenRoleResponse(error);
+    }
+    if (error instanceof SubscriptionLockedError) {
+      return subscriptionLockedResponse(error);
+    }
     // A unique-constraint violation on (tenantId, barcode) can still slip
     // through the pre-check above under concurrent requests (two identical
     // imports/submissions racing each other) — surface it as the same

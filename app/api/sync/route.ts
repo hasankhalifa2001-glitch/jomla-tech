@@ -25,7 +25,11 @@ import {
   sumMoney,
   MoneyError,
 } from "@/lib/utils/money";
-import { getFreshTenantStatus } from "@/lib/auth/tenant";
+import {
+  assertTenantWritable,
+  SubscriptionLockedError,
+  subscriptionLockedResponse,
+} from "@/lib/auth/tenant";
 
 export const dynamic = "force-dynamic";
 
@@ -315,12 +319,13 @@ export async function POST(req: NextRequest) {
   // Middleware already blocks writes for a locked-out tenant, but this is a
   // financially sensitive write endpoint — a single point of enforcement
   // (route matcher) is not enough of a guarantee to skip a second check here.
-  const freshStatus = await getFreshTenantStatus(session.user.tenantId);
-  if (freshStatus !== "ACTIVE") {
-    return NextResponse.json(
-      { error: "SUBSCRIPTION_LOCKED", message: "اشتراكك منتهي أو معلق. لا يمكن إتمام المزامنة." },
-      { status: 403 }
-    );
+  try {
+    await assertTenantWritable(session.user.tenantId);
+  } catch (error) {
+    if (error instanceof SubscriptionLockedError) {
+      return subscriptionLockedResponse(error);
+    }
+    throw error;
   }
 
   const tenantId = session.user.tenantId;

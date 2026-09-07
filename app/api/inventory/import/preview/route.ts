@@ -1,17 +1,12 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-// [NOTE — intentionally the raw client, not getTenantDb()] Same
-// architectural category as fifo-preview/route.ts and import/commit/route.ts:
-// `validateAndPreviewCsv` enforces tenant isolation manually and explicitly
-// inside itself (`db.productUnit.findMany({ where: { tenantId } })`), not
-// via the Client Extension, and is typed to accept either a plain
-// PrismaClient or a Prisma.TransactionClient for that reason. This import
-// needs the same documented-allowlist treatment as the other two files;
-// the ESLint suppression below stays narrowly scoped to this one line
-// pending that config update.
-// eslint-disable-next-line no-restricted-imports -- see note above: raw client required for validateAndPreviewCsv's type compatibility; tenant isolation enforced manually inside csv-parser.ts itself.
 import { prisma } from "@/lib/db";
 import { validateAndPreviewCsv } from "@/lib/inventory/csv-parser";
+import {
+  assertRolePermission,
+  ForbiddenRoleError,
+  forbiddenRoleResponse,
+} from "@/lib/auth/role-matrix";
 
 // A reasonable ceiling for a product-catalog CSV. validateAndPreviewCsv
 // also runs a full productUnit.findMany() scan over the tenant's barcodes,
@@ -25,27 +20,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Role check stays — this is a permission/visibility decision
-    // (CASHIER shouldn't see catalog-wide pricing), unrelated to whether
-    // the tenant is locked. Matches products/route.ts and commit/route.ts.
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "معاينة استيراد المنتجات بالجملة متاحة لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
-
-    // [FIX — removed subscriptionStatus lockout check] This route is
-    // deliberately listed in middleware.ts's READ_ONLY_POST_PREFIXES,
-    // whose entire documented purpose is to let a locked-out tenant still
-    // preview a CSV import while blocked from committing anything (same
-    // exemption fifo-preview/route.ts already correctly has no lockout
-    // check for). This route's own 403 check was silently overriding the
-    // middleware's intent — no locked tenant could ever reach this
-    // endpoint despite the middleware explicitly letting the request
-    // through. The actual write path (import/commit/route.ts) still
-    // enforces the lockout correctly; only the read-only preview is
-    // exempt, matching fifo-preview's behavior exactly.
+    // Role check: viewing pricing / previewing catalog-wide CSV is ADMIN-only per Role Capability Matrix.
+    // Deliberately NO assertTenantWritable here: this route is in READ_ONLY_POST_PREFIXES
+    // so locked-out tenants can still preview before committing.
+    assertRolePermission(session.user.role, "inventory:mutate");
 
     const tenantId = session.user.tenantId;
 
@@ -94,6 +72,9 @@ export async function POST(req: Request) {
       preview: previewResult,
     });
   } catch (error) {
+    if (error instanceof ForbiddenRoleError) {
+      return forbiddenRoleResponse(error);
+    }
     console.error("Error generating CSV import preview:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء تحليل ومعاينة ملف CSV." }, { status: 500 });
   }

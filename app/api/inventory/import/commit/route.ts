@@ -1,22 +1,17 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-// [NOTE — intentionally the raw client, not getTenantDb()] Same
-// architectural category as lib/inventory/fifo.ts's resolveFifoAllocation
-// (see app/api/inventory/fifo-preview/route.ts's own header note for the
-// full reasoning). `commitCsvImport` is typed to accept the plain
-// `PrismaClient` specifically because it opens its own per-row
-// `db.$transaction(...)` calls internally — it cannot be handed an
-// interactive transaction client, and an extended client from
-// `getTenantDb(tenantId)` is not structurally assignable to that type
-// either. Tenant isolation for every write inside `commitCsvImport` is
-// enforced manually and explicitly (every `where`/`data` clause includes
-// `tenantId`) — see lib/inventory/csv-parser.ts — not via the Client
-// Extension. This import needs the same documented-allowlist treatment as
-// fifo-preview/route.ts; the ESLint suppression below stays narrowly
-// scoped to this one line pending that config update.
-// eslint-disable-next-line no-restricted-imports -- see note above: raw PrismaClient required for commitCsvImport's own internal $transaction calls; tenant isolation enforced manually inside csv-parser.ts itself.
 import { prisma } from "@/lib/db";
 import { commitCsvImport } from "@/lib/inventory/csv-parser";
+import {
+  assertTenantWritable,
+  SubscriptionLockedError,
+  subscriptionLockedResponse,
+} from "@/lib/auth/tenant";
+import {
+  assertRolePermission,
+  ForbiddenRoleError,
+  forbiddenRoleResponse,
+} from "@/lib/auth/role-matrix";
 import { z } from "zod";
 
 // [FIX] Field names below were out of sync with lib/inventory/csv-parser.ts
@@ -79,19 +74,10 @@ export async function POST(req: Request) {
 
     // ADMIN-only: a bulk import is a catalog-wide operation, same reasoning
     // as manual product creation and the storefront toggle.
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "استيراد المنتجات بالجملة متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    assertRolePermission(session.user.role, "inventory:mutate");
 
-    if (session.user.subscriptionStatus === "EXPIRED" || session.user.subscriptionStatus === "PENDING") {
-      return NextResponse.json(
-        { error: "SUBSCRIPTION_LOCKED", message: "اشتراكك منتهي أو معلق. لا يمكنك تنفيذ عملية الاستيراد." },
-        { status: 403 }
-      );
-    }
+    // Security boundary: check fresh subscription status in DB
+    await assertTenantWritable(session.user.tenantId);
 
     const tenantId = session.user.tenantId;
     const body = await req.json();
@@ -160,6 +146,12 @@ export async function POST(req: Request) {
       hasFailures,
     });
   } catch (error) {
+    if (error instanceof ForbiddenRoleError) {
+      return forbiddenRoleResponse(error);
+    }
+    if (error instanceof SubscriptionLockedError) {
+      return subscriptionLockedResponse(error);
+    }
     console.error("Error executing CSV import commit:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء حفظ بيانات الاستيراد." }, { status: 500 });
   }

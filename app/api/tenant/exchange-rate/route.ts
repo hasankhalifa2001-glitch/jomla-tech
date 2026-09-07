@@ -1,7 +1,16 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { getTenantDb } from "@/lib/db";
-import { getFreshTenantStatus } from "@/lib/auth/tenant";
+import {
+    assertTenantWritable,
+    SubscriptionLockedError,
+    subscriptionLockedResponse,
+} from "@/lib/auth/tenant";
+import {
+    assertAdmin,
+    ForbiddenRoleError,
+    forbiddenRoleResponse,
+} from "@/lib/auth/role-matrix";
 import { z } from "zod";
 
 const updateRateSchema = z.object({
@@ -55,31 +64,12 @@ export async function POST(req: Request) {
             );
         }
 
-        // Admin-only: the daily exchange rate affects every invoice a
-        // cashier rings up tenant-wide, so it must never be editable by a
-        // CASHIER session — this was previously unchecked entirely.
-        if (session.user.role !== "ADMIN") {
-            return NextResponse.json(
-                {
-                    error: "FORBIDDEN",
-                    message: "هذا الإجراء متاح لمدير المتجر فقط.",
-                },
-                { status: 403 }
-            );
-        }
+        // Admin-only per Role Capability Matrix: the daily exchange rate affects every invoice
+        // tenant-wide, so it must never be editable by a CASHIER session.
+        assertAdmin(session.user.role, "settings:manage");
 
-        // Defense in depth: check the fresh subscriptionStatus from the database
-        // so we never trust a stale JWT session value.
-        const freshStatus = await getFreshTenantStatus(session.user.tenantId);
-        if (freshStatus === "EXPIRED" || freshStatus === "PENDING" || !freshStatus) {
-            return NextResponse.json(
-                {
-                    error: "SUBSCRIPTION_LOCKED",
-                    message: "عذراً، اشتراك هذا المتجر غير مفعّل حالياً. يرجى التجديد للقيام بالتعديلات.",
-                },
-                { status: 403 }
-            );
-        }
+        // Security boundary: check fresh subscriptionStatus directly from DB within request.
+        await assertTenantWritable(session.user.tenantId);
 
         const body = await req.json();
         const validation = updateRateSchema.safeParse(body);
@@ -111,6 +101,12 @@ export async function POST(req: Request) {
             message: "تم تحديث سعر الصرف اليومي بنجاح.",
         });
     } catch (error) {
+        if (error instanceof ForbiddenRoleError) {
+            return forbiddenRoleResponse(error);
+        }
+        if (error instanceof SubscriptionLockedError) {
+            return subscriptionLockedResponse(error);
+        }
         console.error("Error updating exchange rate:", error);
         return NextResponse.json(
             { error: "SERVER_ERROR", message: "حدث خطأ غير متوقع أثناء تحديث سعر الصرف." },

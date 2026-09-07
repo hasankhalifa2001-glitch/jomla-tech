@@ -3,7 +3,7 @@
 import { useState, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { signIn } from "next-auth/react";
+import { signIn, getSession } from "next-auth/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -53,19 +53,39 @@ const DEMO_ACCOUNTS = [
 // which is safe on its own, but nothing stops someone from sharing a
 // hand-crafted `/login?callbackUrl=https://evil.example.com` link instead).
 // A leading single "/" that is NOT a protocol-relative "//" is the standard
-// safe-relative-path check; anything else falls back to "/dashboard".
-function sanitizeCallbackUrl(raw: string | null): string {
-  if (!raw) return "/dashboard";
+// safe-relative-path check.
+//
+// [FIX — ROLE-AWARE REDIRECT] Previously defaulted to "/dashboard" when no
+// callbackUrl was present at all, meaning a CASHIER logging in directly
+// from /login (the common case — no middleware ever redirected them here)
+// would land on /dashboard first and only THEN get bounced to
+// /dashboard/pos by middleware.ts's own CASHIER-landing-page check — an
+// unnecessary extra redirect hop on every single CASHIER login. This now
+// returns `null` (not a string) when no callbackUrl is present, so the
+// caller can distinguish "no explicit destination was requested" (decide
+// by role) from "middleware explicitly sent the user somewhere" (respect
+// that destination as-is, e.g. returning to a page they were trying to
+// reach before being bounced to /login).
+function sanitizeCallbackUrl(raw: string | null): string | null {
+  if (!raw) return null;
   if (raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\")) {
     return raw;
   }
-  return "/dashboard";
+  return null;
+}
+
+// Role-based default landing page, used only when no explicit callbackUrl
+// was supplied — see sanitizeCallbackUrl's comment above. Mirrors T2b's
+// Role Capability Matrix: CASHIER's default landing page is /dashboard/pos
+// (analytics/KPIs at /dashboard is ADMIN-only), ADMIN's is /dashboard.
+function defaultLandingPageForRole(role: string | undefined): string {
+  return role === "CASHIER" ? "/dashboard/pos" : "/dashboard";
 }
 
 function LoginFormContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const callbackUrl = sanitizeCallbackUrl(searchParams.get("callbackUrl"));
+  const explicitCallbackUrl = sanitizeCallbackUrl(searchParams.get("callbackUrl"));
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -103,7 +123,21 @@ function LoginFormContent() {
           return;
         }
 
-        router.push(callbackUrl);
+        // [FIX — ROLE-AWARE REDIRECT] If the user arrived at /login with an
+        // explicit callbackUrl (e.g. bounced here by middleware while
+        // trying to reach a specific protected page), that destination is
+        // always respected as-is — it's already the correct place for them
+        // regardless of role. Only when there was NO explicit destination
+        // do we decide where to send them, based on their actual role —
+        // fetched fresh from the session that signIn() just established,
+        // never assumed or hardcoded to "/dashboard" for everyone.
+        let destination = explicitCallbackUrl;
+        if (!destination) {
+          const freshSession = await getSession();
+          destination = defaultLandingPageForRole(freshSession?.user?.role);
+        }
+
+        router.push(destination);
         router.refresh();
       } catch (err) {
         console.error(err);
@@ -111,7 +145,7 @@ function LoginFormContent() {
         setIsLoading(false);
       }
     },
-    [callbackUrl, router]
+    [explicitCallbackUrl, router]
   );
 
   const handleSubmit = (e: React.FormEvent) => {

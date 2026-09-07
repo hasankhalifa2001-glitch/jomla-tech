@@ -52,32 +52,6 @@ function resolveTenantSlugFromStorePath(pathname: string): string | null {
     return segments.length >= 2 ? segments[1] : null;
 }
 
-// Endpoints that are POST (because they need a request body) but are
-// strictly read-only — no database write happens. The isWriteMethod check
-// below can't tell these apart from a real write by HTTP method alone, so
-// they're listed explicitly here. Locked-tenant "read-only mode" must still
-// let a merchant preview things (FIFO allocation, a CSV import) even while
-// blocked from committing anything.
-const READ_ONLY_POST_PREFIXES = [
-    "/api/inventory/fifo-preview",
-    "/api/inventory/import/preview",
-];
-
-// FIX #1 (chicken-and-egg): a PENDING tenant is locked by definition until
-// its FIRST subscription is approved — so the write path that actually
-// *submits* that first subscription request must stay reachable while
-// locked, not just the receipt-image upload step that precedes it. Both
-// prefixes are listed explicitly rather than inferring "billing-related"
-// from the URL, so this stays an intentional allow-list, not a guess.
-//
-// NOTE: adjust "/api/subscriptions" to match T6's real route name once
-// that endpoint is implemented — this middleware cannot verify the route
-// exists, only that it won't be blocked here if it's named this.
-const WRITE_ALLOWED_WHEN_LOCKED_PREFIXES = [
-    "/api/upload/receipt",
-    "/api/subscriptions",
-];
-
 export default auth((req) => {
     const { nextUrl } = req;
     const isLoggedIn = !!req.auth;
@@ -85,7 +59,7 @@ export default auth((req) => {
     const pathname = nextUrl.pathname;
 
     // Resolved once, used both for the rewrite below AND forwarded to
-    // downstream route handlers via a header — see FIX #3.
+    // downstream route handlers via a header.
     const host = req.headers.get("host") || "";
     const tenantSlug =
         resolveTenantSlugFromStorePath(pathname) || resolveTenantSlugFromHost(host);
@@ -147,18 +121,54 @@ export default auth((req) => {
             return NextResponse.redirect(loginUrl);
         }
 
-        const isSettingsRoute = pathname === "/settings" || pathname.startsWith("/settings/");
-        if (user?.role === "CASHIER" && isSettingsRoute) {
-            const redirectedUrl = new URL("/dashboard", req.url);
-            redirectedUrl.searchParams.set("error", "unauthorized");
-            return NextResponse.redirect(redirectedUrl);
-        }
+        const isSettingsRoute =
+            pathname === "/settings" ||
+            pathname.startsWith("/settings/") ||
+            pathname === "/dashboard/settings" ||
+            pathname.startsWith("/dashboard/settings/");
 
-        const isBillingRoute = pathname.startsWith("/settings/billing");
+        const isBillingRoute =
+            pathname === "/settings/billing" ||
+            pathname.startsWith("/settings/billing/") ||
+            pathname === "/dashboard/settings/billing" ||
+            pathname.startsWith("/dashboard/settings/billing/");
+
         const isAccountLockedRoute = pathname.startsWith("/account-locked");
         const isLocked =
             user?.subscriptionStatus === "EXPIRED" || user?.subscriptionStatus === "PENDING";
 
+        // CASHIER settings restriction: CASHIER is never permitted to access settings.
+        // If the tenant is locked, cashier goes to /account-locked; if active, to /dashboard/pos.
+        if (user?.role === "CASHIER" && isSettingsRoute) {
+            if (isLocked) {
+                return NextResponse.redirect(new URL("/account-locked", req.url));
+            }
+            const posUrl = new URL("/dashboard/pos", req.url);
+            posUrl.searchParams.set("error", "unauthorized");
+            return NextResponse.redirect(posUrl);
+        }
+
+        // CASHIER default landing page: /dashboard (analytics/KPIs) is ADMIN-only per
+        // Role Capability Matrix. CASHIER's default landing page is /dashboard/pos instead.
+        if (user?.role === "CASHIER" && (pathname === "/dashboard" || pathname === "/dashboard/")) {
+            if (isLocked) {
+                return NextResponse.redirect(new URL("/account-locked", req.url));
+            }
+            return NextResponse.redirect(new URL("/dashboard/pos", req.url));
+        }
+
+        // Page-navigation layer subscription lockout:
+        // Locked tenants (EXPIRED or PENDING) are routed by role:
+        // - ADMIN -> /settings/billing (where they can act on the subscription)
+        // - CASHIER -> /account-locked (read-only explanation)
+        //
+        // NOTE: this check may rely on a short-TTL cached/session subscriptionStatus for
+        // redirect speed — staleness here only delays how fast an already-approved
+        // merchant sees the dashboard. It is NOT a security boundary. The actual write
+        // protection for mutating API requests lives exclusively inside each route
+        // handler via assertTenantWritable(tenantId), which performs a fresh database
+        // read at request time — never in this middleware, since middleware only has
+        // access to the JWT session snapshot which can be stale by design.
         if (isLocked && !isBillingRoute && !isAccountLockedRoute) {
             if (user?.role === "CASHIER") {
                 return NextResponse.redirect(new URL("/account-locked", req.url));
@@ -168,51 +178,35 @@ export default auth((req) => {
             return NextResponse.redirect(billingUrl);
         }
 
-        // FIX #4: an ADMIN who navigates to /account-locked directly (e.g. a
-        // stale bookmark, or a link meant for a CASHIER) is bounced to
-        // /settings/billing instead — keeping the ADMIN-vs-CASHIER lockout
-        // split (T1/T2) enforced regardless of how the ADMIN got there, not
-        // just on the initial redirect.
+        // Cross-bounce safeguard 1: an ADMIN who navigates to /account-locked directly
+        // is bounced to /settings/billing where they can act on subscription.
         if (isAccountLockedRoute && user?.role === "ADMIN" && isLocked) {
             const billingUrl = new URL("/settings/billing", req.url);
             billingUrl.searchParams.set("reason", user!.subscriptionStatus!.toLowerCase());
             return NextResponse.redirect(billingUrl);
         }
-    }
 
-    // ── 4. Block write operations on API endpoints for expired/pending tenants.
-    //
-    // SCOPE NOTE (FIX #3): this check is necessarily session-based — it can
-    // only ever lock down writes made by an AUTHENTICATED merchant user
-    // (ADMIN/CASHIER on their own dashboard, e.g. /api/sync). It does NOT
-    // and architecturally CANNOT cover /api/store/* (the public B2B
-    // storefront submission endpoint): a retail customer placing an order
-    // has no session at all, so there is no `user.subscriptionStatus` to
-    // read here regardless of how this block is written. Locking a
-    // suspended tenant's storefront must be enforced inside the
-    // /api/store/orders route handler itself, keyed off the TARGET
-    // tenant's live status (looked up via the `x-tenant-slug` header this
-    // middleware sets above, or re-derived from the host), not the
-    // requester's session — there isn't one to check.
-    if (pathname.startsWith("/api/") && !pathname.startsWith("/api/auth")) {
-        const isWriteMethod = ["POST", "PUT", "DELETE", "PATCH"].includes(req.method);
-        const isAllowedWhenLocked = WRITE_ALLOWED_WHEN_LOCKED_PREFIXES.some((p) =>
-            pathname.startsWith(p)
-        );
-        const isReadOnlyAction = READ_ONLY_POST_PREFIXES.some((p) => pathname.startsWith(p));
-        const isLocked =
-            user?.subscriptionStatus === "EXPIRED" || user?.subscriptionStatus === "PENDING";
-
-        if (isWriteMethod && !isAllowedWhenLocked && !isReadOnlyAction && isLocked) {
-            return NextResponse.json(
-                {
-                    error: "SUBSCRIPTION_LOCKED",
-                    message: "عذراً، اشتراك هذا المتجر غير مفعّل حالياً. يرجى التجديد لتفادي إيقاف الميزات.",
-                },
-                { status: 403 }
-            );
+        // Cross-bounce safeguard 2: a CASHIER who navigates to /settings/billing directly
+        // is bounced to /account-locked if locked, or /dashboard/pos if active.
+        if (isBillingRoute && user?.role === "CASHIER") {
+            if (isLocked) {
+                return NextResponse.redirect(new URL("/account-locked", req.url));
+            }
+            const posUrl = new URL("/dashboard/pos", req.url);
+            posUrl.searchParams.set("error", "unauthorized");
+            return NextResponse.redirect(posUrl);
         }
     }
+
+    // NOTE: there is deliberately no API-mutation subscription-lock check here.
+    // Section 4 (a fast-path session-based 403 for locked tenants on mutating API
+    // routes) was removed: it read subscriptionStatus from the JWT, which can be
+    // stale, and would incorrectly block an already-approved tenant's writes until
+    // the ADMIN logged out and back in — failing the T2b requirement that an
+    // approved subscription unblocks writes on the tenant's very next request with
+    // no session refresh. The real security boundary is assertTenantWritable(tenantId)
+    // inside each mutating route handler (see lib/auth/tenant.ts), which reads
+    // subscriptionStatus fresh from the database on every request.
 
     const response = NextResponse.next();
     if (tenantSlug) {

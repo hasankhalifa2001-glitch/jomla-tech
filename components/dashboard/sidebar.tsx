@@ -32,7 +32,7 @@ function isRouteActive(pathname: string, href: string): boolean {
 }
 
 const navItems = [
-    { href: "/dashboard", label: "الرئيسية", icon: LayoutDashboard },
+    { href: "/dashboard", label: "الرئيسية", icon: LayoutDashboard, adminOnly: true },
     { href: "/pos", label: "نقطة البيع", icon: ShoppingCart },
     { href: "/inventory", label: "المخزون", icon: Package },
     { href: "/ledger", label: "دفتر الديون", icon: BookOpen },

@@ -1,26 +1,18 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-// [FIX] Same fix as products/route.ts: this is an ordinary authenticated
-// tenant route, not on the small documented allowlist (registration,
-// seed.ts, isPlatformAdmin-gated super-admin routes) permitted to import
-// the raw, unscoped `prisma` client from lib/db.ts. Every query here must
-// go through `getTenantDb(tenantId)` so tenantId is injected automatically
-// by the Prisma Client Extension rather than depending on every `where`/
-// `data` clause in this file being hand-written correctly forever.
 import { getTenantDb } from "@/lib/db/tenant-scope";
+import {
+  assertTenantWritable,
+  SubscriptionLockedError,
+  subscriptionLockedResponse,
+} from "@/lib/auth/tenant";
+import {
+  assertRolePermission,
+  ForbiddenRoleError,
+  forbiddenRoleResponse,
+} from "@/lib/auth/role-matrix";
 import { z } from "zod";
 
-// [FIX] Same strict-format requirement already established in
-// lib/inventory/csv-parser.ts for the exact same field (ProductBatch.
-// expiryDate). The previous version of this route accepted any string and
-// passed it straight to `new Date(str)`, which happily parses ambiguous
-// formats like "03/04/2026" (day/month or month/day, interpreted silently
-// and inconsistently depending on the JS engine/locale) — a batch's
-// expiry date silently misinterpreted this way corrupts T3's expiry-badge
-// logic (RED/YELLOW thresholds) and the negative-stock/reconciliation
-// surface with no error at all. Requiring the same YYYY-MM-DD format this
-// codebase already enforces elsewhere means a badly-formatted date is
-// REJECTED with a clear reason instead of silently stored wrong.
 const STRICT_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
 const createBatchSchema = z.object({
@@ -49,20 +41,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Both ADMIN and CASHIER may record a received batch — restocking is a
-    // routine operational task, unlike catalog/pricing decisions (see
-    // products/route.ts, which is ADMIN-only). Any authenticated tenant
-    // member reaches this far; no further role narrowing needed here.
+    // Role Capability Matrix: inventory mutation (adding batches) is ADMIN-only
+    assertRolePermission(session.user.role, "inventory:mutate");
 
-    // [v3.5] Locked out identically for EXPIRED and PENDING — a tenant
-    // awaiting first Super-Admin approval has no more write access than one
-    // whose subscription has lapsed.
-    if (session.user.subscriptionStatus === "EXPIRED" || session.user.subscriptionStatus === "PENDING") {
-      return NextResponse.json(
-        { error: "SUBSCRIPTION_LOCKED", message: "اشتراكك منتهي أو معلق. لا يمكنك إضافة دفعات جديدة." },
-        { status: 403 }
-      );
-    }
+    // Security boundary: check fresh subscription status in DB
+    await assertTenantWritable(session.user.tenantId);
 
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
@@ -81,11 +64,7 @@ export async function POST(req: Request) {
 
     const { productId, unitId, batchNumber, quantity, expiryDate } = validation.data;
 
-    // Verify product & unit belong to tenant. `tenantId` is included here
-    // explicitly even though `db` (the tenant-scoped client) would inject
-    // it automatically on this `findFirst` call regardless — kept for
-    // readability/defense-in-depth, matching the same pattern used in
-    // products/route.ts.
+    // Verify product & unit belong to tenant.
     const productUnit = await db.productUnit.findFirst({
       where: {
         id: unitId,
@@ -112,14 +91,6 @@ export async function POST(req: Request) {
       },
     });
 
-    // [FIX] `batch.quantity` and `batch.unit.conversionFactor` are Prisma
-    // `Decimal` instances. Serializing them straight into
-    // `NextResponse.json(...)` relies on `Decimal`'s own `toJSON()`, which
-    // returns a STRING — silently handing the frontend a different wire
-    // type than the numeric one it likely expects (and than
-    // GET /api/inventory/products already returns for the equivalent
-    // fields). Explicitly unwrapped with `Number(...)` here so this
-    // response is consistent with the rest of the inventory API.
     const responseBatch = {
       ...batch,
       quantity: Number(batch.quantity),
@@ -142,6 +113,12 @@ export async function POST(req: Request) {
       message: "تمت إضافة الدفعة الجديدة بنجاح.",
     });
   } catch (error) {
+    if (error instanceof ForbiddenRoleError) {
+      return forbiddenRoleResponse(error);
+    }
+    if (error instanceof SubscriptionLockedError) {
+      return subscriptionLockedResponse(error);
+    }
     console.error("Error creating batch:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء إضافة الدفعة." }, { status: 500 });
   }

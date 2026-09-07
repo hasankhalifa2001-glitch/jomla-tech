@@ -6,6 +6,16 @@ import {
   ALLOWED_IMAGE_TYPES,
   MAX_UPLOAD_BYTES,
 } from "@/lib/storage";
+import {
+  assertTenantWritable,
+  SubscriptionLockedError,
+  subscriptionLockedResponse,
+} from "@/lib/auth/tenant";
+import {
+  assertAdmin,
+  ForbiddenRoleError,
+  forbiddenRoleResponse,
+} from "@/lib/auth/role-matrix";
 
 // ============================================================================
 // Shared upload endpoint — despite the file's path (kept from T1's original
@@ -58,37 +68,18 @@ export async function POST(req: Request) {
       );
     }
 
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "رفع الصور والإيصالات متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role gate: ADMIN only for receipt/product image uploads
+    assertAdmin(session.user.role);
 
     const formData = await req.formData();
     const file = formData.get("file");
     const kindInput = (formData.get("type") as string | null) || "product";
     const kind: "products" | "receipts" = kindInput === "receipt" ? "receipts" : "products";
 
-    // [FIX] Type-aware lockout check. A receipt upload (`kind === "receipts"`)
-    // is exactly the escape hatch a PENDING/EXPIRED tenant needs to submit
-    // their subscription payment (T6) — never blocked here regardless of
-    // subscriptionStatus. A product-image upload (`kind === "products"`) is
-    // blocked identically to POST /api/inventory/products itself: EXPIRED
-    // and PENDING are locked out the same way (see T2's middleware note —
-    // a tenant awaiting first approval has no more write access than one
-    // whose subscription lapsed).
-    if (
-      kind === "products" &&
-      (session.user.subscriptionStatus === "EXPIRED" || session.user.subscriptionStatus === "PENDING")
-    ) {
-      return NextResponse.json(
-        {
-          error: "SUBSCRIPTION_LOCKED",
-          message: "اشتراكك منتهي أو معلق. لا يمكنك رفع صور منتجات جديدة.",
-        },
-        { status: 403 }
-      );
+    // When uploading product images, assert fresh tenant writability directly against the database.
+    // Receipts remain allowed when locked so the merchant can submit proof of payment to unlock.
+    if (kind === "products") {
+      await assertTenantWritable(session.user.tenantId);
     }
 
     if (!(file instanceof File)) {
@@ -142,6 +133,12 @@ export async function POST(req: Request) {
       url: publicUrl,
     });
   } catch (error) {
+    if (error instanceof ForbiddenRoleError) {
+      return forbiddenRoleResponse(error);
+    }
+    if (error instanceof SubscriptionLockedError) {
+      return subscriptionLockedResponse(error);
+    }
     console.error("Error uploading file to storage:", error);
 
     const message =
