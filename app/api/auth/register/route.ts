@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
+import { generateOfflineId } from "@/lib/offline/id";
 
 // FIX: reused Upstash instance, IP-keyed. This endpoint has no email
 // verification and no CAPTCHA, and creates real DB rows (Tenant + Customer
@@ -122,9 +123,13 @@ export async function POST(req: Request) {
 
         const passwordHash = await bcrypt.hash(password, 10);
 
-        // Single transaction (Scope 3 atomicity rule): Tenant (PENDING) ->
-        // system Customer -> link systemCustomerId -> ADMIN User.
+        // T2a Four ordered top-level writes in one atomic transaction:
+        // 1. Create Tenant (subscriptionStatus: PENDING)
+        // 2. Create first User (role: ADMIN)
+        // 3. Create System Customer (isSystemGenerated: true, "زبون نقدي", offlineId)
+        // 4. Link systemCustomerId on Tenant
         const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+            // 1. Tenant row
             const tenant = await tx.tenant.create({
                 data: {
                     name: tenantName.trim(),
@@ -134,19 +139,7 @@ export async function POST(req: Request) {
                 },
             });
 
-            const systemCustomer = await tx.customer.create({
-                data: {
-                    tenantId: tenant.id,
-                    name: "زبون نقدي",
-                    isSystemGenerated: true,
-                },
-            });
-
-            await tx.tenant.update({
-                where: { id: tenant.id },
-                data: { systemCustomerId: systemCustomer.id },
-            });
-
+            // 2. First ADMIN User row
             const adminUser = await tx.user.create({
                 data: {
                     tenantId: tenant.id,
@@ -159,7 +152,23 @@ export async function POST(req: Request) {
                 },
             });
 
-            return { tenant, systemCustomer, adminUser };
+            // 3. System Customer row ("زبون نقدي")
+            const systemCustomer = await tx.customer.create({
+                data: {
+                    tenantId: tenant.id,
+                    name: "زبون نقدي",
+                    isSystemGenerated: true,
+                    offlineId: generateOfflineId(),
+                },
+            });
+
+            // 4. Set Tenant.systemCustomerId
+            await tx.tenant.update({
+                where: { id: tenant.id },
+                data: { systemCustomerId: systemCustomer.id },
+            });
+
+            return { tenant, adminUser, systemCustomer };
         });
 
         return NextResponse.json({

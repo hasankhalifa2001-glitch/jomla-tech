@@ -25,6 +25,7 @@ import {
   sumMoney,
   MoneyError,
 } from "@/lib/utils/money";
+import { getFreshTenantStatus } from "@/lib/auth/tenant";
 
 export const dynamic = "force-dynamic";
 
@@ -314,7 +315,8 @@ export async function POST(req: NextRequest) {
   // Middleware already blocks writes for a locked-out tenant, but this is a
   // financially sensitive write endpoint — a single point of enforcement
   // (route matcher) is not enough of a guarantee to skip a second check here.
-  if (session.user.subscriptionStatus !== "ACTIVE") {
+  const freshStatus = await getFreshTenantStatus(session.user.tenantId);
+  if (freshStatus !== "ACTIVE") {
     return NextResponse.json(
       { error: "SUBSCRIPTION_LOCKED", message: "اشتراكك منتهي أو معلق. لا يمكن إتمام المزامنة." },
       { status: 403 }
@@ -561,7 +563,7 @@ export async function POST(req: NextRequest) {
               if (!voidItem.batchId) {
                 throw new Error(
                   `عنصر الإلغاء (${voidItem.productId}/${voidItem.unitId}) بلا batchId — ` +
-                    "يجب أن يرسل التطبيق batchId الأصلي مع كل عنصر إلغاء."
+                  "يجب أن يرسل التطبيق batchId الأصلي مع كل عنصر إلغاء."
                 );
               }
               const originalItem = originalInvoice.items.find(
@@ -583,8 +585,8 @@ export async function POST(req: NextRequest) {
               ) {
                 throw new Error(
                   `كمية عنصر الإلغاء (${Math.abs(voidItem.quantity)}) لا تطابق الكمية الأصلية ` +
-                    `(${originalItem.quantity.toString()}) — الإلغاء يجب أن يكون استرجاعاً كاملاً، ` +
-                    "أي تصحيح جزئي يُسجَّل كدفعة (CustomerPayment) بدلاً من إلغاء."
+                  `(${originalItem.quantity.toString()}) — الإلغاء يجب أن يكون استرجاعاً كاملاً، ` +
+                  "أي تصحيح جزئي يُسجَّل كدفعة (CustomerPayment) بدلاً من إلغاء."
                 );
               }
               return {

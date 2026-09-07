@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { getTenantDb } from "@/lib/db";
+import { getFreshTenantStatus } from "@/lib/auth/tenant";
 import { z } from "zod";
 
 const updateRateSchema = z.object({
@@ -67,16 +68,10 @@ export async function POST(req: Request) {
             );
         }
 
-        // Defense in depth: middleware.ts already blocks writes for
-        // EXPIRED/PENDING tenants at the edge, but this check must still
-        // match it exactly here in case this route is ever reached by a
-        // path that bypasses the middleware (a server-to-server call, a
-        // future matcher change, etc.). PENDING must be treated identically
-        // to EXPIRED everywhere in the codebase — never just one of the two.
-        if (
-            session.user.subscriptionStatus === "EXPIRED" ||
-            session.user.subscriptionStatus === "PENDING"
-        ) {
+        // Defense in depth: check the fresh subscriptionStatus from the database
+        // so we never trust a stale JWT session value.
+        const freshStatus = await getFreshTenantStatus(session.user.tenantId);
+        if (freshStatus === "EXPIRED" || freshStatus === "PENDING" || !freshStatus) {
             return NextResponse.json(
                 {
                     error: "SUBSCRIPTION_LOCKED",

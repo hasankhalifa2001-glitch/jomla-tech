@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { getTenantDb } from "@/lib/db";
+import { getFreshTenantStatus } from "@/lib/auth/tenant";
 
 // ============================================================================
 // Read-only tenant status endpoint.
@@ -31,18 +31,9 @@ export async function GET() {
             );
         }
 
-        // Note: Tenant is NOT in TENANT_SCOPED_MODELS (lib/db/tenant-scope.ts)
-        // — it's the isolation unit itself, not a model scoped to one. The
-        // extension applies no automatic filtering here; scoping is done
-        // explicitly via `where: { id: session.user.tenantId }`, same pattern
-        // as app/api/tenant/exchange-rate/route.ts's GET handler.
-        const db = getTenantDb(session.user.tenantId);
-        const tenant = await db.tenant.findUnique({
-            where: { id: session.user.tenantId },
-            select: { subscriptionStatus: true },
-        });
+        const subscriptionStatus = await getFreshTenantStatus(session.user.tenantId);
 
-        if (!tenant) {
+        if (!subscriptionStatus) {
             return NextResponse.json(
                 { error: "NOT_FOUND", message: "لم يتم العثور على بيانات المتجر." },
                 { status: 404 }
@@ -51,7 +42,7 @@ export async function GET() {
 
         return NextResponse.json({
             success: true,
-            subscriptionStatus: tenant.subscriptionStatus,
+            subscriptionStatus,
         });
     } catch (error) {
         console.error("Error fetching tenant status:", error);
