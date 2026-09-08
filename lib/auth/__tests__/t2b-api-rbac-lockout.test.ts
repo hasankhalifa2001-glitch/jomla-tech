@@ -1,8 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-/* eslint-disable no-restricted-imports */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockTenant, mockProduct, mockProductUnit, mockProductBatch, mockRawPrisma, mockSessionState } =
+const { mockTenant, mockRawPrisma, mockSessionState } =
   vi.hoisted(() => {
     const mockTenant = {
       findUnique: vi.fn(),
@@ -21,8 +20,12 @@ const { mockTenant, mockProduct, mockProductUnit, mockProductBatch, mockRawPrism
     const mockProductBatch = {
       create: vi.fn(),
     };
+    const mockUser = {
+      findUnique: vi.fn(async () => ({ isActive: true })),
+    };
     const mockRawPrisma: any = {
       tenant: mockTenant,
+      user: mockUser,
       product: mockProduct,
       productUnit: mockProductUnit,
       productBatch: mockProductBatch,

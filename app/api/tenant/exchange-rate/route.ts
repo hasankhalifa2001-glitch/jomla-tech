@@ -7,6 +7,11 @@ import {
     subscriptionLockedResponse,
 } from "@/lib/auth/tenant";
 import {
+    assertUserActive,
+    UserInactiveError,
+    userInactiveResponse,
+} from "@/lib/auth/user";
+import {
     assertAdmin,
     ForbiddenRoleError,
     forbiddenRoleResponse,
@@ -57,7 +62,7 @@ export async function POST(req: Request) {
     try {
         const session = await auth();
 
-        if (!session || !session.user || !session.user.tenantId) {
+        if (!session || !session.user || !session.user.tenantId || !session.user.id) {
             return NextResponse.json(
                 { error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." },
                 { status: 401 }
@@ -67,6 +72,10 @@ export async function POST(req: Request) {
         // Admin-only per Role Capability Matrix: the daily exchange rate affects every invoice
         // tenant-wide, so it must never be editable by a CASHIER session.
         assertAdmin(session.user.role, "settings:manage");
+        // [FIX] Now passes tenantId — assertUserActive's signature changed
+        // to (tenantId, userId) when lib/auth/user.ts was corrected to use
+        // getTenantDb(tenantId) instead of the restricted raw `prisma` import.
+        await assertUserActive(session.user.tenantId, session.user.id);
 
         // Security boundary: check fresh subscriptionStatus directly from DB within request.
         await assertTenantWritable(session.user.tenantId);
@@ -103,6 +112,9 @@ export async function POST(req: Request) {
     } catch (error) {
         if (error instanceof ForbiddenRoleError) {
             return forbiddenRoleResponse(error);
+        }
+        if (error instanceof UserInactiveError) {
+            return userInactiveResponse(error);
         }
         if (error instanceof SubscriptionLockedError) {
             return subscriptionLockedResponse(error);

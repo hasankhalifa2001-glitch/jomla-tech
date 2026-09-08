@@ -12,6 +12,7 @@ const pathMap: Record<string, string> = {
     "/inventory": "إدارة المخزون والمنتجات",
     "/ledger": "دفتر الديون والتحصيل",
     "/orders": "سجل الطلبات والفواتير",
+    "/settings/staff": "إدارة طاقم العمل",
     "/settings/billing": "إعدادات المتجر والفوترة",
 };
 

@@ -6,14 +6,35 @@ import { useSession } from "next-auth/react";
 import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { formatMoney } from "@/lib/utils/money";
 import { toast } from "sonner";
 import { DollarSign, RefreshCw, CheckCircle2 } from "lucide-react";
 
 export function ExchangeRateTopbar() {
     const { data: session, update: updateSession } = useSession();
-    const { dailyExchangeRate, isUpdating, error, updateExchangeRate, setExchangeRate } =
-        useExchangeRateStore();
+    const {
+        dailyExchangeRate,
+        isUpdating,
+        error,
+        updateExchangeRate,
+        setExchangeRate,
+        setCurrentTenantId,
+    } = useExchangeRateStore();
     const [isEditing, setIsEditing] = useState<boolean>(false);
+
+    const isAdmin = session?.user?.role === "ADMIN";
+
+    // Registers this tab's tenantId with the store as soon as the session is
+    // known. This is a genuine external-system sync (Zustand store state
+    // living outside this component), so useEffect is the right tool here —
+    // unlike the inputValue/lastSyncedRate adjustment below, which is a
+    // different case (see that comment).
+    useEffect(() => {
+        if (session?.user?.tenantId) {
+            setCurrentTenantId(session.user.tenantId);
+        }
+    }, [session?.user?.tenantId, setCurrentTenantId]);
 
     useEffect(() => {
         if (session?.user?.dailyExchangeRate !== undefined && dailyExchangeRate === null) {
@@ -24,6 +45,19 @@ export function ExchangeRateTopbar() {
     const [inputValue, setInputValue] = useState<string>("");
     const [lastSyncedRate, setLastSyncedRate] = useState<number | null>(null);
 
+    // [FIX — reverted] This is React's officially documented pattern for
+    // "adjusting state when a value changes" (react.dev/learn/
+    // you-might-not-need-an-effect, "Adjusting some state when a prop
+    // changes"). Calling setState directly in the render body like this is
+    // intentional and safe: React detects the state change, discards the
+    // in-progress render, and re-renders immediately with the new state
+    // BEFORE committing anything to the screen or running any effects — so
+    // this never produces a visible cascading render or an infinite loop.
+    // It is also cheaper than wrapping this in useEffect, which would
+    // require a full extra render + commit + effect cycle to achieve the
+    // same result, and which React itself now warns against for this exact
+    // shape ("Calling setState synchronously within an effect can trigger
+    // cascading renders").
     if (dailyExchangeRate !== lastSyncedRate) {
         setLastSyncedRate(dailyExchangeRate);
         setInputValue(
@@ -41,6 +75,7 @@ export function ExchangeRateTopbar() {
 
     const handleSave = async (e?: React.FormEvent) => {
         if (e) e.preventDefault();
+        if (!isAdmin) return;
 
         const numericRate = parseFloat(inputValue);
         if (isNaN(numericRate) || numericRate <= 0) {
@@ -58,6 +93,28 @@ export function ExchangeRateTopbar() {
             await updateSession({ dailyExchangeRate: numericRate });
         }
     };
+
+    // CASHIER view: purely read-only badge with zero input controls or buttons
+    if (!isAdmin) {
+        return (
+            <div className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-1.5 dark:border-zinc-800 dark:bg-zinc-900/80">
+                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
+                    <DollarSign className="h-3.5 w-3.5" />
+                </div>
+                <div className="flex items-center gap-1.5 text-xs font-semibold">
+                    <span className="text-zinc-600 dark:text-zinc-400 hidden sm:inline">سعر الصرف اليومي:</span>
+                    <span className="text-zinc-600 dark:text-zinc-400 sm:hidden">الصرف:</span>
+                    {dailyExchangeRate ? (
+                        <Badge variant="outline" className="font-mono font-bold bg-white text-emerald-700 border-emerald-200 dark:bg-zinc-950 dark:text-emerald-300 dark:border-emerald-900/60 px-2 py-0.5 text-xs">
+                            {formatMoney(dailyExchangeRate, "SYP", 0)} ل.س / $
+                        </Badge>
+                    ) : (
+                        <span className="text-zinc-400 font-normal">غير محدد</span>
+                    )}
+                </div>
+            </div>
+        );
+    }
 
     return (
         <form

@@ -17,6 +17,7 @@ import {
     BookOpen,
     Receipt,
     Settings,
+    Users,
     ChevronRight,
     ChevronLeft,
     LogOut,
@@ -37,6 +38,7 @@ const navItems = [
     { href: "/inventory", label: "المخزون", icon: Package },
     { href: "/ledger", label: "دفتر الديون", icon: BookOpen },
     { href: "/orders", label: "الطلبات", icon: Receipt },
+    { href: "/settings/staff", label: "طاقم العمل", icon: Users, adminOnly: true },
     { href: "/settings/billing", label: "الإعدادات والفوترة", icon: Settings, adminOnly: true },
 ];
 

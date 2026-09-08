@@ -218,11 +218,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 
             return token;
         },
-        // [FIX] Now delegates to the same applySessionFromToken() that
-        // auth.config.ts uses for the Edge/middleware instance, so the two
-        // can never drift out of sync with each other again the way the
-        // middleware instance silently did before this fix.
-        async session({ session, token }) {
+        session({ session, token }) {
             return applySessionFromToken(session, token);
         },
     },

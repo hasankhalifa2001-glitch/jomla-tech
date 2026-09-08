@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-/* eslint-disable no-restricted-imports */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // [FIX] vi.mock(...) calls below are hoisted to the top of the file by

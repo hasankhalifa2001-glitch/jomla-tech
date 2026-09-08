@@ -316,9 +316,15 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Middleware already blocks writes for a locked-out tenant, but this is a
-  // financially sensitive write endpoint — a single point of enforcement
-  // (route matcher) is not enough of a guarantee to skip a second check here.
+  // Security boundary: this is a financially sensitive write endpoint, so
+  // subscription writability is checked here with a fresh database read via
+  // assertTenantWritable(tenantId) — never inferred from the session/JWT.
+  // There is deliberately no session-based lockout check in middleware.ts
+  // (that fast-path check was removed in T2b: it read subscriptionStatus
+  // from the JWT, which can be stale, and would incorrectly keep blocking
+  // an already-approved tenant's writes until the ADMIN logged out and back
+  // in). This route-level check is therefore the ONLY subscription-lockout
+  // enforcement for /api/sync, not a second layer on top of middleware.
   try {
     await assertTenantWritable(session.user.tenantId);
   } catch (error) {
