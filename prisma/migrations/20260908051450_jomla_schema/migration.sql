@@ -22,6 +22,9 @@ CREATE TYPE "BarcodeSource" AS ENUM ('GS1', 'INTERNAL');
 -- CreateEnum
 CREATE TYPE "ReportStatus" AS ENUM ('PENDING', 'RESOLVED', 'DISMISSED');
 
+-- CreateEnum
+CREATE TYPE "B2BOrderStatus" AS ENUM ('PENDING_REVIEW', 'APPROVED', 'REJECTED');
+
 -- CreateTable
 CREATE TABLE "Tenant" (
     "id" TEXT NOT NULL,
@@ -79,6 +82,7 @@ CREATE TABLE "ProductUnit" (
     "pricingCurrency" "PricingCurrency" NOT NULL DEFAULT 'SYP',
     "priceWholesale" DECIMAL(18,4) NOT NULL,
     "priceRetail" DECIMAL(18,4),
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
     "imageUrl" TEXT,
     "barcode" TEXT,
     "barcodeSource" "BarcodeSource",
@@ -222,14 +226,60 @@ CREATE TABLE "CustomerPayment" (
 CREATE TABLE "Subscription" (
     "id" TEXT NOT NULL,
     "tenantId" TEXT NOT NULL,
+    "tier" TEXT NOT NULL,
     "receiptImageURL" TEXT,
     "amountUSD" DECIMAL(18,4) NOT NULL,
+    "referenceCode" TEXT NOT NULL,
     "status" "SubscriptionRecordStatus" NOT NULL DEFAULT 'PENDING_APPROVAL',
     "expiresAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "Subscription_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "B2BOrderRequest" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "retailerName" TEXT NOT NULL,
+    "retailerPhone" TEXT NOT NULL,
+    "retailerShopName" TEXT,
+    "status" "B2BOrderStatus" NOT NULL DEFAULT 'PENDING_REVIEW',
+    "rejectionReason" TEXT,
+    "matchedCustomerId" TEXT,
+    "resultingInvoiceId" TEXT,
+    "reviewedByUserId" TEXT,
+    "reviewedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "B2BOrderRequest_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "B2BOrderRequestItem" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "orderRequestId" TEXT NOT NULL,
+    "productId" TEXT NOT NULL,
+    "unitId" TEXT NOT NULL,
+    "quantity" DECIMAL(18,4) NOT NULL,
+    "priceWholesaleSnapshot" DECIMAL(18,4) NOT NULL,
+    "pricingCurrencySnapshot" "PricingCurrency" NOT NULL,
+
+    CONSTRAINT "B2BOrderRequestItem_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "CustomerMergeLog" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "survivingCustomerId" TEXT NOT NULL,
+    "mergedCustomerId" TEXT NOT NULL,
+    "performedByUserId" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "CustomerMergeLog_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateIndex
@@ -255,6 +305,9 @@ CREATE INDEX "ProductUnit_tenantId_idx" ON "ProductUnit"("tenantId");
 
 -- CreateIndex
 CREATE INDEX "ProductUnit_productId_idx" ON "ProductUnit"("productId");
+
+-- CreateIndex
+CREATE INDEX "ProductUnit_tenantId_isActive_idx" ON "ProductUnit"("tenantId", "isActive");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ProductUnit_tenantId_barcode_key" ON "ProductUnit"("tenantId", "barcode");
@@ -353,10 +406,40 @@ CREATE INDEX "CustomerPayment_customerId_idx" ON "CustomerPayment"("customerId")
 CREATE INDEX "CustomerPayment_offlineId_idx" ON "CustomerPayment"("offlineId");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "Subscription_referenceCode_key" ON "Subscription"("referenceCode");
+
+-- CreateIndex
 CREATE INDEX "Subscription_tenantId_status_idx" ON "Subscription"("tenantId", "status");
 
 -- CreateIndex
 CREATE INDEX "Subscription_status_idx" ON "Subscription"("status");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "B2BOrderRequest_resultingInvoiceId_key" ON "B2BOrderRequest"("resultingInvoiceId");
+
+-- CreateIndex
+CREATE INDEX "B2BOrderRequest_tenantId_idx" ON "B2BOrderRequest"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "B2BOrderRequest_tenantId_status_idx" ON "B2BOrderRequest"("tenantId", "status");
+
+-- CreateIndex
+CREATE INDEX "B2BOrderRequest_tenantId_retailerPhone_status_idx" ON "B2BOrderRequest"("tenantId", "retailerPhone", "status");
+
+-- CreateIndex
+CREATE INDEX "B2BOrderRequestItem_tenantId_idx" ON "B2BOrderRequestItem"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "B2BOrderRequestItem_orderRequestId_idx" ON "B2BOrderRequestItem"("orderRequestId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "CustomerMergeLog_mergedCustomerId_key" ON "CustomerMergeLog"("mergedCustomerId");
+
+-- CreateIndex
+CREATE INDEX "CustomerMergeLog_tenantId_idx" ON "CustomerMergeLog"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "CustomerMergeLog_survivingCustomerId_idx" ON "CustomerMergeLog"("survivingCustomerId");
 
 -- AddForeignKey
 ALTER TABLE "Tenant" ADD CONSTRAINT "Tenant_systemCustomerId_fkey" FOREIGN KEY ("systemCustomerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -426,3 +509,39 @@ ALTER TABLE "CustomerPayment" ADD CONSTRAINT "CustomerPayment_invoiceId_fkey" FO
 
 -- AddForeignKey
 ALTER TABLE "Subscription" ADD CONSTRAINT "Subscription_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequest" ADD CONSTRAINT "B2BOrderRequest_matchedCustomerId_fkey" FOREIGN KEY ("matchedCustomerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequest" ADD CONSTRAINT "B2BOrderRequest_resultingInvoiceId_fkey" FOREIGN KEY ("resultingInvoiceId") REFERENCES "Invoice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequest" ADD CONSTRAINT "B2BOrderRequest_reviewedByUserId_fkey" FOREIGN KEY ("reviewedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequest" ADD CONSTRAINT "B2BOrderRequest_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequestItem" ADD CONSTRAINT "B2BOrderRequestItem_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequestItem" ADD CONSTRAINT "B2BOrderRequestItem_orderRequestId_fkey" FOREIGN KEY ("orderRequestId") REFERENCES "B2BOrderRequest"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequestItem" ADD CONSTRAINT "B2BOrderRequestItem_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "B2BOrderRequestItem" ADD CONSTRAINT "B2BOrderRequestItem_unitId_fkey" FOREIGN KEY ("unitId") REFERENCES "ProductUnit"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_survivingCustomerId_fkey" FOREIGN KEY ("survivingCustomerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_mergedCustomerId_fkey" FOREIGN KEY ("mergedCustomerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_performedByUserId_fkey" FOREIGN KEY ("performedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
