@@ -143,18 +143,18 @@ export default auth((req) => {
             if (isLocked) {
                 return NextResponse.redirect(new URL("/account-locked", req.url));
             }
-            const posUrl = new URL("/dashboard/pos", req.url);
+            const posUrl = new URL("/pos", req.url);
             posUrl.searchParams.set("error", "unauthorized");
             return NextResponse.redirect(posUrl);
         }
 
         // CASHIER default landing page: /dashboard (analytics/KPIs) is ADMIN-only per
-        // Role Capability Matrix. CASHIER's default landing page is /dashboard/pos instead.
+        // Role Capability Matrix. CASHIER's default landing page is /pos instead.
         if (user?.role === "CASHIER" && (pathname === "/dashboard" || pathname === "/dashboard/")) {
             if (isLocked) {
                 return NextResponse.redirect(new URL("/account-locked", req.url));
             }
-            return NextResponse.redirect(new URL("/dashboard/pos", req.url));
+            return NextResponse.redirect(new URL("/pos", req.url));
         }
 
         // Page-navigation layer subscription lockout:
@@ -192,7 +192,7 @@ export default auth((req) => {
             if (isLocked) {
                 return NextResponse.redirect(new URL("/account-locked", req.url));
             }
-            const posUrl = new URL("/dashboard/pos", req.url);
+            const posUrl = new URL("/pos", req.url);
             posUrl.searchParams.set("error", "unauthorized");
             return NextResponse.redirect(posUrl);
         }

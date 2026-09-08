@@ -79,7 +79,7 @@ function sanitizeCallbackUrl(raw: string | null): string | null {
 // Role Capability Matrix: CASHIER's default landing page is /dashboard/pos
 // (analytics/KPIs at /dashboard is ADMIN-only), ADMIN's is /dashboard.
 function defaultLandingPageForRole(role: string | undefined): string {
-  return role === "CASHIER" ? "/dashboard/pos" : "/dashboard";
+  return role === "CASHIER" ? "/pos" : "/dashboard";
 }
 
 function LoginFormContent() {

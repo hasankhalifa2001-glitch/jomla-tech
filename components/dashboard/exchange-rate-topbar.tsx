@@ -36,11 +36,72 @@ export function ExchangeRateTopbar() {
         }
     }, [session?.user?.tenantId, setCurrentTenantId]);
 
+    // [FIX — stale JWT source of truth] Previously seeded dailyExchangeRate
+    // exclusively from session.user.dailyExchangeRate (the JWT), matching
+    // T2a's own rule that this field must never be trusted from the token:
+    // it can change mid-session on ANY device (another ADMIN tab, another
+    // browser, another ADMIN account entirely) and this device's JWT has no
+    // way to know that happened until its own token is explicitly refreshed
+    // via updateSession(). That refresh only ever fires on the editing
+    // ADMIN's own tab after a successful save — every OTHER open
+    // session (a CASHIER's separate browser, an ADMIN's second device, a
+    // stale tab that's simply been open a while) never gets it, and a
+    // manual page reload doesn't help either, since a plain session read is
+    // not a `trigger: 'update'` and re-hydrates the same stale JWT value.
+    //
+    // Fixed the same way subscriptionStatus already is elsewhere in this
+    // codebase: fetch the live value from the database via GET
+    // /api/tenant/exchange-rate on every mount, unconditionally — not only
+    // when the store happens to be empty. session.user.dailyExchangeRate is
+    // used strictly as a same-tick fallback so the badge/input isn't blank
+    // while the fetch is in flight; the fetched value always overwrites it
+    // once the request resolves, and is treated as the sole source of
+    // truth from that point on.
     useEffect(() => {
         if (session?.user?.dailyExchangeRate !== undefined && dailyExchangeRate === null) {
             setExchangeRate(session.user.dailyExchangeRate, session.user.tenantId);
         }
     }, [session, dailyExchangeRate, setExchangeRate]);
+
+    useEffect(() => {
+        if (!session?.user?.tenantId) return;
+
+        let cancelled = false;
+
+        (async () => {
+            try {
+                const res = await fetch("/api/tenant/exchange-rate", {
+                    method: "GET",
+                    cache: "no-store",
+                });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (cancelled) return;
+                if (data?.success && data.dailyExchangeRate !== undefined) {
+                    // Always applied, even if it matches what's already
+                    // shown — this fetch result is what makes the value
+                    // authoritative for this mount, not a conditional
+                    // "only if different" update.
+                    setExchangeRate(data.dailyExchangeRate, session.user.tenantId);
+                }
+            } catch (err) {
+                // Network/offline failure: silently keep whatever value is
+                // already shown (session fallback or cache) rather than
+                // surfacing an error toast for a background refresh.
+                console.error("Failed to fetch fresh daily exchange rate:", err);
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+        // Intentionally re-runs whenever the tenant changes (covers a
+        // session/account switch in the same tab), and once per mount
+        // otherwise — this is the fresh-read-on-load fix itself, so it must
+        // not be skipped when dailyExchangeRate is already non-null (e.g.
+        // seeded from a stale JWT or Dexie cache).
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [session?.user?.tenantId]);
 
     const [inputValue, setInputValue] = useState<string>("");
     const [lastSyncedRate, setLastSyncedRate] = useState<number | null>(null);
