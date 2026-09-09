@@ -5,7 +5,17 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSession } from "next-auth/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Package, Plus, FileUp, Route, Search, Globe, Layers, AlertCircle } from "lucide-react";
+import {
+  Package,
+  Plus,
+  FileUp,
+  Route,
+  Search,
+  Globe,
+  Layers,
+  AlertCircle,
+  type LucideIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { AddProductModal } from "@/components/inventory/AddProductModal";
 import { EditProductModal } from "@/components/inventory/EditProductModal";
@@ -31,6 +41,71 @@ type FilterTab =
   | "discontinued_unit_stock"
   | "inactive_products";
 
+// Filter-tab config, deduped into one table instead of seven near-identical
+// JSX blocks. Each tab only differs by value/label/icon/color — adding or
+// re-theming a tab is now a one-line change instead of a copy-paste risk.
+type FilterTabConfig = {
+  value: Exclude<FilterTab, "all">;
+  label: string;
+  icon: LucideIcon;
+  activeClass: string;
+  inactiveClass: string;
+};
+
+const FILTER_TABS: FilterTabConfig[] = [
+  {
+    value: "public",
+    label: "منشور بالمتجر",
+    icon: Globe,
+    activeClass: "bg-blue-600 text-white hover:bg-blue-700",
+    inactiveClass:
+      "border-blue-200 text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-400",
+  },
+  {
+    value: "expiring",
+    label: "قريب من الانتهاء",
+    icon: AlertCircle,
+    activeClass: "bg-amber-600 text-white hover:bg-amber-700",
+    inactiveClass:
+      "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400",
+  },
+  {
+    // [FIX] New tab — was entirely missing. Color aligned with
+    // NegativeStockBadge (purple), which is the badge this filter's
+    // results are meant to correspond to at the row/batch level.
+    value: "needs_reconciliation",
+    label: "يحتاج تسوية",
+    icon: AlertCircle,
+    activeClass: "bg-purple-600 text-white hover:bg-purple-700",
+    inactiveClass:
+      "border-purple-200 text-purple-700 hover:bg-purple-50 dark:border-purple-900 dark:text-purple-400",
+  },
+  {
+    value: "out_of_stock",
+    label: "نافذ من المخزون",
+    icon: Package,
+    activeClass: "bg-red-600 text-white hover:bg-red-700",
+    inactiveClass:
+      "border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400",
+  },
+  {
+    value: "discontinued_unit_stock",
+    label: "مخزون على وحدة متوقفة",
+    icon: AlertCircle,
+    activeClass: "bg-amber-600 text-white hover:bg-amber-700",
+    inactiveClass:
+      "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400",
+  },
+  {
+    value: "inactive_products",
+    label: "منتجات معطلة",
+    icon: Package,
+    activeClass: "bg-zinc-700 text-white hover:bg-zinc-800",
+    inactiveClass:
+      "border-zinc-200 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-400",
+  },
+];
+
 export function InventoryClient() {
   // "New product" and "CSV import" are ADMIN-only server-side (see
   // products/route.ts POST and import/commit/route.ts) — hiding them from
@@ -48,6 +123,14 @@ export function InventoryClient() {
   const [expandedProductIds, setExpandedProductIds] = useState<Set<string>>(new Set());
   const [togglingPublicId, setTogglingPublicId] = useState<string | null>(null);
   const [togglingActiveId, setTogglingActiveId] = useState<string | null>(null);
+
+  const [addProductOpen, setAddProductOpen] = useState(false);
+  const [editProductOpen, setEditProductOpen] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<ProductItem | null>(null);
+  const [addBatchOpen, setAddBatchOpen] = useState(false);
+  const [csvImportOpen, setCsvImportOpen] = useState(false);
+  const [fifoPreviewOpen, setFifoPreviewOpen] = useState(false);
+  const [preselectedProductId, setPreselectedProductId] = useState<string | undefined>(undefined);
 
   const handleToggleProductActive = async (productId: string) => {
     setTogglingActiveId(productId);
@@ -100,14 +183,6 @@ export function InventoryClient() {
     }
   };
 
-  const [addProductOpen, setAddProductOpen] = useState(false);
-  const [editProductOpen, setEditProductOpen] = useState(false);
-  const [editingProduct, setEditingProduct] = useState<ProductItem | null>(null);
-  const [addBatchOpen, setAddBatchOpen] = useState(false);
-  const [csvImportOpen, setCsvImportOpen] = useState(false);
-  const [fifoPreviewOpen, setFifoPreviewOpen] = useState(false);
-  const [preselectedProductId, setPreselectedProductId] = useState<string | undefined>(undefined);
-
   // [FIX] Cancels any in-flight request before starting a new one. Without
   // this, a slow debounced search response landing after a fast filter-tab
   // response (or vice versa) could overwrite the screen with stale,
@@ -147,7 +222,7 @@ export function InventoryClient() {
     }
   }, [searchQuery, activeFilter]);
 
-  // FIX: the previous version decided the delay by checking whether
+  // [FIX] The previous version decided the delay by checking whether
   // `searchQuery` is CURRENTLY non-empty (`searchQuery ? 300 : 0`) — not
   // whether searchQuery is what actually changed on this render. That
   // meant clicking a filter tab while text was already typed in the search
@@ -223,12 +298,12 @@ export function InventoryClient() {
   };
 
   return (
-    <div className="space-y-6" dir="rtl">
+    <div className="space-y-5 sm:space-y-6" dir="rtl">
       {/* Action Bar Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-2 border-b border-zinc-200 dark:border-zinc-800">
+      <div className="flex flex-col gap-4 pb-2 border-b border-zinc-200 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
-            <Package className="w-7 h-7 text-emerald-600 dark:text-emerald-400" />
+          <h1 className="flex items-center gap-2 text-xl font-bold text-zinc-900 dark:text-zinc-100 sm:text-2xl">
+            <Package className="w-6 h-6 text-emerald-600 dark:text-emerald-400 sm:w-7 sm:h-7" />
             <span>إدارة المخزون والدفعات</span>
           </h1>
           <p className="text-xs text-zinc-500 mt-1">
@@ -236,11 +311,14 @@ export function InventoryClient() {
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        {/* 2-column grid on mobile for full-width, equal-size tap targets;
+            reverts to an inline wrapping row from `sm` up where width isn't
+            a constraint. */}
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
           {isAdmin && (
             <Button
               onClick={() => setAddProductOpen(true)}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs gap-1.5 shadow-sm"
+              className="w-full gap-1.5 bg-emerald-600 text-xs text-white shadow-sm hover:bg-emerald-700 sm:w-auto"
             >
               <Plus className="w-4 h-4" />
               <span>منتج جديد</span>
@@ -250,7 +328,7 @@ export function InventoryClient() {
           <Button
             onClick={() => handleOpenAddBatch()}
             variant="outline"
-            className="border-emerald-300 text-emerald-800 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 text-xs gap-1.5"
+            className="w-full gap-1.5 border-emerald-300 text-xs text-emerald-800 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 sm:w-auto"
           >
             <Layers className="w-4 h-4" />
             <span>دفعة جديدة</span>
@@ -260,7 +338,7 @@ export function InventoryClient() {
             <Button
               onClick={() => setCsvImportOpen(true)}
               variant="outline"
-              className="border-blue-300 text-blue-800 hover:bg-blue-50 dark:border-blue-800 dark:text-blue-300 text-xs gap-1.5"
+              className="w-full gap-1.5 border-blue-300 text-xs text-blue-800 hover:bg-blue-50 dark:border-blue-800 dark:text-blue-300 sm:w-auto"
             >
               <FileUp className="w-4 h-4" />
               <span>استيراد CSV</span>
@@ -270,7 +348,7 @@ export function InventoryClient() {
           <Button
             onClick={() => handleOpenFifoPreview()}
             variant="outline"
-            className="border-indigo-300 text-indigo-800 hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 text-xs gap-1.5"
+            className="w-full gap-1.5 border-indigo-300 text-xs text-indigo-800 hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 sm:w-auto"
           >
             <Route className="w-4 h-4" />
             <span>معاينة FIFO</span>
@@ -278,110 +356,46 @@ export function InventoryClient() {
         </div>
       </div>
 
-      {/* Search Bar & Visible Filter Tab Buttons */}
-      <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
-        <div className="relative flex-1 max-w-md">
-          <Search className="absolute right-3 top-2.5 w-4 h-4 text-zinc-400" />
+      {/* Search Bar & Filter Tabs */}
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="relative w-full md:max-w-md">
+          <Search className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
           <Input
             type="text"
             placeholder="ابحث بالاسم أو الباركود..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="pr-9 text-xs bg-white dark:bg-zinc-900"
+            className="w-full bg-white pr-9 text-xs dark:bg-zinc-900"
           />
         </div>
 
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
+        {/* flex-wrap instead of a horizontal scroller: on a narrow phone
+            the chips fall onto a second/third line instead of hiding behind
+            an unlabeled scroll area, so every filter stays discoverable. */}
+        <div className="flex flex-wrap items-center gap-1.5">
           <Button
             variant={activeFilter === "all" ? "default" : "outline"}
             size="sm"
             onClick={() => setActiveFilter("all")}
-            className={`text-xs h-8 rounded-lg ${activeFilter === "all" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : ""
+            className={`h-8 rounded-lg text-xs ${activeFilter === "all" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : ""
               }`}
           >
             الكل
           </Button>
 
-          <Button
-            variant={activeFilter === "public" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setActiveFilter("public")}
-            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "public"
-              ? "bg-blue-600 text-white hover:bg-blue-700"
-              : "border-blue-200 text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-400"
-              }`}
-          >
-            <Globe className="w-3.5 h-3.5" />
-            <span>منشور بالمتجر</span>
-          </Button>
-
-          <Button
-            variant={activeFilter === "expiring" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setActiveFilter("expiring")}
-            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "expiring"
-              ? "bg-amber-600 text-white hover:bg-amber-700"
-              : "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400"
-              }`}
-          >
-            <AlertCircle className="w-3.5 h-3.5" />
-            <span>قريب من الانتهاء</span>
-          </Button>
-
-          {/* [FIX] New tab — was entirely missing. Color aligned with
-              NegativeStockBadge (purple), which is the badge this filter's
-              results are meant to correspond to at the row/batch level. */}
-          <Button
-            variant={activeFilter === "needs_reconciliation" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setActiveFilter("needs_reconciliation")}
-            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "needs_reconciliation"
-              ? "bg-purple-600 text-white hover:bg-purple-700"
-              : "border-purple-200 text-purple-700 hover:bg-purple-50 dark:border-purple-900 dark:text-purple-400"
-              }`}
-          >
-            <AlertCircle className="w-3.5 h-3.5" />
-            <span>يحتاج تسوية</span>
-          </Button>
-
-          <Button
-            variant={activeFilter === "out_of_stock" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setActiveFilter("out_of_stock")}
-            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "out_of_stock"
-              ? "bg-red-600 text-white hover:bg-red-700"
-              : "border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400"
-              }`}
-          >
-            <Package className="w-3.5 h-3.5" />
-            <span>نافذ من المخزون</span>
-          </Button>
-
-          <Button
-            variant={activeFilter === "discontinued_unit_stock" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setActiveFilter("discontinued_unit_stock")}
-            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "discontinued_unit_stock"
-              ? "bg-amber-600 text-white hover:bg-amber-700"
-              : "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400"
-              }`}
-          >
-            <AlertCircle className="w-3.5 h-3.5" />
-            <span>مخزون على وحدة متوقفة</span>
-          </Button>
-
-          <Button
-            variant={activeFilter === "inactive_products" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setActiveFilter("inactive_products")}
-            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "inactive_products"
-              ? "bg-zinc-700 text-white hover:bg-zinc-800"
-              : "border-zinc-200 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-400"
-              }`}
-          >
-            <Package className="w-3.5 h-3.5" />
-            <span>منتجات معطلة</span>
-          </Button>
+          {FILTER_TABS.map(({ value, label, icon: Icon, activeClass, inactiveClass }) => (
+            <Button
+              key={value}
+              variant={activeFilter === value ? "default" : "outline"}
+              size="sm"
+              onClick={() => setActiveFilter(value)}
+              className={`h-8 gap-1.5 rounded-lg text-xs ${activeFilter === value ? activeClass : inactiveClass
+                }`}
+            >
+              <Icon className="h-3.5 w-3.5" />
+              <span>{label}</span>
+            </Button>
+          ))}
         </div>
       </div>
 

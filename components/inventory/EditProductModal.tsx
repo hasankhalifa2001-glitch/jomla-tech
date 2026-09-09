@@ -165,6 +165,29 @@ export function EditProductModal({
     }
   }
 
+  // ---------------------------------------------------------------------
+  // [FIX — base-unit identity bug] Previously, "is this the base unit"
+  // was computed live as `unit.conversionFactor === 1` inside the render
+  // loop below. That recomputes on every keystroke from the CURRENT input
+  // value, not a stable identity. So editing a non-base unit's conversion
+  // factor (e.g. typing "10" over "12") would briefly produce the
+  // intermediate value "1" after the first keystroke — at which point
+  // `isBase` flipped to true and the input immediately became `disabled`,
+  // locking mid-edit before the rest of the digits could be typed. The
+  // "الوحدة الأساسية" badge flickered incorrectly for the same reason.
+  //
+  // Fix: `units` is sorted by conversionFactor ascending exactly once, at
+  // load time (see the init block above), so the base unit (factor === 1)
+  // is always at index 0 the moment the modal opens. handleAddUnit only
+  // ever appends to the END of the array, and the base unit can never be
+  // removed (see the index === 0 guard in handleRemoveUnit below), so
+  // index 0 stays a stable, load-time-fixed identity for "the base unit"
+  // for the entire lifetime of the open modal — completely independent of
+  // whatever value is currently being typed into any conversionFactor
+  // input. `isBase` is now derived from array position, never from the
+  // live value.
+  // ---------------------------------------------------------------------
+
   // Handle Barcode Classification Gate
   const requestBarcodeClassification = (unitIndex: number, rawBarcode: string) => {
     const cleaned = rawBarcode.trim();
@@ -302,7 +325,11 @@ export function EditProductModal({
   };
 
   const handleRemoveUnit = (index: number) => {
-    if (units[index].conversionFactor === 1) {
+    // [FIX] Was `units[index].conversionFactor === 1`, the same live-value
+    // bug as the render-loop isBase check. The base unit is always at
+    // index 0 (see note above) — guard on position, not on a value that
+    // can transiently equal 1 while a user is mid-edit of another unit.
+    if (index === 0) {
       toast.error("لا يمكن حذف الوحدة الأساسية.");
       return;
     }
@@ -571,7 +598,9 @@ export function EditProductModal({
 
               <div className="space-y-3">
                 {units.map((unit, index) => {
-                  const isBase = unit.conversionFactor === 1;
+                  // [FIX] Stable, load-time identity — see note above.
+                  // Was: `const isBase = unit.conversionFactor === 1;`
+                  const isBase = index === 0;
                   return (
                     <div
                       key={unit.id || index}
