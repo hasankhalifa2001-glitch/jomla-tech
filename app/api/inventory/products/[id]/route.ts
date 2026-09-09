@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { getTenantDb } from "@/lib/db/tenant-scope";
-import { prisma } from "@/lib/db";
 import {
   assertTenantWritable,
   SubscriptionLockedError,
@@ -13,6 +12,7 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
 const unitSchema = z
@@ -92,12 +92,8 @@ export async function PATCH(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: تعديل المنتجات متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role Capability Matrix (T2b) is the single authoritative permission
+    // check — no separate manual role comparison here.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -145,6 +141,17 @@ export async function PATCH(
 
       const factors = new Set<number>();
       const names = new Set<string>();
+      // Barcodes are checked for uniqueness WITHIN this same request's
+      // unit list first — previously only a duplicate against a DIFFERENT
+      // product was checked (`NOT: { productId: id }`), so two units on
+      // the SAME product sharing a barcode slipped past this pre-check
+      // and only surfaced later as a raw P2002 from the DB's
+      // `@@unique([tenantId, barcode])` constraint, with no friendly
+      // message. Both checks run: in-request duplicates (this Set) and
+      // cross-product duplicates (the existing DB lookup, still excluding
+      // this product's OTHER existing units so a unit can keep its own
+      // unchanged barcode across an edit).
+      const barcodesInRequest = new Set<string>();
       for (const u of data.units) {
         if (factors.has(u.conversionFactor)) {
           return NextResponse.json(
@@ -170,9 +177,22 @@ export async function PATCH(
         names.add(lowerName);
 
         if (u.barcode && u.barcode.trim()) {
+          const barcodeTrim = u.barcode.trim();
+
+          if (barcodesInRequest.has(barcodeTrim)) {
+            return NextResponse.json(
+              {
+                error: "DUPLICATE_BARCODE",
+                message: `الباركود ${barcodeTrim} مكرر لأكثر من وحدة ضمن نفس الطلب.`,
+              },
+              { status: 400 }
+            );
+          }
+          barcodesInRequest.add(barcodeTrim);
+
           const duplicate = await db.productUnit.findFirst({
             where: {
-              barcode: u.barcode.trim(),
+              barcode: barcodeTrim,
               product: { tenantId },
               NOT: { productId: id },
             },
@@ -181,7 +201,7 @@ export async function PATCH(
             return NextResponse.json(
               {
                 error: "DUPLICATE_BARCODE",
-                message: `الباركود ${u.barcode.trim()} مستخدم مسبقاً في منتج آخر لديك.`,
+                message: `الباركود ${barcodeTrim} مستخدم مسبقاً في منتج آخر لديك.`,
               },
               { status: 400 }
             );
@@ -190,23 +210,23 @@ export async function PATCH(
       }
     }
 
+    // isActive and isPublic are two fully independent fields, per T1/T3a:
+    // "Deactivation/reactivation is purely a visibility toggle, never a
+    // data-migration event, and requires no field re-validation."
+    //   - isActive changes only if the request explicitly sets it.
+    //   - isPublic changes ONLY if the request explicitly sets it
+    //     (`data.isPublic !== undefined`). Editing name/category/units, or
+    //     toggling isActive, NEVER touches isPublic on its own — it simply
+    //     carries over unchanged, exactly as the spec requires for a
+    //     reactivated product's prior state to be preserved automatically.
+    //   - The publishing gate is validated ONLY when the request is
+    //     explicitly trying to turn isPublic ON (data.isPublic === true).
+    //     Turning it off, or leaving it untouched, never re-runs the gate.
     const nextIsActive = data.isActive !== undefined ? data.isActive : existingProduct.isActive;
-    let nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
+    const nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
 
-    const candidateUnits = data.units
-      ? data.units.map((u) => ({
-          isActive: u.isActive !== false,
-          imageUrl: u.imageUrl,
-          priceRetail: u.priceRetail,
-        }))
-      : existingProduct.units.map((u) => ({
-          isActive: u.isActive !== false,
-          imageUrl: u.imageUrl,
-          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? Number(u.priceRetail) : null,
-        }));
-
-    if (!nextIsActive) {
-      if (data.isPublic === true) {
+    if (data.isPublic === true) {
+      if (!nextIsActive) {
         return NextResponse.json(
           {
             error: "PRODUCT_INACTIVE",
@@ -215,23 +235,31 @@ export async function PATCH(
           { status: 400 }
         );
       }
-      nextIsPublic = false;
-    } else if (nextIsPublic) {
+
+      const candidateUnits = data.units
+        ? data.units.map((u) => ({
+          isActive: u.isActive !== false,
+          imageUrl: u.imageUrl,
+          priceRetail: u.priceRetail,
+        }))
+        : existingProduct.units.map((u) => ({
+          isActive: u.isActive !== false,
+          imageUrl: u.imageUrl,
+          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? Number(u.priceRetail) : null,
+        }));
+
       const gateCheck = checkProductPublishable({
         isActive: nextIsActive,
         units: candidateUnits,
       });
       if (!gateCheck.publishable) {
-        if (data.isPublic === true) {
-          return NextResponse.json(
-            {
-              error: "PUBLISH_GATE_BLOCKED",
-              message: gateCheck.reason,
-            },
-            { status: 400 }
-          );
-        }
-        nextIsPublic = false;
+        return NextResponse.json(
+          {
+            error: "PUBLISH_GATE_BLOCKED",
+            message: gateCheck.reason,
+          },
+          { status: 400 }
+        );
       }
     }
 
@@ -281,13 +309,35 @@ export async function PATCH(
             });
           }
 
+          // [FIX — CRITICAL, per Master Spec T3a §6 / ProductCatalogEntry]
+          // ProductCatalogEntry is write-once at creation and MUST NEVER
+          // be updated afterward by anyone — not even by the tenant that
+          // originally created it. Spec: "a one-time fill-in-the-form
+          // convenience, never re-read afterward and never silently kept
+          // in sync with a tenant's own edited copy." The previous
+          // `else if (existingCatalog.addedByTenantId === tenantId) {
+          // update(...) }` branch violated this directly: it silently
+          // synced the owning tenant's later product edits back into the
+          // shared catalog entry, meaning any OTHER tenant scanning the
+          // same barcode later would see whatever the owner's local
+          // product happens to say TODAY, not the value that was true
+          // when the entry was first created. That branch is removed
+          // entirely. The only two valid outcomes here are:
+          //   (a) no entry exists yet for this barcode → create one
+          //       (this tenant becomes its permanent owner), or
+          //   (b) an entry already exists (owned by this tenant or any
+          //       other) → do absolutely nothing to it. The only path
+          //       that may ever change an existing entry is a
+          //       Super-Admin resolving a ProductCatalogEntryReport
+          //       (T6) — never a direct tenant write, regardless of
+          //       ownership.
           if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
             const barcodeTrim = u.barcode.trim();
-            const existingCatalog = await prisma.productCatalogEntry.findUnique({
+            const existingCatalog = await tx.productCatalogEntry.findUnique({
               where: { barcode: barcodeTrim },
             });
             if (!existingCatalog) {
-              await prisma.productCatalogEntry.create({
+              await tx.productCatalogEntry.create({
                 data: {
                   barcode: barcodeTrim,
                   name: data.name || product.name,
@@ -296,16 +346,9 @@ export async function PATCH(
                   addedByTenantId: tenantId,
                 },
               });
-            } else if (existingCatalog.addedByTenantId === tenantId) {
-              await prisma.productCatalogEntry.update({
-                where: { id: existingCatalog.id },
-                data: {
-                  name: data.name || product.name,
-                  category: data.category !== undefined ? data.category : product.category,
-                  imageUrl: u.imageUrl || existingCatalog.imageUrl,
-                },
-              });
             }
+            // No `else` branch — an existing entry, owned by this tenant
+            // or any other, is never touched here under any condition.
           }
         }
       }
@@ -330,6 +373,17 @@ export async function PATCH(
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse();
     }
+    // P2002 (unique constraint violation) can still slip through the
+    // in-request and cross-product pre-checks above under a concurrent
+    // request racing this same edit — surface it as a friendly Arabic
+    // message instead of a generic 500, same pattern already used in
+    // products/route.ts's POST handler.
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      return NextResponse.json(
+        { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لوحدة أخرى." },
+        { status: 400 }
+      );
+    }
     console.error("PATCH product error:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء تعديل المنتج." }, { status: 500 });
   }
@@ -345,12 +399,8 @@ export async function DELETE(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: تعطيل المنتجات متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role Capability Matrix (T2b) is the single authoritative permission
+    // check — no separate manual role comparison here.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -367,17 +417,23 @@ export async function DELETE(
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
+    // isPublic is deliberately left untouched by this write. Deactivation
+    // here is the same soft-delete action as the toggle-active route — a
+    // pure visibility toggle. The storefront query already filters on
+    // isActive: true, so isActive: false alone already hides the product;
+    // isPublic stays exactly as it was, so a later reactivation restores
+    // the product's storefront visibility automatically with no manual
+    // re-publishing step.
     await db.product.update({
       where: { id },
       data: {
         isActive: false,
-        isPublic: false,
       },
     });
 
     return NextResponse.json({
       success: true,
-      message: "تم تعطيل المنتج وإلغاء نشره من المتجر بنجاح.",
+      message: "تم تعطيل المنتج بنجاح.",
     });
   } catch (error) {
     if (error instanceof SubscriptionLockedError) {

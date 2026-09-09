@@ -46,6 +46,7 @@ export interface ProductItem {
   baseUnitName: string;
   hasExpiringSoonBatch: boolean;
   hasNegativeStockBatch?: boolean;
+  hasDiscontinuedUnitStock?: boolean;
   isOutOfStock: boolean;
 }
 
@@ -61,6 +62,7 @@ interface ProductTableProps {
   togglingActiveId?: string | null;
   onAddBatch: (productId: string) => void;
   onFifoPreview: (productId: string) => void;
+  onEditProduct?: (product: ProductItem) => void;
   isAdmin: boolean;
 }
 
@@ -76,6 +78,7 @@ export function ProductTable({
   togglingActiveId,
   onAddBatch,
   onFifoPreview,
+  onEditProduct,
   isAdmin,
 }: ProductTableProps) {
   if (loading) {
@@ -127,6 +130,11 @@ export function ProductTable({
                             موقوف
                           </Badge>
                         )}
+                        {product.hasDiscontinuedUnitStock && (
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-amber-50 text-amber-800 border-amber-300">
+                            مخزون على وحدة متوقفة
+                          </Badge>
+                        )}
                         {product.hasNegativeStockBatch && (
                           <span title="يوجد دفعة بمخزون سالب تحتاج تسوية">
                             <Package className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
@@ -147,46 +155,58 @@ export function ProductTable({
 
                     <td className="py-3.5 px-4 align-top">
                       <div className="space-y-1">
-                        {product.units.map((unit) => (
-                          <div key={unit.id} className="flex items-center gap-2 text-xs">
-                            <span className={`font-medium ${unit.isActive === false ? "line-through text-zinc-400" : "text-zinc-800 dark:text-zinc-200"}`}>
-                              {unit.unitName}
-                            </span>
-                            {unit.isActive === false && (
-                              <Badge variant="outline" className="text-[9px] px-1 py-0 text-red-500 border-red-200 bg-red-50">
-                                معطلة
-                              </Badge>
-                            )}
-                            <span className="text-zinc-400 text-[11px]">(معامل {unit.conversionFactor})</span>
-                            <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">
-                              {formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}
-                            </span>
-                            {unit.priceRetail != null && (
-                              <span className="text-[10px] text-zinc-400">
-                                (تجزئة: {formatMoney(unit.priceRetail, unit.pricingCurrency ?? "SYP")})
+                        {product.units.map((unit) => {
+                          const discontinuedStock = !unit.isActive
+                            ? product.batches
+                              .filter((b) => b.unitId === unit.id && b.quantity > 0)
+                              .reduce((sum, b) => sum + b.quantity, 0)
+                            : 0;
+                          return (
+                            <div key={unit.id} className="flex items-center gap-2 text-xs">
+                              <span className={`font-medium ${unit.isActive === false ? "line-through text-zinc-400" : "text-zinc-800 dark:text-zinc-200"}`}>
+                                {unit.unitName}
                               </span>
-                            )}
-                            {unit.barcode && (
-                              <span className="font-mono text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-500">
-                                {unit.barcode}
-                                {unit.barcodeSource && (
-                                  <span className="mr-1 text-[9px] text-zinc-400 font-sans">({unit.barcodeSource})</span>
-                                )}
+                              {unit.isActive === false && (
+                                <Badge variant="outline" className="text-[9px] px-1 py-0 text-red-500 border-red-200 bg-red-50">
+                                  معطلة
+                                </Badge>
+                              )}
+                              {discontinuedStock > 0 && (
+                                <Badge variant="outline" className="text-[9px] px-1 py-0 text-amber-700 border-amber-300 bg-amber-50">
+                                  مخزون على وحدة متوقفة ({discontinuedStock})
+                                </Badge>
+                              )}
+                              <span className="text-zinc-400 text-[11px]">(معامل {unit.conversionFactor})</span>
+                              <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">
+                                {formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}
                               </span>
-                            )}
-                            {isAdmin && onToggleUnitActive && (
-                              <button
-                                type="button"
-                                onClick={() => onToggleUnitActive(product.id, unit.id)}
-                                disabled={togglingActiveId === unit.id}
-                                className="text-[10px] text-zinc-400 hover:text-zinc-700 underline mr-1"
-                                title={unit.isActive === false ? "تفعيل هذه الوحدة" : "تعطيل هذه الوحدة"}
-                              >
-                                {unit.isActive === false ? "تفعيل" : "تعطيل"}
-                              </button>
-                            )}
-                          </div>
-                        ))}
+                              {unit.priceRetail != null && (
+                                <span className="text-[10px] text-zinc-400">
+                                  (تجزئة: {formatMoney(unit.priceRetail, unit.pricingCurrency ?? "SYP")})
+                                </span>
+                              )}
+                              {unit.barcode && (
+                                <span className="font-mono text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-500">
+                                  {unit.barcode}
+                                  {unit.barcodeSource && (
+                                    <span className="mr-1 text-[9px] text-zinc-400 font-sans">({unit.barcodeSource})</span>
+                                  )}
+                                </span>
+                              )}
+                              {isAdmin && onToggleUnitActive && (
+                                <button
+                                  type="button"
+                                  onClick={() => onToggleUnitActive(product.id, unit.id)}
+                                  disabled={togglingActiveId === unit.id}
+                                  className="text-[10px] text-zinc-400 hover:text-zinc-700 underline mr-1"
+                                  title={unit.isActive === false ? "تفعيل هذه الوحدة" : "تعطيل هذه الوحدة"}
+                                >
+                                  {unit.isActive === false ? "تفعيل" : "تعطيل"}
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </td>
 
@@ -231,6 +251,17 @@ export function ProductTable({
 
                     <td className="py-3.5 px-4 align-top text-center">
                       <div className="flex items-center justify-center gap-1">
+                        {isAdmin && onEditProduct && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => onEditProduct(product)}
+                            title="تعديل المنتج والوحدات"
+                            className="h-7 text-[11px] px-2 text-zinc-700 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                          >
+                            تعديل
+                          </Button>
+                        )}
                         {isAdmin && onToggleProductActive && (
                           <Button
                             size="sm"
@@ -238,11 +269,10 @@ export function ProductTable({
                             onClick={() => onToggleProductActive(product.id)}
                             disabled={togglingActiveId === product.id}
                             title={product.isActive ? "تعطيل المنتج" : "تفعيل المنتج"}
-                            className={`h-7 text-[11px] px-2 ${
-                              product.isActive
+                            className={`h-7 text-[11px] px-2 ${product.isActive
                                 ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
                                 : "text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/20"
-                            }`}
+                              }`}
                           >
                             {product.isActive ? "تعطيل" : "تفعيل"}
                           </Button>

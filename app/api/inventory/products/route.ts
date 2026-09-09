@@ -1,14 +1,5 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-// [FIX] The raw, unscoped `prisma` client is only meant to be imported by a
-// small documented allowlist of routes that legitimately run before any
-// tenant/session context exists (registration, seed.ts, isPlatformAdmin-
-// gated super-admin routes — see lib/db.ts's own header comment). This is
-// an ordinary authenticated tenant route, not on that allowlist. It must go
-// through `getTenantDb(tenantId)` instead, so every query on a
-// tenant-scoped model gets `tenantId` injected automatically by the Prisma
-// Client Extension rather than depending on every `where`/`data` clause in
-// this file being hand-written correctly forever.
 import { getTenantDb } from "@/lib/db/tenant-scope";
 import {
   assertTenantWritable,
@@ -20,6 +11,7 @@ import {
   ForbiddenRoleError,
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
+import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
@@ -28,8 +20,6 @@ const unitSchema = z
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
     conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
-    // [FIX] `priceWholesale` is REQUIRED and must be strictly greater than
-    // zero.
     priceWholesale: z.number().positive("سعر الجملة يجب أن يكون أكبر من صفر"),
     priceRetail: z.number().min(0).optional().nullable(),
     barcode: z.string().optional().nullable(),
@@ -59,17 +49,13 @@ const createProductSchema = z.object({
     .object({
       unitIndex: z.number().default(0),
       batchNumber: z.string().min(1, "رقم الدفعة مطلوب"),
-      quantity: z.number(), // Can be negative for initial reconciliation
+      quantity: z.number(),
       expiryDate: z.string().optional().nullable(),
     })
     .optional()
     .nullable(),
 });
 
-// Narrow, honestly-named type for what this route actually reads back from
-// Prisma before reshaping it for the response. Avoids the previous file's
-// blanket `any` on every mapped row, which silently hid shape mistakes
-// (e.g. the dead `u.priceUSD` read below that this fix removes).
 type ProductUnitRow = {
   id: string;
   unitName: string;
@@ -115,15 +101,14 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
     const q = (searchParams.get("q") || "").trim();
     const filter = searchParams.get("filter") || "all";
-    const status = searchParams.get("status") || "active";
+    const status = searchParams.get("status");
 
     const whereClause: Prisma.ProductWhereInput = {};
     if (status === "active") {
       whereClause.isActive = true;
-    } else if (status === "inactive") {
+    } else if (status === "inactive" || filter === "inactive_products") {
       whereClause.isActive = false;
     }
-    // If status === "all", do not filter on isActive at the product query level
 
     const products = (await db.product.findMany({
       where: whereClause,
@@ -194,7 +179,6 @@ export async function GET(req: Request) {
       const totalStockInBase = totalBaseStock / baseFactor;
       const isOutOfStock = totalStockInBase <= 0;
 
-      // Check if product has positive stock on an inactive unit
       const hasDiscontinuedUnitStock = product.units.some(
         (u) =>
           !u.isActive &&
@@ -281,17 +265,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // ADMIN-only: creating a catalog product is a pricing/catalog decision,
-    // not a day-to-day operational task a cashier performs.
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: هذا الإجراء متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role Capability Matrix (T2b) is the single authoritative permission
+    // check — no separate manual role comparison here, to avoid two
+    // sources of truth drifting apart if the matrix ever changes.
     assertRolePermission(session.user.role, "inventory:mutate");
 
-    // Security boundary: check fresh subscription status in DB
     await assertTenantWritable(session.user.tenantId);
 
     const tenantId = session.user.tenantId;
@@ -311,30 +289,23 @@ export async function POST(req: Request) {
 
     const { name, category, isPublic, units, initialBatch } = validation.data;
 
-    // PUBLISHING GATE RULE: requires both priceRetail > 0 AND imageUrl on at least one active unit
+    // PUBLISHING GATE: delegates to the single shared implementation in
+    // lib/inventory/publishing-gate.ts rather than re-deriving the same
+    // rule here by hand — keeps this route and the toggle-public route
+    // permanently in sync with exactly one definition of "publishable".
     if (isPublic) {
-      const isPublishable = units.some(
-        (u) =>
-          (u.isActive === undefined || u.isActive === true) &&
-          u.imageUrl !== undefined &&
-          u.imageUrl !== null &&
-          u.imageUrl.trim().length > 0 &&
-          u.priceRetail !== undefined &&
-          u.priceRetail !== null &&
-          Number(u.priceRetail) > 0
-      );
-      if (!isPublishable) {
+      const gateCheck = checkProductPublishable({ isActive: true, units });
+      if (!gateCheck.publishable) {
         return NextResponse.json(
           {
             error: "PUBLISH_GATE_BLOCKED",
-            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة صورة وسعر مفرق أكبر من صفر على وحدة نشطة واحدة على الأقل.",
+            message: gateCheck.reason,
           },
           { status: 400 }
         );
       }
     }
 
-    // Barcode uniqueness pre-check across ALL units in this tenant (active and inactive)
     const incomingBarcodes = units
       .map((u) => u.barcode?.trim())
       .filter((b): b is string => !!b);
@@ -370,37 +341,6 @@ export async function POST(req: Request) {
       }
     }
 
-    // [FIX] `tx: any` removed. The blanket `any` on this callback (and on
-    // every row mapped from it) erased type checking for the entire
-    // transaction body — the same category of problem documented and
-    // fixed in lib/inventory/fifo.ts, where a hand-rolled client alias
-    // silently forced unsafe casts everywhere it was used.
-    //
-    // [FIX — corrected from an earlier, wrong assumption] `tx`'s type is
-    // deliberately left to TypeScript's inference here rather than
-    // annotated as `Prisma.TransactionClient`. `getTenantDb(tenantId)`
-    // returns an EXTENDED client, and calling `$transaction(...)` on an
-    // extended client hands the callback a `tx` that is itself the
-    // extended client's own transaction shape (`DynamicClientExtensionThis<...>`),
-    // not the plain `Prisma.TransactionClient` type — forcing that
-    // annotation produces a real type error, since the two shapes are not
-    // assignable to each other. Letting TypeScript infer `tx`'s type from
-    // `db.$transaction` is what makes a typo like `tx.productUnti.create(...)`
-    // fail to compile instead of failing at runtime, without fighting the
-    // extended client's actual generic type.
-    //
-    // Practical consequence: because `tx` here carries the SAME tenant-
-    // scoping query extension as `db` (Prisma applies `$extends` query
-    // interceptors inside interactive transactions too, not just at the
-    // top level), every `tx.<tenantScopedModel>.create/update/...` call
-    // below already has `tenantId` auto-injected by the extension, exactly
-    // like calls made directly on `db`. The explicit `tenantId` fields
-    // still written into `data` below are therefore redundant with what
-    // the extension would inject on its own — but they are kept
-    // deliberately, as defense-in-depth: they cost nothing (the extension
-    // simply overwrites `tenantId` with the same closed-over value), and
-    // they mean this code stays correct even if a future Prisma version
-    // or refactor changes whether the extension propagates into `tx`.
     const createdProduct = await db.$transaction(async (tx) => {
       const product = await tx.product.create({
         data: {
@@ -414,10 +354,6 @@ export async function POST(req: Request) {
       const unitIds: string[] = [];
       const createdUnits: ProductUnitRow[] = [];
       for (const u of units) {
-        // [FIX] `u.priceUSD` fallback removed — `priceWholesale` is now a
-        // required, strictly-positive field on the validated input (see
-        // unitSchema above), so there is no ambiguity or fallback needed
-        // here at all.
         const createdUnit = await tx.productUnit.create({
           data: {
             tenantId,
@@ -436,7 +372,33 @@ export async function POST(req: Request) {
         unitIds.push(createdUnit.id);
         createdUnits.push(createdUnit as unknown as ProductUnitRow);
 
-        // GS1 shared catalog contribution (write-once)
+        // [FIX — CRITICAL, per Master Spec T3a §6 / ProductCatalogEntry]
+        // ProductCatalogEntry is write-once at creation and MUST NEVER be
+        // updated afterward by anyone — not even by the tenant that
+        // originally created it. Spec: "a one-time fill-in-the-form
+        // convenience, never re-read afterward and never silently kept in
+        // sync with a tenant's own edited copy."
+        //
+        // The previous `else if (existingCatalog.addedByTenantId ===
+        // tenantId) { update(...) }` branch here was flagged as
+        // practically unreachable in THIS specific POST flow — the
+        // barcode-uniqueness pre-check a few lines above already rejects
+        // the request with DUPLICATE_BARCODE before this transaction ever
+        // starts, for any barcode this tenant already owns a ProductUnit
+        // with (which is the only way this tenant could already own a
+        // matching ProductCatalogEntry). That "unreachable today" argument
+        // is not a reason to keep it: the branch still encodes the wrong
+        // rule, and a future change to the pre-check above (e.g. loosening
+        // the DUPLICATE_BARCODE guard) would silently reactivate it. It is
+        // removed here for the same reason it was removed from the PATCH
+        // handler in products/[id]/route.ts — this file and that one must
+        // never disagree on this rule.
+        //
+        // The only two valid outcomes are: (a) no entry exists yet for
+        // this barcode → create one (this tenant becomes its permanent
+        // owner), or (b) an entry already exists, owned by anyone → do
+        // nothing. The only path that may ever change an existing entry is
+        // a Super-Admin resolving a ProductCatalogEntryReport (T6).
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
           const barcodeTrim = u.barcode.trim();
           const existingCatalog = await tx.productCatalogEntry.findUnique({
@@ -452,16 +414,9 @@ export async function POST(req: Request) {
                 addedByTenantId: tenantId,
               },
             });
-          } else if (existingCatalog.addedByTenantId === tenantId) {
-            await tx.productCatalogEntry.update({
-              where: { id: existingCatalog.id },
-              data: {
-                name,
-                category: category || null,
-                imageUrl: u.imageUrl || existingCatalog.imageUrl,
-              },
-            });
           }
+          // No `else` branch — an existing entry, owned by this tenant or
+          // any other, is never touched here under any condition.
         }
       }
 
@@ -482,17 +437,6 @@ export async function POST(req: Request) {
       return { ...product, units: createdUnits };
     });
 
-    // [FIX] Every Decimal-typed field coming back from Prisma
-    // (conversionFactor, priceWholesale, priceRetail) is explicitly
-    // unwrapped with `Number(...)` before being serialized into the JSON
-    // response. Prisma.Decimal instances survive `NextResponse.json(...)`
-    // via their own `toJSON()` (which returns a STRING, not a number) —
-    // silently changing the wire type a frontend consumer receives
-    // depending on which code path produced the object. The GET handler
-    // above already does this correctly for its own response; POST's
-    // response previously did not, returning raw Decimal-serialized
-    // strings for a freshly created product while GET returned numbers for
-    // the exact same fields.
     const responseProduct = {
       ...createdProduct,
       units: createdProduct.units.map((u) => ({
@@ -515,10 +459,6 @@ export async function POST(req: Request) {
     if (error instanceof SubscriptionLockedError) {
       return subscriptionLockedResponse(error);
     }
-    // A unique-constraint violation on (tenantId, barcode) can still slip
-    // through the pre-check above under concurrent requests (two identical
-    // imports/submissions racing each other) — surface it as the same
-    // friendly Arabic message instead of a generic 500.
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       return NextResponse.json(
         { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لمنتج آخر." },

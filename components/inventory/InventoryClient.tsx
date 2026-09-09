@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Package, Plus, FileUp, Route, Search, Globe, Layers, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 import { AddProductModal } from "@/components/inventory/AddProductModal";
+import { EditProductModal } from "@/components/inventory/EditProductModal";
 import { AddBatchModal } from "@/components/inventory/AddBatchModal";
 import { CsvImportModal } from "@/components/inventory/CsvImportModal";
 import { FifoPreviewModal } from "@/components/inventory/FifoPreviewModal";
@@ -21,7 +22,14 @@ import { ProductTable, ProductItem } from "@/components/inventory/ProductTable";
 // therefore only half-met. Standardized on "needs_reconciliation" only —
 // the backend's "reconcile" alias is redundant and dropped there too, so
 // there is exactly one accepted value for this filter going forward.
-type FilterTab = "all" | "public" | "expiring" | "out_of_stock" | "needs_reconciliation";
+type FilterTab =
+  | "all"
+  | "public"
+  | "expiring"
+  | "out_of_stock"
+  | "needs_reconciliation"
+  | "discontinued_unit_stock"
+  | "inactive_products";
 
 export function InventoryClient() {
   // "New product" and "CSV import" are ADMIN-only server-side (see
@@ -93,6 +101,8 @@ export function InventoryClient() {
   };
 
   const [addProductOpen, setAddProductOpen] = useState(false);
+  const [editProductOpen, setEditProductOpen] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<ProductItem | null>(null);
   const [addBatchOpen, setAddBatchOpen] = useState(false);
   const [csvImportOpen, setCsvImportOpen] = useState(false);
   const [fifoPreviewOpen, setFifoPreviewOpen] = useState(false);
@@ -205,6 +215,11 @@ export function InventoryClient() {
   const handleOpenFifoPreview = (productId?: string) => {
     setPreselectedProductId(productId);
     setFifoPreviewOpen(true);
+  };
+
+  const handleEditProduct = (product: ProductItem) => {
+    setEditingProduct(product);
+    setEditProductOpen(true);
   };
 
   return (
@@ -341,6 +356,32 @@ export function InventoryClient() {
             <Package className="w-3.5 h-3.5" />
             <span>نافذ من المخزون</span>
           </Button>
+
+          <Button
+            variant={activeFilter === "discontinued_unit_stock" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setActiveFilter("discontinued_unit_stock")}
+            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "discontinued_unit_stock"
+              ? "bg-amber-600 text-white hover:bg-amber-700"
+              : "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400"
+              }`}
+          >
+            <AlertCircle className="w-3.5 h-3.5" />
+            <span>مخزون على وحدة متوقفة</span>
+          </Button>
+
+          <Button
+            variant={activeFilter === "inactive_products" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setActiveFilter("inactive_products")}
+            className={`text-xs h-8 rounded-lg gap-1.5 ${activeFilter === "inactive_products"
+              ? "bg-zinc-700 text-white hover:bg-zinc-800"
+              : "border-zinc-200 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-400"
+              }`}
+          >
+            <Package className="w-3.5 h-3.5" />
+            <span>منتجات معطلة</span>
+          </Button>
         </div>
       </div>
 
@@ -357,16 +398,25 @@ export function InventoryClient() {
         togglingActiveId={togglingActiveId}
         onAddBatch={handleOpenAddBatch}
         onFifoPreview={handleOpenFifoPreview}
+        onEditProduct={handleEditProduct}
         isAdmin={isAdmin}
       />
 
       {/* Modals */}
       {isAdmin && (
-        <AddProductModal
-          open={addProductOpen}
-          onOpenChange={setAddProductOpen}
-          onSuccess={fetchProducts}
-        />
+        <>
+          <AddProductModal
+            open={addProductOpen}
+            onOpenChange={setAddProductOpen}
+            onSuccess={fetchProducts}
+          />
+          <EditProductModal
+            open={editProductOpen}
+            onOpenChange={setEditProductOpen}
+            product={editingProduct}
+            onSuccess={fetchProducts}
+          />
+        </>
       )}
 
       <AddBatchModal

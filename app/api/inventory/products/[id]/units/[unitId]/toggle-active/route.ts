@@ -11,7 +11,6 @@ import {
   ForbiddenRoleError,
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
-import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 
 export async function PATCH(
   req: Request,
@@ -23,12 +22,8 @@ export async function PATCH(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: تعديل حالة الوحدة متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role Capability Matrix (T2b) is the single authoritative permission
+    // check — no separate manual role comparison here.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -53,41 +48,24 @@ export async function PATCH(
 
     const nextUnitActive = !unit.isActive;
 
-    // Evaluate impact on storefront publishing gate if product is currently public
-    let nextProductIsPublic = product.isPublic;
-    if (product.isPublic) {
-      const updatedUnits = product.units.map((u) =>
-        u.id === unitId ? { ...u, isActive: nextUnitActive } : u
-      );
-      const gateCheck = checkProductPublishable({
-        isActive: product.isActive,
-        units: updatedUnits,
-      });
-      if (!gateCheck.publishable) {
-        nextProductIsPublic = false;
-      }
-    }
-
-    const result = await db.$transaction(async (tx) => {
-      const updatedUnit = await tx.productUnit.update({
-        where: { id: unitId },
-        data: { isActive: nextUnitActive },
-      });
-
-      if (nextProductIsPublic !== product.isPublic) {
-        await tx.product.update({
-          where: { id: productId },
-          data: { isPublic: nextProductIsPublic },
-        });
-      }
-
-      return { updatedUnit, isPublic: nextProductIsPublic };
+    // Deactivating/reactivating a ProductUnit is also a PURE visibility
+    // toggle (T3a scope item 4) — it must never cascade into changing
+    // Product.isPublic. The storefront already filters units by isActive,
+    // so a deactivated unit simply disappears from pickers on its own; if
+    // that was the product's only eligible unit, the product's own
+    // storefront card just won't have a valid display unit to show — no
+    // need to also flip isPublic to enforce that. Reactivating the unit
+    // must restore full pre-deactivation behavior automatically, with no
+    // admin re-publishing step required anywhere.
+    const updatedUnit = await db.productUnit.update({
+      where: { id: unitId },
+      data: { isActive: nextUnitActive },
     });
 
     return NextResponse.json({
       success: true,
-      unit: result.updatedUnit,
-      productIsPublic: result.isPublic,
+      unit: updatedUnit,
+      productIsPublic: product.isPublic,
       message: nextUnitActive ? "تم تفعيل الوحدة بنجاح." : "تم إيقاف تفعيل الوحدة بنجاح.",
     });
   } catch (error) {

@@ -22,12 +22,9 @@ export async function PATCH(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: تعديل حالة المنتج متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role Capability Matrix (T2b) is the single authoritative permission
+    // check — no separate manual role comparison here, to avoid two sources
+    // of truth drifting apart if the matrix ever changes.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -45,13 +42,19 @@ export async function PATCH(
     }
 
     const nextIsActive = !product.isActive;
-    const nextIsPublic = nextIsActive ? product.isPublic : false;
 
+    // Deactivation/reactivation is PURELY a visibility toggle (T1 Tenant
+    // Lifecycle & Deletion Policy / T3a scope item 3) — it must never be a
+    // data-migration event and requires no field re-validation. isPublic is
+    // deliberately left untouched here: the storefront query already
+    // filters on isActive AND isPublic together, so isActive: false alone
+    // already hides the product. A reactivated product's isPublic value
+    // must return to whatever it was before deactivation, automatically,
+    // with zero manual re-publishing required from the admin.
     const updated = await db.product.update({
       where: { id },
       data: {
         isActive: nextIsActive,
-        isPublic: nextIsPublic,
       },
     });
 
@@ -59,7 +62,7 @@ export async function PATCH(
       success: true,
       isActive: updated.isActive,
       isPublic: updated.isPublic,
-      message: updated.isActive ? "تم تفعيل المنتج بنجاح." : "تم تعطيل المنتج وإلغاء نشره بنجاح.",
+      message: updated.isActive ? "تم تفعيل المنتج بنجاح." : "تم تعطيل المنتج بنجاح.",
     });
   } catch (error) {
     if (error instanceof SubscriptionLockedError) {

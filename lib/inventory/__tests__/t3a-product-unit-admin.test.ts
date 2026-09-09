@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect } from "vitest";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import { Prisma } from "@prisma/client";

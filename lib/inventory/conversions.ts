@@ -1,0 +1,178 @@
+/**
+ * Multi-Unit Conversion Engine (T3a §1)
+ *
+ * Implements packaging unit conversions (base, secondary, tertiary units)
+ * with conversion factors, cost calculations, and inventory deduction math.
+ *
+ * All monetary and quantity math goes through decimal.js — never native JS
+ * numbers — per T1's mandate: "decimal.js — mandatory for every monetary
+ * calculation that happens client-side before a value reaches the Prisma
+ * Decimal boundary." Quantity outputs also route through decimal.js since
+ * they feed ProductBatch.quantity, a Decimal(18,4) column — precision must
+ * be exact from the source, never float-then-converted.
+ *
+ * PERMANENT SPEC ENFORCEMENT NOTE (T3a §5 / schema.prisma BarcodeSource):
+ * No function anywhere in this module or the entire codebase may infer
+ * or guess `barcodeSource` ("GS1" vs "INTERNAL") from digit length, checksum,
+ * or known GS1 prefix patterns. The barcodeSource decision is ALWAYS human
+ * and must be confirmed explicitly by the merchant via the mandatory
+ * BarcodeSourceModal. Any attempt to automate or infer barcodeSource is
+ * strictly forbidden by the Master Technical Specification.
+ *
+ * VALIDATION SCOPE NOTE:
+ * validatePackagingUnits below intentionally enforces ONLY what the spec
+ * states: "arbitrary positive conversion factors" and unitName's non-null
+ * schema constraint. Do NOT add further constraints (integer-only factors,
+ * uniqueness of factors, a mandatory single conversionFactor === 1 "base"
+ * unit, etc.) without explicit confirmation — several such rules were
+ * previously added unprompted and had to be reverted. If a future spec
+ * revision adds one of these, cite the exact clause when reintroducing it.
+ */
+
+import Decimal from "decimal.js";
+
+export interface PackagingUnit {
+  id?: string;
+  unitName: string;
+  conversionFactor: Decimal.Value; // number | string | Decimal — always normalized internally
+  priceWholesale?: Decimal.Value;
+  priceRetail?: Decimal.Value | null;
+  isActive?: boolean;
+}
+
+function toPositiveDecimal(value: Decimal.Value, label: string): Decimal {
+  const d = new Decimal(value);
+  if (d.lte(0)) {
+    throw new Error(`${label} يجب أن يكون رقماً موجباً أكبر من الصفر.`);
+  }
+  return d;
+}
+
+/**
+ * Converts a quantity from one packaging unit to another using their conversion factors.
+ * All conversion factors are defined relative to a base reference (whichever unit's
+ * conversionFactor is smallest / treated as 1 in the merchant's own configuration).
+ *
+ * Example:
+ * 1 Carton = 12 Pieces (carton factor = 12, piece factor = 1)
+ * convertUnitQuantity(2, 12, 1) -> 24 (2 cartons = 24 pieces)
+ * convertUnitQuantity(24, 1, 12) -> 2 (24 pieces = 2 cartons)
+ */
+export function convertUnitQuantity(
+  quantity: Decimal.Value,
+  fromConversionFactor: Decimal.Value,
+  toConversionFactor: Decimal.Value
+): Decimal {
+  const from = toPositiveDecimal(fromConversionFactor, "معامل التحويل المصدر");
+  const to = toPositiveDecimal(toConversionFactor, "معامل التحويل الهدف");
+  const qty = new Decimal(quantity);
+
+  if (qty.isZero()) return new Decimal(0);
+
+  // Convert to the common base quantity first, then to the target unit.
+  const qtyInBase = qty.times(from);
+  return qtyInBase.dividedBy(to);
+}
+
+/**
+ * Converts cost or price from one unit to another.
+ * If 1 Piece costs $1, 1 Carton (factor 12) equivalent base cost is $12.
+ *
+ * convertUnitCost(12, 12, 1) -> 1 ($12 per carton = $1 per piece)
+ * convertUnitCost(1, 1, 12) -> 12 ($1 per piece = $12 per carton)
+ */
+export function convertUnitCost(
+  cost: Decimal.Value,
+  fromConversionFactor: Decimal.Value,
+  toConversionFactor: Decimal.Value
+): Decimal {
+  const from = toPositiveDecimal(fromConversionFactor, "معامل التحويل المصدر");
+  const to = toPositiveDecimal(toConversionFactor, "معامل التحويل الهدف");
+  const c = new Decimal(cost);
+
+  if (c.isZero()) return new Decimal(0);
+
+  const costPerBase = c.dividedBy(from);
+  return costPerBase.times(to);
+}
+
+/**
+ * Calculates how many units must be deducted from a batch unit when
+ * a sale occurs in a requested packaging unit.
+ *
+ * Example:
+ * Requested: 3 Packs (factor 6) = 18 base items.
+ * Batch is tracked in Pieces (factor 1):
+ * deduction = 18 pieces.
+ * Batch is tracked in Boxes (factor 24):
+ * deduction = 18 / 24 = 0.75 boxes.
+ */
+export function calculateBatchDeductions(
+  requestedQty: Decimal.Value,
+  requestedConversionFactor: Decimal.Value,
+  batchConversionFactor: Decimal.Value
+): {
+  allocatedInRequestedUnit: Decimal;
+  deductedInBatchUnit: Decimal;
+  quantityInBaseUnit: Decimal;
+} {
+  const qty = toPositiveDecimal(requestedQty, "الكمية المطلوبة");
+  const reqFactor = toPositiveDecimal(requestedConversionFactor, "معامل تحويل الوحدة المطلوبة");
+  const batchFactor = toPositiveDecimal(batchConversionFactor, "معامل تحويل وحدة الدفعة");
+
+  const quantityInBaseUnit = qty.times(reqFactor);
+  const deductedInBatchUnit = quantityInBaseUnit.dividedBy(batchFactor);
+
+  return {
+    allocatedInRequestedUnit: qty,
+    deductedInBatchUnit,
+    quantityInBaseUnit,
+  };
+}
+
+/**
+ * Validates packaging unit rules for a product.
+ *
+ * Enforces ONLY what the spec actually states:
+ * 1. At least one unit must be provided.
+ * 2. unitName is required (non-empty) — matches the non-nullable schema field.
+ * 3. conversionFactor must be a positive number ("arbitrary positive
+ *    conversion factors" per spec) — NOT restricted to integers, NOT
+ *    required to be unique across units, and NO unit is required to
+ *    equal exactly 1. These three additional constraints were previously
+ *    added without authorization and must not be reintroduced without
+ *    explicit confirmation.
+ */
+export function validatePackagingUnits(units: PackagingUnit[]): {
+  valid: boolean;
+  error?: string;
+} {
+  if (!units || units.length === 0) {
+    return { valid: false, error: "يجب تحديد وحدة قياس واحدة على الأقل." };
+  }
+
+  for (const u of units) {
+    if (!u.unitName || !u.unitName.trim()) {
+      return { valid: false, error: "اسم الوحدة مطلوب لجميع الوحدات." };
+    }
+
+    let factor: Decimal;
+    try {
+      factor = new Decimal(u.conversionFactor);
+    } catch {
+      return {
+        valid: false,
+        error: `معامل التحويل للوحدة "${u.unitName}" غير صالح.`,
+      };
+    }
+
+    if (factor.lte(0)) {
+      return {
+        valid: false,
+        error: `معامل التحويل للوحدة "${u.unitName}" يجب أن يكون رقماً موجباً أكبر من الصفر.`,
+      };
+    }
+  }
+
+  return { valid: true };
+}

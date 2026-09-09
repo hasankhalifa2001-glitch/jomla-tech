@@ -23,13 +23,8 @@ export async function PATCH(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Role Capability Matrix: inventory mutation (storefront toggle) is ADMIN-only
-    if (session.user.role !== "ADMIN") {
-      return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: هذا الإجراء متاح لمدير المتجر فقط." },
-        { status: 403 }
-      );
-    }
+    // Role Capability Matrix (T2b) is the single authoritative permission
+    // check — no separate manual role comparison here.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     // Security boundary: check fresh subscription status in DB
@@ -55,7 +50,32 @@ export async function PATCH(
     const nextIsPublic = !existingProduct.isPublic;
 
     if (nextIsPublic) {
-      const gateCheck = checkProductPublishable(existingProduct);
+      // [FIX] `existingProduct` was previously passed to
+      // checkProductPublishable() as-is, straight from Prisma —
+      // `units[].priceRetail` on that raw object is a `Prisma.Decimal`
+      // instance, not a plain JS number. The PATCH /api/inventory/
+      // products/[id] handler (the main edit endpoint) always normalizes
+      // this with `Number(u.priceRetail)` before calling the same gate
+      // function — this route was the one place that skipped it,
+      // meaning the exact same publishing-gate rule could silently
+      // evaluate differently here than everywhere else it's checked,
+      // depending on how `Decimal` behaves under whatever comparison
+      // checkProductPublishable performs internally. Normalized the same
+      // way as the main PATCH handler so this route can never disagree
+      // with it on the same rule.
+      const candidateUnits = existingProduct.units.map((u) => ({
+        isActive: u.isActive !== false,
+        imageUrl: u.imageUrl,
+        priceRetail:
+          u.priceRetail !== null && u.priceRetail !== undefined
+            ? Number(u.priceRetail)
+            : null,
+      }));
+
+      const gateCheck = checkProductPublishable({
+        isActive: existingProduct.isActive,
+        units: candidateUnits,
+      });
       if (!gateCheck.publishable) {
         return NextResponse.json(
           {
