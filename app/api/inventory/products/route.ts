@@ -23,38 +23,32 @@ import {
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
-const unitSchema = z.object({
-  unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-  conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
-  pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
-  // [FIX] `priceWholesale` is REQUIRED and must be strictly greater than
-  // zero. The previous validator used `.min(0, ...)`, which — despite the
-  // comment right above it explicitly saying "There is no legitimate case
-  // where a merchant means to price a sellable unit at exactly 0" —
-  // actually accepted 0 (and the Arabic message itself said "صفر أو
-  // أكثر", contradicting the stated intent). `.positive()` is what the
-  // comment always meant to enforce: a product being priced at zero is a
-  // data bug, not a valid business state, and must be rejected with a
-  // clear message rather than saved silently.
-  priceWholesale: z.number().positive("سعر الجملة يجب أن يكون أكبر من صفر"),
-  // [FIX — priceUSD removed] `ProductUnit.priceUSD` does not exist in
-  // schema.prisma — it was removed in v3.1, replaced entirely by
-  // `pricingCurrency` + `priceWholesale` + `priceRetail` (T1 acceptance
-  // criteria: "No ProductUnit.priceUSD column exists anywhere in the
-  // schema or generated client"). Accepting a `priceUSD` field from the
-  // client and silently writing it into `priceWholesale` (as an earlier
-  // version of this route did) reintroduces exactly the currency-mixup
-  // risk already found and fixed in lib/inventory/csv-parser.ts: a unit
-  // priced in SYP could have a raw USD-labeled number written straight
-  // into its SYP-denominated price field with no conversion and no
-  // warning, corrupting the price by orders of magnitude. There is no
-  // legacy input path that still needs this field — it is removed, not
-  // deprecated.
-  priceRetail: z.number().min(0).optional().nullable(),
-  barcode: z.string().optional().nullable(),
-  barcodeSource: z.enum(["GS1", "INTERNAL"]).optional().nullable(),
-  imageUrl: z.string().optional().nullable(),
-});
+const unitSchema = z
+  .object({
+    unitName: z.string().min(1, "اسم الوحدة مطلوب"),
+    conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
+    pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
+    // [FIX] `priceWholesale` is REQUIRED and must be strictly greater than
+    // zero.
+    priceWholesale: z.number().positive("سعر الجملة يجب أن يكون أكبر من صفر"),
+    priceRetail: z.number().min(0).optional().nullable(),
+    barcode: z.string().optional().nullable(),
+    barcodeSource: z.enum(["GS1", "INTERNAL"]).optional().nullable(),
+    imageUrl: z.string().optional().nullable(),
+    isActive: z.boolean().optional().default(true),
+  })
+  .refine(
+    (u) => {
+      if (u.barcode && u.barcode.trim().length > 0) {
+        return u.barcodeSource === "GS1" || u.barcodeSource === "INTERNAL";
+      }
+      return true;
+    },
+    {
+      message: "يجب تحديد مصدر الباركود (GS1 أو INTERNAL) عند إدخال باركود للوحدة.",
+      path: ["barcodeSource"],
+    }
+  );
 
 const createProductSchema = z.object({
   name: z.string().min(1, "اسم المنتج مطلوب"),
@@ -86,6 +80,7 @@ type ProductUnitRow = {
   barcode: string | null;
   barcodeSource: string | null;
   imageUrl: string | null;
+  isActive: boolean;
 };
 
 type ProductBatchRow = {
@@ -120,15 +115,18 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
     const q = (searchParams.get("q") || "").trim();
     const filter = searchParams.get("filter") || "all";
+    const status = searchParams.get("status") || "active";
 
-    // NOTE: `where: { isActive: true }` here is intentionally NOT paired
-    // with `tenantId` — `getTenantDb(tenantId)` injects that automatically
-    // on every call against a tenant-scoped model (Product included). See
-    // lib/db/tenant-scope.ts's `WHERE_SCOPED_READ_OPS` handling.
+    const whereClause: Prisma.ProductWhereInput = {};
+    if (status === "active") {
+      whereClause.isActive = true;
+    } else if (status === "inactive") {
+      whereClause.isActive = false;
+    }
+    // If status === "all", do not filter on isActive at the product query level
+
     const products = (await db.product.findMany({
-      where: {
-        isActive: true,
-      },
+      where: whereClause,
       include: {
         units: true,
         batches: {
@@ -194,13 +192,14 @@ export async function GET(req: Request) {
       });
 
       const totalStockInBase = totalBaseStock / baseFactor;
-      // [FIX] Removed the dead `if (totalStockInBase < 0) hasNegativeStockBatch = true;`
-      // that used to sit here — a sum of non-negative per-batch base
-      // quantities can never itself come out negative unless a negative
-      // batch already flipped `hasNegativeStockBatch` inside the loop
-      // above, so that check could never actually fire. No behavior
-      // change; just removing an unreachable branch.
       const isOutOfStock = totalStockInBase <= 0;
+
+      // Check if product has positive stock on an inactive unit
+      const hasDiscontinuedUnitStock = product.units.some(
+        (u) =>
+          !u.isActive &&
+          product.batches.some((b) => b.unitId === u.id && Number(b.quantity) > 0)
+      );
 
       return {
         id: product.id,
@@ -214,21 +213,19 @@ export async function GET(req: Request) {
           unitName: u.unitName,
           conversionFactor: Number(u.conversionFactor),
           pricingCurrency: u.pricingCurrency || "SYP",
-          // [FIX] `u.priceUSD` removed — that column does not exist on
-          // ProductUnit (see T1 acceptance criteria), so this fallback was
-          // always dead code silently resolving to `undefined`.
-          // `priceWholesale` is the only, always-present source of truth.
           priceWholesale: Number(u.priceWholesale ?? 0),
           priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? Number(u.priceRetail) : null,
           barcode: u.barcode,
           barcodeSource: u.barcodeSource,
           imageUrl: u.imageUrl,
+          isActive: u.isActive !== false,
         })),
         batches: processedBatches,
         totalStockInBase,
         baseUnitName: baseUnit?.unitName || "قطعة",
         hasExpiringSoonBatch,
         hasNegativeStockBatch,
+        hasDiscontinuedUnitStock,
         isOutOfStock,
       };
     });
@@ -260,11 +257,11 @@ export async function GET(req: Request) {
     } else if (filter === "out_of_stock") {
       filtered = filtered.filter((p) => p.isOutOfStock);
     } else if (filter === "needs_reconciliation") {
-      // [FIX] Dropped the redundant "reconcile" alias — the client now
-      // sends exactly one value ("needs_reconciliation", matching the
-      // FilterTab type in InventoryClient.tsx) for this filter, so there
-      // is no longer a second accepted spelling to keep in sync here.
       filtered = filtered.filter((p) => p.hasNegativeStockBatch);
+    } else if (filter === "discontinued_unit_stock") {
+      filtered = filtered.filter((p) => p.hasDiscontinuedUnitStock);
+    } else if (filter === "inactive_products") {
+      filtered = filtered.filter((p) => !p.isActive);
     }
 
     return NextResponse.json({
@@ -286,6 +283,12 @@ export async function POST(req: Request) {
 
     // ADMIN-only: creating a catalog product is a pricing/catalog decision,
     // not a day-to-day operational task a cashier performs.
+    if (session.user.role !== "ADMIN") {
+      return NextResponse.json(
+        { error: "FORBIDDEN", message: "غير مصرح: هذا الإجراء متاح لمدير المتجر فقط." },
+        { status: 403 }
+      );
+    }
     assertRolePermission(session.user.role, "inventory:mutate");
 
     // Security boundary: check fresh subscription status in DB
@@ -308,55 +311,62 @@ export async function POST(req: Request) {
 
     const { name, category, isPublic, units, initialBatch } = validation.data;
 
-    // PUBLISHING GATE RULE: [FIX] block isPublic = true unless imageUrl is
-    // filled in on at least one unit. `priceWholesale` is already required
-    // and strictly positive on every unit (see unitSchema above), so a
-    // real, charge-able price is guaranteed by construction and never
-    // needs to be re-checked here. `priceRetail` is a separate, optional
-    // "suggested resale price" hint shown to a buying retailer on the
-    // storefront (see ProductUnit.priceRetail in schema.prisma) — it is
-    // NEVER itself charged on any sale, POS or storefront alike, and must
-    // not be a precondition for publishing: a wholesaler listing plain
-    // wholesale-priced cartons with no suggested retail number attached
-    // must be able to.
+    // PUBLISHING GATE RULE: requires both priceRetail > 0 AND imageUrl on at least one active unit
     if (isPublic) {
       const isPublishable = units.some(
         (u) =>
+          (u.isActive === undefined || u.isActive === true) &&
           u.imageUrl !== undefined &&
           u.imageUrl !== null &&
-          u.imageUrl.trim().length > 0
+          u.imageUrl.trim().length > 0 &&
+          u.priceRetail !== undefined &&
+          u.priceRetail !== null &&
+          Number(u.priceRetail) > 0
       );
       if (!isPublishable) {
         return NextResponse.json(
           {
             error: "PUBLISH_GATE_BLOCKED",
-            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة صورة للمنتج على الأقل.",
+            message: "لا يمكن نشر المنتج في المتجر إلا بعد إضافة صورة وسعر مفرق أكبر من صفر على وحدة نشطة واحدة على الأقل.",
           },
           { status: 400 }
         );
       }
     }
 
-    // [NOTE] This pre-check still uses the tenant-scoped `db`, so
-    // `tenantId` is injected automatically into the `findUnique` lookup
-    // via the compound key below — it does not need to be passed a second
-    // time inside `where`.
-    for (const unit of units) {
-      if (unit.barcode) {
-        const existingBarcode = await db.productUnit.findUnique({
-          where: {
-            tenantId_barcode: {
-              tenantId,
-              barcode: unit.barcode,
-            },
+    // Barcode uniqueness pre-check across ALL units in this tenant (active and inactive)
+    const incomingBarcodes = units
+      .map((u) => u.barcode?.trim())
+      .filter((b): b is string => !!b);
+
+    if (new Set(incomingBarcodes).size !== incomingBarcodes.length) {
+      return NextResponse.json(
+        { error: "DUPLICATE_BARCODE", message: "لا يمكن تكرار نفس الباركود لأكثر من وحدة ضمن نفس الطلب." },
+        { status: 400 }
+      );
+    }
+
+    for (const barcode of incomingBarcodes) {
+      const existingBarcode = await db.productUnit.findUnique({
+        where: {
+          tenantId_barcode: {
+            tenantId,
+            barcode,
           },
-        });
-        if (existingBarcode) {
-          return NextResponse.json(
-            { error: "BARCODE_EXISTS", message: `الباركود (${unit.barcode}) مستخدم بالفعل لمنتج آخر.` },
-            { status: 400 }
-          );
-        }
+        },
+        include: {
+          product: { select: { name: true } },
+        },
+      });
+      if (existingBarcode) {
+        const statusText = existingBarcode.isActive ? "نشطة" : "متوقفة";
+        return NextResponse.json(
+          {
+            error: "DUPLICATE_BARCODE",
+            message: `الباركود (${barcode}) مستخدم مسبقاً في وحدة (${existingBarcode.unitName}) للمنتج (${existingBarcode.product.name}) وهي بحالة [${statusText}].`,
+          },
+          { status: 400 }
+        );
       }
     }
 
@@ -420,12 +430,13 @@ export async function POST(req: Request) {
             barcode: u.barcode || null,
             barcodeSource: u.barcodeSource || null,
             imageUrl: u.imageUrl || null,
+            isActive: u.isActive ?? true,
           },
         });
         unitIds.push(createdUnit.id);
         createdUnits.push(createdUnit as unknown as ProductUnitRow);
 
-        // GS1 shared catalog registration/update
+        // GS1 shared catalog contribution (write-once)
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
           const barcodeTrim = u.barcode.trim();
           const existingCatalog = await tx.productCatalogEntry.findUnique({
@@ -443,7 +454,7 @@ export async function POST(req: Request) {
             });
           } else if (existingCatalog.addedByTenantId === tenantId) {
             await tx.productCatalogEntry.update({
-              where: { barcode: barcodeTrim },
+              where: { id: existingCatalog.id },
               data: {
                 name,
                 category: category || null,

@@ -297,6 +297,10 @@ export function PosLayout() {
   // now captured and stored, matching resolveCartLinePrices()'s real
   // return shape.
   function handleAddToCart(product: PosProductItem, unit: CachedProductUnit) {
+    if (unit.isActive === false) {
+      toast.error("لا يمكن بيع وحدة غير نشطة.");
+      return;
+    }
     const cartItemId = `${product.id}-${unit.id}`;
 
     let unitPriceSYP: string;
@@ -378,7 +382,7 @@ export function PosLayout() {
     setCartItems((prev) =>
       prev.map((item) => {
         if (item.id === cartId) {
-          const selectedUnit = item.product.units?.find((u) => u.id === newUnitId);
+          const selectedUnit = item.product.units?.find((u) => u.id === newUnitId && u.isActive !== false);
           if (selectedUnit) {
             try {
               const prices = resolveCartLinePrices(

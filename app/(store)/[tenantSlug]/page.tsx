@@ -19,6 +19,7 @@ type StorefrontProductUnit = {
   priceRetail: Prisma.Decimal | number | null;
   imageUrl: string | null;
   barcode: string | null;
+  isActive?: boolean;
 };
 
 type StorefrontProduct = {
@@ -44,12 +45,18 @@ type StorefrontPageProps = {
 //   4. first unit (last-resort fallback)
 function pickDisplayUnit(units: StorefrontProductUnit[]): StorefrontProductUnit | undefined {
   const isEligible = (u: StorefrontProductUnit) =>
-    u.priceRetail !== null && u.priceRetail !== undefined && u.imageUrl && u.imageUrl.trim().length > 0;
+    u.isActive !== false &&
+    u.priceRetail !== null &&
+    u.priceRetail !== undefined &&
+    Number(u.priceRetail) > 0 &&
+    u.imageUrl &&
+    u.imageUrl.trim().length > 0;
 
   return (
     units.find((u) => Number(u.conversionFactor) === 1 && isEligible(u)) ??
     units.find(isEligible) ??
-    units.find((u) => Number(u.conversionFactor) === 1) ??
+    units.find((u) => Number(u.conversionFactor) === 1 && u.isActive !== false) ??
+    units.find((u) => u.isActive !== false) ??
     units[0]
   );
 }
@@ -76,7 +83,11 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
         // previously isPublic must never remain visible on the public
         // storefront just because isPublic was never explicitly reset.
         where: { isPublic: true, isActive: true },
-        include: { units: true },
+        include: {
+          units: {
+            where: { isActive: true },
+          },
+        },
         // [FIX] Removed `take: 12`. A hard cap silently hid the rest of a
         // tenant's catalog with no pagination UI to reach it, and the
         // "N منتج متاح" badge below then reported the capped count (12)
@@ -116,7 +127,9 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
     }
   }
 
-  const products = tenant.products as unknown as StorefrontProduct[];
+  const products = (tenant.products as unknown as StorefrontProduct[]).filter(
+    (product) => product.units && product.units.length > 0 && pickDisplayUnit(product.units)
+  );
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 font-sans text-zinc-900 dark:text-zinc-100">

@@ -39,6 +39,58 @@ export function InventoryClient() {
   const [activeFilter, setActiveFilter] = useState<FilterTab>("all");
   const [expandedProductIds, setExpandedProductIds] = useState<Set<string>>(new Set());
   const [togglingPublicId, setTogglingPublicId] = useState<string | null>(null);
+  const [togglingActiveId, setTogglingActiveId] = useState<string | null>(null);
+
+  const handleToggleProductActive = async (productId: string) => {
+    setTogglingActiveId(productId);
+    try {
+      const res = await fetch(`/api/inventory/products/${productId}/toggle-active`, {
+        method: "PATCH",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || "فشل تعديل حالة تفعيل المنتج.");
+      }
+      toast.success(data.message);
+      setProducts((prev) =>
+        prev.map((p) =>
+          p.id === productId ? { ...p, isActive: data.isActive, isPublic: data.isPublic } : p
+        )
+      );
+    } catch (err: any) {
+      toast.error(err.message || "حدث خطأ أثناء تعديل حالة المنتج.");
+    } finally {
+      setTogglingActiveId(null);
+    }
+  };
+
+  const handleToggleUnitActive = async (productId: string, unitId: string) => {
+    setTogglingActiveId(unitId);
+    try {
+      const res = await fetch(`/api/inventory/products/${productId}/units/${unitId}/toggle-active`, {
+        method: "PATCH",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || "فشل تعديل حالة الوحدة.");
+      }
+      toast.success(data.message);
+      setProducts((prev) =>
+        prev.map((p) => {
+          if (p.id !== productId) return p;
+          return {
+            ...p,
+            isPublic: data.productIsPublic !== undefined ? data.productIsPublic : p.isPublic,
+            units: p.units.map((u) => (u.id === unitId ? { ...u, isActive: data.unit.isActive } : u)),
+          };
+        })
+      );
+    } catch (err: any) {
+      toast.error(err.message || "حدث خطأ أثناء تعديل حالة الوحدة.");
+    } finally {
+      setTogglingActiveId(null);
+    }
+  };
 
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [addBatchOpen, setAddBatchOpen] = useState(false);
@@ -300,6 +352,9 @@ export function InventoryClient() {
         toggleExpand={toggleExpand}
         handleTogglePublic={handleTogglePublic}
         togglingPublicId={togglingPublicId}
+        onToggleProductActive={handleToggleProductActive}
+        onToggleUnitActive={handleToggleUnitActive}
+        togglingActiveId={togglingActiveId}
         onAddBatch={handleOpenAddBatch}
         onFifoPreview={handleOpenFifoPreview}
         isAdmin={isAdmin}

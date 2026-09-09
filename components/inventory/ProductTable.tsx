@@ -30,6 +30,7 @@ export interface UnitItem {
   barcode: string | null;
   barcodeSource?: "GS1" | "INTERNAL" | null;
   imageUrl?: string | null;
+  isActive?: boolean;
 }
 
 export interface ProductItem {
@@ -55,6 +56,9 @@ interface ProductTableProps {
   toggleExpand: (productId: string) => void;
   handleTogglePublic: (productId: string) => void;
   togglingPublicId: string | null;
+  onToggleProductActive?: (productId: string) => void;
+  onToggleUnitActive?: (productId: string, unitId: string) => void;
+  togglingActiveId?: string | null;
   onAddBatch: (productId: string) => void;
   onFifoPreview: (productId: string) => void;
   isAdmin: boolean;
@@ -67,6 +71,9 @@ export function ProductTable({
   toggleExpand,
   handleTogglePublic,
   togglingPublicId,
+  onToggleProductActive,
+  onToggleUnitActive,
+  togglingActiveId,
   onAddBatch,
   onFifoPreview,
   isAdmin,
@@ -115,21 +122,16 @@ export function ProductTable({
                         <div className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">
                           {product.name}
                         </div>
+                        {!product.isActive && (
+                          <Badge variant="destructive" className="text-[10px] px-1.5 py-0 bg-red-100 text-red-700 border-red-200">
+                            موقوف
+                          </Badge>
+                        )}
                         {product.hasNegativeStockBatch && (
                           <span title="يوجد دفعة بمخزون سالب تحتاج تسوية">
                             <Package className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
                           </span>
                         )}
-                        {/* [FIX] `hasExpiringSoonBatch` was declared on the
-                            interface (and clearly returned by the API) but
-                            never rendered anywhere in this component — a
-                            merchant had no row-level way to know a product
-                            has a batch nearing expiry without expanding
-                            every single row, unlike `hasNegativeStockBatch`
-                            right above, which already gets exactly this
-                            kind of heads-up. Amber to match the "قريب من
-                            الانتهاء" filter tab and ExpiryBadge's own
-                            YELLOW/RED palette. */}
                         {product.hasExpiringSoonBatch && (
                           <span title="يوجد دفعة قريبة من تاريخ الانتهاء">
                             <Clock className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
@@ -147,7 +149,14 @@ export function ProductTable({
                       <div className="space-y-1">
                         {product.units.map((unit) => (
                           <div key={unit.id} className="flex items-center gap-2 text-xs">
-                            <span className="font-medium text-zinc-800 dark:text-zinc-200">{unit.unitName}</span>
+                            <span className={`font-medium ${unit.isActive === false ? "line-through text-zinc-400" : "text-zinc-800 dark:text-zinc-200"}`}>
+                              {unit.unitName}
+                            </span>
+                            {unit.isActive === false && (
+                              <Badge variant="outline" className="text-[9px] px-1 py-0 text-red-500 border-red-200 bg-red-50">
+                                معطلة
+                              </Badge>
+                            )}
                             <span className="text-zinc-400 text-[11px]">(معامل {unit.conversionFactor})</span>
                             <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">
                               {formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}
@@ -160,7 +169,21 @@ export function ProductTable({
                             {unit.barcode && (
                               <span className="font-mono text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-500">
                                 {unit.barcode}
+                                {unit.barcodeSource && (
+                                  <span className="mr-1 text-[9px] text-zinc-400 font-sans">({unit.barcodeSource})</span>
+                                )}
                               </span>
+                            )}
+                            {isAdmin && onToggleUnitActive && (
+                              <button
+                                type="button"
+                                onClick={() => onToggleUnitActive(product.id, unit.id)}
+                                disabled={togglingActiveId === unit.id}
+                                className="text-[10px] text-zinc-400 hover:text-zinc-700 underline mr-1"
+                                title={unit.isActive === false ? "تفعيل هذه الوحدة" : "تعطيل هذه الوحدة"}
+                              >
+                                {unit.isActive === false ? "تفعيل" : "تعطيل"}
+                              </button>
                             )}
                           </div>
                         ))}
@@ -208,6 +231,22 @@ export function ProductTable({
 
                     <td className="py-3.5 px-4 align-top text-center">
                       <div className="flex items-center justify-center gap-1">
+                        {isAdmin && onToggleProductActive && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => onToggleProductActive(product.id)}
+                            disabled={togglingActiveId === product.id}
+                            title={product.isActive ? "تعطيل المنتج" : "تفعيل المنتج"}
+                            className={`h-7 text-[11px] px-2 ${
+                              product.isActive
+                                ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
+                                : "text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/20"
+                            }`}
+                          >
+                            {product.isActive ? "تعطيل" : "تفعيل"}
+                          </Button>
+                        )}
                         <Button
                           size="sm"
                           variant="outline"

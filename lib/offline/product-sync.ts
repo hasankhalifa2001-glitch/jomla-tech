@@ -27,6 +27,7 @@ interface ServerProductUnit {
     priceRetail: number | null;
     barcode: string | null;
     barcodeSource: "GS1" | "INTERNAL" | null;
+    isActive?: boolean;
 }
 
 interface ServerProductBatch {
@@ -112,6 +113,7 @@ export async function syncProductsFromServer(tenantId?: string): Promise<Product
                 pricingCurrency: u.pricingCurrency,
                 barcode: u.barcode ?? undefined,
                 barcodeSource: u.barcodeSource ?? undefined,
+                isActive: u.isActive !== false,
             })),
             batches: p.batches.map((b) => ({
                 id: b.id,

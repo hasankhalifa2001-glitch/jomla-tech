@@ -278,7 +278,7 @@ export function CartPanel({
                           <SelectValue placeholder="الوحدة" />
                         </SelectTrigger>
                         <SelectContent dir="rtl">
-                          {item.product.units?.map((u) => {
+                          {item.product.units?.filter((u) => u.isActive !== false).map((u) => {
                             const unitPriceSYP = resolvePriceOrNull(u, item.product, exchangeRate);
                             return (
                               <SelectItem

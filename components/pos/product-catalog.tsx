@@ -74,10 +74,10 @@ export function ProductCatalog({
       e.preventDefault();
       const clean = searchQuery.trim().toLowerCase();
 
-      // Check if there is an exact barcode match
+      // Check if there is an exact barcode match among active units
       for (const prod of products) {
         const matchingUnit = prod.units?.find(
-          (u) => u.barcode && u.barcode.toLowerCase() === clean
+          (u) => u.isActive !== false && u.barcode && u.barcode.toLowerCase() === clean
         );
         if (matchingUnit) {
           onAddToCart(prod, matchingUnit);
@@ -86,10 +86,13 @@ export function ProductCatalog({
         }
       }
 
-      // If only 1 product matches in the current filtered list, add its default unit
+      // If only 1 product matches in the current filtered list, add its default active unit
       if (products.length === 1 && products[0].units && products[0].units.length > 0) {
-        onAddToCart(products[0], products[0].units[0]);
-        onSearchChange("");
+        const defaultActiveUnit = products[0].units.find((u) => u.isActive !== false);
+        if (defaultActiveUnit) {
+          onAddToCart(products[0], defaultActiveUnit);
+          onSearchChange("");
+        }
       }
     }
   }
@@ -182,7 +185,7 @@ export function ProductCatalog({
           // wide enough to hold a 4th column comfortably.
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3 pb-2">
             {products.map((product) => {
-              const defaultUnit = product.units?.[0];
+              const defaultUnit = product.units?.find((u) => u.isActive !== false);
               // [v3.6] Primary — SYP, authoritative, never requires a rate
               // for a SYP-priced unit.
               const wholesalePriceSYP = defaultUnit
@@ -296,7 +299,7 @@ export function ProductCatalog({
                         الوحدات المتوفرة (اختر لإضافة السلة):
                       </span>
                       <div className="flex flex-wrap gap-1.5">
-                        {product.units?.map((unit) => {
+                        {product.units?.filter((u) => u.isActive !== false).map((unit) => {
                           const unitPriceSYP = resolveSYPOrNull(unit, product, exchangeRate);
                           const isDisabled = unitPriceSYP === null;
                           return (

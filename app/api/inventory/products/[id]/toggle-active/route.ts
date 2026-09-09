@@ -11,7 +11,6 @@ import {
   ForbiddenRoleError,
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
-import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 
 export async function PATCH(
   req: Request,
@@ -23,70 +22,53 @@ export async function PATCH(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Role Capability Matrix: inventory mutation (storefront toggle) is ADMIN-only
     if (session.user.role !== "ADMIN") {
       return NextResponse.json(
-        { error: "FORBIDDEN", message: "غير مصرح: هذا الإجراء متاح لمدير المتجر فقط." },
+        { error: "FORBIDDEN", message: "غير مصرح: تعديل حالة المنتج متاح لمدير المتجر فقط." },
         { status: 403 }
       );
     }
     assertRolePermission(session.user.role, "inventory:mutate");
 
-    // Security boundary: check fresh subscription status in DB
     await assertTenantWritable(session.user.tenantId);
 
     const { id } = await params;
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    const existingProduct = await db.product.findFirst({
-      where: {
-        id,
-      },
-      include: {
-        units: true,
-      },
+    const product = await db.product.findFirst({
+      where: { id },
     });
 
-    if (!existingProduct) {
+    if (!product) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    const nextIsPublic = !existingProduct.isPublic;
-
-    if (nextIsPublic) {
-      const gateCheck = checkProductPublishable(existingProduct);
-      if (!gateCheck.publishable) {
-        return NextResponse.json(
-          {
-            error: !existingProduct.isActive ? "PRODUCT_INACTIVE" : "PUBLISH_GATE_BLOCKED",
-            message: gateCheck.reason,
-          },
-          { status: 400 }
-        );
-      }
-    }
+    const nextIsActive = !product.isActive;
+    const nextIsPublic = nextIsActive ? product.isPublic : false;
 
     const updated = await db.product.update({
       where: { id },
       data: {
+        isActive: nextIsActive,
         isPublic: nextIsPublic,
       },
     });
 
     return NextResponse.json({
       success: true,
+      isActive: updated.isActive,
       isPublic: updated.isPublic,
-      message: updated.isPublic ? "تم نشر المنتج في متجر العملاء." : "تم إخفاء المنتج من متجر العملاء.",
+      message: updated.isActive ? "تم تفعيل المنتج بنجاح." : "تم تعطيل المنتج وإلغاء نشره بنجاح.",
     });
   } catch (error) {
-    if (error instanceof ForbiddenRoleError) {
-      return forbiddenRoleResponse(error);
-    }
     if (error instanceof SubscriptionLockedError) {
       return subscriptionLockedResponse(error);
     }
-    console.error("Error toggling product storefront status:", error);
+    if (error instanceof ForbiddenRoleError) {
+      return forbiddenRoleResponse();
+    }
+    console.error("PATCH toggle product active error:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء تعديل حالة المنتج." }, { status: 500 });
   }
 }
