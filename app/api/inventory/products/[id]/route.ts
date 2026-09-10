@@ -12,6 +12,7 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
+import { validatePackagingUnits } from "@/lib/inventory/conversions";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
@@ -19,7 +20,18 @@ const unitSchema = z
   .object({
     id: z.string().optional(),
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-    conversionFactor: z.number().int().min(1, "معامل التحويل يجب أن يكون 1 أو أكثر"),
+    // [FIX — CRITICAL] Was `z.number().int().min(1, ...)`, which forbade
+    // fractional conversion factors and forced a minimum of 1. This
+    // directly contradicted the confirmed business rule: a wholesaler may
+    // legitimately sell a quarter- or half-carton at a prorated wholesale
+    // price, so conversionFactor must accept ANY positive number,
+    // fractional or not — exactly like POST /products' schema already
+    // does, and exactly what validatePackagingUnits (unit-conversion.ts)
+    // and the EditProductModal frontend (step="any" min="0.0001") both
+    // already assume. The base-unit-must-equal-1 and
+    // no-duplicate-factors rules are enforced separately below via
+    // validatePackagingUnits — NOT via a schema-level lower bound.
+    conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
     priceWholesale: z.number().min(0, "سعر الجملة لا يمكن أن يكون سالباً"),
     priceRetail: z.number().min(0, "سعر التجزئة لا يمكن أن يكون سالباً").optional().nullable(),
@@ -128,42 +140,30 @@ export async function PATCH(
 
     // Validate units if provided
     if (data.units) {
-      const baseUnits = data.units.filter((u) => u.conversionFactor === 1);
-      if (baseUnits.length !== 1) {
+      // [FIX] Base-unit-required and no-duplicate-factors are now
+      // delegated to the single shared implementation in
+      // unit-conversion.ts instead of being re-derived here by hand —
+      // keeps this route and POST /products permanently in sync with
+      // exactly one definition of "valid packaging units", and keeps the
+      // fractional-factor rule enforced consistently in one place.
+      const packagingCheck = validatePackagingUnits(data.units);
+      if (!packagingCheck.valid) {
         return NextResponse.json(
           {
-            error: "BASE_UNIT_REQUIRED",
-            message: "يجب تحديد وحدة أساسية واحدة فقط بمعامل تحويل يساوي 1",
+            error: "INVALID_PACKAGING_UNITS",
+            message: packagingCheck.error,
           },
           { status: 400 }
         );
       }
 
-      const factors = new Set<number>();
+      // The following two checks are NOT covered by validatePackagingUnits
+      // (which only validates unitName presence + conversionFactor rules)
+      // and remain here: duplicate unit NAMES, and duplicate BARCODES
+      // (both in-request and against this tenant's other products).
       const names = new Set<string>();
-      // Barcodes are checked for uniqueness WITHIN this same request's
-      // unit list first — previously only a duplicate against a DIFFERENT
-      // product was checked (`NOT: { productId: id }`), so two units on
-      // the SAME product sharing a barcode slipped past this pre-check
-      // and only surfaced later as a raw P2002 from the DB's
-      // `@@unique([tenantId, barcode])` constraint, with no friendly
-      // message. Both checks run: in-request duplicates (this Set) and
-      // cross-product duplicates (the existing DB lookup, still excluding
-      // this product's OTHER existing units so a unit can keep its own
-      // unchanged barcode across an edit).
       const barcodesInRequest = new Set<string>();
       for (const u of data.units) {
-        if (factors.has(u.conversionFactor)) {
-          return NextResponse.json(
-            {
-              error: "DUPLICATE_CONVERSION_FACTOR",
-              message: `معامل التحويل ${u.conversionFactor} مكرر أكثر من مرة`,
-            },
-            { status: 400 }
-          );
-        }
-        factors.add(u.conversionFactor);
-
         const lowerName = u.unitName.trim().toLowerCase();
         if (names.has(lowerName)) {
           return NextResponse.json(
@@ -216,12 +216,9 @@ export async function PATCH(
     //   - isActive changes only if the request explicitly sets it.
     //   - isPublic changes ONLY if the request explicitly sets it
     //     (`data.isPublic !== undefined`). Editing name/category/units, or
-    //     toggling isActive, NEVER touches isPublic on its own — it simply
-    //     carries over unchanged, exactly as the spec requires for a
-    //     reactivated product's prior state to be preserved automatically.
+    //     toggling isActive, NEVER touches isPublic on its own.
     //   - The publishing gate is validated ONLY when the request is
     //     explicitly trying to turn isPublic ON (data.isPublic === true).
-    //     Turning it off, or leaving it untouched, never re-runs the gate.
     const nextIsActive = data.isActive !== undefined ? data.isActive : existingProduct.isActive;
     const nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
 
@@ -309,28 +306,14 @@ export async function PATCH(
             });
           }
 
-          // [FIX — CRITICAL, per Master Spec T3a §6 / ProductCatalogEntry]
           // ProductCatalogEntry is write-once at creation and MUST NEVER
           // be updated afterward by anyone — not even by the tenant that
-          // originally created it. Spec: "a one-time fill-in-the-form
-          // convenience, never re-read afterward and never silently kept
-          // in sync with a tenant's own edited copy." The previous
-          // `else if (existingCatalog.addedByTenantId === tenantId) {
-          // update(...) }` branch violated this directly: it silently
-          // synced the owning tenant's later product edits back into the
-          // shared catalog entry, meaning any OTHER tenant scanning the
-          // same barcode later would see whatever the owner's local
-          // product happens to say TODAY, not the value that was true
-          // when the entry was first created. That branch is removed
-          // entirely. The only two valid outcomes here are:
-          //   (a) no entry exists yet for this barcode → create one
-          //       (this tenant becomes its permanent owner), or
-          //   (b) an entry already exists (owned by this tenant or any
-          //       other) → do absolutely nothing to it. The only path
-          //       that may ever change an existing entry is a
-          //       Super-Admin resolving a ProductCatalogEntryReport
-          //       (T6) — never a direct tenant write, regardless of
-          //       ownership.
+          // originally created it (Master Spec T3a §6 / ProductCatalogEntry).
+          // The only two valid outcomes: (a) no entry exists yet → create
+          // it (this tenant becomes its permanent owner), or (b) an entry
+          // already exists (owned by anyone) → do nothing. Only a
+          // Super-Admin resolving a ProductCatalogEntryReport (T6) may
+          // ever change an existing entry.
           if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
             const barcodeTrim = u.barcode.trim();
             const existingCatalog = await tx.productCatalogEntry.findUnique({
@@ -347,8 +330,6 @@ export async function PATCH(
                 },
               });
             }
-            // No `else` branch — an existing entry, owned by this tenant
-            // or any other, is never touched here under any condition.
           }
         }
       }
@@ -373,11 +354,6 @@ export async function PATCH(
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse();
     }
-    // P2002 (unique constraint violation) can still slip through the
-    // in-request and cross-product pre-checks above under a concurrent
-    // request racing this same edit — surface it as a friendly Arabic
-    // message instead of a generic 500, same pattern already used in
-    // products/route.ts's POST handler.
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       return NextResponse.json(
         { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لوحدة أخرى." },
@@ -399,8 +375,6 @@ export async function DELETE(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Role Capability Matrix (T2b) is the single authoritative permission
-    // check — no separate manual role comparison here.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -417,13 +391,6 @@ export async function DELETE(
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    // isPublic is deliberately left untouched by this write. Deactivation
-    // here is the same soft-delete action as the toggle-active route — a
-    // pure visibility toggle. The storefront query already filters on
-    // isActive: true, so isActive: false alone already hides the product;
-    // isPublic stays exactly as it was, so a later reactivation restores
-    // the product's storefront visibility automatically with no manual
-    // re-publishing step.
     await db.product.update({
       where: { id },
       data: {

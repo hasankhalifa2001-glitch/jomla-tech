@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { Prisma, InvoiceStatus, type PaymentMethod } from "@prisma/client";
 import { auth } from "@/auth";
-// resolveFifoAllocation() and tenantScopedRawQuery() are both typed to accept
+// commitFifoAllocation() and tenantScopedRawQuery() are both typed to accept
 // exactly `Prisma.TransactionClient` (see fifo.ts's own header comment on
 // why it deliberately does NOT accept the Client Extension's dynamic
 // transaction type). getTenantDb(tenantId).$transaction(...)'s callback
@@ -15,7 +15,8 @@ import { auth } from "@/auth";
 // eslint-disable-next-line no-restricted-imports
 import { prisma } from "@/lib/db";
 import { tenantScopedRawQuery } from "@/lib/db/tenant-scope";
-import { resolveFifoAllocation, lockBatchesForFifoAllocations } from "@/lib/inventory/fifo";
+import { commitFifoAllocation } from "@/lib/inventory/fifo";
+import { lockBatchesForFifoAllocations } from "@/lib/inventory/batch-locking";
 import {
   compareMoney,
   convertCurrency,
@@ -38,7 +39,7 @@ export const dynamic = "force-dynamic";
  *
  * PUBLIC ENTRY POINT USED: the raw `prisma` client (from lib/db.ts), NOT
  * getTenantDb(tenantId). This is a deliberate, structural exception, not a
- * shortcut: resolveFifoAllocation() and tenantScopedRawQuery() both require
+ * shortcut: commitFifoAllocation() and tenantScopedRawQuery() both require
  * their `tx` argument to be exactly `Prisma.TransactionClient` — the type
  * produced by the raw client's `$transaction(async (tx) => ...)` callback.
  * The extended client returned by getTenantDb() produces a structurally
@@ -62,7 +63,7 @@ export const dynamic = "force-dynamic";
  * its known batchIds in one call to lockBatchesById() below, before any
  * ProductBatch.quantity update. The sale path locks every candidate batch
  * across EVERY line item of the invoice in one call to
- * lockBatchesForFifoAllocations() (lib/inventory/fifo.ts) BEFORE looping
+ * lockBatchesForFifoAllocations() (lib/inventory/batch-locking.ts) BEFORE looping
  * over line items — see the CROSS-ITEM LOCK ORDERING note in the sale path
  * below for why per-line-item locking was insufficient.
  *
@@ -83,7 +84,7 @@ export const dynamic = "force-dynamic";
  * from the already-verified originalInvoice row; the void payload's own
  * customer fields are no longer read for this purpose.
  *
- * UNIT-CONFUSION FIX: resolveFifoAllocation() returns TWO distinct
+ * UNIT-CONFUSION FIX: commitFifoAllocation() returns TWO distinct
  * quantity fields per allocation, on purpose — `allocatedQty` is
  * denominated in the REQUESTED unit (what the cashier picked, e.g.
  * "carton"), while `deductQtyInBatchUnit` is denominated in the BATCH's
@@ -721,24 +722,18 @@ export async function POST(req: NextRequest) {
           // ORDER BY id ASC query up front, so the whole invoice's lock
           // footprint follows a single global order.
           const productIdsInInvoice = [...new Set(inv.items.map((it) => it.productId))];
-          const preLockedQuantities = await lockBatchesForFifoAllocations(
+          await lockBatchesForFifoAllocations(
             tx,
             tenantId,
             productIdsInInvoice
           );
 
           for (const item of inv.items) {
-            // resolveFifoAllocation(mode: "COMMIT") uses preLockedQuantities
-            // directly instead of taking its own internal lock — the lock
-            // for this entire invoice was already acquired above, in one
-            // query, across every product.
-            const resolution = await resolveFifoAllocation(tx, {
+            const resolution = await commitFifoAllocation(tx, {
               tenantId,
               productId: item.productId,
               unitId: item.unitId,
               requestedQty: item.quantity,
-              mode: "COMMIT",
-              preLockedQuantities,
             });
 
             if (resolution.allocations.length === 0) {

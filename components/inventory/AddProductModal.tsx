@@ -13,6 +13,7 @@ import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
+import { validatePackagingUnits } from "@/lib/inventory/conversions";
 
 interface UnitForm {
   unitName: string;
@@ -84,13 +85,8 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
   const [loading, setLoading] = useState(false);
 
-  // Wizard step. Keeping the same single <form> for the whole modal (so
-  // handleSubmit's existing validation/payload logic doesn't need to be
-  // split apart) — this just controls which section is visible and gates
-  // the submit button to the last step.
   const [step, setStep] = useState<1 | 2 | 3>(1);
 
-  // Modal child states
   const [scannerModalOpen, setScannerModalOpen] = useState(false);
   const [activeUnitForScan, setActiveUnitForScan] = useState<number>(0);
 
@@ -100,47 +96,16 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const [catalogInfo, setCatalogInfo] = useState<CatalogEntryInfo | null>(null);
   const [reportModalOpen, setReportModalOpen] = useState(false);
 
-  // [ADDED] A dedicated, optional pre-step scan used ONLY to look the
-  // barcode up in the shared catalog (ProductCatalogEntry) and pre-fill
-  // name/category before the merchant types anything — see the modal-level
-  // comment further down for why this was previously unreachable dead
-  // code. This is NOT a commit of any unit's barcode; it never writes into
-  // `units` on its own. It is copied into the base unit's barcode field
-  // (and put through the exact same mandatory classification modal as any
-  // other barcode entry) only once the merchant reaches Step 2.
   const [quickScanModalOpen, setQuickScanModalOpen] = useState(false);
   const [pendingQuickScanBarcode, setPendingQuickScanBarcode] = useState<string>("");
   const [quickScanConsumed, setQuickScanConsumed] = useState(false);
-  // [FIX] Explicit, user-visible state for the dedicated "تحقق" button
-  // below — "idle" before any check has run (or after the barcode text
-  // changes, since a stale found/not_found result no longer describes the
-  // current field value), "loading" while the request is in flight,
-  // "found"/"not_found" once it resolves.
   const [quickLookupState, setQuickLookupState] = useState<"idle" | "loading" | "found" | "not_found">("idle");
 
-  // ---------------------------------------------------------------------
-  // [FIX — T3a §5] Mandatory barcodeSource confirmation gate.
-  //
-  // This is the SINGLE choke point through which a barcode value is ever
-  // allowed to land in `units[i].barcode`. Nothing in this file sets
-  // `units[i].barcode` directly from a raw keystroke or scan result
-  // anymore — see `requestBarcodeClassification` below. This is what
-  // makes "no unconfirmed barcode ever reaches handleSubmit" a structural
-  // property of the component's data flow, not just a check bolted onto
-  // the end of it.
-  //
-  // `pendingUnitIndex: null` means the modal is closed and there is no
-  // barcode currently awaiting classification.
-  // ---------------------------------------------------------------------
   const [barcodeGate, setBarcodeGate] = useState<{
     unitIndex: number | null;
     barcode: string;
   }>({ unitIndex: null, barcode: "" });
 
-  // Debounce + cancellation for the manual/scanned barcode lookup, mirroring
-  // the pattern used in InventoryClient.tsx's product search. Without this,
-  // every keystroke fires its own fetch with nothing stopping an older,
-  // slower response from overwriting a newer one.
   const lookupAbortRef = useRef<AbortController | null>(null);
   const lookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -175,14 +140,32 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     onOpenChange(isOpen);
   };
 
+  // [FIX] Previously assigned a FIXED `conversionFactor: 12` to every new
+  // unit regardless of how many units already existed — adding two
+  // secondary units in the same session silently created a duplicate
+  // conversionFactor (12, 12), which now gets rejected by
+  // validatePackagingUnits (per the confirmed no-duplicate-factors rule)
+  // only at final submit, with no earlier signal to the merchant about
+  // which two units conflict. Mirrors EditProductModal.tsx's own
+  // `highestFactor * 6` pattern instead: each new unit's factor is always
+  // strictly greater than every existing unit's factor, so two
+  // auto-generated units can never collide with each other. A merchant
+  // can still manually edit the value afterward into an accidental
+  // duplicate — that case is now caught immediately at the Step 2 gate
+  // (see goNext below) rather than silently reaching submit.
   const handleAddUnit = () => {
+    if (units.length >= 5) {
+      toast.error("الحد الأقصى لوحدات التعبئة هو 5 وحدات.");
+      return;
+    }
+    const highestFactor = Math.max(...units.map((u) => u.conversionFactor || 1), 1);
     setUnits([
       ...units,
       {
-        unitName: "كرتونة",
-        conversionFactor: 12,
-        pricingCurrency: "SYP",
-        priceWholesale: 12000,
+        unitName: "",
+        conversionFactor: highestFactor * 6,
+        pricingCurrency: units[0]?.pricingCurrency || "SYP",
+        priceWholesale: 0,
         priceRetail: "",
         barcode: "",
         barcodeSource: "",
@@ -191,15 +174,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     ]);
   };
 
-  // Tracks whether the removed unit was the one selected for the initial
-  // batch, OR sat before it in the array (which shifts every later index
-  // down by one). Either way the previous batchUnitIndex no longer safely
-  // identifies the same unit it did before removal — checking only
-  // "did the index fall out of range" misses the case where it stays
-  // numerically valid but now silently points at a *different* unit,
-  // which would write the initial stock batch against the wrong
-  // ProductUnit on submit. Resetting to 0 forces the merchant to
-  // consciously re-pick instead.
   const handleRemoveUnit = (index: number) => {
     if (units.length <= 1) {
       toast.error("يجب الإبقاء على وحدة قياس واحدة على الأقل.");
@@ -212,8 +186,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       setBatchUnitIndex(0);
     }
 
-    // If the unit being removed was mid-classification in the barcode
-    // gate, close the gate — there is nothing left to classify it for.
     if (barcodeGate.unitIndex === index) {
       setBarcodeGate({ unitIndex: null, barcode: "" });
     }
@@ -225,42 +197,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setUnits(updated);
   };
 
-  // -----------------------------------------------------------------------
-  // [FIX — T3a §5, core of this fix] The one and only entry point for a
-  // barcode value reaching a unit. Called from:
-  //   (a) the manual barcode <Input>'s onBlur (typing a full value and
-  //       moving on — NOT on every keystroke, so the modal doesn't fire
-  //       mid-type),
-  //   (b) the camera scanner's onScan result (a scan is atomic — the whole
-  //       value arrives at once, so there is no "still typing" state to
-  //       wait out), and
-  //   (c) the quick pre-Step-1 scan, once its value is carried into the
-  //       base unit at the start of Step 2.
-  //
-  // It does NOT write `units[i].barcode` itself. It only stages the value
-  // in `barcodeGate` and opens the mandatory modal. The unit's actual
-  // `barcode`/`barcodeSource` fields are written ONLY from
-  // `handleBarcodeSourceConfirm` below, after an explicit human choice.
-  //
-  // Re-editing an existing, already-classified barcode on the same unit
-  // goes through this exact same path — there is no separate "edit" code
-  // path that could accidentally special-case that and skip the modal.
-  // Per spec, the old barcodeSource must never be carried over onto a new
-  // value: since `barcodeGate` starts a fresh classification every time
-  // this function runs, and the PARENT mounts `BarcodeSourceModal` with a
-  // `key` derived from `${unitIndex}-${barcode}` (see the JSX below),
-  // React fully remounts that component on every new request — resetting
-  // its internal `selected` state to null purely through normal
-  // initialization, with no useEffect involved. That "never carried over"
-  // guarantee holds automatically as a result.
-  // -----------------------------------------------------------------------
   const requestBarcodeClassification = (unitIndex: number, rawBarcode: string) => {
     const cleaned = rawBarcode.trim();
 
     if (!cleaned) {
-      // Clearing the field entirely is always allowed with no gate — an
-      // empty barcode has no source to classify. Also clears any stale
-      // classification left on this unit from a previous value.
       const updated = [...units];
       updated[unitIndex] = { ...updated[unitIndex], barcode: "", barcodeSource: "" };
       setUnits(updated);
@@ -268,20 +208,11 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
-    // A no-op re-blur of the exact same, already-classified value must not
-    // reopen the modal every time the merchant tabs through the form —
-    // only a genuinely NEW or NEWLY-TYPED value triggers classification.
     const currentUnit = units[unitIndex];
     if (currentUnit && currentUnit.barcode === cleaned && currentUnit.barcodeSource) {
       return;
     }
 
-    // Immediately strip any previous classification on this unit — the
-    // instant the value changes, its old barcodeSource is stale and must
-    // never survive into a submit by accident, even if the merchant closes
-    // the modal without completing the new classification (in which case
-    // requestBarcodeClassification's own dismiss handler additionally
-    // clears the barcode value itself, per spec — see below).
     const updated = [...units];
     updated[unitIndex] = { ...updated[unitIndex], barcodeSource: "" };
     setUnits(updated);
@@ -303,10 +234,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setBarcodeGate({ unitIndex: null, barcode: "" });
   };
 
-  // [FIX — T3a §5] "barcodeSource stays null if the modal is dismissed,
-  // and in that case the barcode value itself is also not saved." A
-  // dismissal here means the unit's barcode field is wiped back to empty,
-  // not left populated with an unclassified value.
   const handleBarcodeSourceDismiss = () => {
     const { unitIndex } = barcodeGate;
     if (unitIndex !== null) {
@@ -319,32 +246,11 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setBarcodeGate({ unitIndex: null, barcode: "" });
   };
 
-  // `targetUnitIndex` is an explicit, required parameter rather than
-  // implicitly reading `activeUnitForScan` from state — that state is only
-  // ever updated when the camera scanner is opened, never when a barcode
-  // is typed manually into a specific unit's input, so relying on it here
-  // could silently apply the catalog's suggested image to the wrong unit.
-  //
-  // Debounced (300ms) and cancels any in-flight request before starting a
-  // new one, so a fast keystroke can't have its response overwritten by a
-  // slower, now-stale one that lands later.
-  //
-  // NOTE: this lookup is a read-only convenience against the shared
-  // catalog and is intentionally decoupled from barcodeSource
-  // classification — it may run against a barcode still awaiting
-  // classification in `barcodeGate`, since suggesting a name/photo carries
-  // none of the "is this barcode shareable" weight that GS1-vs-INTERNAL
-  // does.
   const lookupBarcodeInCatalog = (barcodeVal: string, targetUnitIndex: number) => {
     if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
 
     const cleanBarcode = barcodeVal.trim();
     if (!cleanBarcode) {
-      // Clear any stale catalog banner when the barcode field this lookup
-      // was tracking is emptied out — otherwise catalogInfo could keep
-      // showing a match for a barcode no longer present in the form at
-      // all (e.g. a match was found, then the barcode was deleted to type
-      // a different one).
       setCatalogInfo(null);
       return;
     }
@@ -385,22 +291,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         }
       } catch (err: any) {
         if (err?.name === "AbortError") return;
-        // Ignore other lookup network errors — this is a convenience
-        // lookup, not a required step.
       }
     }, 300);
   };
 
-  // [CRITICAL] Never auto-sets barcodeSource on a camera scan result.
-  // schema.prisma's v3.1 note is explicit that this exact shortcut must
-  // never happen: "a silent default of GS1 would make an unreviewed
-  // barcode eligible for the shared catalog by accident... must be set
-  // explicitly by the merchant... never guessed." Scanning a barcode with
-  // the camera only reads a number — it says nothing about whether that
-  // number is a real, factory-printed GS1/EAN code or an internal sticker
-  // the merchant wrote themselves. A scan is therefore routed through the
-  // exact same mandatory classification gate as manual entry — it fills
-  // nothing directly, it only stages the value and opens the modal.
   const handleBarcodeScanResult = (scannedBarcode: string) => {
     requestBarcodeClassification(activeUnitForScan, scannedBarcode);
   };
@@ -414,14 +308,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setUnits(updated);
   };
 
-  // [FIX] A dedicated, EXPLICIT catalog check — no debounce, no silent
-  // onBlur trigger. The merchant presses a button and immediately sees one
-  // of three states rendered right under the field: checking..., found
-  // (with the matched name), or not found (a plain, non-alarming "this
-  // will be treated as a new product" note). This replaces relying on
-  // `onBlur` to fire a lookup the merchant has no direct way to observe
-  // happening, with no visible confirmation afterward beyond a toast (and
-  // the top-of-form banner) that's easy to miss inside a scrolling modal.
   const runQuickCatalogCheck = async (barcodeOverride?: string) => {
     const cleaned = (barcodeOverride ?? pendingQuickScanBarcode).trim();
     if (!cleaned) {
@@ -456,56 +342,24 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     }
   };
 
-  // [ADDED] The optional pre-Step-1 quick scan. Purely a catalog lookup +
-  // convenience carrier — see the state comment above. Also routed through
-  // the same mandatory classification gate once its value is committed to
-  // the base unit (at the top of Step 2), never bypassing it.
-  //
-  // Unlike manual typing, a camera scan IS a single, deliberate,
-  // discrete action — there is no "still typing, don't check yet"
-  // ambiguity to wait out — so it's reasonable (and expected) for this
-  // path to trigger the check immediately rather than requiring a second
-  // explicit button press.
   const handleQuickScanResult = (scannedBarcode: string) => {
     const cleaned = scannedBarcode.trim();
     setPendingQuickScanBarcode(cleaned);
     setQuickScanConsumed(false);
     setQuickLookupState("idle");
-    // Run the same explicit check the button triggers, just automatically
-    // since the scan itself was the deliberate trigger. Passed explicitly
-    // rather than relying on `pendingQuickScanBarcode` from state, which
-    // is not guaranteed to have re-rendered yet at this point.
     runQuickCatalogCheck(cleaned);
   };
 
-  // [FIX — corrected from an earlier, WRONG assumption] Publishing to the
-  // storefront requires BOTH a product photo AND a retail price on at
-  // least one active unit — this is a literal, word-for-word acceptance
-  // criterion in the Master Technical Specification (T3a): "isPublic =
-  // true is blocked without both priceRetail and imageUrl." A previous
-  // version of this file relaxed this to "image only," reasoning that
-  // priceRetail is merely a display hint never charged on any sale — that
-  // reasoning is true on its own, but it doesn't change what the spec's
-  // publishing gate itself requires as a precondition for going public;
-  // "never charged" and "not required to publish" are two independent
-  // questions, and only the first one is actually true here. That
-  // relaxed version also silently diverged from EditProductModal.tsx,
-  // which already enforced the correct (image + retail price) rule via
-  // this exact same `checkProductPublishable()` call — meaning a product
-  // could be published from THIS form with only a photo, then immediately
-  // fail re-validation the moment an admin opened it in Edit. Both forms
-  // now share one call to one function, so the rule can only ever be
-  // defined in one place.
   const handleTogglePublic = (checked: boolean) => {
     if (checked) {
       const candidateUnits = units.map((u) => ({
-        isActive: true, // every unit created here starts active by default
+        isActive: true,
         priceRetail: u.priceRetail === "" ? null : Number(u.priceRetail),
         imageUrl: u.imageUrl || null,
       }));
 
       const gate = checkProductPublishable({
-        isActive: true, // a product being created is always active
+        isActive: true,
         units: candidateUnits,
       });
 
@@ -517,10 +371,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setIsPublic(checked);
   };
 
-  // Per-step validation before advancing. This is a UX gate only — it
-  // deliberately mirrors (a subset of) the checks already in handleSubmit
-  // rather than replacing them, so the final submit stays the single
-  // source of truth for "is this payload actually valid."
   const goNext = () => {
     if (step === 1) {
       if (!name.trim()) {
@@ -528,9 +378,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         return;
       }
 
-      // [ADDED] Carry the quick-scan barcode (if any) into the base unit
-      // exactly once, right as Step 2 becomes visible, and route it
-      // through the mandatory classification gate like any other entry.
       if (pendingQuickScanBarcode && !quickScanConsumed) {
         setQuickScanConsumed(true);
         requestBarcodeClassification(0, pendingQuickScanBarcode);
@@ -542,18 +389,29 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         toast.error("يرجى التأكد من ملء جميع الوحدات بمعامل تحويل وسعر جملة أكبر من الصفر.");
         return;
       }
+
+      // [FIX — new] Delegates base-unit-required and no-duplicate-factor
+      // checks to the single shared implementation in unit-conversion.ts,
+      // instead of relying only on the per-field checks above (which never
+      // caught a duplicate conversionFactor or a missing/extra base unit).
+      // Surfaces the problem right here at Step 2, before the merchant
+      // fills in Step 3 and only discovers it at final submit.
+      const packagingCheck = validatePackagingUnits(
+        units.map((u) => ({
+          ...u,
+          priceRetail: u.priceRetail === "" ? null : u.priceRetail,
+        }))
+      );
+      if (!packagingCheck.valid) {
+        toast.error(packagingCheck.error);
+        return;
+      }
+
       const enteredBarcodes = units.map((u) => u.barcode.trim()).filter(Boolean);
       if (new Set(enteredBarcodes).size !== enteredBarcodes.length) {
         toast.error("لا يمكن استخدام نفس الباركود لأكثر من وحدة قياس ضمن المنتج نفسه.");
         return;
       }
-      // [FIX] Block advancing past Step 2 while any barcode sits
-      // unclassified — this catches the case where a merchant typed a
-      // barcode, tabbed away (firing the modal), then dismissed it or
-      // clicked "التالي" before resolving it. Since dismissal already
-      // clears the barcode value (see handleBarcodeSourceDismiss), this
-      // check mainly guards the in-progress state where the gate is still
-      // open when "التالي" is pressed.
       if (barcodeGate.unitIndex !== null) {
         toast.error("يرجى إكمال تصنيف مصدر الباركود المعلّق قبل المتابعة.");
         return;
@@ -570,10 +428,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
   const goBack = () => setStep((s) => (s > 1 ? ((s - 1) as 1 | 2 | 3) : s));
 
-  // Enter-to-submit is the default behavior for inputs inside a <form>.
-  // With three steps sharing one form, pressing Enter while on step 1 or 2
-  // would otherwise silently submit early instead of advancing — block it
-  // everywhere except the final step, where Enter submitting is expected.
   const handleFormKeyDown = (e: React.KeyboardEvent<HTMLFormElement>) => {
     if (e.key === "Enter" && step !== 3) {
       e.preventDefault();
@@ -592,19 +446,30 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
+    // [FIX — new] Same shared validation as goNext's Step 2 gate, run
+    // again here as the final backstop before submit — mirrors how the
+    // barcode-classification check below is also duplicated between
+    // goNext and handleSubmit for the same reason: the Step gate is a UX
+    // convenience, this is the actual source of truth right before the
+    // request is sent.
+    const packagingCheck = validatePackagingUnits(
+      units.map((u) => ({
+        ...u,
+        priceRetail: u.priceRetail === "" ? null : u.priceRetail,
+      }))
+    );
+    if (!packagingCheck.valid) {
+      toast.error(packagingCheck.error);
+      setStep(2);
+      return;
+    }
+
     const enteredBarcodes = units.map((u) => u.barcode.trim()).filter(Boolean);
     if (new Set(enteredBarcodes).size !== enteredBarcodes.length) {
       toast.error("لا يمكن استخدام نفس الباركود لأكثر من وحدة قياس ضمن المنتج نفسه.");
       return;
     }
 
-    // [FIX — final line of defense, T3a §5] This is the hard backstop:
-    // even if every UI gate above were somehow bypassed, a unit reaching
-    // this point with a non-empty barcode and an empty barcodeSource is
-    // rejected outright, exactly like the server-side Zod `.refine()` in
-    // route.ts already does. Unlike the previous version of this file,
-    // there is NO fallback to "INTERNAL" anywhere in this function —
-    // silently defaulting an unclassified barcode was the actual bug.
     const hasUnclassifiedBarcode = units.some((u) => u.barcode.trim() && !u.barcodeSource);
     if (hasUnclassifiedBarcode) {
       toast.error("يوجد باركود واحد أو أكثر بدون تصنيف مصدر (GS1/داخلي) مؤكد. يرجى إعادة إدخاله لإكمال التصنيف.");
@@ -617,10 +482,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
-    // [FIX] Same shared gate as handleTogglePublic above — image AND
-    // retail price together, per T3a's literal acceptance criterion. This
-    // is the final backstop before submit, mirroring
-    // EditProductModal.tsx's own pre-save check via the same function.
     if (isPublic) {
       const candidateUnits = units.map((u) => ({
         isActive: true,
@@ -648,11 +509,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
           priceWholesale: Number(u.priceWholesale),
           priceRetail: u.priceRetail !== "" ? Number(u.priceRetail) : null,
           barcode: u.barcode.trim() || null,
-          // [FIX] No fallback. If `u.barcode` is non-empty here,
-          // `u.barcodeSource` is GUARANTEED non-empty too — the checks
-          // above (goNext's Step-2 gate and this function's own hard
-          // backstop) make that combination unreachable. If the barcode
-          // is empty, barcodeSource is correctly sent as null.
           barcodeSource: u.barcode.trim() ? (u.barcodeSource as "GS1" | "INTERNAL") : null,
           imageUrl: u.imageUrl.trim() || null,
         })),
@@ -691,16 +547,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   return (
     <>
       <Dialog open={open} onOpenChange={handleOpenChange}>
-        {/*
-          Mobile-first positioning: most merchants/cashiers on this project
-          only have a phone (see project decision on mobile-first roles) —
-          so on small screens this renders as a bottom sheet (pinned to the
-          bottom edge, ~92% of viewport height, rounded top corners only),
-          and reverts to a normal centered dialog at the sm: breakpoint and
-          up. The base (mobile) position classes intentionally override
-          the component's default centered-dialog classes via className
-          merging; the sm: variants restore centered desktop positioning.
-        */}
         <DialogContent
           className="
             fixed inset-x-0 bottom-0 top-auto left-0 right-0
@@ -727,7 +573,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
             </DialogDescription>
           </DialogHeader>
 
-          {/* Step indicator */}
           <div className="flex items-center justify-center gap-1.5 sm:gap-2 py-1">
             {STEP_LABELS.map((label, i) => {
               const stepNum = (i + 1) as 1 | 2 | 3;
@@ -788,23 +633,8 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
               </div>
             )}
 
-            {/* STEP 1 — Basic info */}
             {step === 1 && (
               <div className="space-y-3">
-                {/*
-                  [ADDED] Optional quick-scan ahead of the name field.
-                  Purely additive: a merchant who prefers to just type the
-                  name (the previous, only workflow) can ignore this
-                  entirely and nothing below behaves any differently for
-                  them. A merchant standing in front of the physical
-                  product can instead scan first, letting a shared-catalog
-                  match prefill name/category before they type anything.
-                  This scan does NOT commit any unit's barcode by itself —
-                  see handleQuickScanResult and the Step-1 -> Step-2
-                  transition in goNext for where it's actually carried
-                  into the base unit and put through the same mandatory
-                  classification modal as any other entry.
-                */}
                 <div className="p-3 rounded-lg border border-dashed border-emerald-300 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/20 space-y-2">
                   <div className="flex items-start gap-2.5">
                     <ScanBarcode className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
@@ -818,21 +648,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                     </div>
                   </div>
 
-                  {/*
-                    [FIX] Manual typing is now a first-class entry path
-                    here, matching Step 2's per-unit barcode field pattern
-                    — the camera was previously the ONLY way to use this
-                    quick-lookup card, which is a real problem for a
-                    merchant who already knows the barcode by heart, or
-                    whose camera/lighting isn't cooperating. This input
-                    does NOT commit anything or open the mandatory
-                    classification modal by itself — it only stages the
-                    value the exact same way a scan result does (see
-                    handleQuickScanResult), triggering only the read-only
-                    catalog lookup. Classification still only ever happens
-                    once this value is carried into the base unit at the
-                    Step 1 -> Step 2 transition (goNext), same as before.
-                  */}
                   <div className="flex items-center gap-1.5">
                     <Input
                       placeholder="اكتب الباركود هنا يدوياً..."
@@ -841,25 +656,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                         const val = e.target.value;
                         setPendingQuickScanBarcode(val);
                         setQuickScanConsumed(false);
-                        // Any edit to the barcode text invalidates a
-                        // previous found/not_found result — it described
-                        // a DIFFERENT value. Back to idle until the
-                        // merchant explicitly re-checks.
                         setQuickLookupState("idle");
                       }}
                       className={`${FIELD_H} font-mono bg-white dark:bg-zinc-900`}
                     />
-                    {/*
-                      [FIX] This is now the ONLY thing that triggers a
-                      catalog check for manually-typed text — no more
-                      relying on `onBlur`, which the merchant has no way
-                      to perceive happening and which was easy to miss
-                      entirely if they clicked straight into the next
-                      field. Pressing this button runs the check
-                      immediately (no debounce delay) and the result is
-                      shown right below, not just as a toast or a banner
-                      elsewhere in a scrollable modal.
-                    */}
                     <Button
                       type="button"
                       variant="outline"
@@ -884,15 +684,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                     </Button>
                   </div>
 
-                  {/*
-                    [FIX] Explicit, always-visible result of the check —
-                    directly under the field the merchant is looking at,
-                    not a banner that renders elsewhere in the form and
-                    can be scrolled out of view. This is the concrete
-                    answer to "I typed a barcode and waited, nothing
-                    happened": now something ALWAYS visibly happens,
-                    in one of exactly three states.
-                  */}
                   {quickLookupState === "loading" && (
                     <p className="text-[11px] text-zinc-500 flex items-center gap-1.5">
                       <RefreshCw className="w-3 h-3 animate-spin" />
@@ -943,7 +734,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
               </div>
             )}
 
-            {/* STEP 2 — Units & pricing */}
             {step === 2 && (
               <div className="space-y-3">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
@@ -987,7 +777,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                           )}
                         </div>
 
-                        {/* Identity row: name / conversion factor / currency */}
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                           <div>
                             <Label className="text-[11px]">اسم الوحدة *</Label>
@@ -1027,18 +816,8 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                           </div>
                         </div>
 
-                        {/* Pricing row: wholesale vs retail, visually separated since these are the two most-consulted fields */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           <div className="p-2.5 rounded-lg border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/60 dark:bg-emerald-950/20">
-                            {/* [FIX] Dynamic label — this field is the ONLY
-                                price ever actually charged for THIS unit, on
-                                POS and on the storefront alike
-                                (ProductUnit.priceWholesale in schema.prisma).
-                                For the base unit that's typically a single-
-                                piece sale to a walk-in customer; for a
-                                packaging unit it's the bulk/carton price.
-                                Both are the same field — just labeled to
-                                match what's actually being sold. */}
                             <Label className="text-[11px] font-semibold text-emerald-800 dark:text-emerald-400">
                               {idx === 0 ? "سعر بيع القطعة (POS) *" : "سعر الجملة للوحدة (POS) *"}
                             </Label>
@@ -1069,39 +848,24 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                               onChange={(e) => handleUnitChange(idx, "priceRetail", e.target.value)}
                               className={`${FIELD_H} mt-1 font-mono bg-white dark:bg-zinc-900`}
                             />
-                            {/* [FIX] Clarifies this number is never charged —
-                                it's a display-only hint for the storefront
-                                buyer, unrelated to what gets billed. */}
                             <p className="text-[10px] text-blue-600/80 dark:text-blue-400/70 mt-1 leading-snug">
                               سعر استرشادي يظهر لعميل المتجر الإلكتروني فقط — لا يُستخدم أبدًا كسعر فعلي عند البيع من الـ POS.
                             </p>
                           </div>
                         </div>
 
-                        {/* Barcode row */}
                         <div>
                           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                             <div>
                               <Label className="text-[11px]">تصنيف الباركود</Label>
-                              {/*
-                                [FIX] This is now a READ-ONLY status
-                                indicator, not an editable <select>. The
-                                previous dropdown let a merchant leave this
-                                on "بدون تصنيف" and still submit — which is
-                                exactly the silent-default bug this fix
-                                closes. The only way to set or change this
-                                value now is through the mandatory
-                                BarcodeSourceModal, triggered from the
-                                barcode field itself below.
-                              */}
                               <div
                                 className={`w-full ${FIELD_H} mt-1 rounded-md border flex items-center px-2 gap-1.5 ${unit.barcodeSource === "GS1"
-                                    ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400"
-                                    : unit.barcodeSource === "INTERNAL"
-                                      ? "border-blue-300 bg-blue-50 text-blue-700 dark:bg-blue-950/30 dark:text-blue-400"
-                                      : unit.barcode.trim()
-                                        ? "border-amber-300 bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
-                                        : "border-zinc-200 dark:border-zinc-800 text-zinc-400"
+                                  ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400"
+                                  : unit.barcodeSource === "INTERNAL"
+                                    ? "border-blue-300 bg-blue-50 text-blue-700 dark:bg-blue-950/30 dark:text-blue-400"
+                                    : unit.barcode.trim()
+                                      ? "border-amber-300 bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                                      : "border-zinc-200 dark:border-zinc-800 text-zinc-400"
                                   }`}
                               >
                                 {unit.barcode.trim() && !unit.barcodeSource && (
@@ -1124,11 +888,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                                 <Input
                                   placeholder="امسح أو أدخل الباركود"
                                   value={unit.barcode}
-                                  // While typing, only update the visible
-                                  // text — do NOT open the classification
-                                  // modal on every keystroke. The modal
-                                  // opens on blur (a full value was
-                                  // entered) via requestBarcodeClassification.
                                   onChange={(e) => handleUnitChange(idx, "barcode", e.target.value)}
                                   onBlur={(e) => requestBarcodeClassification(idx, e.target.value)}
                                   className={`${FIELD_H} font-mono`}
@@ -1158,7 +917,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                           )}
                         </div>
 
-                        {/* Image row */}
                         <div>
                           <Label className="text-[11px]">صورة الوحدة/المنتج</Label>
                           <div className="flex items-center gap-1.5 mt-1">
@@ -1191,7 +949,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
               </div>
             )}
 
-            {/* STEP 3 — Initial stock + review */}
             {step === 3 && (
               <div className="space-y-3">
                 <div className="p-3 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 space-y-1">
@@ -1203,13 +960,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                   </p>
                 </div>
 
-                {/* [MOVED FROM STEP 1] The storefront-publish toggle now
-                    sits on the final review step, after the merchant has
-                    already gone through step 2 and (ideally) attached a
-                    photo to at least one unit. handleTogglePublic's gate
-                    check is unchanged — this is purely a placement change
-                    so the checkbox isn't reachable before any unit data
-                    (and possibly no photo) exists yet. */}
                 <div className="flex items-start gap-3 p-3 rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900/40">
                   <input
                     type="checkbox"
@@ -1290,27 +1040,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
               </div>
             )}
 
-            {/*
-              Footer: stacked, full-width buttons on mobile with the
-              primary action (Next / Save) last in DOM order so it sits at
-              the bottom of the sheet — closest to a thumb holding the
-              phone. Reverts to a compact inline row at sm: and up.
-
-              [FIX] Each of the "Next" and "Save" buttons is given a
-              distinct, stable `key` ("next-btn" vs "submit-btn"). Without
-              this, React treats them as the *same* element across a
-              step 2 -> step 3 transition (same position in the tree, same
-              parent) and reuses the existing <button> DOM node, merely
-              flipping its `type` attribute from "button" to "submit".
-              That mutation can land mid-click: the browser dispatches the
-              click against a node that was type="button" when pressed but
-              has become type="submit" by the time it checks what to do
-              with the event, firing an unwanted form submit on the
-              step 2 -> 3 transition. Distinct keys force React to unmount
-              the old node and mount a fresh one instead of morphing it in
-              place, so a "Next" click can never be reinterpreted as a
-              "Submit" click.
-            */}
             <DialogFooter className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pt-1">
               <Button
                 type="button"
@@ -1359,65 +1088,30 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         </DialogContent>
       </Dialog>
 
-      {/* Barcode Scanner Modal (per-unit, Step 2) */}
       <BarcodeScannerModal
         open={scannerModalOpen}
         onOpenChange={setScannerModalOpen}
         onScan={handleBarcodeScanResult}
       />
 
-      {/* [ADDED] Quick pre-Step-1 scanner — catalog lookup convenience only,
-          shares the same underlying scanner component. */}
       <BarcodeScannerModal
         open={quickScanModalOpen}
         onOpenChange={setQuickScanModalOpen}
         onScan={handleQuickScanResult}
       />
 
-      {/* Image Crop Modal */}
       <ImageCropModal
         open={cropModalOpen}
         onOpenChange={setCropModalOpen}
         onCropComplete={handleCropResult}
       />
 
-      {/*
-        [FIX — T3a §5] The mandatory barcodeSource confirmation gate.
-        Rendered unconditionally (open is controlled by barcodeGate) so it
-        can appear regardless of which step is currently visible — in
-        practice this only happens while Step 2 is showing, since that is
-        the only place `requestBarcodeClassification` is ever called from
-        (manual entry's onBlur and the scanner's onScan both live there),
-        but the gate's own open state deliberately doesn't depend on
-        `step` to stay correct even if a future change adds another
-        barcode entry point elsewhere in the wizard.
-      */}
       <BarcodeSourceModal
-        // [FIX] `key` forces a full unmount/remount whenever a DIFFERENT
-        // barcode-classification request starts — a different unit, or a
-        // new value on the same unit (re-editing an existing barcode).
-        // This is what makes BarcodeSourceModal's own internal `selected`
-        // state reset to `null` correctly, WITHOUT that component needing
-        // a useEffect to do it (see the [FIX] comment on that component
-        // for why the effect-based version triggered React's
-        // setState-in-effect warning). When the gate is closed
-        // (unitIndex === null), the key stays stable at "closed" so the
-        // dialog's own closing animation isn't interrupted by an
-        // unrelated remount.
         key={barcodeGate.unitIndex !== null ? `${barcodeGate.unitIndex}-${barcodeGate.barcode}` : "closed"}
         open={barcodeGate.unitIndex !== null}
         barcode={barcodeGate.barcode}
         onConfirm={handleBarcodeSourceConfirm}
         onDismiss={handleBarcodeSourceDismiss}
-        // [FIX] Only pass a match when `catalogInfo` actually describes
-        // THIS specific barcode currently awaiting classification.
-        // `catalogInfo` is a single shared piece of state also used by
-        // the top-of-form banner and the quick-scan card — without this
-        // guard, a stale match left over from a PREVIOUSLY typed barcode
-        // (e.g. the merchant tried one barcode, got a match, then edited
-        // the field to a completely different number that has no match
-        // of its own) could incorrectly suggest GS1 for a barcode that
-        // was never actually found in the catalog.
         catalogMatch={
           catalogInfo && catalogInfo.barcode === barcodeGate.barcode
             ? { name: catalogInfo.name }
@@ -1425,15 +1119,8 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         }
       />
 
-      {/* Shared Catalog Correction Report Modal */}
       {catalogInfo && (
         <CatalogReportModal
-          // [FIX] `key={catalogInfo.id}` forces React to fully unmount and
-          // remount this component whenever a DIFFERENT catalog entry is
-          // matched (e.g. scanning a new barcode after cancelling a draft
-          // report for a previous one) — see CatalogReportModal.tsx's own
-          // comment for why this replaces an earlier useEffect-based reset
-          // that triggered React's setState-in-effect warning.
           key={catalogInfo.id}
           open={reportModalOpen}
           onOpenChange={setReportModalOpen}

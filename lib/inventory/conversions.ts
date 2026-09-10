@@ -19,14 +19,30 @@
  * BarcodeSourceModal. Any attempt to automate or infer barcodeSource is
  * strictly forbidden by the Master Technical Specification.
  *
- * VALIDATION SCOPE NOTE:
- * validatePackagingUnits below intentionally enforces ONLY what the spec
- * states: "arbitrary positive conversion factors" and unitName's non-null
- * schema constraint. Do NOT add further constraints (integer-only factors,
- * uniqueness of factors, a mandatory single conversionFactor === 1 "base"
- * unit, etc.) without explicit confirmation — several such rules were
- * previously added unprompted and had to be reverted. If a future spec
- * revision adds one of these, cite the exact clause when reintroducing it.
+ * VALIDATION SCOPE NOTE (confirmed business rules — do not weaken without
+ * explicit confirmation, mirroring the caution this same note used to urge
+ * in the opposite direction):
+ * validatePackagingUnits enforces exactly these packaging-unit rules:
+ *   1. At least one unit must be provided.
+ *   2. unitName is required (non-empty) — matches the non-nullable schema field.
+ *   3. conversionFactor must be a positive number. Fractional factors are
+ *      explicitly ALLOWED and intentional — a wholesaler may legitimately
+ *      sell a quarter- or half-carton at a prorated wholesale price, so
+ *      conversionFactor is NEVER restricted to integers.
+ *   4. Exactly ONE unit per product must have conversionFactor === 1 — the
+ *      designated "base" unit. This is required, not optional: every
+ *      conversion function in this module (convertUnitQuantity,
+ *      convertUnitCost, calculateBatchDeductions) computes through a common
+ *      base reference, and with zero or multiple base units that reference
+ *      point becomes ambiguous or undefined.
+ *   5. No two units on the same product may share the same
+ *      conversionFactor — a duplicate factor creates ambiguity in FIFO
+ *      allocation display and POS/storefront unit pickers (which unit is
+ *      "the" 12-factor unit?), so it is forbidden outright.
+ * Do not add further constraints beyond these five (integer-only factors
+ * being one that was previously and deliberately rejected) without
+ * explicit confirmation, and do not remove rules 4/5 without it either —
+ * both directions of drift have happened before on this module.
  */
 
 import Decimal from "decimal.js";
@@ -131,17 +147,9 @@ export function calculateBatchDeductions(
 }
 
 /**
- * Validates packaging unit rules for a product.
- *
- * Enforces ONLY what the spec actually states:
- * 1. At least one unit must be provided.
- * 2. unitName is required (non-empty) — matches the non-nullable schema field.
- * 3. conversionFactor must be a positive number ("arbitrary positive
- *    conversion factors" per spec) — NOT restricted to integers, NOT
- *    required to be unique across units, and NO unit is required to
- *    equal exactly 1. These three additional constraints were previously
- *    added without authorization and must not be reintroduced without
- *    explicit confirmation.
+ * Validates packaging unit rules for a product. See the VALIDATION SCOPE
+ * NOTE at the top of this file for the full, confirmed rule set and the
+ * reasoning behind each rule.
  */
 export function validatePackagingUnits(units: PackagingUnit[]): {
   valid: boolean;
@@ -150,6 +158,9 @@ export function validatePackagingUnits(units: PackagingUnit[]): {
   if (!units || units.length === 0) {
     return { valid: false, error: "يجب تحديد وحدة قياس واحدة على الأقل." };
   }
+
+  const factorsSeen = new Map<string, string>(); // normalized factor key -> unitName that used it
+  let baseUnitCount = 0;
 
   for (const u of units) {
     if (!u.unitName || !u.unitName.trim()) {
@@ -172,6 +183,37 @@ export function validatePackagingUnits(units: PackagingUnit[]): {
         error: `معامل التحويل للوحدة "${u.unitName}" يجب أن يكون رقماً موجباً أكبر من الصفر.`,
       };
     }
+
+    if (factor.equals(1)) {
+      baseUnitCount += 1;
+    }
+
+    // Normalize the factor to a canonical decimal string so that
+    // mathematically-equal values written differently (e.g. "12" vs
+    // "12.0" vs "12.00") are correctly detected as duplicates.
+    const factorKey = factor.toFixed();
+    const existingUnitName = factorsSeen.get(factorKey);
+    if (existingUnitName) {
+      return {
+        valid: false,
+        error: `معامل التحويل مكرر: الوحدتان "${existingUnitName}" و"${u.unitName}" لهما نفس معامل التحويل (${factor.toString()}).`,
+      };
+    }
+    factorsSeen.set(factorKey, u.unitName);
+  }
+
+  if (baseUnitCount === 0) {
+    return {
+      valid: false,
+      error: "يجب تحديد وحدة أساسية واحدة بمعامل تحويل يساوي 1 (مثلاً: قطعة).",
+    };
+  }
+
+  if (baseUnitCount > 1) {
+    return {
+      valid: false,
+      error: "لا يمكن تحديد أكثر من وحدة أساسية واحدة بمعامل تحويل يساوي 1.",
+    };
   }
 
   return { valid: true };

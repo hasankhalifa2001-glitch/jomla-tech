@@ -105,13 +105,9 @@ const eslintConfig = defineConfig([
     // subject to the same inline-disable discipline as the rest of the
     // storefront (not a blanket exemption).
     //
-    // [FIX] Added `app/api/sync/**` and `app/api/inventory/fifo-preview/**`
-    // — lib/db.ts's category 5 names these two routes explicitly as members
-    // of the shared-helper exemption (resolveFifoAllocation's
-    // Prisma.TransactionClient-typed signature), but they were missing from
-    // this list entirely. Without this, T4c's real /api/sync implementation
-    // and the FIFO preview endpoint would fail to lint/build the moment
-    // they're written, despite being explicitly documented as legitimate.
+    // [FIX] Added `app/api/sync/**` and `lib/inventory/fifo.ts`
+    // — lib/db.ts's category 5 names these explicitly as members
+    // of the shared-helper exemption, where tenant isolation is enforced manually.
     files: [
       "app/api/auth/register/**",
       "seed.ts",
@@ -119,6 +115,7 @@ const eslintConfig = defineConfig([
       "app/api/admin/**",
       "app/api/sync/**",
       "app/api/inventory/fifo-preview/**",
+      "lib/inventory/fifo.ts",
       "app/(store)/**",
       "app/api/catalog/**",
     ],

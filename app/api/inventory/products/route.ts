@@ -12,6 +12,7 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
+import { validatePackagingUnits } from "@/lib/inventory/conversions";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
@@ -109,6 +110,11 @@ export async function GET(req: Request) {
     } else if (status === "inactive" || filter === "inactive_products") {
       whereClause.isActive = false;
     }
+    // NOTE (flagged, unresolved): unlike an earlier version of this route,
+    // an omitted `status` param no longer defaults to "active" — a bare
+    // GET now returns products regardless of isActive. Left exactly as
+    // received pending confirmation of whether this was an intentional
+    // behavior change.
 
     const products = (await db.product.findMany({
       where: whereClause,
@@ -265,9 +271,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Role Capability Matrix (T2b) is the single authoritative permission
-    // check — no separate manual role comparison here, to avoid two
-    // sources of truth drifting apart if the matrix ever changes.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -289,10 +292,25 @@ export async function POST(req: Request) {
 
     const { name, category, isPublic, units, initialBatch } = validation.data;
 
+    // [FIX — new] Previously missing entirely from this route: PATCH
+    // enforced "exactly one base unit (factor === 1)" and "no duplicate
+    // conversion factors" but POST (product creation) did not, so a brand
+    // new product could be created without a base unit or with duplicate
+    // factors, only to be rejected the very first time someone tried to
+    // edit it. Delegates to the same shared implementation PATCH now uses.
+    const packagingCheck = validatePackagingUnits(units);
+    if (!packagingCheck.valid) {
+      return NextResponse.json(
+        {
+          error: "INVALID_PACKAGING_UNITS",
+          message: packagingCheck.error,
+        },
+        { status: 400 }
+      );
+    }
+
     // PUBLISHING GATE: delegates to the single shared implementation in
-    // lib/inventory/publishing-gate.ts rather than re-deriving the same
-    // rule here by hand — keeps this route and the toggle-public route
-    // permanently in sync with exactly one definition of "publishable".
+    // lib/inventory/publishing-gate.ts.
     if (isPublic) {
       const gateCheck = checkProductPublishable({ isActive: true, units });
       if (!gateCheck.publishable) {
@@ -372,33 +390,10 @@ export async function POST(req: Request) {
         unitIds.push(createdUnit.id);
         createdUnits.push(createdUnit as unknown as ProductUnitRow);
 
-        // [FIX — CRITICAL, per Master Spec T3a §6 / ProductCatalogEntry]
         // ProductCatalogEntry is write-once at creation and MUST NEVER be
-        // updated afterward by anyone — not even by the tenant that
-        // originally created it. Spec: "a one-time fill-in-the-form
-        // convenience, never re-read afterward and never silently kept in
-        // sync with a tenant's own edited copy."
-        //
-        // The previous `else if (existingCatalog.addedByTenantId ===
-        // tenantId) { update(...) }` branch here was flagged as
-        // practically unreachable in THIS specific POST flow — the
-        // barcode-uniqueness pre-check a few lines above already rejects
-        // the request with DUPLICATE_BARCODE before this transaction ever
-        // starts, for any barcode this tenant already owns a ProductUnit
-        // with (which is the only way this tenant could already own a
-        // matching ProductCatalogEntry). That "unreachable today" argument
-        // is not a reason to keep it: the branch still encodes the wrong
-        // rule, and a future change to the pre-check above (e.g. loosening
-        // the DUPLICATE_BARCODE guard) would silently reactivate it. It is
-        // removed here for the same reason it was removed from the PATCH
-        // handler in products/[id]/route.ts — this file and that one must
-        // never disagree on this rule.
-        //
-        // The only two valid outcomes are: (a) no entry exists yet for
-        // this barcode → create one (this tenant becomes its permanent
-        // owner), or (b) an entry already exists, owned by anyone → do
-        // nothing. The only path that may ever change an existing entry is
-        // a Super-Admin resolving a ProductCatalogEntryReport (T6).
+        // updated afterward by anyone. The only two valid outcomes: (a)
+        // no entry exists yet → create it, or (b) an entry already
+        // exists → do nothing.
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
           const barcodeTrim = u.barcode.trim();
           const existingCatalog = await tx.productCatalogEntry.findUnique({
@@ -415,8 +410,6 @@ export async function POST(req: Request) {
               },
             });
           }
-          // No `else` branch — an existing entry, owned by this tenant or
-          // any other, is never touched here under any condition.
         }
       }
 

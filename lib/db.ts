@@ -33,20 +33,10 @@
 //        Subscription rows).
 //
 //     5. Routes/functions that call a SHARED helper typed to accept exactly
-//        `Prisma.TransactionClient` (or the raw `PrismaClient`), where that
+//        `Prisma.TransactionClient` (like commitFifoAllocation) where that
 //        helper enforces tenant isolation MANUALLY via its own explicit
 //        `tenantId` filtering on every internal query — rather than relying
-//        on the getTenantDb() Client Extension. This category exists
-//        because such a helper is, by construction, shared across two kinds
-//        of call site that CANNOT both use the extension:
-//          (a) a read-only PREVIEW call made directly with the top-level
-//              client (e.g. app/api/inventory/fifo-preview/route.ts calling
-//              lib/inventory/fifo.ts's resolveFifoAllocation in its default
-//              PREVIEW mode), and
-//          (b) a COMMIT-mode call made from inside an interactive
-//              `prisma.$transaction(async (tx) => ...)` callback
-//              (e.g. app/api/sync/route.ts, T4c), where no getTenantDb()
-//              extension is ever applied to `tx` in the first place.
+//        on the getTenantDb() Client Extension.
 //        getTenantDb(tenantId)'s extended client/`$transaction` callback
 //        produces a type (`DynamicClientExtensionThis<...>`) that is NOT
 //        structurally assignable to `Prisma.TransactionClient` — passing it
@@ -58,11 +48,22 @@
 //          - app/api/sync/route.ts (T4c) — see that route's own header
 //            comment for the full reasoning and the manual-tenantId
 //            discipline it requires on every query/write in the file.
-//          - app/api/inventory/fifo-preview/route.ts — PREVIEW-mode calls
-//            into resolveFifoAllocation(); tenant isolation for that
-//            function comes entirely from its own internal `tenantId`
-//            filtering (see fifo.ts), never from which client type is
-//            passed to it.
+//          - lib/inventory/fifo.ts — commitFifoAllocation() accepts
+//            exactly Prisma.TransactionClient as its required first
+//            parameter, shared with app/api/sync/route.ts's (T4c) and
+//            T5's B2B-approval transaction context; tenant isolation for
+//            that function comes entirely from its own explicit
+//            `tenantId` filtering on every query, never from the client
+//            type it's handed. [CORRECTED] previewFifoAllocation() in the
+//            same file does NOT belong in this exception category — it
+//            takes no `tx` parameter at all and uses getTenantDb(tenantId)
+//            like any other ordinary read-only call site in the codebase.
+//            An earlier revision of this comment incorrectly stated that
+//            previewFifoAllocation() also read via the raw prisma client;
+//            that was true of an earlier draft of fifo.ts, before it was
+//            corrected to use getTenantDb() and this comment was not
+//            updated to match at the time. Only commitFifoAllocation()
+//            requires the raw/transaction client.
 //        A future call site belongs in this category ONLY if it shares a
 //        helper with an existing member above under the same structural
 //        constraint — not merely because getTenantDb() felt inconvenient.
