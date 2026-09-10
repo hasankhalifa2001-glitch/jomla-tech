@@ -58,7 +58,10 @@ datasource db {
 // (if applicable) a new Customer, each as its own top-level call inside one
 // $transaction, then a final top-level update on B2BOrderRequest itself
 // setting resultingInvoiceId/status — never a nested write chained off any
-// of those creates.
+// of those creates. [v3.9] T3c's stock reconciliation (the ProductBatch
+// quantity update plus the new StockAdjustment row) and batch deletion (the
+// ProductBatch delete plus the new BatchDeletionLog row) follow the exact
+// same template.
 //
 // PHASE 2 (hardening, before scaling past the pilot merchant set): real
 // Postgres RLS. Requires, per tenant-scoped table below:
@@ -80,7 +83,8 @@ datasource db {
 // write bypass attempts specifically, not just direct-query isolation.
 // [v3.7] B2BOrderRequest and B2BOrderRequestItem are tenant-scoped models
 // like any other and must be included in that T7 suite and in the Phase 2
-// RLS rollout — they carry no special exemption.
+// RLS rollout — they carry no special exemption. [v3.9] StockAdjustment and
+// BatchDeletionLog carry no special exemption either.
 // ============================================================================
 
 // ============================================================================
@@ -169,6 +173,24 @@ datasource db {
 //      the model below.
 //   3. B2B order approval's payment fields were previously undocumented. See
 //      the Invoice model note below for the resolved decision.
+// ============================================================================
+
+// ============================================================================
+// [v3.9] TWO GAPS CLOSED IN THIS REVISION (T3c — see the two new models
+// below for full reasoning):
+//   1. StockAdjustment — the sole append-only correction path for a
+//      ProductBatch's quantity once any invoice has ever drawn from it (or,
+//      in practice, once it exists at all — direct field writes to
+//      ProductBatch.quantity are never permitted anywhere in this system).
+//      Pairs with an atomic Prisma `increment` update on ProductBatch.
+//      quantity, never a read-then-write, to stay race-safe against T4c's
+//      sync engine and T5's B2B approval decrementing the same row
+//      concurrently.
+//   2. BatchDeletionLog — the audit trail for the one narrow case where a
+//      hard DELETE of a ProductBatch row is actually permitted: a batch
+//      with zero InvoiceItem references. Snapshot fields only, deliberately
+//      NOT live foreign keys back to the batch being deleted — see the
+//      model's own note for why a real FK here would be self-defeating.
 // ============================================================================
 
 enum UserRole {
@@ -301,6 +323,9 @@ model Tenant {
   // [v3.7] ADDITION — see B2BOrderRequest / CustomerMergeLog notes below.
   b2bOrderRequests  B2BOrderRequest[]
   customerMergeLogs CustomerMergeLog[]
+  // [v3.9] ADDITION — see StockAdjustment / BatchDeletionLog notes below.
+  stockAdjustments  StockAdjustment[]
+  batchDeletionLogs BatchDeletionLog[]
 
   // [v3.3, corrected] The tenant's single "Walk-in Cash Customer," seeded
   // at onboarding (T2). A plain 1:1 relation via a nullable scalar FK is
@@ -345,6 +370,14 @@ model User {
   // admin took a given action.
   reviewedB2BOrderRequests B2BOrderRequest[]
   customerMergeLogs        CustomerMergeLog[]
+
+  // [v3.9] ADDITION — the admin who performed a stock reconciliation
+  // (StockAdjustment.adjustedByUser) or a zero-history batch hard-delete
+  // (BatchDeletionLog.deletedByUser). Both Restrict, same reasoning as
+  // every other "who did this financial/audit action" relation above:
+  // deactivating a User must never silently erase which admin acted.
+  stockAdjustments  StockAdjustment[]
+  batchDeletionLogs BatchDeletionLog[]
 
   @@index([tenantId])
 }
@@ -479,6 +512,12 @@ model ProductBatch {
   // render the "يحتاج تسوية" badge/filter tab; a stored flag would risk
   // drifting from the true quantity if a later batch write forgot to
   // update it.
+  //
+  // [v3.9] Never edited by a direct field write once created (T3c). Every
+  // correction — positive or negative — flows either through a
+  // StockAdjustment row (atomic `increment` update, below) or, for a batch
+  // with zero sales history, a hard delete logged via BatchDeletionLog
+  // (below).
   quantity    Decimal   @db.Decimal(18, 4)
   expiryDate  DateTime?
   // resolveFifoAllocation's tie-break (when two batches share the same
@@ -510,10 +549,18 @@ model ProductBatch {
   // neither substitutes for the other.
   createdAt   DateTime  @default(now())
 
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  product      Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
-  unit         ProductUnit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product      Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit         ProductUnit       @relation(fields: [unitId], references: [id], onDelete: Cascade)
   invoiceItems InvoiceItem[]
+  // [v3.9] ADDITION — reverse side of StockAdjustment.batch. The full,
+  // append-only reconciliation history for this specific batch, shown as
+  // an expandable log in T3c's UI (transparency on why a quantity changed,
+  // rather than a silent flip). Restrict on the other side — see
+  // StockAdjustment's own note for why a batch carrying any adjustment
+  // history is not eligible for T3c's hard-delete path either, even with
+  // zero InvoiceItem references.
+  adjustments  StockAdjustment[]
 
   @@index([tenantId])
   @@index([productId])
@@ -1212,4 +1259,113 @@ model CustomerMergeLog {
 
   @@index([tenantId])
   @@index([survivingCustomerId])
+}
+
+// [v3.9] ADDITION (T3c). The sole append-only correction path for a
+// ProductBatch's quantity — see the "never edited by a direct field write"
+// note on ProductBatch.quantity above. Reconciling a negative or otherwise
+// incorrect quantity writes ONE StockAdjustment row here, and updates
+// ProductBatch.quantity as a direct consequence, both as separate top-level
+// calls inside the same $transaction (see the NESTED WRITES note at the top
+// of this file). The ProductBatch.quantity update MUST use Prisma's atomic
+// increment operator —
+//   prisma.productBatch.update({
+//     where: { id: batchId },
+//     data: { quantity: { increment: quantityDelta } },
+//   })
+// — never a read-then-write (read current quantity into application code,
+// compute the new value in JS, write it back). A read-then-write here races
+// against T4c's sync engine and T5's B2B approval, both of which can be
+// decrementing this exact row via commitFifoAllocation at the same moment a
+// reconciliation is applied. Because the increment itself is atomic at the
+// database level, no additional SELECT ... FOR UPDATE lock is required for
+// this specific write — Postgres's own row-level atomicity on a single
+// UPDATE ... SET quantity = quantity + $1 is sufficient. ADMIN-only.
+//
+// [v3.9] `batch` is deliberately Restrict, not Cascade, even though this
+// narrows the spec's literal "a batch with zero InvoiceItem references may
+// be hard-deleted" rule (T3c) to, in practice, "zero InvoiceItem references
+// AND zero StockAdjustment references." A batch that has been reconciled at
+// least once carries real audit history here; unlike BatchDeletionLog
+// (below), StockAdjustment has no snapshot mechanism to preserve that
+// history once its parent ProductBatch row is gone, so hard-deleting a
+// reconciled batch would silently discard part of the audit trail this
+// model exists to keep. This is the same "never silently lose audit
+// history" principle already applied throughout this schema (see the
+// Cascade/Restrict notes on Tenant/ProductUnit/Product above) — Restrict
+// simply extends it one step further than the spec's literal wording, on
+// the conservative side.
+model StockAdjustment {
+  id               String   @id @default(cuid())
+  tenantId         String
+  batchId          String
+  adjustedByUserId String
+  // Signed — positive to add stock back, negative to remove it. The
+  // resulting ProductBatch.quantity after this adjustment is always the
+  // live, authoritative figure (inclusive of every past adjustment); this
+  // row itself is never edited or reversed in place — a mistaken
+  // adjustment is corrected by writing a new, opposite-signed
+  // StockAdjustment row, never by mutating this one (append-only, same as
+  // Invoice/CustomerPayment elsewhere in this schema).
+  quantityDelta    Decimal  @db.Decimal(18, 4)
+  // Required free text — "why did this quantity change" must always be
+  // answerable from this table alone, never inferred from context.
+  reason           String
+  createdAt        DateTime @default(now())
+  // No updatedAt: append-only, same reasoning as Invoice/CustomerPayment.
+
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  batch          ProductBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  adjustedByUser User         @relation(fields: [adjustedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([batchId])
+}
+
+// [v3.9] ADDITION (T3c). The audit trail for the one narrow case where a
+// ProductBatch row may actually be hard-deleted: a mistaken batch entry
+// with zero InvoiceItem references (and, per the note on StockAdjustment
+// above, zero StockAdjustment references either). This is a true DELETE,
+// not a StockAdjustment — the batch never should have existed as entered
+// — restricted to ADMIN.
+model BatchDeletionLog {
+  id       String @id @default(cuid())
+  tenantId String
+
+  // [v3.9] Deliberately a PLAIN SCALAR FIELD, NOT a Prisma relation to
+  // ProductBatch. The row this references is deleted in the exact same
+  // operation that creates this log row. If this were a live FK instead:
+  //   - onDelete: Restrict would make the batch's own hard-delete
+  //     impossible outright — a direct contradiction, since this log's
+  //     entire purpose is to record that very deletion.
+  //   - onDelete: Cascade would mean deleting the ProductBatch row
+  //     cascades into deleting this audit row too, which defeats the
+  //     point of an audit log that must outlive the row it documents —
+  //     the log could then only ever prove a deletion happened while it
+  //     still existed, never afterward, which is precisely backwards.
+  // productId, unitId, batchNumber, and quantityAtDeletion below are the
+  // same kind of plain snapshot field, for the identical reason: they
+  // capture the batch's state at the moment of deletion, since the
+  // batch's own foreign keys and fields disappear along with it. Without
+  // these four snapshot fields, this log could only prove that SOME
+  // deletion happened, never what was actually lost.
+  batchId            String
+  productId          String
+  unitId             String
+  batchNumber        String
+  quantityAtDeletion Decimal  @db.Decimal(18, 4)
+  deletedByUserId    String
+  // Required free text, same reasoning as StockAdjustment.reason and
+  // Invoice.voidReason above.
+  reason             String
+  // The single timestamp for this append-only row — no separate
+  // deletedAt field, since createdAt IS the moment of deletion (the log
+  // row and the delete happen inside the same $transaction).
+  createdAt          DateTime @default(now())
+
+  tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deletedByUser User   @relation(fields: [deletedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([batchId])
 }

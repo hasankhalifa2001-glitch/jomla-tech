@@ -68,6 +68,18 @@
  * extension; a query missing tenant context throws rather than executing
  * unscoped." All three are now included below.
  *
+ * [FIX — this revision] The exact same silent gap existed for the two
+ * models schema.prisma's v3.9 revision added for T3c — StockAdjustment and
+ * BatchDeletionLog. Both carry a denormalized tenantId and a Tenant
+ * relation just like every other model in this set, and T1's Tenant
+ * Isolation acceptance criteria explicitly name them as carrying "no
+ * special exemption from anything." Before this fix, a call site writing
+ * `prisma.stockAdjustment.create(...)` or `prisma.batchDeletionLog.create(...)`
+ * through getTenantDb() would NOT have had tenantId auto-injected — the
+ * write would only be tenant-safe if every call site remembered to pass
+ * tenantId manually, which is precisely the failure mode this whole
+ * extension exists to eliminate. Both are now included below.
+ *
  * Deliberately NOT in this set (correct, not an oversight):
  *   - Tenant itself — it IS the scope, not scoped by it.
  *   - VerifiedRetailer, ProductCatalogEntry, ProductCatalogEntryReport —
@@ -89,10 +101,13 @@ export const TENANT_SCOPED_MODELS = new Set([
   "InvoiceItem",
   "CustomerPayment",
   "Subscription",
-  // [FIX] v3.7 additions — see the file-header note above.
+  // v3.7 additions — see the file-header note above.
   "B2BOrderRequest",
   "B2BOrderRequestItem",
   "CustomerMergeLog",
+  // [FIX] v3.9 additions (T3c) — see the file-header note above.
+  "StockAdjustment",
+  "BatchDeletionLog",
 ]);
 
 // Operations that read/target existing rows and must be scoped via `where`.

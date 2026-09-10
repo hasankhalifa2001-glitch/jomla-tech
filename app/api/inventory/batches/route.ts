@@ -15,11 +15,30 @@ import { z } from "zod";
 
 const STRICT_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
+// [FIX] Quantity is a Prisma Decimal(18,4) column — same precision class as
+// every monetary field in this schema. Accepting it as `z.number()` (a
+// native JS double) risks silent precision loss for large batch quantities
+// or fractional units (e.g. 99999999999.9999 cannot round-trip through an
+// IEEE-754 double without drift), which is exactly what this project's
+// decimal.js-everywhere rule (T1) exists to prevent. Prisma's Decimal
+// fields accept a numeric string directly and construct an exact
+// Prisma.Decimal from it with no float in between — so quantity is
+// received as a string and validated with a regex, never coerced to
+// `number` at any point in this handler.
+const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
+
 const createBatchSchema = z.object({
   productId: z.string().min(1, "معرف المنتج مطلوب"),
   unitId: z.string().min(1, "معرف الوحدة مطلوب"),
   batchNumber: z.string().min(1, "رقم الدفعة مطلوب"),
-  quantity: z.number().min(0, "الكمية يجب أن تكون صفر أو أكثر"),
+  // [FIX] was z.number().min(0) — see the note above the regex constant.
+  quantity: z
+    .string()
+    .min(1, "الكمية مطلوبة")
+    .regex(DECIMAL_STRING_REGEX, "صيغة الكمية غير صالحة (مثال: 10 أو 10.5).")
+    .refine((val) => Number(val) >= 0, {
+      message: "الكمية يجب أن تكون صفر أو أكثر عند إنشاء دفعة جديدة.",
+    }),
   expiryDate: z
     .string()
     .optional()
@@ -83,6 +102,9 @@ export async function POST(req: Request) {
         productId,
         unitId,
         batchNumber,
+        // [FIX] `quantity` is the validated decimal-shaped string itself —
+        // Prisma parses it directly into an exact Decimal(18,4). No
+        // `Number(...)` conversion happens anywhere on this write path.
         quantity,
         expiryDate: expiryDate ? new Date(expiryDate) : null,
       },
@@ -91,6 +113,11 @@ export async function POST(req: Request) {
       },
     });
 
+    // NOTE: converting Decimal -> Number below is fine here because this is
+    // purely a display-shape transform on the JSON response being sent back
+    // to the browser, not a value being written to the database or used in
+    // any further calculation — the authoritative Decimal already landed
+    // in Postgres via the create() call above.
     const responseBatch = {
       ...batch,
       quantity: Number(batch.quantity),
