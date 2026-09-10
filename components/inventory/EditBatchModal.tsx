@@ -36,13 +36,23 @@ export function EditBatchModal({
   const [expiryDate, setExpiryDate] = useState<string>("");
   const [submitting, setSubmitting] = useState<boolean>(false);
 
-  // Track previous props to sync state during render without useEffect
+  // [FIX] Track previous props by batch.id, not by the batch object
+  // reference. Comparing `batch !== prevBatch` re-triggers this reset on
+  // ANY new object reference for the same batch — including one the
+  // parent creates on a routine re-render (e.g. a poll, or unrelated
+  // state changing) while this modal is open. That would silently wipe
+  // out whatever the user is actively typing into batchNumber/expiryDate
+  // mid-edit — a real data-loss bug, not just a wasted render. Keying on
+  // batch?.id instead means this only resets when the modal is opened for
+  // a genuinely different batch (or freshly reopened), matching the same
+  // fix already applied to ReconcileBatchModal.tsx for the same reason.
   const [prevOpen, setPrevOpen] = useState(open);
-  const [prevBatch, setPrevBatch] = useState(batch);
+  const [prevBatchId, setPrevBatchId] = useState<string | null>(batch?.id ?? null);
+  const currentBatchId = batch?.id ?? null;
 
-  if (open !== prevOpen || batch !== prevBatch) {
+  if (open !== prevOpen || currentBatchId !== prevBatchId) {
     setPrevOpen(open);
-    setPrevBatch(batch);
+    setPrevBatchId(currentBatchId);
     if (open && batch) {
       setBatchNumber(batch.batchNumber || "");
       if (batch.expiryDate) {

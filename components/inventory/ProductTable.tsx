@@ -436,7 +436,18 @@ function BatchCard({
         </div>
 
         <div className="flex items-center gap-1">
-          {onReconcileBatch && (
+          {/* [FIX] Wrapped in `isAdmin` — stock reconciliation is
+              ADMIN-only per T2b's Role Capability Matrix ("stock
+              reconciliation (StockAdjustment): not permitted [CASHIER] /
+              permitted [ADMIN]"). This button previously rendered for
+              any session with an `onReconcileBatch` handler regardless of
+              role, unlike its sibling edit/delete buttons right next to
+              it, which were already correctly `isAdmin`-gated. The
+              server-side route still rejects a CASHIER's actual request
+              either way — this fix restores the same UX courtesy of
+              hiding an action the session can't perform, consistent with
+              every other ADMIN-only button on this card. */}
+          {isAdmin && onReconcileBatch && (
             <Button
               size="sm"
               variant="outline"

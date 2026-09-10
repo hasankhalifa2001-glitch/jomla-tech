@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import {
   Dialog,
   DialogContent,
@@ -42,23 +42,12 @@ export function ReconcileBatchModal({
   const [liveQuantity, setLiveQuantity] = useState<number>(batch?.quantity ?? 0);
   const [fetchingLive, setFetchingLive] = useState<boolean>(false);
 
-  // [FIX] Previously this synchronous reset (liveQuantity, deltaInput,
-  // targetInput, reason, mode) lived inside a `useEffect` keyed on
-  // [open, batch, fetchLiveBatch] — calling setState synchronously inside
-  // an effect body to sync internal state FROM props is exactly the
-  // anti-pattern React's own docs warn against (see
-  // https://react.dev/learn/you-might-not-need-an-effect,
-  // "Adjusting some state when a prop changes"), and is what the dev
-  // overlay error was flagging. It also forced an extra, avoidable render
-  // pass every time this modal opened (mount with stale/default state ->
-  // effect runs -> second render with the real batch's data).
-  //
-  // Fix follows the same pattern already applied to EditProductModal.tsx:
-  // adjust state DURING RENDER by comparing against a stored "last
-  // initialized for" key, instead of inside an effect. React explicitly
-  // supports this — it re-renders with the corrected state before
-  // committing to the DOM, so the user never sees a stale intermediate
-  // frame.
+  // Adjusting state FROM PROPS during render (React's own recommended
+  // pattern — see https://react.dev/learn/you-might-not-need-an-effect,
+  // "Adjusting some state when a prop changes") instead of inside a
+  // useEffect. Keyed on batch.id, not the batch object reference, so this
+  // only re-runs when the modal is opened for a genuinely different batch
+  // (or reopened), never on every parent re-render.
   const [initializedFor, setInitializedFor] = useState<string | null>(null);
   const currentInitKey = open && batch ? batch.id : null;
 
@@ -74,48 +63,25 @@ export function ReconcileBatchModal({
     }
   }
 
-  const fetchLiveBatch = useCallback(async (batchId: string) => {
-    setFetchingLive(true);
-    try {
-      const res = await fetch(`/api/inventory/batches/${batchId}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.batch) {
-          setLiveQuantity(data.batch.quantity);
-        }
-      }
-    } catch {
-      // Fall back to batch.quantity prop
-    } finally {
-      setFetchingLive(false);
-    }
-  }, []);
-
-  // [FIX] This useEffect is now the correct, narrow use of an effect —
-  // fetching data over the network is one of the two documented
-  // legitimate reasons to use an effect ("Fetching data" per React's own
-  // guidance), unlike the synchronous prop-to-state sync that was removed
-  // above. It only fires the network request; it no longer touches any of
-  // the synchronous form-reset state, which is now handled entirely in
-  // the render body above.
-  // [FIX] Replaces the previous fetchLiveBatch + bare useEffect pair.
+  // [FIX] The previous version kept a separate `fetchLiveBatch` (defined
+  // via useCallback) that had become dead code once this effect below was
+  // rewritten to build its own fetch inline — nothing called it anymore.
+  // Removed entirely rather than left unused.
   //
-  // The lint warning was pointing at a real bug, not just noise: calling
-  // `fetchLiveBatch(batch.id)` directly inside the effect with no
-  // cancellation guard means a STALE response can overwrite fresher state.
-  // Scenario: user opens the modal for batch A (fetch A starts), quickly
-  // closes and reopens it for batch B (effect re-runs, fetch B starts). If
-  // fetch A's response arrives AFTER fetch B's (ordinary network jitter),
-  // `setLiveQuantity` from the stale batch-A response silently overwrites
-  // the correct batch-B quantity already on screen.
+  // [FIX] Dependency array narrowed from `[open, batch]` to
+  // `[open, batch?.id]`. Depending on the whole `batch` object means this
+  // effect re-fires on every parent re-render that passes a new object
+  // reference for the same batch (common when the parent doesn't memoize
+  // it), triggering a redundant network request and a flash of
+  // `fetchingLive` each time. Keying on `batch?.id` matches the render-time
+  // reset above and only re-fires when the modal opens for an actually
+  // different batch. `batch` itself is still used inside the effect body
+  // (for `batch.id` in the fetch URL) via closure — safe because the
+  // early-return guard narrows it to non-null for the rest of that run.
   //
-  // The fix follows React's own documented pattern for effects that fetch
-  // data (https://react.dev/learn/you-might-not-need-an-effect#fetching-data):
-  // a cleanup function that flags the previous effect run's result as
-  // stale, checked before every setState call. An AbortController is added
-  // on top so the underlying HTTP request is actually cancelled too, not
-  // just its result ignored — avoiding wasted network/server work whenever
-  // the modal is closed/reopened quickly.
+  // The cancellation guard (`ignore` flag + AbortController) is unchanged:
+  // it prevents a stale, slow response from a previous batch overwriting
+  // the correct quantity already on screen after a quick close/reopen.
   useEffect(() => {
     if (!(open && batch)) return;
 
@@ -130,18 +96,11 @@ export function ReconcileBatchModal({
         });
         if (res.ok) {
           const data = await res.json();
-          // Only apply the result if this effect run is still the current
-          // one — i.e. `batch`/`open` haven't changed since this fetch
-          // started.
           if (!ignore && data.batch) {
             setLiveQuantity(data.batch.quantity);
           }
         }
       } catch (err) {
-        // AbortError is expected whenever cleanup fires mid-request (modal
-        // closed/reopened quickly) — not a real failure, so it's silently
-        // swallowed here. Any other error falls back to the batch.quantity
-        // prop, same as before.
         if (!ignore && (err as Error)?.name !== "AbortError") {
           // Intentionally silent fallback — see original behavior.
         }
@@ -154,7 +113,8 @@ export function ReconcileBatchModal({
       ignore = true;
       controller.abort();
     };
-  }, [open, batch]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, batch?.id]);
 
   if (!batch) return null;
 

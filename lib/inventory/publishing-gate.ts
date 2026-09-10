@@ -24,12 +24,32 @@
  *       admin request to set isPublic: true
  * It must NOT be used to silently flip isPublic to false from any
  * isActive-toggle code path.
+ *
+ * [FIX] priceRetail's accepted type now includes `string`, matching how
+ * this module is actually called. products/route.ts validates priceRetail
+ * through `nonNegativeDecimalString(...)` (a Zod-checked decimal STRING,
+ * per T1's decimal.js-everywhere rule — Decimal(18,4) columns are never
+ * passed through a native JS number), so `validation.data.units[i].priceRetail`
+ * is typed `string | null | undefined` at the call site in
+ * checkProductPublishable({ isActive: true, units }). The previous type
+ * signature (`number | { toNumber?: () => number } | null`) did not
+ * include `string` at all, so that real call site could not type-check
+ * correctly against this function's generic constraint — the runtime
+ * logic already handled a string correctly via `Number(unit.priceRetail)`,
+ * but the type signature was silently lying about what shapes this
+ * function actually accepts and was exercised with in practice. This is
+ * also why a second caller — e.g. the toggle-public route, or a future
+ * caller reading priceRetail directly off a fetched Prisma.ProductUnit row
+ * (a real `Prisma.Decimal` instance, not a string) — is still supported by
+ * the `.toNumber()` branch below.
  */
+
+type PriceRetailValue = number | string | { toNumber?: () => number } | null | undefined;
 
 export function isUnitPublishable(unit: {
   isActive?: boolean;
   imageUrl?: string | null;
-  priceRetail?: number | { toNumber?: () => number } | null;
+  priceRetail?: PriceRetailValue;
 }): boolean {
   // isActive defaults to true at the schema level (ProductUnit.isActive
   // @default(true)) — treat undefined/null as active, only an explicit
@@ -40,8 +60,11 @@ export function isUnitPublishable(unit: {
   if (unit.priceRetail === null || unit.priceRetail === undefined) return false;
 
   const price =
-    typeof unit.priceRetail === "object" && unit.priceRetail !== null && "toNumber" in unit.priceRetail
-      ? (unit.priceRetail as { toNumber: () => number }).toNumber()
+    typeof unit.priceRetail === "object" &&
+      unit.priceRetail !== null &&
+      "toNumber" in unit.priceRetail &&
+      typeof unit.priceRetail.toNumber === "function"
+      ? unit.priceRetail.toNumber()
       : Number(unit.priceRetail);
 
   return !Number.isNaN(price) && price > 0;
@@ -51,7 +74,7 @@ export function checkProductPublishable<
   T extends {
     isActive?: boolean;
     imageUrl?: string | null;
-    priceRetail?: number | { toNumber?: () => number } | null;
+    priceRetail?: PriceRetailValue;
   }
 >(product: {
   isActive: boolean;

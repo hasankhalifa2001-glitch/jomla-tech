@@ -524,13 +524,23 @@ export function InventoryClient() {
         </>
       )}
 
-      <ReconcileBatchModal
-        open={reconcileOpen}
-        onOpenChange={setReconcileOpen}
-        batch={reconcileBatch}
-        productName={reconcileProductName}
-        onSuccess={fetchProducts}
-      />
+      {/* [FIX] Wrapped in `isAdmin`, matching every other ADMIN-only
+          action modal in this file (AddProductModal, EditProductModal,
+          CsvImportModal, EditBatchModal, DeleteBatchModal). Stock
+          reconciliation is ADMIN-only per T2b's Role Capability Matrix —
+          this modal was previously rendered unconditionally, the only
+          ADMIN-only action in this file not hidden from a CASHIER session
+          as a UX courtesy (the server-side route still enforces the real
+          boundary either way). */}
+      {isAdmin && (
+        <ReconcileBatchModal
+          open={reconcileOpen}
+          onOpenChange={setReconcileOpen}
+          batch={reconcileBatch}
+          productName={reconcileProductName}
+          onSuccess={fetchProducts}
+        />
+      )}
 
       <BarcodeScannerModal
         open={barcodeScannerOpen}
