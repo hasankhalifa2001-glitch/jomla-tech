@@ -3,10 +3,31 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
-import { Layers, ChevronDown, ChevronUp, Package, RefreshCw, Clock } from "lucide-react";
+import {
+  Layers,
+  ChevronDown,
+  ChevronUp,
+  Package,
+  RefreshCw,
+  Clock,
+  Scale,
+  Edit2,
+  Trash2,
+  History,
+  AlertTriangle,
+} from "lucide-react";
+import { useState } from "react";
 import { ExpiryBadge } from "@/components/inventory/ExpiryBadge";
 import { NegativeStockBadge } from "@/components/inventory/NegativeStockBadge";
 import { formatMoney } from "@/lib/utils/money";
+
+export interface BatchAdjustmentItem {
+  id: string;
+  quantityDelta: number;
+  reason: string;
+  adjustedByUserName: string;
+  createdAt: string;
+}
 
 export interface BatchItem {
   id: string;
@@ -18,6 +39,11 @@ export interface BatchItem {
   daysToExpiry: number | null;
   expiryStatus: "RED" | "YELLOW" | "NORMAL";
   isNegative?: boolean;
+  adjustments?: BatchAdjustmentItem[];
+  _count?: {
+    invoiceItems: number;
+    adjustments: number;
+  };
 }
 
 export interface UnitItem {
@@ -63,6 +89,9 @@ interface ProductTableProps {
   onAddBatch: (productId: string) => void;
   onFifoPreview: (productId: string) => void;
   onEditProduct?: (product: ProductItem) => void;
+  onReconcileBatch?: (product: ProductItem, batch: BatchItem) => void;
+  onEditBatch?: (product: ProductItem, batch: BatchItem) => void;
+  onDeleteBatch?: (product: ProductItem, batch: BatchItem) => void;
   isAdmin: boolean;
 }
 
@@ -312,6 +341,192 @@ function ActionButtons({
   );
 }
 
+function BatchCard({
+  product,
+  batch,
+  isAdmin,
+  isLogExpanded,
+  onToggleLog,
+  onReconcileBatch,
+  onEditBatch,
+  onDeleteBatch,
+}: {
+  product: ProductItem;
+  batch: BatchItem;
+  isAdmin: boolean;
+  isLogExpanded: boolean;
+  onToggleLog: () => void;
+  onReconcileBatch?: (product: ProductItem, batch: BatchItem) => void;
+  onEditBatch?: (product: ProductItem, batch: BatchItem) => void;
+  onDeleteBatch?: (product: ProductItem, batch: BatchItem) => void;
+}) {
+  const hasSales = (batch._count?.invoiceItems || 0) > 0;
+  const hasAdjustments = (batch._count?.adjustments || 0) > 0;
+  const canDelete = !hasSales && !hasAdjustments && isAdmin;
+  const deleteDisabledReason = hasSales
+    ? "لا يمكن حذف الدفعة لوجود مبيعات مسجلة عليها"
+    : hasAdjustments
+    ? "لا يمكن حذف دفعة تم إجراء تسويات سابقة عليها"
+    : !isAdmin
+    ? "حذف الدفعات متاح لمدير المتجر فقط"
+    : undefined;
+
+  const adjustmentsCount = batch.adjustments?.length || 0;
+
+  return (
+    <div className="rounded-lg border border-zinc-200 bg-white p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900 space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="font-semibold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+            <span>دفعة #{batch.batchNumber}</span>
+            {adjustmentsCount > 0 && (
+              <Badge
+                variant="outline"
+                className="border-purple-200 bg-purple-50 text-[10px] text-purple-700 dark:border-purple-900 dark:bg-purple-950/30 dark:text-purple-300"
+              >
+                خضعت لتسوية ({adjustmentsCount})
+              </Badge>
+            )}
+          </div>
+          <div className="mt-0.5 text-zinc-500">
+            الكمية الحالية:{" "}
+            <span
+              className={`font-bold ${
+                batch.quantity < 0
+                  ? "text-purple-700 dark:text-purple-400 font-mono"
+                  : "text-zinc-800 dark:text-zinc-200"
+              }`}
+            >
+              {batch.quantity}
+            </span>{" "}
+            {batch.unitName}
+          </div>
+        </div>
+
+        <div className="flex flex-col items-end gap-1 text-left">
+          <ExpiryBadge
+            daysToExpiry={batch.daysToExpiry}
+            expiryDate={batch.expiryDate}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+        <div className="flex items-center gap-1.5">
+          {adjustmentsCount > 0 ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onToggleLog}
+              className="h-6 gap-1 px-1.5 text-[11px] text-purple-700 hover:bg-purple-50 dark:text-purple-400 dark:hover:bg-purple-950/30"
+            >
+              <History className="h-3 w-3" />
+              <span>سجل التسويات ({adjustmentsCount})</span>
+              {isLogExpanded ? (
+                <ChevronUp className="h-3 w-3" />
+              ) : (
+                <ChevronDown className="h-3 w-3" />
+              )}
+            </Button>
+          ) : (
+            <span className="text-[10px] text-zinc-400">لا توجد تسويات سابقة</span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1">
+          {onReconcileBatch && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onReconcileBatch(product, batch)}
+              title="إجراء تسوية مخزنية (Stock Reconciliation)"
+              className="h-6 gap-1 border-purple-200 px-2 text-[10px] text-purple-700 hover:bg-purple-50 dark:border-purple-800 dark:text-purple-300 dark:hover:bg-purple-950/30"
+            >
+              <Scale className="h-3 w-3" />
+              تسوية
+            </Button>
+          )}
+
+          {isAdmin && onEditBatch && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onEditBatch(product, batch)}
+              title="تعديل رقم الدفعة وتاريخ الصلاحية"
+              className="h-6 gap-1 px-1.5 text-[10px] text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+            >
+              <Edit2 className="h-3 w-3" />
+              تعديل
+            </Button>
+          )}
+
+          {isAdmin && onDeleteBatch && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => canDelete && onDeleteBatch(product, batch)}
+              disabled={!canDelete}
+              title={deleteDisabledReason || "حذف الدفعة المدخلة بالخطأ"}
+              className={`h-6 gap-1 px-1.5 text-[10px] ${
+                canDelete
+                  ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                  : "cursor-not-allowed text-zinc-300 dark:text-zinc-600"
+              }`}
+            >
+              <Trash2 className="h-3 w-3" />
+              حذف
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {isLogExpanded && batch.adjustments && batch.adjustments.length > 0 && (
+        <div className="rounded-md border border-purple-100 bg-purple-50/40 p-2 text-[11px] dark:border-purple-900/60 dark:bg-purple-950/20 space-y-1.5 animate-in fade-in-50">
+          <div className="font-semibold text-purple-900 dark:text-purple-200 flex items-center gap-1">
+            <History className="h-3 w-3 text-purple-600" />
+            <span>تفاصيل سجل تسويات الدفعة:</span>
+          </div>
+          <div className="space-y-1 divide-y divide-purple-100/60 dark:divide-purple-900/40">
+            {batch.adjustments.map((adj) => (
+              <div
+                key={adj.id}
+                className="flex flex-wrap items-center justify-between gap-2 pt-1.5 first:pt-0"
+              >
+                <div>
+                  <span className="font-medium text-zinc-800 dark:text-zinc-200">
+                    {adj.reason}
+                  </span>
+                  <div className="text-[10px] text-zinc-400">
+                    بواسطة: {adj.adjustedByUserName} •{" "}
+                    {new Date(adj.createdAt).toLocaleString("ar-SY", {
+                      dateStyle: "short",
+                      timeStyle: "short",
+                    })}
+                  </div>
+                </div>
+                <div
+                  className={`font-mono font-bold ${
+                    adj.quantityDelta > 0
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-red-600 dark:text-red-400"
+                  }`}
+                >
+                  {adj.quantityDelta > 0 ? `+${adj.quantityDelta}` : adj.quantityDelta}{" "}
+                  {batch.unitName}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+            status={batch.expiryStatus}
+          />
+          {batch.quantity < 0 && (
+            <NegativeStockBadge quantity={batch.quantity} unitName={batch.unitName} />
+          )}
+        </div>
+      </div>
+
 // ---------------------------------------------------------------------------
 
 export function ProductTable({
@@ -327,8 +542,21 @@ export function ProductTable({
   onAddBatch,
   onFifoPreview,
   onEditProduct,
+  onReconcileBatch,
+  onEditBatch,
+  onDeleteBatch,
   isAdmin,
 }: ProductTableProps) {
+  const [expandedBatchLogIds, setExpandedBatchLogIds] = useState<Set<string>>(new Set());
+
+  const toggleBatchLogExpand = (batchId: string) => {
+    setExpandedBatchLogIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(batchId)) next.delete(batchId);
+      else next.add(batchId);
+      return next;
+    });
+  };
   if (loading) {
     return (
       <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-12 text-center text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">
@@ -514,32 +742,17 @@ export function ProductTable({
                   ) : (
                     <div className="space-y-2">
                       {product.batches.map((batch) => (
-                        <div
+                        <BatchCard
                           key={batch.id}
-                          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-200 bg-white p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900"
-                        >
-                          <div>
-                            <div className="font-semibold text-zinc-900 dark:text-zinc-100">
-                              دفعة #{batch.batchNumber}
-                            </div>
-                            <div className="mt-0.5 text-zinc-500">
-                              الكمية:{" "}
-                              <span className="font-bold text-zinc-800 dark:text-zinc-200">{batch.quantity}</span>{" "}
-                              {batch.unitName}
-                            </div>
-                          </div>
-
-                          <div className="flex flex-col items-end gap-1 text-left">
-                            <ExpiryBadge
-                              daysToExpiry={batch.daysToExpiry}
-                              expiryDate={batch.expiryDate}
-                              status={batch.expiryStatus}
-                            />
-                            {batch.quantity < 0 && (
-                              <NegativeStockBadge quantity={batch.quantity} unitName={batch.unitName} />
-                            )}
-                          </div>
-                        </div>
+                          product={product}
+                          batch={batch}
+                          isAdmin={isAdmin}
+                          isLogExpanded={expandedBatchLogIds.has(batch.id)}
+                          onToggleLog={() => toggleBatchLogExpand(batch.id)}
+                          onReconcileBatch={onReconcileBatch}
+                          onEditBatch={onEditBatch}
+                          onDeleteBatch={onDeleteBatch}
+                        />
                       ))}
                     </div>
                   )}

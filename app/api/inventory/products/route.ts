@@ -16,13 +16,39 @@ import { validatePackagingUnits } from "@/lib/inventory/conversions";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
+// [FIX] Every field below backed by a Prisma Decimal(18,4) column
+// (conversionFactor, priceWholesale, priceRetail, and initialBatch.quantity
+// further down) is now accepted as a validated decimal STRING, never a
+// native JS `number`. Same reasoning as the standalone batch-creation
+// route's `quantity` fix: a JS double cannot exactly represent every value
+// a Decimal(18,4) column can hold, and this project's decimal.js-everywhere
+// rule (T1) exists precisely to keep numbers like these from ever passing
+// through an IEEE-754 float on their way into a Decimal column. Prisma
+// accepts a numeric string directly for a Decimal field and constructs an
+// exact Prisma.Decimal from it with no float in between.
+const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
+
+const positiveDecimalString = (message: string) =>
+  z
+    .string()
+    .regex(DECIMAL_STRING_REGEX, message)
+    .refine((val) => Number(val) > 0, { message });
+
+const nonNegativeDecimalString = (message: string) =>
+  z
+    .string()
+    .regex(DECIMAL_STRING_REGEX, message)
+    .refine((val) => Number(val) >= 0, { message });
+
 const unitSchema = z
   .object({
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-    conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
+    conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
-    priceWholesale: z.number().positive("سعر الجملة يجب أن يكون أكبر من صفر"),
-    priceRetail: z.number().min(0).optional().nullable(),
+    priceWholesale: positiveDecimalString("سعر الجملة يجب أن يكون أكبر من صفر"),
+    priceRetail: nonNegativeDecimalString("سعر التجزئة يجب أن يكون صفراً أو أكثر")
+      .optional()
+      .nullable(),
     barcode: z.string().optional().nullable(),
     barcodeSource: z.enum(["GS1", "INTERNAL"]).optional().nullable(),
     imageUrl: z.string().optional().nullable(),
@@ -50,7 +76,8 @@ const createProductSchema = z.object({
     .object({
       unitIndex: z.number().default(0),
       batchNumber: z.string().min(1, "رقم الدفعة مطلوب"),
-      quantity: z.number(),
+      // [FIX] was z.number() — see the file-header note.
+      quantity: nonNegativeDecimalString("الكمية يجب أن تكون صفراً أو أكثر"),
       expiryDate: z.string().optional().nullable(),
     })
     .optional()
@@ -70,6 +97,18 @@ type ProductUnitRow = {
   isActive: boolean;
 };
 
+type ProductAdjustmentRow = {
+  id: string;
+  quantityDelta: Prisma.Decimal | number;
+  reason: string;
+  createdAt: Date;
+  adjustedByUser?: {
+    id: string;
+    name: string | null;
+    email: string | null;
+  } | null;
+};
+
 type ProductBatchRow = {
   id: string;
   batchNumber: string;
@@ -77,6 +116,11 @@ type ProductBatchRow = {
   unitId: string;
   expiryDate: Date | null;
   unit: { unitName: string; conversionFactor: Prisma.Decimal | number } | null;
+  adjustments?: ProductAdjustmentRow[];
+  _count?: {
+    invoiceItems: number;
+    adjustments: number;
+  };
 };
 
 type ProductRow = {
@@ -110,11 +154,13 @@ export async function GET(req: Request) {
     } else if (status === "inactive" || filter === "inactive_products") {
       whereClause.isActive = false;
     }
-    // NOTE (flagged, unresolved): unlike an earlier version of this route,
+    // NOTE (still flagged, unresolved — left as-is pending a product
+    // decision, not a bug fix): unlike an earlier version of this route,
     // an omitted `status` param no longer defaults to "active" — a bare
-    // GET now returns products regardless of isActive. Left exactly as
-    // received pending confirmation of whether this was an intentional
-    // behavior change.
+    // GET now returns products regardless of isActive. Whether the
+    // inventory screen's default (no filter selected) should show active
+    // products only or everything is a product decision, not something
+    // this pass changes unilaterally.
 
     const products = (await db.product.findMany({
       where: whereClause,
@@ -123,6 +169,26 @@ export async function GET(req: Request) {
         batches: {
           include: {
             unit: true,
+            adjustments: {
+              include: {
+                adjustedByUser: {
+                  select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                  },
+                },
+              },
+              orderBy: {
+                createdAt: "desc",
+              },
+            },
+            _count: {
+              select: {
+                invoiceItems: true,
+                adjustments: true,
+              },
+            },
           },
         },
       },
@@ -179,6 +245,18 @@ export async function GET(req: Request) {
           daysToExpiry,
           expiryStatus,
           isNegative: batchQty < 0,
+          adjustments: (batch.adjustments || []).map((adj) => ({
+            id: adj.id,
+            quantityDelta: Number(adj.quantityDelta),
+            reason: adj.reason,
+            adjustedByUserName:
+              adj.adjustedByUser?.name || adj.adjustedByUser?.email || "مستخدم",
+            createdAt: adj.createdAt,
+          })),
+          _count: {
+            invoiceItems: batch._count?.invoiceItems || 0,
+            adjustments: batch._count?.adjustments || 0,
+          },
         };
       });
 
@@ -292,12 +370,6 @@ export async function POST(req: Request) {
 
     const { name, category, isPublic, units, initialBatch } = validation.data;
 
-    // [FIX — new] Previously missing entirely from this route: PATCH
-    // enforced "exactly one base unit (factor === 1)" and "no duplicate
-    // conversion factors" but POST (product creation) did not, so a brand
-    // new product could be created without a base unit or with duplicate
-    // factors, only to be rejected the very first time someone tried to
-    // edit it. Delegates to the same shared implementation PATCH now uses.
     const packagingCheck = validatePackagingUnits(units);
     if (!packagingCheck.valid) {
       return NextResponse.json(
@@ -377,6 +449,10 @@ export async function POST(req: Request) {
             tenantId,
             productId: product.id,
             unitName: u.unitName,
+            // [FIX] These four fields are now validated decimal strings
+            // (see unitSchema above) — Prisma parses each directly into an
+            // exact Decimal(18,4). No `Number(...)` conversion happens
+            // anywhere on this write path.
             conversionFactor: u.conversionFactor,
             pricingCurrency: u.pricingCurrency || "SYP",
             priceWholesale: u.priceWholesale,
@@ -390,16 +466,31 @@ export async function POST(req: Request) {
         unitIds.push(createdUnit.id);
         createdUnits.push(createdUnit as unknown as ProductUnitRow);
 
-        // ProductCatalogEntry is write-once at creation and MUST NEVER be
-        // updated afterward by anyone. The only two valid outcomes: (a)
-        // no entry exists yet → create it, or (b) an entry already
-        // exists → do nothing.
+        // [FIX — closes a real cross-tenant race condition] ProductCatalogEntry
+        // is a platform-wide (not tenant-scoped) table, and two entirely
+        // unrelated tenants creating a product under the same real GS1
+        // barcode at close to the same moment is an explicitly legitimate
+        // case per schema.prisma's own note on ProductUnit.barcode
+        // ("two different tenants can legitimately sell the same imported
+        // item under the same barcode"). The previous
+        // findUnique-then-create pattern had a TOCTOU race: both
+        // transactions could see `existingCatalog === null`, then both
+        // attempt `create`, and the loser would hit the table's `@unique`
+        // constraint on `barcode` with a raw Prisma P2002 — which the
+        // outer catch block below was written to interpret as "this
+        // TENANT tried to reuse a barcode," failing the entire product
+        // creation for a tenant who did nothing wrong. A P2002 on THIS
+        // specific insert means only "another tenant's request won the
+        // race to create the shared catalog convenience entry a moment
+        // earlier" — an entirely expected, harmless outcome per this
+        // table's own "never read again after creation, one-time
+        // convenience" design (see schema.prisma's ProductCatalogEntry
+        // note) — never a real conflict for the current tenant's own
+        // product. It is caught and swallowed right here, not allowed to
+        // propagate to the transaction's outer catch.
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
           const barcodeTrim = u.barcode.trim();
-          const existingCatalog = await tx.productCatalogEntry.findUnique({
-            where: { barcode: barcodeTrim },
-          });
-          if (!existingCatalog) {
+          try {
             await tx.productCatalogEntry.create({
               data: {
                 barcode: barcodeTrim,
@@ -409,6 +500,20 @@ export async function POST(req: Request) {
                 addedByTenantId: tenantId,
               },
             });
+          } catch (catalogError) {
+            const isBenignRace =
+              catalogError instanceof Prisma.PrismaClientKnownRequestError &&
+              catalogError.code === "P2002";
+            if (!isBenignRace) {
+              // Anything other than the specific race above is a real,
+              // unexpected failure — let it propagate and abort the
+              // transaction normally.
+              throw catalogError;
+            }
+            // Otherwise: another tenant's request already created this
+            // exact catalog entry a moment earlier. Nothing to do — this
+            // tenant's own Product/ProductUnit creation proceeds
+            // completely unaffected.
           }
         }
       }
@@ -421,6 +526,7 @@ export async function POST(req: Request) {
             productId: product.id,
             unitId: selectedUnitId,
             batchNumber: initialBatch.batchNumber,
+            // [FIX] validated decimal string — see createProductSchema above.
             quantity: initialBatch.quantity,
             expiryDate: initialBatch.expiryDate ? new Date(initialBatch.expiryDate) : null,
           },
@@ -453,6 +559,11 @@ export async function POST(req: Request) {
       return subscriptionLockedResponse(error);
     }
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      // With the ProductCatalogEntry race now caught and swallowed inside
+      // the transaction above, a P2002 reaching this outer catch can only
+      // come from this tenant's OWN unique constraints (e.g.
+      // ProductUnit's (tenantId, barcode) unique) — the case this message
+      // was originally written for.
       return NextResponse.json(
         { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لمنتج آخر." },
         { status: 400 }

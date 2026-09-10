@@ -14,6 +14,7 @@ import {
   Globe,
   Layers,
   AlertCircle,
+  Camera,
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -22,7 +23,11 @@ import { EditProductModal } from "@/components/inventory/EditProductModal";
 import { AddBatchModal } from "@/components/inventory/AddBatchModal";
 import { CsvImportModal } from "@/components/inventory/CsvImportModal";
 import { FifoPreviewModal } from "@/components/inventory/FifoPreviewModal";
-import { ProductTable, ProductItem } from "@/components/inventory/ProductTable";
+import { ReconcileBatchModal } from "@/components/inventory/ReconcileBatchModal";
+import { DeleteBatchModal } from "@/components/inventory/DeleteBatchModal";
+import { EditBatchModal } from "@/components/inventory/EditBatchModal";
+import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
+import { ProductTable, ProductItem, BatchItem } from "@/components/inventory/ProductTable";
 
 // [FIX] Added "needs_reconciliation" — the backend (/api/inventory/products
 // GET) already supports this filter value (see route.ts's
@@ -131,6 +136,20 @@ export function InventoryClient() {
   const [csvImportOpen, setCsvImportOpen] = useState(false);
   const [fifoPreviewOpen, setFifoPreviewOpen] = useState(false);
   const [preselectedProductId, setPreselectedProductId] = useState<string | undefined>(undefined);
+
+  const [reconcileOpen, setReconcileOpen] = useState(false);
+  const [reconcileBatch, setReconcileBatch] = useState<BatchItem | null>(null);
+  const [reconcileProductName, setReconcileProductName] = useState<string>("");
+
+  const [editBatchOpen, setEditBatchOpen] = useState(false);
+  const [editingBatch, setEditingBatch] = useState<BatchItem | null>(null);
+  const [editingBatchProductName, setEditingBatchProductName] = useState<string>("");
+
+  const [deleteBatchOpen, setDeleteBatchOpen] = useState(false);
+  const [deletingBatch, setDeletingBatch] = useState<BatchItem | null>(null);
+  const [deletingBatchProductName, setDeletingBatchProductName] = useState<string>("");
+
+  const [barcodeScannerOpen, setBarcodeScannerOpen] = useState(false);
 
   const handleToggleProductActive = async (productId: string) => {
     setTogglingActiveId(productId);
@@ -297,6 +316,30 @@ export function InventoryClient() {
     setEditProductOpen(true);
   };
 
+  const handleReconcileBatch = (product: ProductItem, batch: BatchItem) => {
+    setReconcileBatch(batch);
+    setReconcileProductName(product.name);
+    setReconcileOpen(true);
+  };
+
+  const handleEditBatch = (product: ProductItem, batch: BatchItem) => {
+    setEditingBatch(batch);
+    setEditingBatchProductName(product.name);
+    setEditBatchOpen(true);
+  };
+
+  const handleDeleteBatch = (product: ProductItem, batch: BatchItem) => {
+    setDeletingBatch(batch);
+    setDeletingBatchProductName(product.name);
+    setDeleteBatchOpen(true);
+  };
+
+  const handleBarcodeScanned = (barcode: string) => {
+    setSearchQuery(barcode);
+    setBarcodeScannerOpen(false);
+    toast.success(`تم مسح الباركود: ${barcode}`);
+  };
+
   return (
     <div className="space-y-5 sm:space-y-6" dir="rtl">
       {/* Action Bar Header */}
@@ -358,15 +401,28 @@ export function InventoryClient() {
 
       {/* Search Bar & Filter Tabs */}
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div className="relative w-full md:max-w-md">
-          <Search className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-          <Input
-            type="text"
-            placeholder="ابحث بالاسم أو الباركود..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-white pr-9 text-xs dark:bg-zinc-900"
-          />
+        <div className="flex items-center gap-2 w-full md:max-w-md">
+          <div className="relative flex-1">
+            <Search className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
+            <Input
+              type="text"
+              placeholder="ابحث بالاسم أو الباركود..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-white pr-9 text-xs dark:bg-zinc-900"
+            />
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setBarcodeScannerOpen(true)}
+            title="مسح الباركود بالكاميرا"
+            className="h-9 gap-1 px-2.5 text-xs text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            <Camera className="h-4 w-4 text-emerald-600" />
+            <span className="hidden sm:inline">مسح باركود</span>
+          </Button>
         </div>
 
         {/* flex-wrap instead of a horizontal scroller: on a narrow phone
@@ -413,6 +469,9 @@ export function InventoryClient() {
         onAddBatch={handleOpenAddBatch}
         onFifoPreview={handleOpenFifoPreview}
         onEditProduct={handleEditProduct}
+        onReconcileBatch={handleReconcileBatch}
+        onEditBatch={handleEditBatch}
+        onDeleteBatch={handleDeleteBatch}
         isAdmin={isAdmin}
       />
 
@@ -442,12 +501,42 @@ export function InventoryClient() {
       />
 
       {isAdmin && (
-        <CsvImportModal
-          open={csvImportOpen}
-          onOpenChange={setCsvImportOpen}
-          onSuccess={fetchProducts}
-        />
+        <>
+          <CsvImportModal
+            open={csvImportOpen}
+            onOpenChange={setCsvImportOpen}
+            onSuccess={fetchProducts}
+          />
+          <EditBatchModal
+            open={editBatchOpen}
+            onOpenChange={setEditBatchOpen}
+            batch={editingBatch}
+            productName={editingBatchProductName}
+            onSuccess={fetchProducts}
+          />
+          <DeleteBatchModal
+            open={deleteBatchOpen}
+            onOpenChange={setDeleteBatchOpen}
+            batch={deletingBatch}
+            productName={deletingBatchProductName}
+            onSuccess={fetchProducts}
+          />
+        </>
       )}
+
+      <ReconcileBatchModal
+        open={reconcileOpen}
+        onOpenChange={setReconcileOpen}
+        batch={reconcileBatch}
+        productName={reconcileProductName}
+        onSuccess={fetchProducts}
+      />
+
+      <BarcodeScannerModal
+        open={barcodeScannerOpen}
+        onOpenChange={setBarcodeScannerOpen}
+        onScan={handleBarcodeScanned}
+      />
 
       <FifoPreviewModal
         open={fifoPreviewOpen}
