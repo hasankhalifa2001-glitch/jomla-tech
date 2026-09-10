@@ -312,8 +312,8 @@ function ActionButtons({
           disabled={togglingActiveId === product.id}
           title={product.isActive ? "تعطيل المنتج" : "تفعيل المنتج"}
           className={`h-7 px-2 text-[11px] ${product.isActive
-              ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
-              : "text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/20"
+            ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
+            : "text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/20"
             }`}
         >
           {product.isActive ? "تعطيل" : "تفعيل"}
@@ -366,10 +366,10 @@ function BatchCard({
   const deleteDisabledReason = hasSales
     ? "لا يمكن حذف الدفعة لوجود مبيعات مسجلة عليها"
     : hasAdjustments
-    ? "لا يمكن حذف دفعة تم إجراء تسويات سابقة عليها"
-    : !isAdmin
-    ? "حذف الدفعات متاح لمدير المتجر فقط"
-    : undefined;
+      ? "لا يمكن حذف دفعة تم إجراء تسويات سابقة عليها"
+      : !isAdmin
+        ? "حذف الدفعات متاح لمدير المتجر فقط"
+        : undefined;
 
   const adjustmentsCount = batch.adjustments?.length || 0;
 
@@ -391,11 +391,10 @@ function BatchCard({
           <div className="mt-0.5 text-zinc-500">
             الكمية الحالية:{" "}
             <span
-              className={`font-bold ${
-                batch.quantity < 0
+              className={`font-bold ${batch.quantity < 0
                   ? "text-purple-700 dark:text-purple-400 font-mono"
                   : "text-zinc-800 dark:text-zinc-200"
-              }`}
+                }`}
             >
               {batch.quantity}
             </span>{" "}
@@ -407,6 +406,14 @@ function BatchCard({
           <ExpiryBadge
             daysToExpiry={batch.daysToExpiry}
             expiryDate={batch.expiryDate}
+            status={batch.expiryStatus}
+          />
+          {batch.quantity < 0 && (
+            <NegativeStockBadge quantity={batch.quantity} unitName={batch.unitName} />
+          )}
+        </div>
+      </div>
+
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2 dark:border-zinc-800">
         <div className="flex items-center gap-1.5">
           {adjustmentsCount > 0 ? (
@@ -463,11 +470,10 @@ function BatchCard({
               onClick={() => canDelete && onDeleteBatch(product, batch)}
               disabled={!canDelete}
               title={deleteDisabledReason || "حذف الدفعة المدخلة بالخطأ"}
-              className={`h-6 gap-1 px-1.5 text-[10px] ${
-                canDelete
+              className={`h-6 gap-1 px-1.5 text-[10px] ${canDelete
                   ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
                   : "cursor-not-allowed text-zinc-300 dark:text-zinc-600"
-              }`}
+                }`}
             >
               <Trash2 className="h-3 w-3" />
               حذف
@@ -501,11 +507,10 @@ function BatchCard({
                   </div>
                 </div>
                 <div
-                  className={`font-mono font-bold ${
-                    adj.quantityDelta > 0
+                  className={`font-mono font-bold ${adj.quantityDelta > 0
                       ? "text-emerald-600 dark:text-emerald-400"
                       : "text-red-600 dark:text-red-400"
-                  }`}
+                    }`}
                 >
                   {adj.quantityDelta > 0 ? `+${adj.quantityDelta}` : adj.quantityDelta}{" "}
                   {batch.unitName}
@@ -518,14 +523,6 @@ function BatchCard({
     </div>
   );
 }
-
-            status={batch.expiryStatus}
-          />
-          {batch.quantity < 0 && (
-            <NegativeStockBadge quantity={batch.quantity} unitName={batch.unitName} />
-          )}
-        </div>
-      </div>
 
 // ---------------------------------------------------------------------------
 
@@ -557,6 +554,7 @@ export function ProductTable({
       return next;
     });
   };
+
   if (loading) {
     return (
       <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-12 text-center text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">

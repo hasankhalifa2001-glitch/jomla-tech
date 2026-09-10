@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -34,11 +35,28 @@ export function DeleteBatchModal({
   const [reason, setReason] = useState<string>("");
   const [submitting, setSubmitting] = useState<boolean>(false);
 
-  useEffect(() => {
+  // [FIX] Was `useEffect(() => { if (open) setReason(""); }, [open])`.
+  // React's own guidance ("You Might Not Need an Effect" —
+  // https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes)
+  // is that resetting state in response to a PROP change should happen
+  // during rendering itself, not inside an Effect — calling setState
+  // synchronously inside an Effect body causes an extra, wasted render
+  // pass (React commits the stale render to the screen first, THEN runs
+  // the Effect, THEN re-renders with the reset value), which is exactly
+  // the "cascading renders" warning this triggered. The fix below tracks
+  // the previous `open` value in state and, when it differs from the
+  // current one, calls `setReason` directly in the render body. React
+  // detects a state update during render and re-renders immediately with
+  // the new value BEFORE painting anything to the screen — no extra
+  // commit, no Effect, no warning — while still resetting the reason text
+  // exactly once per open transition, same as before.
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
     if (open) {
       setReason("");
     }
-  }, [open]);
+  }
 
   if (!batch) return null;
 

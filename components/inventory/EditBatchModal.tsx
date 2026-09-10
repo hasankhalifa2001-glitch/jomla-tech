@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -35,7 +36,13 @@ export function EditBatchModal({
   const [expiryDate, setExpiryDate] = useState<string>("");
   const [submitting, setSubmitting] = useState<boolean>(false);
 
-  useEffect(() => {
+  // Track previous props to sync state during render without useEffect
+  const [prevOpen, setPrevOpen] = useState(open);
+  const [prevBatch, setPrevBatch] = useState(batch);
+
+  if (open !== prevOpen || batch !== prevBatch) {
+    setPrevOpen(open);
+    setPrevBatch(batch);
     if (open && batch) {
       setBatchNumber(batch.batchNumber || "");
       if (batch.expiryDate) {
@@ -45,7 +52,7 @@ export function EditBatchModal({
         setExpiryDate("");
       }
     }
-  }, [open, batch]);
+  }
 
   if (!batch) return null;
 
@@ -126,13 +133,17 @@ export function EditBatchModal({
               onChange={(e) => setExpiryDate(e.target.value)}
               className="text-xs"
             />
-            <p className="text-[11px] text-zinc-400">اتركه فارغاً إذا لم يكن للمنتج تاريخ صلاحية محدد.</p>
+            <p className="text-[11px] text-zinc-400">
+              اتركه فارغاً إذا لم يكن للمنتج تاريخ صلاحية محدد.
+            </p>
           </div>
 
           <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-300">
             <Info className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
             <span>
-              ملاحظة: الكمية ({batch.quantity} {batch.unitName}) غير قابلة للتعديل المباشر هنا لضمان تتبع FIFO. لتصحيح الكميات استخدم زر &quot;تسوية المخزون&quot;.
+              ملاحظة: الكمية ({batch.quantity} {batch.unitName}) غير قابلة
+              للتعديل المباشر هنا لضمان تتبع FIFO. لتصحيح الكميات استخدم زر
+              &quot;تسوية المخزون&quot;.
             </span>
           </div>
 
@@ -152,7 +163,9 @@ export function EditBatchModal({
               disabled={!isFormValid}
               className="bg-blue-600 hover:bg-blue-700 text-white gap-1.5"
             >
-              {submitting && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
+              {submitting && (
+                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+              )}
               حفظ التعديلات
             </Button>
           </DialogFooter>
