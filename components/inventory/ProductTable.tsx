@@ -14,7 +14,6 @@ import {
   Edit2,
   Trash2,
   History,
-  AlertTriangle,
 } from "lucide-react";
 import { useState } from "react";
 import { ExpiryBadge } from "@/components/inventory/ExpiryBadge";
@@ -392,8 +391,8 @@ function BatchCard({
             الكمية الحالية:{" "}
             <span
               className={`font-bold ${batch.quantity < 0
-                  ? "text-purple-700 dark:text-purple-400 font-mono"
-                  : "text-zinc-800 dark:text-zinc-200"
+                ? "text-purple-700 dark:text-purple-400 font-mono"
+                : "text-zinc-800 dark:text-zinc-200"
                 }`}
             >
               {batch.quantity}
@@ -471,8 +470,8 @@ function BatchCard({
               disabled={!canDelete}
               title={deleteDisabledReason || "حذف الدفعة المدخلة بالخطأ"}
               className={`h-6 gap-1 px-1.5 text-[10px] ${canDelete
-                  ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
-                  : "cursor-not-allowed text-zinc-300 dark:text-zinc-600"
+                ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                : "cursor-not-allowed text-zinc-300 dark:text-zinc-600"
                 }`}
             >
               <Trash2 className="h-3 w-3" />
@@ -508,8 +507,8 @@ function BatchCard({
                 </div>
                 <div
                   className={`font-mono font-bold ${adj.quantityDelta > 0
-                      ? "text-emerald-600 dark:text-emerald-400"
-                      : "text-red-600 dark:text-red-400"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-red-600 dark:text-red-400"
                     }`}
                 >
                   {adj.quantityDelta > 0 ? `+${adj.quantityDelta}` : adj.quantityDelta}{" "}
