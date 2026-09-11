@@ -282,6 +282,35 @@ CREATE TABLE "CustomerMergeLog" (
     CONSTRAINT "CustomerMergeLog_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "StockAdjustment" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "batchId" TEXT NOT NULL,
+    "adjustedByUserId" TEXT NOT NULL,
+    "quantityDelta" DECIMAL(18,4) NOT NULL,
+    "reason" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "StockAdjustment_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "BatchDeletionLog" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "batchId" TEXT NOT NULL,
+    "productId" TEXT NOT NULL,
+    "unitId" TEXT NOT NULL,
+    "batchNumber" TEXT NOT NULL,
+    "quantityAtDeletion" DECIMAL(18,4) NOT NULL,
+    "deletedByUserId" TEXT NOT NULL,
+    "reason" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "BatchDeletionLog_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "Tenant_slug_key" ON "Tenant"("slug");
 
@@ -441,6 +470,18 @@ CREATE INDEX "CustomerMergeLog_tenantId_idx" ON "CustomerMergeLog"("tenantId");
 -- CreateIndex
 CREATE INDEX "CustomerMergeLog_survivingCustomerId_idx" ON "CustomerMergeLog"("survivingCustomerId");
 
+-- CreateIndex
+CREATE INDEX "StockAdjustment_tenantId_idx" ON "StockAdjustment"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "StockAdjustment_batchId_idx" ON "StockAdjustment"("batchId");
+
+-- CreateIndex
+CREATE INDEX "BatchDeletionLog_tenantId_idx" ON "BatchDeletionLog"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "BatchDeletionLog_batchId_idx" ON "BatchDeletionLog"("batchId");
+
 -- AddForeignKey
 ALTER TABLE "Tenant" ADD CONSTRAINT "Tenant_systemCustomerId_fkey" FOREIGN KEY ("systemCustomerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
@@ -545,3 +586,18 @@ ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_mergedCustomerId
 
 -- AddForeignKey
 ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_performedByUserId_fkey" FOREIGN KEY ("performedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_batchId_fkey" FOREIGN KEY ("batchId") REFERENCES "ProductBatch"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_adjustedByUserId_fkey" FOREIGN KEY ("adjustedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BatchDeletionLog" ADD CONSTRAINT "BatchDeletionLog_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BatchDeletionLog" ADD CONSTRAINT "BatchDeletionLog_deletedByUserId_fkey" FOREIGN KEY ("deletedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
