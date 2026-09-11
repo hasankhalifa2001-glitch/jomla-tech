@@ -430,8 +430,8 @@ describe("T3a API Endpoints — Product & Unit Administration", () => {
           units: [
             {
               unitName: "علبة",
-              conversionFactor: 1,
-              priceWholesale: 100,
+              conversionFactor: "1",
+              priceWholesale: "100",
               barcode: "6291041500214",
               barcodeSource: "INTERNAL",
             },

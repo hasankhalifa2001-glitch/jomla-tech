@@ -63,20 +63,30 @@ vi.mock("@/lib/db/tenant-scope", () => ({
   tenantScopedRawQuery: vi.fn(async () => []),
 }));
 
-vi.mock("@/lib/inventory/csv-parser", () => ({
-  commitCsvImport: vi.fn(async () => ({
-    createdProductsCount: 1,
-    updatedPricesCount: 0,
-    failedNewProducts: [],
-    skippedPriceUpdates: 0,
-    failedPriceUpdates: [],
-  })),
-  validateAndPreviewCsv: vi.fn(async () => ({
-    validNewProducts: [],
-    validPriceUpdates: [],
-    errors: [],
-  })),
-}));
+// Partially mock csv-parser: keep every real export (including STRICT_DATE_REGEX
+// and any future export added by T3d) via importOriginal, and only override the
+// two functions this test suite actually needs to stub out. This avoids the
+// suite breaking every time csv-parser.ts gains a new export that some route
+// file imports directly, since a full vi.mock({...}) replacement silently
+// leaves such new exports undefined.
+vi.mock("@/lib/inventory/csv-parser", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/inventory/csv-parser")>();
+  return {
+    ...actual,
+    commitCsvImport: vi.fn(async () => ({
+      createdProductsCount: 1,
+      updatedPricesCount: 0,
+      failedNewProducts: [],
+      skippedPriceUpdates: 0,
+      failedPriceUpdates: [],
+    })),
+    validateAndPreviewCsv: vi.fn(async () => ({
+      validNewProducts: [],
+      validPriceUpdates: [],
+      errors: [],
+    })),
+  };
+});
 
 vi.mock("@/auth", () => ({
   auth: vi.fn(async () => mockSessionState.session),

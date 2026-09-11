@@ -86,24 +86,29 @@ describe("T2b — Middleware Redirects, Sub-Link Protection & RBAC Matrix", () =
       },
     };
 
-    it("redirects CASHIER from /dashboard (analytics) to /dashboard/pos", async () => {
+    // NOTE: Actual app routes have no "/dashboard" prefix on these screens —
+    // app/(dashboard)/... is a Next.js route GROUP (parentheses), which is
+    // stripped from the URL. Real paths are /pos, /ledger, /orders,
+    // /settings/billing, etc. See middleware.ts header comment for the
+    // canonical statement of this decision.
+    it("redirects CASHIER from /dashboard (analytics) to /pos", async () => {
       const req = createMockRequest("http://localhost:3000/dashboard", { session: activeCashier });
       const res = await handler(req);
 
       expect(res.status).toBe(307);
-      expect(res.headers.get("location")).toBe("http://localhost:3000/dashboard/pos");
+      expect(res.headers.get("location")).toBe("http://localhost:3000/pos");
     });
 
-    it("redirects CASHIER from /settings to /dashboard/pos with unauthorized error", async () => {
+    it("redirects CASHIER from /settings to /pos with unauthorized error", async () => {
       const req = createMockRequest("http://localhost:3000/settings", { session: activeCashier });
       const res = await handler(req);
 
       expect(res.status).toBe(307);
-      expect(res.headers.get("location")).toBe("http://localhost:3000/dashboard/pos?error=unauthorized");
+      expect(res.headers.get("location")).toBe("http://localhost:3000/pos?error=unauthorized");
     });
 
-    it("allows active CASHIER to access /dashboard/pos without redirect", async () => {
-      const req = createMockRequest("http://localhost:3000/dashboard/pos", { session: activeCashier });
+    it("allows active CASHIER to access /pos without redirect", async () => {
+      const req = createMockRequest("http://localhost:3000/pos", { session: activeCashier });
       const res = await handler(req);
 
       expect(res.status).toBe(200);
@@ -157,7 +162,7 @@ describe("T2b — Middleware Redirects, Sub-Link Protection & RBAC Matrix", () =
     });
 
     it("redirects CASHIER with PENDING subscription to /account-locked", async () => {
-      const req = createMockRequest("http://localhost:3000/dashboard/pos", {
+      const req = createMockRequest("http://localhost:3000/pos", {
         session: {
           user: {
             id: "cashier-1",
@@ -230,7 +235,7 @@ describe("T2b — Middleware Redirects, Sub-Link Protection & RBAC Matrix", () =
       expect(res.headers.get("location")).toBe("http://localhost:3000/account-locked");
     });
 
-    it("bounces active CASHIER accessing /settings/billing to /dashboard/pos with unauthorized error", async () => {
+    it("bounces active CASHIER accessing /settings/billing to /pos with unauthorized error", async () => {
       const req = createMockRequest("http://localhost:3000/settings/billing", {
         session: {
           user: {
@@ -245,7 +250,7 @@ describe("T2b — Middleware Redirects, Sub-Link Protection & RBAC Matrix", () =
       const res = await handler(req);
 
       expect(res.status).toBe(307);
-      expect(res.headers.get("location")).toBe("http://localhost:3000/dashboard/pos?error=unauthorized");
+      expect(res.headers.get("location")).toBe("http://localhost:3000/pos?error=unauthorized");
     });
   });
 
