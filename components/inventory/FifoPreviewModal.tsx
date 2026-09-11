@@ -7,22 +7,22 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Route, CheckCircle2, AlertTriangle } from "lucide-react";
+import { Route, CheckCircle2, AlertTriangle, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 
-interface ProductUnitItem {
+export interface ProductUnitItem {
   id: string;
   unitName: string;
   conversionFactor: number;
 }
 
-interface ProductItem {
+export interface ProductItem {
   id: string;
   name: string;
   units: ProductUnitItem[];
 }
 
-interface FifoAllocationItem {
+export interface FifoAllocationItem {
   batchId: string;
   batchNumber: string;
   expiryDate: string | null;
@@ -31,65 +31,100 @@ interface FifoAllocationItem {
   batchUnitName: string;
 }
 
-interface FifoResolution {
+export interface FifoResolution {
+  productId?: string;
+  requestedUnitId?: string;
   requestedUnitName: string;
   requestedQty: number;
   totalAllocatedQty: number;
   remainingQty: number;
   isSufficient: boolean;
+  fullyAllocated?: boolean;
+  shortfallQty?: number;
   allocations: FifoAllocationItem[];
 }
 
-interface FifoPreviewModalProps {
+export interface FifoPreviewModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  products: ProductItem[];
+  products?: ProductItem[];
   preselectedProductId?: string;
+  // [RESERVED FOR T4b POS PRE-CHECKOUT REUSE]
+  // Allows direct single-product/unit pre-checkout inspection without requiring full catalog list
+  productId?: string;
+  unitId?: string;
+  requestedQty?: number;
+  onQuantityChange?: (qty: number) => void;
+  onProductChange?: (productId: string) => void;
+  onUnitChange?: (unitId: string) => void;
 }
 
 const DEFAULT_REQUESTED_QTY = 5;
 
-export function FifoPreviewModal({ open, onOpenChange, products, preselectedProductId }: FifoPreviewModalProps) {
-  const [productId, setProductId] = useState<string>("");
-  const [unitId, setUnitId] = useState<string>("");
-  const [requestedQty, setRequestedQty] = useState<number>(DEFAULT_REQUESTED_QTY);
+export function FifoPreviewModal({
+  open,
+  onOpenChange,
+  products = [],
+  preselectedProductId,
+  productId: directProductId,
+  unitId: directUnitId,
+  requestedQty: directRequestedQty,
+  onQuantityChange,
+  onProductChange,
+  onUnitChange,
+}: FifoPreviewModalProps) {
+  const [internalProductId, setInternalProductId] = useState<string>("");
+  const [internalUnitId, setInternalUnitId] = useState<string>("");
+  const [internalRequestedQty, setInternalRequestedQty] = useState<number>(DEFAULT_REQUESTED_QTY);
   const [loading, setLoading] = useState<boolean>(false);
   const [resolution, setResolution] = useState<FifoResolution | null>(null);
 
-  // #1: productId resets to preselectedProductId (or the first product)
-  // whenever preselectedProductId changes — e.g. the merchant clicked
-  // "FIFO" on a different product row while this modal was already
-  // mounted.
-  //
-  // [FIX] Now also clears `resolution` and resets `requestedQty` to the
-  // default in the SAME adjustment. Previously only the manual dropdown
-  // onChange handlers cleared `resolution` — switching products via the
-  // row button (which goes through THIS block, not those onChange
-  // handlers) left the PREVIOUS product's allocation result visibly
-  // displayed under the new product's selectors until the merchant
-  // manually re-ran the preview, which could read as a real (but wrong)
-  // FIFO result for the newly selected product.
+  // Active selections (supporting either controlled/direct props or internal state)
+  const effectiveProductId = directProductId !== undefined ? directProductId : internalProductId;
+  const effectiveUnitId = directUnitId !== undefined ? directUnitId : internalUnitId;
+  const effectiveRequestedQty = directRequestedQty !== undefined ? directRequestedQty : internalRequestedQty;
+
+  // #1: productId resets to preselectedProductId (or first product) when preselectedProductId changes
   const [prevPreselectedProductId, setPrevPreselectedProductId] = useState(preselectedProductId);
   if (preselectedProductId !== prevPreselectedProductId) {
     setPrevPreselectedProductId(preselectedProductId);
-    setProductId(preselectedProductId || products[0]?.id || "");
+    const nextProdId = preselectedProductId || products[0]?.id || "";
+    setInternalProductId(nextProdId);
     setResolution(null);
-    setRequestedQty(DEFAULT_REQUESTED_QTY);
+    setInternalRequestedQty(DEFAULT_REQUESTED_QTY);
   }
 
-  const selectedProduct = products.find((p) => p.id === productId);
+  const selectedProduct = products.find((p) => p.id === effectiveProductId);
 
-  // #2: unitId resets to the selected product's first unit whenever
-  // productId changes (either from #1 above, or the merchant picking a
-  // different product from the dropdown).
-  const [prevProductId, setPrevProductId] = useState(productId);
-  if (productId !== prevProductId) {
-    setPrevProductId(productId);
-    setUnitId(selectedProduct?.units[0]?.id || "");
+  // #2: unitId resets to selected product's first unit when productId changes
+  const [prevProductId, setPrevProductId] = useState(effectiveProductId);
+  if (effectiveProductId !== prevProductId) {
+    setPrevProductId(effectiveProductId);
+    const defaultUnitId = selectedProduct?.units[0]?.id || "";
+    setInternalUnitId(defaultUnitId);
+    setResolution(null);
   }
+
+  const handleProductSelect = (newProdId: string) => {
+    setInternalProductId(newProdId);
+    setResolution(null);
+    onProductChange?.(newProdId);
+  };
+
+  const handleUnitSelect = (newUnitId: string) => {
+    setInternalUnitId(newUnitId);
+    setResolution(null);
+    onUnitChange?.(newUnitId);
+  };
+
+  const handleQtyChange = (newQty: number) => {
+    setInternalRequestedQty(newQty);
+    setResolution(null);
+    onQuantityChange?.(newQty);
+  };
 
   const handleRunPreview = async () => {
-    if (!productId || !unitId || requestedQty <= 0) {
+    if (!effectiveProductId || !effectiveUnitId || effectiveRequestedQty <= 0) {
       toast.error("يرجى تحديد المنتج والوحدة والكمية المطلوب معاينتها.");
       return;
     }
@@ -100,9 +135,9 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          productId,
-          unitId,
-          requestedQty: Number(requestedQty),
+          productId: effectiveProductId,
+          unitId: effectiveUnitId,
+          requestedQty: Number(effectiveRequestedQty),
         }),
       });
 
@@ -119,6 +154,9 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
     }
   };
 
+  const isShortfall = resolution && (!resolution.isSufficient || resolution.fullyAllocated === false || resolution.remainingQty > 0);
+  const shortfallAmount = resolution?.shortfallQty ?? resolution?.remainingQty ?? 0;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg" dir="rtl">
@@ -133,65 +171,59 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
         </DialogHeader>
 
         <div className="space-y-4 py-2">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <Label className="text-xs">اختر المنتج</Label>
-              <select
-                value={productId}
-                onChange={(e) => {
-                  setProductId(e.target.value);
-                  setResolution(null);
-                }}
-                className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2"
-              >
-                <option value="">اختر...</option>
-                {products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+          {products.length > 0 && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <Label className="text-xs">اختر المنتج</Label>
+                <select
+                  value={effectiveProductId}
+                  onChange={(e) => handleProductSelect(e.target.value)}
+                  className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2"
+                >
+                  <option value="">اختر...</option>
+                  {products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            <div>
-              <Label className="text-xs">وحدة البيع</Label>
-              <select
-                value={unitId}
-                onChange={(e) => {
-                  setUnitId(e.target.value);
-                  setResolution(null);
-                }}
-                className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2"
-                disabled={!selectedProduct}
-              >
-                {selectedProduct?.units.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.unitName}
-                  </option>
-                ))}
-              </select>
-            </div>
+              <div>
+                <Label className="text-xs">الوحدة المطلوبة</Label>
+                <select
+                  value={effectiveUnitId}
+                  onChange={(e) => handleUnitSelect(e.target.value)}
+                  disabled={!selectedProduct}
+                  className="w-full h-8 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2 disabled:opacity-50"
+                >
+                  <option value="">اختر...</option>
+                  {selectedProduct?.units.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.unitName} (معامل {u.conversionFactor})
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            <div>
-              <Label className="text-xs">الكمية المراد بيعها</Label>
-              <Input
-                type="number"
-                min="0.1"
-                step="any"
-                value={requestedQty}
-                onChange={(e) => {
-                  setRequestedQty(parseFloat(e.target.value) || 0);
-                  setResolution(null);
-                }}
-                className="h-8 text-xs"
-              />
+              <div>
+                <Label className="text-xs">الكمية المطلوبة</Label>
+                <Input
+                  type="number"
+                  min="0.01"
+                  step="any"
+                  value={effectiveRequestedQty || ""}
+                  onChange={(e) => handleQtyChange(parseFloat(e.target.value) || 0)}
+                  className="h-8 text-xs font-mono"
+                />
+              </div>
             </div>
-          </div>
+          )}
 
           <Button
             type="button"
             onClick={handleRunPreview}
-            disabled={loading}
+            disabled={loading || !effectiveProductId || !effectiveUnitId || effectiveRequestedQty <= 0}
             className="w-full bg-indigo-600 hover:bg-indigo-700 text-white gap-2"
           >
             <Route className="w-4 h-4" />
@@ -201,8 +233,8 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
           {resolution && (
             <div className="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 space-y-3">
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-sm">نتيجة محاكة السحب:</span>
-                {resolution.isSufficient ? (
+                <span className="font-semibold text-sm">نتيجة محاكاة السحب:</span>
+                {!isShortfall ? (
                   <Badge className="bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 gap-1">
                     <CheckCircle2 className="w-3.5 h-3.5" />
                     <span>المخزون كافٍ للطلب</span>
@@ -210,10 +242,24 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
                 ) : (
                   <Badge className="bg-amber-500/15 text-amber-800 dark:text-amber-400 gap-1">
                     <AlertTriangle className="w-3.5 h-3.5" />
-                    <span>عجز في المخزون ({resolution.remainingQty} {resolution.requestedUnitName})</span>
+                    <span>عجز في المخزون ({shortfallAmount} {resolution.requestedUnitName})</span>
                   </Badge>
                 )}
               </div>
+
+              {/* Explicit shortfall explanation warning box */}
+              {isShortfall && (
+                <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-xs flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                  <div>
+                    <p className="font-semibold">الكمية المطلوبة غير متوفرة بالكامل</p>
+                    <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-0.5">
+                      تم تخصيص {resolution.totalAllocatedQty} من أصل {resolution.requestedQty} {resolution.requestedUnitName}.
+                      يوجد نقص قدره {shortfallAmount} {resolution.requestedUnitName}.
+                    </p>
+                  </div>
+                </div>
+              )}
 
               {resolution.allocations.length === 0 ? (
                 <p className="text-xs text-red-500 font-medium">لا توجد دفعات متوفرة بها كمية موجبة لهذا المنتج حالياً.</p>
@@ -231,11 +277,6 @@ export function FifoPreviewModal({ open, onOpenChange, products, preselectedProd
                             الدفعة #{alloc.batchNumber}
                           </p>
                           <p className="text-zinc-500">
-                            {/* [FIX] ar-EG → ar-SY: platform-wide locale
-                                convention per the spec (Intl.NumberFormat
-                                'ar-SY' for currency) — this was the one
-                                spot in the reviewed components using a
-                                different Arabic locale. */}
                             تاريخ الصلاحية: {alloc.expiryDate ? new Date(alloc.expiryDate).toLocaleDateString("ar-SY") : "غير محدد"}
                           </p>
                         </div>
