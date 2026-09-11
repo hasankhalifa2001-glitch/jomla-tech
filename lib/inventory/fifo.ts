@@ -44,6 +44,20 @@ export interface CommitFifoParams {
 
 export type FifoRequest = CommitFifoParams;
 
+// [FIX — TypeScript build error, same root cause as lib/inventory/
+// conversions.ts] `Decimal.Value` does not resolve under this project's
+// TypeScript/module configuration (Next.js 16 + Turbopack, "moduleResolution":
+// "bundler") — the default import `import Decimal from "decimal.js"` only
+// carries the VALUE binding, not decimal.js's merged namespace/type, so
+// every `as Decimal.Value` cast below failed to compile (TS2833). `Decimal`
+// still works perfectly fine as a VALUE (constructing instances via `new
+// Decimal(...)` is unaffected) — only its use as a standalone type name is
+// broken in this config. Fixed the same way as conversions.ts: a local type
+// alias derived from `typeof Decimal`, which TypeScript can always compute
+// from a value regardless of whether that value's own type name resolves.
+type DecimalInstance = InstanceType<typeof Decimal>;
+type DecimalValue = number | string | DecimalInstance;
+
 interface BatchRecord {
   id: string;
   batchNumber: string;
@@ -88,7 +102,7 @@ function allocateBatches(
   requestedQty: number,
   productId: string
 ): AllocationPlan {
-  const requestedFactor = new Decimal(requestedUnit.conversionFactor as Decimal.Value || 1);
+  const requestedFactor = new Decimal((requestedUnit.conversionFactor as DecimalValue) || 1);
   // Base-unit equivalent of the requested quantity (base unit == factor 1).
   const requestedQtyInBase = convertUnitQuantity(requestedQty, requestedFactor, 1);
 
@@ -114,8 +128,8 @@ function allocateBatches(
   for (const batch of sortedBatches) {
     if (remainingNeededInBase.lte(0)) break;
 
-    const batchUnitFactor = new Decimal((batch.unit?.conversionFactor as Decimal.Value) || 1);
-    const batchAvailableInBatchUnit = new Decimal(batch.quantity as Decimal.Value);
+    const batchUnitFactor = new Decimal((batch.unit?.conversionFactor as DecimalValue) || 1);
+    const batchAvailableInBatchUnit = new Decimal(batch.quantity as DecimalValue);
     const batchAvailableInBase = convertUnitQuantity(batchAvailableInBatchUnit, batchUnitFactor, 1);
 
     if (batchAvailableInBase.lte(0)) continue;

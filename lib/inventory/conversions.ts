@@ -43,20 +43,41 @@
  * being one that was previously and deliberately rejected) without
  * explicit confirmation, and do not remove rules 4/5 without it either —
  * both directions of drift have happened before on this module.
+ *
+ * [FIX — TypeScript build error] `Decimal.Value` (the namespace-merged
+ * type decimal.js's own .d.ts declares alongside the `Decimal` class) does
+ * not resolve under this project's TypeScript/module configuration
+ * (Next.js 16 + Turbopack, "moduleResolution": "bundler") — the default
+ * import `import Decimal from "decimal.js"` only carries the VALUE binding
+ * here, not the merged namespace/type, so every use of `Decimal.Value` or
+ * even the bare `Decimal` class name AS A TYPE failed to compile
+ * (`TS2749`/`TS2833`). `Decimal` still works perfectly fine as a VALUE
+ * (constructing instances via `new Decimal(...)` is unaffected) — only
+ * its use as a standalone type name is broken in this config. Fixed by
+ * defining two local type aliases derived from `typeof Decimal` — which
+ * TypeScript can always compute from a value regardless of whether that
+ * value's own type name resolves — instead of depending on decimal.js's
+ * own namespace declaration:
+ *   - `DecimalInstance` replaces every bare `Decimal` used as a type.
+ *   - `DecimalValue` replaces every `Decimal.Value` used as a type.
+ * No runtime behavior changes; this is a type-only fix.
  */
 
 import Decimal from "decimal.js";
 
+type DecimalInstance = InstanceType<typeof Decimal>;
+type DecimalValue = number | string | DecimalInstance;
+
 export interface PackagingUnit {
   id?: string;
   unitName: string;
-  conversionFactor: Decimal.Value; // number | string | Decimal — always normalized internally
-  priceWholesale?: Decimal.Value;
-  priceRetail?: Decimal.Value | null;
+  conversionFactor: DecimalValue; // number | string | Decimal — always normalized internally
+  priceWholesale?: DecimalValue;
+  priceRetail?: DecimalValue | null;
   isActive?: boolean;
 }
 
-function toPositiveDecimal(value: Decimal.Value, label: string): Decimal {
+function toPositiveDecimal(value: DecimalValue, label: string): DecimalInstance {
   const d = new Decimal(value);
   if (d.lte(0)) {
     throw new Error(`${label} يجب أن يكون رقماً موجباً أكبر من الصفر.`);
@@ -75,10 +96,10 @@ function toPositiveDecimal(value: Decimal.Value, label: string): Decimal {
  * convertUnitQuantity(24, 1, 12) -> 2 (24 pieces = 2 cartons)
  */
 export function convertUnitQuantity(
-  quantity: Decimal.Value,
-  fromConversionFactor: Decimal.Value,
-  toConversionFactor: Decimal.Value
-): Decimal {
+  quantity: DecimalValue,
+  fromConversionFactor: DecimalValue,
+  toConversionFactor: DecimalValue
+): DecimalInstance {
   const from = toPositiveDecimal(fromConversionFactor, "معامل التحويل المصدر");
   const to = toPositiveDecimal(toConversionFactor, "معامل التحويل الهدف");
   const qty = new Decimal(quantity);
@@ -98,10 +119,10 @@ export function convertUnitQuantity(
  * convertUnitCost(1, 1, 12) -> 12 ($1 per piece = $12 per carton)
  */
 export function convertUnitCost(
-  cost: Decimal.Value,
-  fromConversionFactor: Decimal.Value,
-  toConversionFactor: Decimal.Value
-): Decimal {
+  cost: DecimalValue,
+  fromConversionFactor: DecimalValue,
+  toConversionFactor: DecimalValue
+): DecimalInstance {
   const from = toPositiveDecimal(fromConversionFactor, "معامل التحويل المصدر");
   const to = toPositiveDecimal(toConversionFactor, "معامل التحويل الهدف");
   const c = new Decimal(cost);
@@ -124,13 +145,13 @@ export function convertUnitCost(
  * deduction = 18 / 24 = 0.75 boxes.
  */
 export function calculateBatchDeductions(
-  requestedQty: Decimal.Value,
-  requestedConversionFactor: Decimal.Value,
-  batchConversionFactor: Decimal.Value
+  requestedQty: DecimalValue,
+  requestedConversionFactor: DecimalValue,
+  batchConversionFactor: DecimalValue
 ): {
-  allocatedInRequestedUnit: Decimal;
-  deductedInBatchUnit: Decimal;
-  quantityInBaseUnit: Decimal;
+  allocatedInRequestedUnit: DecimalInstance;
+  deductedInBatchUnit: DecimalInstance;
+  quantityInBaseUnit: DecimalInstance;
 } {
   const qty = toPositiveDecimal(requestedQty, "الكمية المطلوبة");
   const reqFactor = toPositiveDecimal(requestedConversionFactor, "معامل تحويل الوحدة المطلوبة");
@@ -167,7 +188,7 @@ export function validatePackagingUnits(units: PackagingUnit[]): {
       return { valid: false, error: "اسم الوحدة مطلوب لجميع الوحدات." };
     }
 
-    let factor: Decimal;
+    let factor: DecimalInstance;
     try {
       factor = new Decimal(u.conversionFactor);
     } catch {

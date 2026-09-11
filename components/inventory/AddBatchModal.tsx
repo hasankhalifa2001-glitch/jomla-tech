@@ -108,7 +108,7 @@ export function AddBatchModal({ open, onOpenChange, products, preselectedProduct
         productId: selectedProductId,
         unitId: selectedUnitId,
         batchNumber: batchNumber.trim(),
-        quantity: Number(quantity),
+        quantity: String(quantity),
         expiryDate: expiryDate || null,
       };
 

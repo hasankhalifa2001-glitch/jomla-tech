@@ -7,10 +7,21 @@ import {
   validatePackagingUnits,
 } from "../conversions";
 
+// [FIX — TypeScript build error] Same root cause as documented atop
+// conversions.ts: decimal.js's own namespace-merged `Decimal` type does
+// not resolve under this project's Next.js 16 + Turbopack
+// "moduleResolution": "bundler" config — `import Decimal from "decimal.js"`
+// only carries the VALUE binding here, so using the bare `Decimal` class
+// name AS A TYPE fails with TS2749. `Decimal` still works fine as a VALUE
+// (e.g. inside the imported functions). Fixed by deriving a local
+// `DecimalInstance` type alias from `typeof Decimal`, which TypeScript can
+// always compute regardless of whether the value's own type name resolves.
+type DecimalInstance = InstanceType<typeof Decimal>;
+
 // All conversion functions return Decimal instances, never native numbers
 // (per T1's decimal.js mandate) — compare via .toNumber() for readability
 // in these tests, or .equals() when checking against another Decimal.
-const num = (d: Decimal) => d.toNumber();
+const num = (d: DecimalInstance) => d.toNumber();
 
 describe("T3a Packaging Unit Conversion Engine", () => {
   describe("convertUnitQuantity", () => {

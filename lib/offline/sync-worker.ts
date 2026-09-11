@@ -188,6 +188,7 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
               phone: localCustomer.phone,
               shopName: localCustomer.shopName,
               cachedBalanceDebtUSD: "0.0000",
+              cachedBalanceDebtSYP: "0.0000",
               isSystemGenerated: false,
             });
           }
@@ -340,7 +341,7 @@ export function useSyncWorker(tenantId?: string) {
           setPendingCount(count);
         }
       })
-      .catch(() => {});
+      .catch(() => { });
 
     const scheduleSync = () => {
       if (debounceTimerRef.current) {
