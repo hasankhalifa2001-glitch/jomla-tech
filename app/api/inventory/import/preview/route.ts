@@ -1,6 +1,19 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { prisma } from "@/lib/db";
+// [FIX #3 — critical, same class of bug as the commit route] This route
+// previously imported the RAW, unscoped `prisma` client from "@/lib/db".
+// It matches none of lib/db.ts's six documented exception categories —
+// this is an ordinary authenticated, tenant-context ADMIN read. Beyond the
+// tenant-isolation gap itself (the preview's own productUnit.findMany() /
+// product.findMany() scans would have run completely unscoped across every
+// tenant's catalog data), this import now also fails to COMPILE: after the
+// fix to lib/inventory/csv-parser.ts, validateAndPreviewCsv()'s first
+// parameter is typed as ReturnType<typeof getTenantDb> specifically to
+// reject a raw PrismaClient at the type level. getTenantDb(tenantId)'s
+// Prisma Client Extension auto-injects tenantId into both findMany() calls
+// this route triggers, closing the gap without any change to
+// csv-parser.ts's own query logic.
+import { getTenantDb } from "@/lib/db";
 import { validateAndPreviewCsv } from "@/lib/inventory/csv-parser";
 import {
   assertRolePermission,
@@ -65,7 +78,10 @@ export async function POST(req: Request) {
       );
     }
 
-    const previewResult = await validateAndPreviewCsv(prisma, tenantId, csvString);
+    // [FIX #3] Tenant-scoped client, not the raw one — see the import
+    // comment above.
+    const db = getTenantDb(tenantId);
+    const previewResult = await validateAndPreviewCsv(db, tenantId, csvString);
 
     return NextResponse.json({
       success: true,

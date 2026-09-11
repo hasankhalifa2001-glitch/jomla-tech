@@ -95,6 +95,33 @@ export const dynamic = "force-dynamic";
  * `allocatedQtyInRequestedUnit` -> InvoiceItem.quantity (paired with the
  * requested unitId), `deductQtyInBatchUnit` -> ProductBatch.quantity
  * decrement only. Same fix applied to the negative-stock fallback branch.
+ *
+ * [FIX — CRITICAL, CURRENCY AUTHORITY] The version of this file submitted
+ * for review validated and wrote invoices/items using ONLY the *USD*
+ * fields (totalUSD, paidAmountUSD, debtAmountUSD, unitPriceUSD) as the
+ * source of truth, and derived SYP from them via convertCurrency(...,
+ * "USD", "SYP"). That is the PRE-v3.6 model. Per the schema's own
+ * "CURRENCY RE-ANCHORING NOTE" (T1), as of v3.6 the *SYP* fields
+ * (totalSYP, paidAmountSYP, debtAmountSYP, unitPriceSYP) are authoritative
+ * — every validation and business rule reads/writes them first — and the
+ * USD fields are informational-only, derived, and must NEVER block a sync
+ * on their own. Concretely, two things were wrong and are fixed below:
+ *   1. `paidAmountSYP`, `debtAmountSYP` (Invoice) and `unitPriceSYP`
+ *      (InvoiceItem) are REQUIRED, non-nullable, no-default Decimal
+ *      columns on the schema. The submitted version never wrote them at
+ *      all — every invoice/item write would fail (or fail to compile)
+ *      against the current schema. They are now read from the payload,
+ *      validated, and written on every Invoice/InvoiceItem create() call,
+ *      sale path and void path alike.
+ *   2. The authoritative validation — `debtAmountSYP ≈ totalSYP −
+ *      paidAmountSYP` and `totalSYP ≈ Σ(unitPriceSYP × quantity)` — now
+ *      gates the sync. The USD-side equivalents are checked only as a
+ *      non-blocking sanity signal (logged, never thrown) — see the
+ *      dedicated comment at that check below.
+ * The Zod schemas (offlineInvoiceSchema, offlineInvoiceItemSchema) were
+ * extended to require the SYP fields the client already computes (per
+ * T1's Dexie schema, every persisted offline record has both currencies
+ * populated by the time it reaches this endpoint).
  */
 
 // ============================================================================
@@ -130,6 +157,12 @@ const offlineInvoiceItemSchema = z.object({
   quantity: z.number().refine((n) => n !== 0, {
     message: "الكمية يجب ألا تساوي صفر.",
   }),
+  // [FIX — CURRENCY AUTHORITY] unitPriceSYP is AUTHORITATIVE
+  // (InvoiceItem.unitPriceSYP is a required, no-default Decimal column —
+  // see the file-level note above). unitPriceUSD stays required too,
+  // since it's still persisted (informational/derived column), but it is
+  // never used to validate or derive anything below.
+  unitPriceSYP: z.string().min(1),
   unitPriceUSD: z.string().min(1),
   // Present only on a void item, mirroring the original sale's batch.
   // See VOID MATCHING note below for why this is required, not inferred.
@@ -142,10 +175,17 @@ const offlineInvoiceSchema = z
     customerId: z.string().min(1).optional(),
     offlineCustomerId: z.string().min(1).optional(),
     items: z.array(offlineInvoiceItemSchema).min(1),
-    totalUSD: z.string().min(1),
+    // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP / debtAmountSYP
+    // are AUTHORITATIVE (Invoice's required, no-default Decimal columns —
+    // see the file-level note above). The *USD fields remain required
+    // inputs too (still persisted as informational/derived columns) but
+    // are never used to validate or derive the SYP-side figures below.
     totalSYP: z.string().min(1),
+    totalUSD: z.string().min(1),
     exchangeRateUsed: z.string().min(1),
+    paidAmountSYP: z.string().min(1),
     paidAmountUSD: z.string().min(1),
+    debtAmountSYP: z.string().min(1),
     debtAmountUSD: z.string().min(1),
     paymentMethod: paymentMethodEnum.optional(),
     voidsOfflineInvoiceId: z.string().min(1).optional(),
@@ -183,8 +223,12 @@ const offlinePaymentSchema = z
     offlineId: z.string().min(1),
     customerId: z.string().min(1).optional(),
     offlineCustomerId: z.string().min(1).optional(),
-    amountUSD: z.string().min(1),
+    // [FIX — CURRENCY AUTHORITY] amountSYP is AUTHORITATIVE
+    // (CustomerPayment.amountSYP). amountUSD stays required as an input
+    // (still persisted, informational/derived) but is never used to
+    // validate or derive anything below.
     amountSYP: z.string().min(1),
+    amountUSD: z.string().min(1),
     exchangeRate: z.string().min(1),
     paymentMethod: paymentMethodEnum,
     receiptNo: z.string().optional(),
@@ -483,40 +527,75 @@ export async function POST(req: NextRequest) {
           });
           if (existing) return existing;
 
-          const totalUSD = serializeMoney(inv.totalUSD);
+          // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP /
+          // debtAmountSYP are read and validated as the SOURCE OF TRUTH
+          // (v3.6). totalUSD / paidAmountUSD / debtAmountUSD are still
+          // read and persisted (informational/derived columns) but never
+          // used below to validate or derive anything — see the
+          // file-level [FIX — CRITICAL, CURRENCY AUTHORITY] note at the
+          // top of this file.
           const totalSYP = serializeMoney(inv.totalSYP);
+          const totalUSD = serializeMoney(inv.totalUSD);
           const exchangeRateUsed = serializeMoney(inv.exchangeRateUsed);
+          const paidSYP = serializeMoney(inv.paidAmountSYP);
           const paidUSD = serializeMoney(inv.paidAmountUSD);
+          const debtSYP = serializeMoney(inv.debtAmountSYP);
           const debtUSD = serializeMoney(inv.debtAmountUSD);
 
           if (compareMoney(exchangeRateUsed, 0) <= 0) {
             throw new Error("سعر الصرف المستخدم يجب أن يكون أكبر من الصفر.");
           }
 
-          const expectedDebt = subtractMoney(totalUSD, paidUSD);
-          if (compareMoney(expectedDebt, debtUSD) !== 0) {
-            throw new Error("قيمة الدين لا تطابق الفرق بين إجمالي الفاتورة والمبلغ المدفوع.");
-          }
-
-          const expectedSYP = convertCurrency(totalUSD, exchangeRateUsed, "USD", "SYP");
-          if (compareMoney(expectedSYP, totalSYP) !== 0) {
-            throw new Error("قيمة الإجمالي بالليرة السورية غير متطابقة مع سعر الصرف.");
-          }
-
-          // Recomputes totalUSD independently from the line items and
-          // requires it to match what the client claims — none of the
-          // checks above validate totalUSD itself, they all treat it as
-          // ground truth and cross-check the *other* fields against it.
-          const isVoidForTotalCheck = Boolean(inv.voidsOfflineInvoiceId);
-          const computedItemsTotal = sumMoney(
-            inv.items.map((item) => multiplyMoney(Math.abs(item.quantity), item.unitPriceUSD))
-          );
-          const expectedTotalUSD = isVoidForTotalCheck
-            ? subtractMoney("0", computedItemsTotal)
-            : computedItemsTotal;
-          if (compareMoney(expectedTotalUSD, totalUSD) !== 0) {
+          // AUTHORITATIVE (v3.6): debtAmountSYP ≈ totalSYP − paidAmountSYP.
+          // This is the check that actually blocks a malformed invoice —
+          // never the USD-side equivalent (see the sanity-only check
+          // below).
+          const expectedDebtSYP = subtractMoney(totalSYP, paidSYP);
+          if (compareMoney(expectedDebtSYP, debtSYP) !== 0) {
             throw new Error(
-              `إجمالي الفاتورة (${totalUSD}) لا يطابق مجموع البنود (${expectedTotalUSD}).`
+              "قيمة الدين بالليرة السورية لا تطابق الفرق بين إجمالي الفاتورة والمبلغ المدفوع."
+            );
+          }
+
+          // SANITY-ONLY, NEVER BLOCKS A SYNC (v3.6 currency re-anchoring):
+          // totalUSD is expected to be close to totalSYP ÷ exchangeRateUsed,
+          // but this is a display-consistency signal, not a validation
+          // gate — the SYP-side checks above and below are what govern
+          // whether this invoice is accepted. A USD-side mismatch (e.g.
+          // client-side rounding) is logged, never thrown.
+          try {
+            const expectedTotalUSDForSanity = convertCurrency(
+              totalSYP,
+              exchangeRateUsed,
+              "SYP",
+              "USD"
+            );
+            if (compareMoney(expectedTotalUSDForSanity, totalUSD) !== 0) {
+              console.warn(
+                `[sync] invoice ${inv.offlineId}: USD sanity mismatch ` +
+                `(expected ≈${expectedTotalUSDForSanity}, got ${totalUSD}) — ` +
+                "informational only, did not block sync."
+              );
+            }
+          } catch {
+            // A USD-side conversion failure must never block a sync —
+            // SYP is authoritative, per the currency re-anchoring note.
+          }
+
+          // Recomputes totalSYP independently from the line items
+          // (unitPriceSYP × quantity) and requires it to match what the
+          // client claims — AUTHORITATIVE, since InvoiceItem.unitPriceSYP
+          // is itself the authoritative per-item field (v3.6).
+          const isVoidForTotalCheck = Boolean(inv.voidsOfflineInvoiceId);
+          const computedItemsTotalSYP = sumMoney(
+            inv.items.map((item) => multiplyMoney(Math.abs(item.quantity), item.unitPriceSYP))
+          );
+          const expectedTotalSYP = isVoidForTotalCheck
+            ? subtractMoney("0", computedItemsTotalSYP)
+            : computedItemsTotalSYP;
+          if (compareMoney(expectedTotalSYP, totalSYP) !== 0) {
+            throw new Error(
+              `إجمالي الفاتورة بالليرة السورية (${totalSYP}) لا يطابق مجموع البنود (${expectedTotalSYP}).`
             );
           }
 
@@ -606,6 +685,10 @@ export async function POST(req: NextRequest) {
                 unitId: voidItem.unitId,
                 batchId: voidItem.batchId,
                 quantity: voidItem.quantity, // already negative — enforced by the schema now
+                // [FIX — CURRENCY AUTHORITY] unitPriceSYP is now carried
+                // through and written — InvoiceItem.unitPriceSYP is a
+                // required, no-default column (see file-level note).
+                unitPriceSYP: serializeMoney(voidItem.unitPriceSYP),
                 unitPriceUSD: serializeMoney(voidItem.unitPriceUSD),
               };
             });
@@ -627,10 +710,16 @@ export async function POST(req: NextRequest) {
                 tenantId,
                 userId,
                 customerId: targetCustomerId,
-                totalUSD,
+                // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP /
+                // debtAmountSYP are now written — required columns (see
+                // file-level note). totalUSD / paidAmountUSD /
+                // debtAmountUSD remain persisted as informational/derived.
                 totalSYP,
+                totalUSD,
                 exchangeRateUsed,
+                paidAmountSYP: paidSYP,
                 paidAmountUSD: paidUSD,
+                debtAmountSYP: debtSYP,
                 debtAmountUSD: debtUSD,
                 isPaid: true,
                 status: InvoiceStatus.VOIDED,
@@ -652,6 +741,9 @@ export async function POST(req: NextRequest) {
                   unitId: item.unitId,
                   batchId: item.batchId,
                   quantity: item.quantity,
+                  // [FIX — CURRENCY AUTHORITY] unitPriceSYP now written —
+                  // required column (see file-level note).
+                  unitPriceSYP: item.unitPriceSYP,
                   unitPriceUSD: item.unitPriceUSD,
                 },
               });
@@ -683,7 +775,11 @@ export async function POST(req: NextRequest) {
             where: { id: targetCustomerId, tenantId },
             select: { isSystemGenerated: true },
           });
-          if (customerRecord?.isSystemGenerated && compareMoney(debtUSD, 0) > 0) {
+          // [FIX — CURRENCY AUTHORITY] Gated on debtSYP, not debtUSD — per
+          // T1: "An invoice may reference the system-generated customer
+          // only when debtAmountSYP = 0" (v3.6; was debtAmountUSD = 0
+          // through v3.5).
+          if (customerRecord?.isSystemGenerated && compareMoney(debtSYP, 0) > 0) {
             throw new Error(
               "لا يمكن تسجيل دين على الزبون النقدي العام — يجب اختيار زبون حقيقي له اسم ورقم هاتف."
             );
@@ -701,6 +797,10 @@ export async function POST(req: NextRequest) {
             productId: string;
             unitId: string; // the REQUESTED unit — matches InvoiceItem.unitId
             batchId: string;
+            // [FIX — CURRENCY AUTHORITY] unitPriceSYP carried alongside
+            // unitPriceUSD — InvoiceItem.unitPriceSYP is a required,
+            // no-default column (see file-level note).
+            unitPriceSYP: string;
             unitPriceUSD: string;
             allocatedQtyInRequestedUnit: number;
             deductQtyInBatchUnit: number;
@@ -745,6 +845,7 @@ export async function POST(req: NextRequest) {
                 productId: item.productId,
                 unitId: item.unitId,
                 batchId: alloc.batchId,
+                unitPriceSYP: serializeMoney(item.unitPriceSYP),
                 unitPriceUSD: serializeMoney(item.unitPriceUSD),
                 // allocatedQty is already denominated in the REQUESTED
                 // unit (fifo.ts: "Quantity in terms of the requested
@@ -794,6 +895,7 @@ export async function POST(req: NextRequest) {
                 productId: item.productId,
                 unitId: item.unitId,
                 batchId: last.batchId,
+                unitPriceSYP: serializeMoney(item.unitPriceSYP),
                 unitPriceUSD: serializeMoney(item.unitPriceUSD),
                 allocatedQtyInRequestedUnit: resolution.remainingQty,
                 deductQtyInBatchUnit: remainingDeductInBatchUnit,
@@ -806,12 +908,20 @@ export async function POST(req: NextRequest) {
               tenantId,
               userId,
               customerId: targetCustomerId,
-              totalUSD,
+              // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP /
+              // debtAmountSYP now written — required columns (see
+              // file-level note). totalUSD / paidAmountUSD /
+              // debtAmountUSD remain persisted as informational/derived.
               totalSYP,
+              totalUSD,
               exchangeRateUsed,
+              paidAmountSYP: paidSYP,
               paidAmountUSD: paidUSD,
+              debtAmountSYP: debtSYP,
               debtAmountUSD: debtUSD,
-              isPaid: compareMoney(debtUSD, 0) <= 0,
+              // [FIX — CURRENCY AUTHORITY] isPaid derives from debtSYP,
+              // the authoritative field, not debtUSD.
+              isPaid: compareMoney(debtSYP, 0) <= 0,
               status: InvoiceStatus.COMPLETED,
               offlineId: inv.offlineId,
               syncedAt: new Date(),
@@ -832,6 +942,9 @@ export async function POST(req: NextRequest) {
                 unitId: alloc.unitId,
                 batchId: alloc.batchId,
                 quantity: alloc.allocatedQtyInRequestedUnit,
+                // [FIX — CURRENCY AUTHORITY] unitPriceSYP now written —
+                // required column (see file-level note).
+                unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
               },
             });
@@ -846,17 +959,24 @@ export async function POST(req: NextRequest) {
             });
           }
 
-          if (compareMoney(paidUSD, 0) > 0) {
+          // [FIX — CURRENCY AUTHORITY] Gated on paidSYP, not paidUSD — a
+          // sale-time CustomerPayment is created whenever the
+          // authoritative paid amount (SYP) is positive.
+          if (compareMoney(paidSYP, 0) > 0) {
             if (!inv.paymentMethod) {
-              throw new Error("paymentMethod مطلوب عندما paidAmountUSD > 0.");
+              throw new Error("paymentMethod مطلوب عندما paidAmountSYP > 0.");
             }
             await tx.customerPayment.create({
               data: {
                 tenantId,
                 customerId: targetCustomerId,
                 invoiceId: invoice.id,
+                // [FIX — CURRENCY AUTHORITY] amountSYP is the
+                // authoritative figure, taken directly from the invoice's
+                // own paidSYP — no longer derived via convertCurrency from
+                // USD. amountUSD stays informational/derived.
+                amountSYP: paidSYP,
                 amountUSD: paidUSD,
-                amountSYP: convertCurrency(paidUSD, exchangeRateUsed, "USD", "SYP"),
                 exchangeRate: exchangeRateUsed,
                 paymentMethod: inv.paymentMethod as PaymentMethod,
                 syncedAt: new Date(),
@@ -919,12 +1039,16 @@ export async function POST(req: NextRequest) {
           });
           if (existing) return existing;
 
-          const amountUSD = serializeMoney(p.amountUSD);
+          // [FIX — CURRENCY AUTHORITY] amountSYP is AUTHORITATIVE — read
+          // and validated first. amountUSD stays required/persisted
+          // (informational/derived) but is never used to validate or
+          // derive anything below.
           const amountSYP = serializeMoney(p.amountSYP);
+          const amountUSD = serializeMoney(p.amountUSD);
           const exchangeRate = serializeMoney(p.exchangeRate);
 
-          if (compareMoney(amountUSD, 0) <= 0) {
-            throw new Error("قيمة الدفعة يجب أن تكون أكبر من الصفر.");
+          if (compareMoney(amountSYP, 0) <= 0) {
+            throw new Error("قيمة الدفعة بالليرة السورية يجب أن تكون أكبر من الصفر.");
           }
           if (compareMoney(exchangeRate, 0) <= 0) {
             throw new Error("سعر الصرف يجب أن يكون أكبر من الصفر.");
@@ -943,8 +1067,8 @@ export async function POST(req: NextRequest) {
               tenantId,
               customerId: targetCustomerId,
               invoiceId: null,
-              amountUSD,
               amountSYP,
+              amountUSD,
               exchangeRate,
               paymentMethod: p.paymentMethod as PaymentMethod,
               receiptNo: p.receiptNo || null,

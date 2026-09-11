@@ -1,7 +1,27 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { prisma } from "@/lib/db";
-import { commitCsvImport } from "@/lib/inventory/csv-parser";
+// [FIX #3 — critical] This route previously imported the RAW, unscoped
+// `prisma` client from "@/lib/db". Per lib/db.ts's own header comment, that
+// export is restricted to six narrow, documented categories (registration,
+// seed.ts, the authorize() callback, isPlatformAdmin-gated super-admin
+// routes, the T4c/fifo.ts shared-transaction-client category, and the
+// storefront tenant-by-slug lookup) — this route is none of those. It is
+// an ordinary authenticated, tenant-context ADMIN action, exactly the case
+// lib/db.ts's header says must use getTenantDb(tenantId) instead. Before
+// this fix, EVERY tenant-isolation guarantee for this entire CSV import
+// path rested solely on csv-parser.ts's manual `tenantId` filtering on each
+// individual query — correct today, but with zero structural backstop if a
+// future edit to that file ever missed one. getTenantDb(tenantId)'s Prisma
+// Client Extension now auto-injects/re-asserts tenantId on every
+// tenant-scoped model operation — including inside the `$transaction`
+// callback csv-parser.ts opens per row, since the extension is preserved
+// through `$transaction` (confirmed via lib/db.ts's own category-5 note:
+// the extended transaction client's type is deliberately NOT
+// `Prisma.TransactionClient`-compatible, specifically because it carries
+// the extension). This closes the gap without changing any of
+// csv-parser.ts's existing per-row logic.
+import { getTenantDb } from "@/lib/db";
+import { commitCsvImport, DECIMAL_STRING_REGEX, STRICT_DATE_REGEX } from "@/lib/inventory/csv-parser";
 import {
   assertTenantWritable,
   SubscriptionLockedError,
@@ -14,48 +34,101 @@ import {
 } from "@/lib/auth/role-matrix";
 import { z } from "zod";
 
-// [FIX] Field names below were out of sync with lib/inventory/csv-parser.ts
-// after that file's own currency-safety fix renamed `priceUSD` →
-// `priceWholesale` (NewProductImportData) and `currentPriceUSD`/
-// `newPriceUSD` → `currentPriceWholesale`/`newPriceWholesale` plus added a
-// required `pricingCurrency` field (PriceUpdateImportData). The previous
-// version of this schema still validated against the OLD, removed field
-// names — meaning every real commit request built from the current
-// preview endpoint's actual response shape would fail Zod validation
-// outright (a required `newPriceUSD`/`priceUSD` field that no longer
-// exists anywhere in the real payload), breaking the entire CSV import
-// commit path silently behind a generic "VALIDATION_ERROR" response. Kept
-// in exact sync with NewProductImportData / PriceUpdateImportData in
-// lib/inventory/csv-parser.ts — update both together if that file's shape
-// ever changes again.
-const newProductRowSchema = z.object({
-  lineNumber: z.number(),
-  barcode: z.string().optional(),
-  name: z.string().min(1, "اسم المنتج مطلوب"),
-  category: z.string().optional(),
-  unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-  conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
-  priceWholesale: z.number().positive("السعر يجب أن يكون رقماً موجباً"),
-  priceRetail: z.number().min(0).optional(),
-  pricingCurrency: z.enum(["SYP", "USD"]).optional(),
-  batchNumber: z.string().optional(),
-  quantity: z.number().min(0).optional(),
-  expiryDate: z.string().optional(),
-});
+const positiveDecimalSchema = z
+  .union([z.string(), z.number()])
+  .transform((v) => String(v).trim())
+  .refine((v) => DECIMAL_STRING_REGEX.test(v) && Number(v) > 0, {
+    message: "يجب أن يكون رقماً موجباً أكبر من الصفر",
+  });
+
+const nonNegativeDecimalSchema = z
+  .union([z.string(), z.number()])
+  .transform((v) => String(v).trim())
+  .refine((v) => DECIMAL_STRING_REGEX.test(v) && Number(v) >= 0, {
+    message: "يجب أن يكون رقماً غير سالب (صفر أو أكثر)",
+  });
+
+// [FIX #2 — defensive] A frontend that omits an optional field by sending
+// an empty string ("") rather than truly dropping the key from the JSON
+// body is a common pattern (e.g. a controlled <input> bound to "" by
+// default). Without this normalization, "" reaches STRICT_DATE_REGEX,
+// fails it, and the ENTIRE commit request is rejected with 400 — even
+// though every other row in the same payload is perfectly valid and the
+// merchant's intent was clearly "no expiry date for this row." Empty
+// string is treated identically to an absent field: normalized to
+// `undefined` BEFORE the date-shape regex ever sees it. A non-empty but
+// malformed value (e.g. "31-12-2026") is still rejected with the same
+// specific, actionable message as before — this only widens what counts
+// as "field not provided," it does not loosen the format check itself.
+const expiryDateSchema = z
+  .string()
+  .optional()
+  .transform((v) => (v === "" ? undefined : v))
+  .pipe(
+    z
+      .string()
+      .regex(STRICT_DATE_REGEX, "تاريخ الانتهاء يجب أن يكون بالصيغة YYYY-MM-DD (مثال: 2026-12-31)")
+      .refine((v) => !isNaN(new Date(v).getTime()), {
+        message: "تاريخ الانتهاء غير صالح",
+      })
+      .optional()
+  );
+
+const newProductRowSchema = z
+  .object({
+    lineNumber: z.number(),
+    barcode: z.string().optional(),
+    name: z.string().min(1, "اسم المنتج مطلوب"),
+    category: z.string().optional(),
+    unitName: z.string().min(1, "اسم الوحدة مطلوب"),
+    conversionFactor: positiveDecimalSchema,
+    priceWholesale: positiveDecimalSchema,
+    priceRetail: nonNegativeDecimalSchema.optional(),
+    pricingCurrency: z.enum(["SYP", "USD"]).optional(),
+    initialBatchNumber: z.string().optional(),
+    initialQuantity: nonNegativeDecimalSchema.optional(),
+    batchNumber: z.string().optional(),
+    quantity: nonNegativeDecimalSchema.optional(),
+    expiryDate: expiryDateSchema,
+  })
+  .refine((data) => !!(data.initialBatchNumber || data.batchNumber), {
+    message: "رقم الدفعة الأولى مطلوب",
+    path: ["initialBatchNumber"],
+  })
+  .refine(
+    (data) => data.initialQuantity !== undefined || data.quantity !== undefined,
+    {
+      message: "الكمية الأولية مطلوبة",
+      path: ["initialQuantity"],
+    }
+  )
+  // [FIX #4 — compile error] The two .refine() calls above only VALIDATE at
+  // runtime — Zod's type system can't narrow z.infer's output based on a
+  // refine's boolean condition, so TypeScript still saw
+  // initialBatchNumber/initialQuantity as optional even on a row that had
+  // already passed both refines. That mismatched NewProductImportData's
+  // actual shape (both fields required, non-optional) in csv-parser.ts,
+  // which is what produced the "Type 'string | undefined' is not
+  // assignable to type 'string'" error at the commitCsvImport(db, tenantId,
+  // { newProducts, priceUpdates }) call site. This transform runs only
+  // AFTER both refines have already passed, so the fallback here is
+  // runtime-safe, not just a type-level assertion: it collapses each alias
+  // pair into the single guaranteed field NewProductImportData expects,
+  // producing an output type that matches it exactly instead of asking
+  // TypeScript to trust a validation it structurally cannot see.
+  .transform((data) => ({
+    ...data,
+    initialBatchNumber: (data.initialBatchNumber || data.batchNumber)!,
+    initialQuantity: (data.initialQuantity ?? data.quantity)!,
+  }));
 
 const priceUpdateRowSchema = z.object({
   lineNumber: z.number(),
   barcode: z.string().min(1, "الباركود مطلوب لتحديث السعر"),
   productName: z.string(),
   unitName: z.string(),
-  currentPriceWholesale: z.number(),
-  newPriceWholesale: z.number().positive("السعر يجب أن يكون رقماً موجباً"),
-  // [FIX] Was missing entirely. `pricingCurrency` is a required field on
-  // PriceUpdateImportData as of csv-parser.ts's currency-safety fix — the
-  // preview endpoint always sends it, and its presence here is what would
-  // let a future version of this route re-validate currency consistency
-  // at commit time too (see the currency-safety note in csv-parser.ts
-  // about the small race window between preview and commit).
+  currentPriceWholesale: z.union([z.number(), z.string()]),
+  newPriceWholesale: positiveDecimalSchema,
   pricingCurrency: z.enum(["SYP", "USD"]),
   unitId: z.string().min(1, "معرف الوحدة مطلوب"),
 });
@@ -102,27 +175,39 @@ export async function POST(req: Request) {
       );
     }
 
-    // NOT wrapped in prisma.$transaction(...) — commitCsvImport does not
-    // need an outer transaction: each row's product/unit/batch creation,
-    // and each price update, is already atomic on its own (see that
-    // function's own docstring). Passing the plain `prisma` client makes
-    // each row's success or failure genuinely independent.
-    const result = await commitCsvImport(prisma, tenantId, {
+    // [FIX #3] Tenant-scoped client, not the raw one — see the import
+    // comment above. NOT wrapped in an additional outer $transaction here:
+    // commitCsvImport does not need one — each row's product/unit/batch
+    // creation, and each price update, is already atomic on its own (see
+    // that function's own docstring). Using getTenantDb(tenantId) instead
+    // of the raw client makes each row's success or failure genuinely
+    // independent AND tenant-safe by construction, not just by manual
+    // discipline inside csv-parser.ts.
+    const db = getTenantDb(tenantId);
+    const result = await commitCsvImport(db, tenantId, {
       newProducts,
       priceUpdates,
     });
 
-    // [FIX] Previously only checked `failedNewProducts.length` and
-    // `skippedPriceUpdates` — missing `failedPriceUpdates`, the array
-    // csv-parser.ts's own per-row error-isolation fix introduced for price
-    // updates that threw an unexpected error (as opposed to `skipped`,
-    // which specifically means "0 rows matched — the unitId no longer
-    // resolves"). Without this, a price update that failed for a real
-    // reason (e.g. a transient DB error on that one row) was reported back
-    // to the merchant as a clean, fully-successful import.
+    // [FIX #1 — critical] `skippedPriceUpdates` and `failedPriceUpdates` are
+    // ARRAYS (see CommitCsvImportResult in csv-parser.ts), not counters.
+    // The previous code compared `result.skippedPriceUpdates > 0` — an
+    // array compared to a number. JS coerces the array via `.toString()`
+    // (e.g. "[object Object],[object Object]" for 2+ entries, or the
+    // stringified single object for exactly 1), then that string is
+    // coerced to a number for `>`, which is always NaN. `NaN > 0` is
+    // ALWAYS false. Net effect: `hasFailures` could never become true
+    // because of a skipped price update, and the merchant-facing failure
+    // message for skipped price updates could never be appended — an
+    // import that silently skipped price-update rows (e.g. because the
+    // row meant to create their target unit earlier in the same file had
+    // itself failed) was reported back as a clean, fully-successful
+    // import. Fixed by reading `.length` on both arrays, as already done
+    // correctly for `failedNewProducts` and `failedPriceUpdates` elsewhere
+    // in this same block.
     const hasFailures =
       result.failedNewProducts.length > 0 ||
-      result.skippedPriceUpdates > 0 ||
+      result.skippedPriceUpdates.length > 0 ||
       result.failedPriceUpdates.length > 0;
 
     const baseMessage = `تم تنفيذ الاستيراد: تم إنشاء ${result.createdProductsCount} منتج جديد وتحديث ${result.updatedPricesCount} سعر.`;
@@ -130,10 +215,10 @@ export async function POST(req: Request) {
     if (result.failedNewProducts.length > 0) {
       failureParts.push(`تعذّر إنشاء ${result.failedNewProducts.length} منتج بسبب تعارض في الباركود`);
     }
-    if (result.skippedPriceUpdates > 0) {
-      failureParts.push(`تم تجاهل ${result.skippedPriceUpdates} تحديث سعر (الوحدة غير موجودة)`);
+    // [FIX #1, continued] `.length`, not the array itself.
+    if (result.skippedPriceUpdates.length > 0) {
+      failureParts.push(`تم تجاهل ${result.skippedPriceUpdates.length} تحديث سعر (الوحدة غير موجودة)`);
     }
-    // [FIX] New message segment for failedPriceUpdates — previously silent.
     if (result.failedPriceUpdates.length > 0) {
       failureParts.push(`تعذّر تنفيذ ${result.failedPriceUpdates.length} تحديث سعر بسبب خطأ غير متوقع`);
     }

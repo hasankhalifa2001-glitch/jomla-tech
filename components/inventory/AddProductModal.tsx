@@ -15,6 +15,26 @@ import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inven
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import { validatePackagingUnits } from "@/lib/inventory/conversions";
 
+// [FIX] products/route.ts's POST now requires conversionFactor/
+// priceWholesale/priceRetail/initialBatch.quantity as validated DECIMAL
+// STRINGS (regex-checked, max 4 decimal places) rather than JSON numbers —
+// see that file's DECIMAL_STRING_REGEX note. This component's internal
+// state stays `number` (simplest for <input type="number"> controls), but
+// every value crossing into the API payload must go through this helper
+// rather than a raw `Number(...)`/`String(...)` cast:
+//   - `String(0.1 + 0.2)` can produce floating-point noise like
+//     "0.30000000000000004", which has more than 4 decimal digits and
+//     would fail the backend's regex outright.
+//   - `toFixed(4)` both rounds to the column's actual precision
+//     (Decimal(18,4)) and guarantees a plain, non-exponential decimal
+//     string, matching the regex `^-?\d{1,14}(\.\d{1,4})?$` in every case.
+// Non-finite input (a NaN slipping through a bad parseFloat) is coerced to
+// "0" rather than emitting an invalid string like "NaN".
+const toDecimalString = (value: number): string => {
+  if (!Number.isFinite(value)) return "0";
+  return value.toFixed(4);
+};
+
 interface UnitForm {
   unitName: string;
   conversionFactor: number;
@@ -63,11 +83,8 @@ interface CatalogEntryInfo {
 
 const STEP_LABELS = ["المعلومات الأساسية", "الوحدات والأسعار", "المخزون الأولي"];
 
-// Shared sizing classes: mobile-first at ~44px (comfortable tap target for
-// a cashier/merchant using this on a phone with no laptop), shrinking back
-// to the original compact desktop density at the sm: breakpoint.
 const FIELD_H = "h-11 sm:h-8 text-sm sm:text-xs";
-const FIELD_H_PROMINENT = "h-11 sm:h-9 text-sm mt-1"; // step-1 name/category
+const FIELD_H_PROMINENT = "h-11 sm:h-9 text-sm mt-1";
 const BTN_H = "h-11 sm:h-8 text-sm sm:text-xs";
 
 export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductModalProps) {
@@ -140,19 +157,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     onOpenChange(isOpen);
   };
 
-  // [FIX] Previously assigned a FIXED `conversionFactor: 12` to every new
-  // unit regardless of how many units already existed — adding two
-  // secondary units in the same session silently created a duplicate
-  // conversionFactor (12, 12), which now gets rejected by
-  // validatePackagingUnits (per the confirmed no-duplicate-factors rule)
-  // only at final submit, with no earlier signal to the merchant about
-  // which two units conflict. Mirrors EditProductModal.tsx's own
-  // `highestFactor * 6` pattern instead: each new unit's factor is always
-  // strictly greater than every existing unit's factor, so two
-  // auto-generated units can never collide with each other. A merchant
-  // can still manually edit the value afterward into an accidental
-  // duplicate — that case is now caught immediately at the Step 2 gate
-  // (see goNext below) rather than silently reaching submit.
   const handleAddUnit = () => {
     if (units.length >= 5) {
       toast.error("الحد الأقصى لوحدات التعبئة هو 5 وحدات.");
@@ -390,12 +394,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         return;
       }
 
-      // [FIX — new] Delegates base-unit-required and no-duplicate-factor
-      // checks to the single shared implementation in unit-conversion.ts,
-      // instead of relying only on the per-field checks above (which never
-      // caught a duplicate conversionFactor or a missing/extra base unit).
-      // Surfaces the problem right here at Step 2, before the merchant
-      // fills in Step 3 and only discovers it at final submit.
       const packagingCheck = validatePackagingUnits(
         units.map((u) => ({
           ...u,
@@ -446,12 +444,6 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
-    // [FIX — new] Same shared validation as goNext's Step 2 gate, run
-    // again here as the final backstop before submit — mirrors how the
-    // barcode-classification check below is also duplicated between
-    // goNext and handleSubmit for the same reason: the Step gate is a UX
-    // convenience, this is the actual source of truth right before the
-    // request is sent.
     const packagingCheck = validatePackagingUnits(
       units.map((u) => ({
         ...u,
@@ -502,12 +494,18 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         name: name.trim(),
         category: category.trim() || null,
         isPublic,
+        // [FIX] Every field the backend validates as a decimal string
+        // (conversionFactor, priceWholesale, priceRetail) now goes through
+        // `toDecimalString` instead of `Number(...)` — see the helper's
+        // comment above for why a plain String()/Number() cast is unsafe
+        // here. `pricingCurrency`/`barcode`/`barcodeSource`/`imageUrl` are
+        // untouched — none of those are Decimal-backed columns.
         units: units.map((u) => ({
           unitName: u.unitName.trim(),
-          conversionFactor: Number(u.conversionFactor),
+          conversionFactor: toDecimalString(Number(u.conversionFactor)),
           pricingCurrency: u.pricingCurrency,
-          priceWholesale: Number(u.priceWholesale),
-          priceRetail: u.priceRetail !== "" ? Number(u.priceRetail) : null,
+          priceWholesale: toDecimalString(Number(u.priceWholesale)),
+          priceRetail: u.priceRetail !== "" ? toDecimalString(Number(u.priceRetail)) : null,
           barcode: u.barcode.trim() || null,
           barcodeSource: u.barcode.trim() ? (u.barcodeSource as "GS1" | "INTERNAL") : null,
           imageUrl: u.imageUrl.trim() || null,
@@ -516,7 +514,9 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
           ? {
             unitIndex: batchUnitIndex,
             batchNumber: batchNumber.trim() || `BATCH-${Date.now().toString().slice(-6)}`,
-            quantity: Number(batchQuantity),
+            // [FIX] Same reasoning — initialBatch.quantity is validated as
+            // a nonNegativeDecimalString on the backend now too.
+            quantity: toDecimalString(Number(batchQuantity)),
             expiryDate: expiryDate || null,
           }
           : null,

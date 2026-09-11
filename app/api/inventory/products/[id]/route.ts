@@ -16,25 +16,45 @@ import { validatePackagingUnits } from "@/lib/inventory/conversions";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
+// [FIX] Matches products/route.ts POST's own DECIMAL_STRING_REGEX exactly
+// (18,4) — kept as a separate literal here rather than importing it from
+// that file, per the decision not to introduce a shared decimal-format
+// module for this pass. conversionFactor/priceWholesale/priceRetail are
+// all backed by Decimal(18,4) columns; accepting them as native JS
+// numbers (the previous schema) risks the exact same float-precision loss
+// this project's decimal.js-everywhere rule (T1) exists to prevent — this
+// PATCH route was the one remaining write path still doing that after
+// POST was already fixed.
+const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
+
+const positiveDecimalString = (message: string) =>
+  z
+    .string()
+    .regex(DECIMAL_STRING_REGEX, message)
+    .refine((val) => Number(val) > 0, { message });
+
+const nonNegativeDecimalString = (message: string) =>
+  z
+    .string()
+    .regex(DECIMAL_STRING_REGEX, message)
+    .refine((val) => Number(val) >= 0, { message });
+
 const unitSchema = z
   .object({
     id: z.string().optional(),
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-    // [FIX — CRITICAL] Was `z.number().int().min(1, ...)`, which forbade
-    // fractional conversion factors and forced a minimum of 1. This
-    // directly contradicted the confirmed business rule: a wholesaler may
-    // legitimately sell a quarter- or half-carton at a prorated wholesale
-    // price, so conversionFactor must accept ANY positive number,
-    // fractional or not — exactly like POST /products' schema already
-    // does, and exactly what validatePackagingUnits (unit-conversion.ts)
-    // and the EditProductModal frontend (step="any" min="0.0001") both
-    // already assume. The base-unit-must-equal-1 and
-    // no-duplicate-factors rules are enforced separately below via
-    // validatePackagingUnits — NOT via a schema-level lower bound.
-    conversionFactor: z.number().positive("معامل التحويل يجب أن يكون رقماً موجباً"),
+    // [FIX] Was `z.number().positive(...)` — switched to a validated
+    // decimal string, matching POST's unitSchema. Fractional factors
+    // remain fully supported (a quarter/half carton) — this only changes
+    // HOW the exact value is transmitted, not what values are allowed.
+    conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
-    priceWholesale: z.number().min(0, "سعر الجملة لا يمكن أن يكون سالباً"),
-    priceRetail: z.number().min(0, "سعر التجزئة لا يمكن أن يكون سالباً").optional().nullable(),
+    // [FIX] Was `z.number().min(0, ...)`.
+    priceWholesale: nonNegativeDecimalString("سعر الجملة لا يمكن أن يكون سالباً"),
+    // [FIX] Was `z.number().min(0, ...).optional().nullable()`.
+    priceRetail: nonNegativeDecimalString("سعر التجزئة لا يمكن أن يكون سالباً")
+      .optional()
+      .nullable(),
     barcode: z.string().optional().nullable(),
     barcodeSource: z.enum(["GS1", "INTERNAL"]).optional().nullable(),
     imageUrl: z.string().optional().nullable(),
@@ -60,6 +80,45 @@ const updateProductSchema = z.object({
   isPublic: z.boolean().optional(),
   units: z.array(unitSchema).min(1, "يجب أن يحتوي المنتج على وحدة قياس واحدة على الأقل").optional(),
 });
+
+// [FIX — TYPE ERROR] checkProductPublishable<T>() infers T from the shape
+// of the `units` array it's given. The PATCH handler below builds that
+// array via a ternary — `data.units ? data.units.map(...) : existingProduct
+// .units.map(...)` — and the two branches previously produced two
+// STRUCTURALLY DIFFERENT element shapes: the `data.units` branch has
+// `priceRetail: string | null | undefined` (Zod's validated decimal
+// string), while the `existingProduct.units` branch used to convert its
+// Prisma.Decimal via `Number(...)` into `priceRetail: number | null`.
+// A ternary whose two branches produce different array element types
+// gives the variable a UNION of two array types (`A[] | B[]`), not a
+// single array of a union element type (`(A|B)[]`) — and TypeScript's
+// generic inference does not reliably unify that into one T when the
+// argument itself is such a union, which is exactly the compile error
+// this produced ("Type ... priceRetail: number | null ... is not
+// assignable to ... priceRetail: string | null | undefined").
+//
+// Fixed two ways together:
+//   1. `candidateUnits` below is given ONE explicit, concrete type
+//      annotation, so both ternary branches are contextually checked
+//      against that same declared type instead of each inferring its own
+//      shape independently.
+//   2. The `existingProduct.units` branch no longer converts via
+//      `Number(...)` at all — it passes the live `Prisma.Decimal | null`
+//      straight through. This is not just a type-checking convenience:
+//      `checkProductPublishable`'s own `PriceRetailValue` type already
+//      accepts anything with a `.toNumber()` method (a `Prisma.Decimal`
+//      qualifies structurally), and `isUnitPublishable` already branches
+//      on exactly that case internally. Passing the Decimal through
+//      avoids an unnecessary premature float coercion here, consistent
+//      with T1's decimal.js-everywhere rule — even though this is only a
+//      read-time gate check (not a value that gets persisted), there is
+//      no reason to convert earlier than the one place that actually
+//      needs a plain number for its `> 0` comparison.
+interface PublishabilityCandidateUnit {
+  isActive: boolean;
+  imageUrl: string | null | undefined;
+  priceRetail: string | number | Prisma.Decimal | null | undefined;
+}
 
 export async function GET(
   req: Request,
@@ -104,8 +163,6 @@ export async function PATCH(
       return NextResponse.json({ error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." }, { status: 401 });
     }
 
-    // Role Capability Matrix (T2b) is the single authoritative permission
-    // check — no separate manual role comparison here.
     assertRolePermission(session.user.role, "inventory:mutate");
 
     await assertTenantWritable(session.user.tenantId);
@@ -138,14 +195,7 @@ export async function PATCH(
 
     const data = parsed.data;
 
-    // Validate units if provided
     if (data.units) {
-      // [FIX] Base-unit-required and no-duplicate-factors are now
-      // delegated to the single shared implementation in
-      // unit-conversion.ts instead of being re-derived here by hand —
-      // keeps this route and POST /products permanently in sync with
-      // exactly one definition of "valid packaging units", and keeps the
-      // fractional-factor rule enforced consistently in one place.
       const packagingCheck = validatePackagingUnits(data.units);
       if (!packagingCheck.valid) {
         return NextResponse.json(
@@ -157,10 +207,6 @@ export async function PATCH(
         );
       }
 
-      // The following two checks are NOT covered by validatePackagingUnits
-      // (which only validates unitName presence + conversionFactor rules)
-      // and remain here: duplicate unit NAMES, and duplicate BARCODES
-      // (both in-request and against this tenant's other products).
       const names = new Set<string>();
       const barcodesInRequest = new Set<string>();
       for (const u of data.units) {
@@ -210,15 +256,6 @@ export async function PATCH(
       }
     }
 
-    // isActive and isPublic are two fully independent fields, per T1/T3a:
-    // "Deactivation/reactivation is purely a visibility toggle, never a
-    // data-migration event, and requires no field re-validation."
-    //   - isActive changes only if the request explicitly sets it.
-    //   - isPublic changes ONLY if the request explicitly sets it
-    //     (`data.isPublic !== undefined`). Editing name/category/units, or
-    //     toggling isActive, NEVER touches isPublic on its own.
-    //   - The publishing gate is validated ONLY when the request is
-    //     explicitly trying to turn isPublic ON (data.isPublic === true).
     const nextIsActive = data.isActive !== undefined ? data.isActive : existingProduct.isActive;
     const nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
 
@@ -233,7 +270,12 @@ export async function PATCH(
         );
       }
 
-      const candidateUnits = data.units
+      // [FIX — TYPE ERROR, see the PublishabilityCandidateUnit comment
+      // above for the full explanation] Both ternary branches are now
+      // contextually typed against the SAME explicit annotation, and the
+      // `existingProduct.units` branch passes its Prisma.Decimal straight
+      // through instead of pre-converting via Number(...).
+      const candidateUnits: PublishabilityCandidateUnit[] = data.units
         ? data.units.map((u) => ({
           isActive: u.isActive !== false,
           imageUrl: u.imageUrl,
@@ -242,7 +284,7 @@ export async function PATCH(
         : existingProduct.units.map((u) => ({
           isActive: u.isActive !== false,
           imageUrl: u.imageUrl,
-          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? Number(u.priceRetail) : null,
+          priceRetail: u.priceRetail,
         }));
 
       const gateCheck = checkProductPublishable({
@@ -278,6 +320,9 @@ export async function PATCH(
               where: { id: u.id },
               data: {
                 unitName: u.unitName,
+                // [FIX] These three are now validated decimal strings —
+                // Prisma parses each directly into an exact Decimal(18,4),
+                // matching POST's write path. No Number(...) conversion.
                 conversionFactor: u.conversionFactor,
                 pricingCurrency: u.pricingCurrency,
                 priceWholesale: u.priceWholesale,
@@ -306,29 +351,37 @@ export async function PATCH(
             });
           }
 
-          // ProductCatalogEntry is write-once at creation and MUST NEVER
-          // be updated afterward by anyone — not even by the tenant that
-          // originally created it (Master Spec T3a §6 / ProductCatalogEntry).
-          // The only two valid outcomes: (a) no entry exists yet → create
-          // it (this tenant becomes its permanent owner), or (b) an entry
-          // already exists (owned by anyone) → do nothing. Only a
-          // Super-Admin resolving a ProductCatalogEntryReport (T6) may
-          // ever change an existing entry.
           if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
             const barcodeTrim = u.barcode.trim();
             const existingCatalog = await tx.productCatalogEntry.findUnique({
               where: { barcode: barcodeTrim },
             });
             if (!existingCatalog) {
-              await tx.productCatalogEntry.create({
-                data: {
-                  barcode: barcodeTrim,
-                  name: data.name || product.name,
-                  category: data.category !== undefined ? data.category : product.category,
-                  imageUrl: u.imageUrl || null,
-                  addedByTenantId: tenantId,
-                },
-              });
+              try {
+                await tx.productCatalogEntry.create({
+                  data: {
+                    barcode: barcodeTrim,
+                    name: data.name || product.name,
+                    category: data.category !== undefined ? data.category : product.category,
+                    imageUrl: u.imageUrl || null,
+                    addedByTenantId: tenantId,
+                  },
+                });
+              } catch (catalogError) {
+                // [FIX] Same benign cross-tenant race guard as
+                // products/route.ts's POST — a P2002 here means another
+                // tenant's request won the race to create this exact
+                // shared catalog entry a moment earlier, which is a
+                // harmless, expected outcome for a platform-wide,
+                // write-once-per-barcode table, never a real conflict for
+                // THIS tenant's own product/unit write.
+                const isBenignRace =
+                  catalogError instanceof Prisma.PrismaClientKnownRequestError &&
+                  catalogError.code === "P2002";
+                if (!isBenignRace) {
+                  throw catalogError;
+                }
+              }
             }
           }
         }

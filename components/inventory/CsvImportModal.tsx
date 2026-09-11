@@ -30,12 +30,14 @@ interface NewProductRow {
   name: string;
   category?: string;
   unitName: string;
-  conversionFactor: number;
-  priceWholesale: number;
-  priceRetail?: number;
+  conversionFactor: string | number;
+  priceWholesale: string | number;
+  priceRetail?: string | number;
   pricingCurrency?: "SYP" | "USD";
+  initialBatchNumber?: string;
+  initialQuantity?: string | number;
   batchNumber?: string;
-  quantity?: number;
+  quantity?: string | number;
   expiryDate?: string;
 }
 
@@ -44,8 +46,8 @@ interface PriceUpdateRow {
   barcode: string;
   productName: string;
   unitName: string;
-  currentPriceWholesale: number;
-  newPriceWholesale: number;
+  currentPriceWholesale: string | number;
+  newPriceWholesale: string | number;
   pricingCurrency: "SYP" | "USD";
   unitId: string;
 }
@@ -68,15 +70,25 @@ interface PreviewData {
   rejectedRows: RejectedRow[];
 }
 
-// [FIX] Added `failedPriceUpdates` — matches CommitCsvImportResult in
-// lib/inventory/csv-parser.ts after its per-row error-isolation fix.
-// Without this, a real (non-"skipped") price-update failure was silently
-// invisible to `hasPartialFailure` below, even though the server's
-// `hasFailures` flag correctly reported it.
+// [FIX — critical] `skippedPriceUpdates` was previously typed as `number`.
+// The actual server response (CommitCsvImportResult in csv-parser.ts)
+// returns an ARRAY of detail objects — the exact same shape as
+// `failedPriceUpdates` right below it. Because `const data = await
+// res.json()` is untyped (`any`), TypeScript never caught the mismatch at
+// `setCommitResult(data.result)` — the array flowed straight into a field
+// declared `number` with zero compile error. Every downstream `> 0`
+// comparison against this field then compared an array to a number,
+// which JS coerces to NaN, and `NaN > 0` is always false: a skipped price
+// update (e.g. because the row meant to create its target unit earlier in
+// the same file had itself failed) could never surface to the merchant —
+// not in the summary count, not in `hasPartialFailure`, and there was no
+// per-row detail list for it at all (unlike failedNewProducts/
+// failedPriceUpdates, which do get one). Fixed by typing it correctly and
+// adding the matching detail-list rendering below.
 interface CommitResult {
   createdProductsCount: number;
   updatedPricesCount: number;
-  skippedPriceUpdates: number;
+  skippedPriceUpdates: { lineNumber: number; barcode: string; unitName: string; reason: string }[];
   failedNewProducts: { lineNumber: number; name: string; barcode?: string; reason: string }[];
   failedPriceUpdates: { lineNumber: number; barcode: string; unitName: string; reason: string }[];
 }
@@ -191,11 +203,13 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
   const canCommit =
     !!preview && (preview.newProducts.length > 0 || preview.priceUpdates.length > 0);
 
-  // [FIX] Now also triggers on failedPriceUpdates — see interface comment.
+  // [FIX — critical] `.length`, not a truthy/numeric comparison on the
+  // array itself. See the CommitResult interface comment above for the
+  // full failure mode this fixes.
   const hasPartialFailure =
     !!commitResult &&
     (commitResult.failedNewProducts.length > 0 ||
-      commitResult.skippedPriceUpdates > 0 ||
+      commitResult.skippedPriceUpdates.length > 0 ||
       commitResult.failedPriceUpdates.length > 0);
 
   return (
@@ -220,8 +234,9 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                   تم إنشاء {commitResult.createdProductsCount} منتج وتحديث {commitResult.updatedPricesCount} سعر.
                   {commitResult.failedNewProducts.length > 0 &&
                     ` تعذّر إنشاء ${commitResult.failedNewProducts.length} منتج.`}
-                  {commitResult.skippedPriceUpdates > 0 &&
-                    ` تم تجاهل ${commitResult.skippedPriceUpdates} تحديث سعر (الوحدة غير موجودة).`}
+                  {/* [FIX] `.length`, not the array itself — see interface comment above. */}
+                  {commitResult.skippedPriceUpdates.length > 0 &&
+                    ` تم تجاهل ${commitResult.skippedPriceUpdates.length} تحديث سعر (الوحدة غير موجودة).`}
                   {commitResult.failedPriceUpdates.length > 0 &&
                     ` تعذّر تنفيذ ${commitResult.failedPriceUpdates.length} تحديث سعر بسبب خطأ غير متوقع.`}
                 </span>
@@ -266,11 +281,36 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                 </div>
               )}
 
-              {commitResult.skippedPriceUpdates > 0 && (
-                <p className="text-xs text-amber-700 dark:text-amber-400">
-                  {commitResult.skippedPriceUpdates} تحديث سعر تم تجاهله لأن الوحدة المرتبطة به لم تعد موجودة —
-                  يُنصح بإعادة معاينة الملف واستيراده من جديد للتأكد من سلامة البيانات.
-                </p>
+              {/* [FIX — new] Per-row detail list for skippedPriceUpdates,
+                  matching the failedNewProducts/failedPriceUpdates pattern
+                  above. Previously this data existed on the server
+                  response (with a real `reason` per row, e.g. "the unit
+                  this barcode was supposed to create earlier in this file
+                  never got created") but the modal only ever rendered a
+                  single generic sentence below — and that sentence could
+                  never even appear due to the array/number bug fixed
+                  above. Every skipped row's specific reason is now
+                  visible, not just a bare count. */}
+              {commitResult.skippedPriceUpdates.length > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+                    تحديثات أسعار تم تجاهلها (الوحدة غير موجودة):
+                  </p>
+                  {commitResult.skippedPriceUpdates.map((row) => (
+                    <div
+                      key={`skip-${row.lineNumber}`}
+                      className="p-2.5 bg-white dark:bg-zinc-900 rounded-lg border border-amber-200 dark:border-amber-900/50 text-xs"
+                    >
+                      <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                        السطر {row.lineNumber} — {row.unitName} ({row.barcode}):
+                      </span>{" "}
+                      <span className="text-amber-700 dark:text-amber-400">{row.reason}</span>
+                    </div>
+                  ))}
+                  <p className="text-xs text-amber-700 dark:text-amber-400">
+                    يُنصح بإعادة معاينة الملف واستيراده من جديد للتأكد من سلامة البيانات.
+                  </p>
+                </div>
               )}
 
               <Button

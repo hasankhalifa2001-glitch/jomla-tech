@@ -39,6 +39,25 @@ import { validatePackagingUnits } from "@/lib/inventory/conversions";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import type { ProductItem, UnitItem } from "@/components/inventory/ProductTable";
 
+// [FIX] `[id]/route.ts`'s PATCH now validates conversionFactor/
+// priceWholesale/priceRetail as decimal STRINGS (regex-checked, max 4
+// decimal places), matching products/route.ts's POST — see that file's
+// DECIMAL_STRING_REGEX note. This modal's internal state stays `number`
+// (simplest for <input type="number"> controls), but every such value
+// crossing into the PATCH payload must go through this helper rather than
+// a raw `String(...)` cast: `String(0.1 + 0.2)` can produce floating-point
+// noise ("0.30000000000000004") with more than 4 decimal digits, which
+// would fail the backend's regex outright. `toFixed(4)` both rounds to the
+// column's actual precision (Decimal(18,4)) and guarantees a plain,
+// non-exponential decimal string. Non-finite input is coerced to "0"
+// rather than emitting an invalid string like "NaN". Duplicated here
+// (rather than shared with AddProductModal.tsx's identical helper) per
+// the decision not to introduce a shared decimal-format module.
+const toDecimalString = (value: number): string => {
+  if (!Number.isFinite(value)) return "0";
+  return value.toFixed(4);
+};
+
 export interface EditUnitForm {
   id?: string;
   unitName: string;
@@ -82,54 +101,20 @@ export function EditProductModal({
   const [units, setUnits] = useState<EditUnitForm[]>([]);
   const [saving, setSaving] = useState(false);
 
-  // Modals & sub-flows
   const [scannerOpen, setScannerOpen] = useState(false);
   const [cropModalOpen, setCropModalOpen] = useState(false);
   const [catalogReportOpen, setCatalogReportOpen] = useState(false);
   const [activeUnitIndex, setActiveUnitIndex] = useState<number>(0);
 
-  // Barcode Source Gate
   const [barcodeGate, setBarcodeGate] = useState<{
     unitIndex: number | null;
     barcode: string;
   }>({ unitIndex: null, barcode: "" });
 
-  // Catalog Lookup info
   const [catalogInfo, setCatalogInfo] = useState<CatalogLookupResult | null>(null);
 
   const lookupAbortRef = useRef<AbortController | null>(null);
 
-  // ---------------------------------------------------------------------
-  // [FIX] Removed the useEffect that previously called setName/setCategory
-  // /setIsPublic/setIsActive/setUnits/setCatalogInfo/setBarcodeGate
-  // synchronously inside its body every time `product`/`open` changed.
-  // Calling setState directly inside an effect body to sync internal
-  // state FROM a prop is exactly the anti-pattern React's own docs warn
-  // against — see https://react.dev/learn/you-might-not-need-an-effect,
-  // "Adjusting some state when a prop changes." It forces an extra,
-  // avoidable render pass (mount with stale/empty state -> effect runs ->
-  // second render with real data) every single time this modal opens.
-  //
-  // The fix follows React's own recommended alternative for this exact
-  // scenario: adjust state DURING RENDER by comparing against a stored
-  // "last initialized for" key, not inside an effect. When the key
-  // differs, this synchronously calls the setters below right here in the
-  // render body — React explicitly supports this (it immediately
-  // re-renders with the corrected state before committing to the DOM, so
-  // the user never sees the stale intermediate frame an effect-based reset
-  // would flash).
-  //
-  // A `key`-based remount (the approach used for BarcodeSourceModal
-  // elsewhere in this codebase) was deliberately NOT used here instead:
-  // this Dialog is typically kept mounted by the underlying Radix
-  // primitive across open/close transitions (for its own close
-  // animation), so a parent-supplied `key` change on `open` would fight
-  // that animation rather than cleanly resetting internal state. Deriving
-  // the reset condition from BOTH `open` and `product?.id` (not just
-  // `product?.id` alone) is what makes RE-opening the SAME product after
-  // a previous cancelled edit correctly discard any unsaved changes, not
-  // just switching to a genuinely different product.
-  // ---------------------------------------------------------------------
   const [initializedFor, setInitializedFor] = useState<string | null>(null);
   const currentInitKey = open && product ? product.id : null;
 
@@ -165,30 +150,6 @@ export function EditProductModal({
     }
   }
 
-  // ---------------------------------------------------------------------
-  // [FIX — base-unit identity bug] Previously, "is this the base unit"
-  // was computed live as `unit.conversionFactor === 1` inside the render
-  // loop below. That recomputes on every keystroke from the CURRENT input
-  // value, not a stable identity. So editing a non-base unit's conversion
-  // factor (e.g. typing "10" over "12") would briefly produce the
-  // intermediate value "1" after the first keystroke — at which point
-  // `isBase` flipped to true and the input immediately became `disabled`,
-  // locking mid-edit before the rest of the digits could be typed. The
-  // "الوحدة الأساسية" badge flickered incorrectly for the same reason.
-  //
-  // Fix: `units` is sorted by conversionFactor ascending exactly once, at
-  // load time (see the init block above), so the base unit (factor === 1)
-  // is always at index 0 the moment the modal opens. handleAddUnit only
-  // ever appends to the END of the array, and the base unit can never be
-  // removed (see the index === 0 guard in handleRemoveUnit below), so
-  // index 0 stays a stable, load-time-fixed identity for "the base unit"
-  // for the entire lifetime of the open modal — completely independent of
-  // whatever value is currently being typed into any conversionFactor
-  // input. `isBase` is now derived from array position, never from the
-  // live value.
-  // ---------------------------------------------------------------------
-
-  // Handle Barcode Classification Gate
   const requestBarcodeClassification = (unitIndex: number, rawBarcode: string) => {
     const cleaned = rawBarcode.trim();
 
@@ -325,10 +286,6 @@ export function EditProductModal({
   };
 
   const handleRemoveUnit = (index: number) => {
-    // [FIX] Was `units[index].conversionFactor === 1`, the same live-value
-    // bug as the render-loop isBase check. The base unit is always at
-    // index 0 (see note above) — guard on position, not on a value that
-    // can transiently equal 1 while a user is mid-edit of another unit.
     if (index === 0) {
       toast.error("لا يمكن حذف الوحدة الأساسية.");
       return;
@@ -370,6 +327,24 @@ export function EditProductModal({
 
     if (!name.trim()) {
       toast.error("اسم المنتج مطلوب.");
+      return;
+    }
+
+    // [FIX — GAP CLOSED] AddProductModal.tsx already enforces this exact
+    // check (in both goNext's step-2 gate and handleSubmit) — priceWholesale
+    // is the ONLY figure ever used to bill a sale (POS or B2B alike, per
+    // T1), so a unit reaching submit with priceWholesale <= 0 must be
+    // rejected here too. This modal previously had NO such check: the
+    // backend's own validator (nonNegativeDecimalString, [id]/route.ts)
+    // accepts priceWholesale === 0, and validatePackagingUnits()
+    // deliberately does not check priceWholesale at all (see that file's
+    // own VALIDATION SCOPE NOTE — it is intentionally out of that
+    // function's scope, left to each call site). Without this check, an
+    // ADMIN editing an existing unit through this screen could save a
+    // priceWholesale of 0 with nothing anywhere rejecting it, producing a
+    // unit sellable at zero cost on the POS.
+    if (units.some((u) => !u.unitName.trim() || u.conversionFactor <= 0 || u.priceWholesale <= 0)) {
+      toast.error("يرجى التأكد من ملء جميع الوحدات بمعامل تحويل وسعر جملة أكبر من الصفر.");
       return;
     }
 
@@ -416,13 +391,20 @@ export function EditProductModal({
         category: category.trim() || null,
         isPublic,
         isActive,
+        // [FIX] conversionFactor/priceWholesale/priceRetail now sent as
+        // decimal strings via toDecimalString — matches [id]/route.ts's
+        // PATCH schema. Was previously sending raw numbers
+        // (`u.conversionFactor`, `Number(u.priceWholesale) || 0`, etc.).
         units: units.map((u) => ({
           ...(u.id ? { id: u.id } : {}),
           unitName: u.unitName.trim(),
-          conversionFactor: u.conversionFactor,
+          conversionFactor: toDecimalString(Number(u.conversionFactor)),
           pricingCurrency: u.pricingCurrency,
-          priceWholesale: Number(u.priceWholesale) || 0,
-          priceRetail: u.priceRetail === "" || u.priceRetail === null ? null : Number(u.priceRetail),
+          priceWholesale: toDecimalString(Number(u.priceWholesale) || 0),
+          priceRetail:
+            u.priceRetail === "" || u.priceRetail === null
+              ? null
+              : toDecimalString(Number(u.priceRetail)),
           barcode: u.barcode.trim() || null,
           barcodeSource: u.barcode.trim() ? u.barcodeSource : null,
           imageUrl: u.imageUrl.trim() || null,
@@ -505,7 +487,6 @@ export function EditProductModal({
           )}
 
           <div className="space-y-6 py-2">
-            {/* Main Product Info */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <Label htmlFor="edit-name" className="text-xs font-semibold">
@@ -534,7 +515,6 @@ export function EditProductModal({
               </div>
             </div>
 
-            {/* Product Status & Publishing Gate */}
             <div className="p-4 bg-zinc-50 dark:bg-zinc-800/40 rounded-xl border border-zinc-200 dark:border-zinc-800 space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
@@ -572,7 +552,6 @@ export function EditProductModal({
               </div>
             </div>
 
-            {/* Packaging Units Engine */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <div>
@@ -598,8 +577,6 @@ export function EditProductModal({
 
               <div className="space-y-3">
                 {units.map((unit, index) => {
-                  // [FIX] Stable, load-time identity — see note above.
-                  // Was: `const isBase = unit.conversionFactor === 1;`
                   const isBase = index === 0;
                   return (
                     <div
@@ -795,7 +772,6 @@ export function EditProductModal({
                         </div>
                       </div>
 
-                      {/* Unit Image */}
                       <div className="mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-800 flex items-center justify-between text-xs">
                         <div className="flex items-center gap-2">
                           <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
@@ -883,7 +859,6 @@ export function EditProductModal({
         </DialogContent>
       </Dialog>
 
-      {/* Barcode Source Modal */}
       {barcodeGate.unitIndex !== null && (
         <BarcodeSourceModal
           key={`${barcodeGate.unitIndex}-${barcodeGate.barcode}`}
@@ -899,21 +874,18 @@ export function EditProductModal({
         />
       )}
 
-      {/* Barcode Scanner Modal */}
       <BarcodeScannerModal
         open={scannerOpen}
         onOpenChange={setScannerOpen}
         onScan={handleScanSuccess}
       />
 
-      {/* Image Crop Modal */}
       <ImageCropModal
         open={cropModalOpen}
         onOpenChange={setCropModalOpen}
         onCropComplete={handleCropComplete}
       />
 
-      {/* Shared Catalog Report Modal */}
       {catalogInfo && (
         <CatalogReportModal
           key={catalogInfo.id}
