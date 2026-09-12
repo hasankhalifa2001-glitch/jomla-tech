@@ -36,33 +36,25 @@ export function ExchangeRateTopbar() {
         }
     }, [session?.user?.tenantId, setCurrentTenantId]);
 
-    // [FIX — stale JWT source of truth] Previously seeded dailyExchangeRate
-    // exclusively from session.user.dailyExchangeRate (the JWT), matching
-    // T2a's own rule that this field must never be trusted from the token:
-    // it can change mid-session on ANY device (another ADMIN tab, another
-    // browser, another ADMIN account entirely) and this device's JWT has no
-    // way to know that happened until its own token is explicitly refreshed
-    // via updateSession(). That refresh only ever fires on the editing
-    // ADMIN's own tab after a successful save — every OTHER open
-    // session (a CASHIER's separate browser, an ADMIN's second device, a
-    // stale tab that's simply been open a while) never gets it, and a
-    // manual page reload doesn't help either, since a plain session read is
-    // not a `trigger: 'update'` and re-hydrates the same stale JWT value.
-    //
-    // Fixed the same way subscriptionStatus already is elsewhere in this
-    // codebase: fetch the live value from the database via GET
-    // /api/tenant/exchange-rate on every mount, unconditionally — not only
-    // when the store happens to be empty. session.user.dailyExchangeRate is
-    // used strictly as a same-tick fallback so the badge/input isn't blank
-    // while the fetch is in flight; the fetched value always overwrites it
-    // once the request resolves, and is treated as the sole source of
-    // truth from that point on.
-    useEffect(() => {
-        if (session?.user?.dailyExchangeRate !== undefined && dailyExchangeRate === null) {
-            setExchangeRate(session.user.dailyExchangeRate, session.user.tenantId);
-        }
-    }, [session, dailyExchangeRate, setExchangeRate]);
-
+    // [REMOVED — stale JWT source of truth] This component previously had a
+    // second effect here that seeded `dailyExchangeRate` from
+    // `session.user.dailyExchangeRate` whenever the store was still null.
+    // That violates T2a directly: the JWT can go stale mid-session on ANY
+    // device the moment a different admin/tab/account updates the rate, and
+    // this tab's token has no way to know until it's explicitly refreshed
+    // via updateSession() — which only ever happens on the editing admin's
+    // own tab after their own save. Every other open session (a CASHIER's
+    // browser, this same admin's second device, a tab that's simply been
+    // open a while) would show a stale rate with no signal anything was
+    // wrong, and pos-layout.tsx prices real invoices off this exact store
+    // value. <ExchangeRateInitializer />, mounted once at the app shell
+    // root, now owns bootstrapping this value (Dexie cache first, then an
+    // unconditional fresh fetch) for every screen — including ones that
+    // never render this component. The fetch effect directly below is kept
+    // as a defensive second read (harmless if it duplicates
+    // ExchangeRateInitializer's own fetch — both simply overwrite the store
+    // with the same live database value), in case a future route ever
+    // renders this component without the initializer mounted above it.
     useEffect(() => {
         if (!session?.user?.tenantId) return;
 
@@ -86,8 +78,8 @@ export function ExchangeRateTopbar() {
                 }
             } catch (err) {
                 // Network/offline failure: silently keep whatever value is
-                // already shown (session fallback or cache) rather than
-                // surfacing an error toast for a background refresh.
+                // already shown (initializer's cache/fetch result) rather
+                // than surfacing an error toast for a background refresh.
                 console.error("Failed to fetch fresh daily exchange rate:", err);
             }
         })();
@@ -99,7 +91,7 @@ export function ExchangeRateTopbar() {
         // session/account switch in the same tab), and once per mount
         // otherwise — this is the fresh-read-on-load fix itself, so it must
         // not be skipped when dailyExchangeRate is already non-null (e.g.
-        // seeded from a stale JWT or Dexie cache).
+        // seeded by ExchangeRateInitializer already).
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [session?.user?.tenantId]);
 

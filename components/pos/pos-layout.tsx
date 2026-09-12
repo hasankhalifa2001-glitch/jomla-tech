@@ -53,7 +53,7 @@ export function PosLayout() {
   const { data: session } = useSession();
   const tenantId = session?.user?.tenantId;
 
-  const isDbReady = useOfflineDbReady();
+  const { isReady: isDbReady, status: dbStatus } = useOfflineDbReady(tenantId);
   const dailyExchangeRate = useExchangeRateStore((state) => state.dailyExchangeRate);
   const hydrateExchangeRate = useExchangeRateStore((state) => state.hydrateFromCache);
 
@@ -601,9 +601,19 @@ export function PosLayout() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="flex items-center gap-1.5 shrink-0">
             <span
-              className={`inline-block h-2 w-2 rounded-full ${isDbReady ? "bg-emerald-500" : "bg-zinc-300 animate-pulse"
+              className={`inline-block h-2 w-2 rounded-full ${isDbReady
+                  ? "bg-emerald-500"
+                  : dbStatus === "NO_CACHED_DATA"
+                    ? "bg-amber-500"
+                    : "bg-zinc-300 animate-pulse"
                 }`}
-              title={isDbReady ? "قاعدة البيانات المحلية جاهزة" : "جاري تهيئة قاعدة البيانات..."}
+              title={
+                isDbReady
+                  ? "قاعدة البيانات المحلية جاهزة"
+                  : dbStatus === "NO_CACHED_DATA"
+                    ? "لا توجد بيانات مخزنة محلياً بعد — يرجى الاتصال بالإنترنت للمزامنة"
+                    : "جاري تهيئة قاعدة البيانات..."
+              }
             />
             {pendingInvoicesCount > 0 && (
               <Badge

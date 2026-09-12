@@ -2,7 +2,12 @@
 "use client";
 
 import { create } from "zustand";
-import { setCachedDailyExchangeRate, getCachedDailyExchangeRate } from "@/lib/offline";
+import {
+    setCachedDailyExchangeRate,
+    getCachedDailyExchangeRate,
+    setCachedRate,
+    getCachedRate,
+} from "@/lib/offline";
 
 // FIX: matches the shape of next-auth's useSession().update — passed in by
 // the calling component (Zustand stores are plain JS, not React hooks, so
@@ -86,6 +91,10 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => {
 
                 set({ dailyExchangeRate: incomingRate, error: null });
 
+                // incomingTenantId is guaranteed non-empty here (the guard
+                // above already rejected any message without one), so this
+                // always calls setCachedDailyExchangeRate with a real
+                // tenantId — never hits the now-required-tenantId guard.
                 if (incomingRate !== null && incomingRate > 0) {
                     setCachedDailyExchangeRate(incomingRate, incomingTenantId).catch((err) => {
                         console.error("Failed to cache broadcasted daily exchange rate in Dexie:", err);
@@ -100,11 +109,43 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => {
         currentTenantId: null,
         isUpdating: false,
         error: null,
-        setCurrentTenantId: (tenantId) => set({ currentTenantId: tenantId }),
+        // [FIX — cross-tenant stale-rate leak] Previously only set
+        // `currentTenantId`, leaving `dailyExchangeRate` untouched. If a
+        // session ever switches from Tenant A to Tenant B WITHOUT a full
+        // page reload (e.g. a session-update-driven tenant switch, or any
+        // future multi-tenant-account UI), the store would keep showing
+        // Tenant A's rate — a real number, not a loading/empty state —
+        // for the entire window between this call and whichever resolves
+        // first: hydrateFromCache(tenantIdB) or the live
+        // /api/tenant/exchange-rate fetch. hydrateFromCache's own guard
+        // (`dailyExchangeRate === null`) would refuse to apply Tenant B's
+        // cached rate during that window specifically BECAUSE the stale
+        // Tenant A value is still non-null, making the leak persist even
+        // longer than a single tick. Fixed by resetting
+        // `dailyExchangeRate` to null immediately whenever the tenant
+        // actually changes (a same-tenant call — e.g. re-registering the
+        // same tenantId on a re-render — is a no-op, not a reset, so it
+        // never introduces an unnecessary flash of "غير محدد" on an
+        // ordinary re-render).
+        setCurrentTenantId: (tenantId) =>
+            set((state) => ({
+                currentTenantId: tenantId,
+                dailyExchangeRate:
+                    tenantId !== state.currentTenantId ? null : state.dailyExchangeRate,
+            })),
         setExchangeRate: (rate, tenantId, broadcast = false) => {
             set({ dailyExchangeRate: rate, error: null });
-            if (rate !== null && rate > 0) {
-                setCachedDailyExchangeRate(rate, tenantId).catch((err) => {
+            // [FIX] exchange-rate.ts no longer has a shared/global cache
+            // fallback — setCachedDailyExchangeRate now throws if called
+            // without a tenantId, rather than silently writing to a cache
+            // row shared across every tenant that ever used this device.
+            // Every real call site already resolves a tenantId before
+            // reaching here, so a caller missing one simply skips the
+            // local cache write (the in-memory store value above is still
+            // set either way) instead of crashing or falling back to a
+            // shared key.
+            if (rate !== null && rate > 0 && tenantId) {
+                setCachedRate(tenantId, rate).catch((err) => {
                     console.error("Failed to cache daily exchange rate locally:", err);
                 });
             }
@@ -139,17 +180,23 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => {
                 set({ dailyExchangeRate: newRate, isUpdating: false, error: null });
 
                 // [FIX — unhandled rejection, same reasoning as setExchangeRate
-                // above] `newRate` is already validated positive above, so this
-                // shouldn't reject today — but it's now a throwing function, and
-                // a bare `void` on it is fragile the same way. Caught and
-                // logged rather than surfaced: the server write (the actual
-                // source of truth) already succeeded by this point, so a local
-                // cache-write failure must never flip this call's overall
-                // result to `false` or overwrite the success state set above.
-                try {
-                    await setCachedDailyExchangeRate(newRate, tenantId);
-                } catch (cacheErr) {
-                    console.error("Failed to cache daily exchange rate locally:", cacheErr);
+                // above] The server write (the actual source of truth) already
+                // succeeded by this point, so a local cache-write failure must
+                // never flip this call's overall result to `false` or overwrite
+                // the success state set above.
+                //
+                // [FIX] setCachedDailyExchangeRate now requires a tenantId
+                // (no shared/global fallback — see exchange-rate.ts). If this
+                // call somehow arrives without one, the local Dexie cache is
+                // simply skipped rather than writing to a cross-tenant shared
+                // key or throwing here — the server write above already
+                // succeeded and is the actual source of truth either way.
+                if (tenantId) {
+                    try {
+                        await setCachedRate(tenantId, newRate);
+                    } catch (cacheErr) {
+                        console.error("Failed to cache daily exchange rate locally:", cacheErr);
+                    }
                 }
 
                 // Broadcast to other tabs on the same device
@@ -164,6 +211,15 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => {
                 // source of truth for THIS device — this only prevents *other*
                 // parts of the app that read useSession() directly from
                 // showing a stale rate on this same device.
+                //
+                // NOTE: as of the ExchangeRateInitializer/ExchangeRateTopbar
+                // fix, nothing in the app reads session.user.dailyExchangeRate
+                // as a trusted value anymore (per T2a, it must never be
+                // trusted from the JWT). This call — and the syncSession
+                // parameter/SessionUpdateFn type above — are kept only for
+                // any future non-critical display that might want a
+                // same-tick-fresher JWT; they are not load-bearing for
+                // correctness. Safe to remove entirely in a later cleanup.
                 if (syncSession) {
                     try {
                         await syncSession({ dailyExchangeRate: newRate });
@@ -183,6 +239,13 @@ export const useExchangeRateStore = create<ExchangeRateState>((set, get) => {
             }
         },
         hydrateFromCache: async (tenantId?: string) => {
+            // [FIX] getCachedDailyExchangeRate now requires a tenantId (no
+            // shared/global fallback — see exchange-rate.ts). A caller
+            // without one has nothing tenant-scoped to read, so this
+            // returns null immediately instead of throwing or reading a
+            // cross-tenant shared key.
+            if (!tenantId) return null;
+
             try {
                 const cached = await getCachedDailyExchangeRate(tenantId);
                 if (cached !== null && get().dailyExchangeRate === null) {

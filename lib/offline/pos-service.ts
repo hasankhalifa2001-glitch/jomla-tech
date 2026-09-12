@@ -17,11 +17,26 @@
  *   a bucket no legitimate tenant will ever query again.
  * - READ paths (getOfflineProducts, getOfflineCustomers,
  *   getOfflineInvoicesList, findMatchingCustomerByPhone) fall back to a
- *   shared sentinel key via resolveTenantId() when no tenantId is given.
- *   A read can only ever return an empty/default result in that state —
- *   it cannot create or corrupt tenant data — so this is safe for a
- *   pre-login or mid-hydration UI state without forcing every read call
- *   site to guard against a not-yet-available session.
+ *   local, read-only sentinel key via resolveTenantId() when no tenantId
+ *   is given. This is safe specifically because nothing in this file ever
+ *   WRITES under that sentinel — every write path above requires a real
+ *   tenantId and throws otherwise — so a read that falls back to it can
+ *   only ever resolve to an empty result, never another tenant's data.
+ *   This is deliberately a private constant local to this file, not
+ *   shared with exchange-rate.ts's own tenant-scoping — that module's
+ *   former shared cache key was a real cross-tenant leak precisely
+ *   because it WAS written to from more than one call path; that
+ *   reasoning does not apply here.
+ *
+ *   [FIX — review pass 3] resolveTenantId() previously fell back to this
+ *   sentinel silently, with no signal to the developer that a read
+ *   happened without a real tenantId. Silence here is safe (see above)
+ *   but not necessarily correct — a screen that forgot to pass tenantId
+ *   (e.g. a session/tenant context not yet loaded) would render an empty
+ *   list with no error, no warning, nothing to explain why. A dev-only
+ *   console.warn now fires on that fallback, so a missing-tenantId bug
+ *   surfaces during development instead of only manifesting as "why is
+ *   the POS showing zero products" days later.
  *
  * [v3.6] CURRENCY RE-ANCHORING — mirrors schema.prisma and db.ts. SYP is
  * now the authoritative currency for cart line items, cart totals, and
@@ -60,6 +75,62 @@
  *      (the synced server copy). offlineCustomers is now filtered to
  *      exclude SYNCED rows before merging, so a synced walk-in customer
  *      is represented exactly once, via its real cachedCustomers copy.
+ *
+ * [FIX — review pass 2]
+ *   1. This file previously imported DEFAULT_TENANT_CACHE_KEY from
+ *      ./exchange-rate for use in resolveTenantId(). That constant was
+ *      removed from exchange-rate.ts entirely (it was a genuine
+ *      cross-tenant leak there — the old key WAS written to, from
+ *      multiple call sites, whenever a caller forgot to pass tenantId).
+ *      This file now defines its own private, read-only sentinel
+ *      (READ_ONLY_UNSCOPED_KEY) — safe here specifically because nothing
+ *      in this file ever writes under it (see TENANT SCOPING POLICY
+ *      above), unlike the old exchange-rate.ts key.
+ *   2. seedSampleOfflineData() previously passed a top-level
+ *      `priceWholesale` field into every createCachedProductRecord(...)
+ *      call across all 7 sample products. createCachedProductRecord's
+ *      signature (db.ts) has no such field — per T1's Local Offline
+ *      Database Schema, pricing lives only on each unit
+ *      (CachedProductUnit.priceWholesale), never on the product itself,
+ *      since a single product can carry units priced very differently
+ *      (e.g. 1.2$ per كيس vs 55$ per شوال كبير). Removed from all 7
+ *      product literals — each unit's own priceWholesale (already
+ *      correctly present in every `units: [...]` array below) is
+ *      untouched and remains the real, authoritative price.
+ *   3. submitOfflineSale() now normalizes paymentMethod defensively
+ *      before constructing the invoice record — undefined whenever
+ *      paidAmountSYP is exactly 0 — rather than trusting the caller (the
+ *      POS UI) to have already cleared it for a fully-on-credit sale.
+ *      createOfflineInvoiceRecord (db.ts) throws if paymentMethod is set
+ *      on a paidAmountSYP === 0 sale; this normalization makes that
+ *      invariant hold here regardless of what the UI passed in.
+ *
+ * [FIX — review pass 3]
+ *   1. submitOfflineSale() now resolves whether the sale's customer is
+ *      the system-generated cash customer and passes that explicitly to
+ *      createOfflineInvoiceRecord as `isSystemCustomer`. Previously the
+ *      system-customer/zero-debt rule was enforced ONLY here, one layer
+ *      above db.ts's factory — a gap of exactly the same shape as the
+ *      totalSYP-matches-items check fixed in review pass 1, just for a
+ *      different invariant. db.ts now enforces the rule directly too;
+ *      this call site is updated to actually supply the information that
+ *      enforcement needs.
+ *   2. findMatchingCustomerByPhone()'s ONLINE branch previously returned
+ *      a hardcoded `balanceDebtSYP: 0` for a server-matched customer,
+ *      indistinguishable from a customer that genuinely has a zero
+ *      balance. A cashier acting on that figure (e.g. deciding whether a
+ *      credit sale is reasonable) could be shown "0 debt" for a customer
+ *      who actually owes a real balance the API response never carried.
+ *      Changed to `undefined` (balance genuinely unknown from this
+ *      lookup) so a caller/UI can distinguish "confirmed zero" from
+ *      "not fetched" and avoid displaying a misleading confirmed-zero
+ *      figure.
+ *   3. seedSampleOfflineData() now calls setCachedRate(tenantId, rate)
+ *      directly instead of the legacy setCachedDailyExchangeRate(rate,
+ *      tenantId) wrapper — this is new code with an already-validated,
+ *      non-empty tenantId in scope, so there's no reason to go through
+ *      the (rate, tenantId) legacy argument order meant for old call
+ *      sites.
  */
 
 import {
@@ -75,7 +146,7 @@ import {
   type CachedProductUnit,
   type OfflineInvoice,
 } from "./db";
-import { setCachedDailyExchangeRate, DEFAULT_TENANT_CACHE_KEY } from "./exchange-rate";
+import { setCachedRate } from "./exchange-rate";
 import { generateOfflineId } from "./id";
 import {
   compareMoney,
@@ -98,7 +169,9 @@ export interface SelectedCustomer {
   name: string;
   phone?: string;
   shopName?: string;
-  // [v3.6] AUTHORITATIVE.
+  // [v3.6] AUTHORITATIVE. undefined means "not known from this lookup" —
+  // NEVER assume undefined means zero; only an explicit 0 is a confirmed
+  // zero balance. See findMatchingCustomerByPhone's ONLINE branch.
   balanceDebtSYP?: number;
   // [v3.6] Derived/informational, when available.
   balanceDebtUSD?: number;
@@ -189,6 +262,14 @@ export interface StockBreakdownPart {
  * Deliberately unit-name-agnostic (works for "شوال"/"طرد"/"باكيت", not
  * just "كرتونة"/"قطعة") since ProductUnit.unitName is merchant-defined
  * free text, not a fixed enum.
+ *
+ * [NOTE] If `units` contains no conversionFactor === 1 entry at all (a
+ * product defined entirely in packaging units above the base — unusual,
+ * but not schema-impossible), any leftover remainder is labeled "قطعة" as
+ * a display fallback even though no such unit actually exists on this
+ * product. This is a cosmetic labeling edge case, not a stock-accuracy
+ * bug — the numeric `count` is still correct; only the unit name shown
+ * for the remainder may not match a real unit on this specific product.
  */
 export function breakdownStockByUnits(
   totalBaseQuantity: number,
@@ -272,9 +353,29 @@ function cachedCustomerToSelected(c: CachedCustomer): SelectedCustomer {
   };
 }
 
+// [FIX — review pass 2] Private, read-only sentinel local to this file —
+// see the TENANT SCOPING POLICY note at the top of this file for why this
+// is safe here (nothing in this file ever writes under it) despite the
+// equivalent shared key in exchange-rate.ts having been removed for the
+// opposite reason (it WAS written to there). Used only by READ paths.
+const READ_ONLY_UNSCOPED_KEY = "unscoped_read_only";
+
 // Used by READ paths only — see the tenant-scoping policy note above.
+// [FIX — review pass 3] Now warns in development when falling back, so a
+// missing-tenantId bug upstream (a session/tenant context not yet loaded)
+// surfaces as a visible signal instead of silently rendering empty lists.
 function resolveTenantId(tenantId?: string): string {
-  return tenantId && tenantId.trim() ? tenantId.trim() : DEFAULT_TENANT_CACHE_KEY;
+  if (!tenantId || !tenantId.trim()) {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(
+        "[pos-service] Read called without a tenantId — resolving to an " +
+        "empty, unscoped result. This usually indicates a missing " +
+        "session/tenant context upstream."
+      );
+    }
+    return READ_ONLY_UNSCOPED_KEY;
+  }
+  return tenantId.trim();
 }
 
 export function calculateCartTotals(
@@ -615,7 +716,14 @@ export async function findMatchingCustomerByPhone(
               name: data.customer.name,
               phone: data.customer.phone,
               shopName: data.customer.shopName,
-              balanceDebtSYP: 0,
+              // [FIX — review pass 3] Was hardcoded to 0, indistinguishable
+              // from a genuinely zero balance. /api/customers/lookup does
+              // not currently return a balance figure at all, so this is
+              // honestly "unknown", not "confirmed zero" — leaving it
+              // undefined lets a caller/UI show "balance unavailable"
+              // instead of a misleading "0 دين" for a customer who may
+              // actually owe money.
+              balanceDebtSYP: undefined,
               isSystemGenerated: data.customer.isSystemGenerated,
             },
             source: "ONLINE",
@@ -761,6 +869,14 @@ export async function submitOfflineSale(
   // exchangeRateUsed, so a mismatch is structurally impossible rather
   // than something this function has to catch after the fact.
 
+  // [FIX — ADDED, review pass 2] Normalize paymentMethod defensively
+  // rather than trusting the caller to have already cleared it for a
+  // fully-on-credit sale. createOfflineInvoiceRecord (db.ts) throws if
+  // paymentMethod is set while paidAmountSYP === 0 — this makes that
+  // invariant hold here regardless of what the POS UI actually passed.
+  const normalizedPaymentMethod =
+    compareMoney(payload.paidAmountSYP, 0) === 0 ? undefined : payload.paymentMethod;
+
   const invoiceItems = payload.items.map((item) => ({
     productId: item.product.id,
     unitId: item.unitId,
@@ -771,18 +887,26 @@ export async function submitOfflineSale(
   const isWalkIn = customer.type === "WALK_IN";
   const customerId = !isWalkIn ? customer.id : undefined;
   const offlineCustomerId = isWalkIn ? customer.id : undefined;
+  // [FIX — review pass 3] Resolved once here and passed through explicitly
+  // to createOfflineInvoiceRecord, which now enforces T1's "system
+  // customer only with zero debt" rule directly — see db.ts's file-header
+  // note. This call site is where that information is actually known (the
+  // `customer` resolved above), so it's the right place to supply it
+  // rather than leaving the factory to trust the debt check alone.
+  const isSystemCustomer = isSystemCashCustomer(customer);
 
   const invoiceRecord = createOfflineInvoiceRecord({
     tenantId: scopedTenantId,
     offlineId: generateOfflineId(),
     customerId,
     offlineCustomerId,
+    isSystemCustomer,
     items: invoiceItems,
     totalSYP: payload.totalSYP,
     exchangeRateUsed: payload.exchangeRateUsed,
     paidAmountSYP: payload.paidAmountSYP,
     debtAmountSYP: payload.debtAmountSYP,
-    paymentMethod: payload.paymentMethod,
+    paymentMethod: normalizedPaymentMethod,
     createdAt: new Date(),
     status: "PENDING",
   });
@@ -806,10 +930,10 @@ export async function getOfflineInvoicesList(tenantId?: string): Promise<Offline
  * `tenantId` is REQUIRED, not optional with a sentinel fallback. This
  * function performs real writes (bulkPut into cachedProducts /
  * cachedCustomers) — unlike the pure-read functions above, running it
- * without a real tenantId would durably seed demo data under the shared
- * "global_tenant" bucket, where it would then silently satisfy any FUTURE
- * read that also forgot to pass a real tenantId (masking that bug instead
- * of surfacing it) and would never be cleaned up by any per-tenant flow.
+ * without a real tenantId would durably seed demo data under a shared
+ * bucket, where it would then silently satisfy any FUTURE read that also
+ * forgot to pass a real tenantId (masking that bug instead of surfacing
+ * it) and would never be cleaned up by any per-tenant flow.
  */
 export async function seedSampleOfflineData(tenantId: string): Promise<void> {
   if (!tenantId || !tenantId.trim()) {
@@ -828,7 +952,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-1",
         name: "سكر أبيض ناعم (الأسرة)",
-        priceWholesale: 1.2,
         units: [
           { id: "unit-1-1", unitName: "كيس (1 كغ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 1.2, priceRetail: 1.5, barcode: "6291001001" },
           { id: "unit-1-2", unitName: "شوال (10 كغ)", conversionFactor: 10, pricingCurrency: "USD", priceWholesale: 11.5, priceRetail: 14.0, barcode: "6291001002" },
@@ -843,7 +966,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-2",
         name: "زيت دوار الشمس (عافية 1.5 لتر)",
-        priceWholesale: 3.5,
         units: [
           { id: "unit-2-1", unitName: "عبوة (1.5 لتر)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 3.5, priceRetail: 4.2, barcode: "6292002001" },
           { id: "unit-2-2", unitName: "كرتونة (6 عبوات)", conversionFactor: 6, pricingCurrency: "USD", priceWholesale: 20.0, priceRetail: 24.0, barcode: "6292002002" },
@@ -856,7 +978,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-3",
         name: "شاي أسود فرط (الكبوس 450 غرام)",
-        priceWholesale: 4.8,
         units: [
           { id: "unit-3-1", unitName: "باكيت (450 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 4.8, priceRetail: 5.5, barcode: "6293003001" },
           { id: "unit-3-2", unitName: "كرتونة (24 باكيت)", conversionFactor: 24, pricingCurrency: "USD", priceWholesale: 110.0, barcode: "6293003002" },
@@ -869,7 +990,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-4",
         name: "أرز بسمتي هندي (أبو كاس 5 كغ)",
-        priceWholesale: 8.5,
         units: [
           { id: "unit-4-1", unitName: "كيس (5 كغ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 8.5, priceRetail: 10.0, barcode: "6294004001" },
           { id: "unit-4-2", unitName: "كرتونة (4 أكياس)", conversionFactor: 4, pricingCurrency: "USD", priceWholesale: 33.0, barcode: "6294004002" },
@@ -882,7 +1002,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-5",
         name: "حليب مجفف كامل الدسم (نيدو 900 غرام)",
-        priceWholesale: 7.2,
         units: [
           { id: "unit-5-1", unitName: "علبة (900 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 7.2, priceRetail: 8.5, barcode: "6295005001" },
           { id: "unit-5-2", unitName: "كرتونة (12 علبة)", conversionFactor: 12, pricingCurrency: "USD", priceWholesale: 84.0, barcode: "6295005002" },
@@ -895,7 +1014,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-6",
         name: "معكرونة إيطالية (سباغيتي 500 غ)",
-        priceWholesale: 0.85,
         units: [
           { id: "unit-6-1", unitName: "كيس (500 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 0.85, priceRetail: 1.1, barcode: "6296006001" },
           { id: "unit-6-2", unitName: "طرد (20 كيس)", conversionFactor: 20, pricingCurrency: "USD", priceWholesale: 16.0, barcode: "6296006002" },
@@ -908,7 +1026,6 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         tenantId: scopedTenantId,
         id: "prod-7",
         name: "طحين سميد فاخر (كيس 1 كغ)",
-        priceWholesale: 18000,
         units: [
           {
             id: "unit-7-1",
@@ -951,6 +1068,10 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
 
   const settingsCount = await db.cachedTenantSettings.where("tenantId").equals(scopedTenantId).count();
   if (settingsCount === 0) {
-    await setCachedDailyExchangeRate(15000, scopedTenantId);
+    // [FIX — review pass 3] Calls the canonical setCachedRate(tenantId,
+    // rate) directly — scopedTenantId is already validated and non-empty
+    // here, so there's no reason for new code to go through the legacy
+    // (rate, tenantId) wrapper meant for old call sites.
+    await setCachedRate(scopedTenantId, 15000);
   }
 }

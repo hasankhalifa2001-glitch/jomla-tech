@@ -21,6 +21,14 @@ import Decimal from "decimal.js";
  * payment row — right up until someone notices the books don't add up.
  * Every function below throws a `MoneyError` rather than returning a
  * plausible-looking-but-wrong value for any input it cannot trust.
+ *
+ * [NOTE] The one deliberate exception to "fail loud" is rounding, not
+ * validation: serializeMoney()/addMoney()/etc. all round their RESULT to
+ * 4 decimal places via toFixed(4), matching every Decimal(18,4) column on
+ * the server. A caller passing "10.123456" gets back "10.1235" with no
+ * error — this is intentional precision-matching with the DB schema, not
+ * a silently-wrong value. It never discards an invalid/NaN/Infinity
+ * input; it only rounds an already-valid one to the schema's precision.
  * ============================================================================
  */
 
@@ -104,7 +112,8 @@ export function toDecimal(value: MoneyInput): MoneyDecimal {
 
 /**
  * Serializes any monetary value to a string representation for safe DB
- * storage (Dexie / API).
+ * storage (Dexie / API). Rounds to 4 decimal places — see the file-header
+ * NOTE on rounding vs. fail-loud validation.
  */
 export function serializeMoney(value: MoneyInput): string {
   return toDecimal(value).toFixed(4);
@@ -153,6 +162,14 @@ export function divideMoney(a: MoneyInput, b: MoneyInput): string {
  * currency is "authoritative" (that's a v3.6 business-logic decision made
  * at the call site — see Invoice/CustomerPayment/InvoiceItem in
  * schema.prisma), it just converts whichever direction is asked for.
+ *
+ * [FIX] Previously duplicated divideMoney's own zero-divisor logic inline
+ * (`decAmount.dividedBy(rate)`) instead of calling divideMoney() itself —
+ * two independent implementations of "divide with a validated divisor"
+ * for the exact same operation, one extra place a future change (e.g. a
+ * stricter minimum-rate floor) could be applied to one path and forgotten
+ * on the other. Now routes through multiplyMoney()/divideMoney() directly;
+ * the single rate validation below covers both directions.
  */
 export function convertCurrency(
   amount: MoneyInput,
@@ -171,12 +188,13 @@ export function convertCurrency(
     );
   }
 
-  const decAmount = toDecimal(amount);
   if (fromCurrency === "USD" && toCurrency === "SYP") {
-    return decAmount.times(rate).toFixed(4);
+    return multiplyMoney(amount, rate);
   }
   if (fromCurrency === "SYP" && toCurrency === "USD") {
-    return decAmount.dividedBy(rate).toFixed(4);
+    // rate is already validated non-zero/non-negative above; divideMoney's
+    // own isZero() guard is defense-in-depth, not the primary check here.
+    return divideMoney(amount, rate);
   }
 
   // Unreachable given the "USD" | "SYP" union, but keeps this function
@@ -199,20 +217,14 @@ export function compareMoney(a: MoneyInput, b: MoneyInput): number {
  * the Arabic-first UI instead of a hand-rolled, locale-unaware comma
  * formatter. Defaults to 2 decimals for USD, 0 for SYP.
  *
- * [v3.6] Default `currency` changed from "USD" to "SYP". Through v3.5, USD
- * was the authoritative currency everywhere, so defaulting an
- * unspecified call to USD matched the rest of the system. As of v3.6, SYP
- * is authoritative on Invoice/CustomerPayment/InvoiceItem — leaving the
- * old "USD" default in place would mean any call site that forgot to pass
- * `currency` explicitly (old code not yet migrated, or a new call site
- * that omits it by mistake) silently formats a SYP amount as if it were
- * USD, with no error and no visual sign anything is wrong beyond the
- * number itself. Defaulting to "SYP" now matches the new authoritative
- * currency, so an unspecified call fails toward the currency that's
- * actually correct almost everywhere in the app today. This does NOT
- * change behavior for any call site that already passes `currency`
- * explicitly (which every call site should — treat the default as a
- * safety net, not a reason to omit the argument).
+ * Defaults to "SYP" since that's the ledger's authoritative currency
+ * (see schema.prisma). Treat this as a safety net only — every real
+ * call site should pass `currency` explicitly.
+ *
+ * DO NOT reuse this function's output (a `Number`-rounded display string)
+ * as an input to any further monetary calculation — it exists purely to
+ * feed Intl.NumberFormat's digit grouping and is not part of the
+ * decimal.js-safe calculation chain.
  */
 export function formatMoney(
   amount: MoneyInput,

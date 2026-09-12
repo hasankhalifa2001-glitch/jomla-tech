@@ -6,6 +6,7 @@ import { SubscriptionBanner } from "@/components/dashboard/subscription-banner";
 import { DashboardSidebar } from "@/components/dashboard/sidebar";
 import { DashboardTopBar } from "@/components/dashboard/top-bar";
 import { Toaster } from "@/components/ui/sonner";
+import { OfflineCacheInitializer } from "@/components/dashboard/product-cache-initializer";
 
 export default async function DashboardLayout({
   children,
@@ -26,6 +27,7 @@ export default async function DashboardLayout({
     <SessionProvider session={session}>
       <ExchangeRateInitializer />
       <SyncWorkerInitializer />
+      <OfflineCacheInitializer />
       <div className="flex h-screen w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900">
         {/* RTL Collapsible Navigation Sidebar */}
         <DashboardSidebar />

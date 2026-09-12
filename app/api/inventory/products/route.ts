@@ -209,6 +209,13 @@ export async function GET(req: Request) {
 
       const processedBatches = product.batches.map((batch) => {
         const batchUnitFactor = batch.unit ? Number(batch.unit.conversionFactor) : 1;
+        // [NOTE] `batchQty` (a native number) is used ONLY for this route's
+        // own internal, display-oriented arithmetic below (total base
+        // stock, out-of-stock/expiry-badge derivation) — none of which is
+        // itself a value persisted anywhere or fed back into a Decimal
+        // column. It is deliberately kept separate from the `quantity`
+        // field actually returned in the JSON response (see [FIX] below),
+        // which must stay a decimal string all the way to the client.
         const batchQty = Number(batch.quantity);
         totalBaseStock += batchQty * batchUnitFactor;
 
@@ -238,7 +245,21 @@ export async function GET(req: Request) {
         return {
           id: batch.id,
           batchNumber: batch.batchNumber,
-          quantity: batchQty,
+          // [FIX — critical, closes the cache-refresh.ts contract gap]
+          // Previously returned `batchQty` (a native `number`, derived via
+          // `Number(batch.quantity)` above). ProductBatch.quantity is a
+          // Decimal(18,4) column — converting it to a JS double here, before
+          // it ever leaves the server, is exactly the precision-loss path
+          // T1's decimal.js-everywhere rule exists to prevent, and directly
+          // contradicts lib/offline/cache-refresh.ts's documented contract
+          // for ServerProductBatch.quantity ("Expected as a decimal string
+          // from the server... never a native JS number"). refreshProductCache()
+          // reads this exact field into `createCachedProductRecord`, so a
+          // `number` here meant the precision was already lost by the time
+          // it reached the offline cache — no downstream fix could recover
+          // it. `.toString()` on the raw Prisma Decimal preserves the exact
+          // stored value with no float round-trip.
+          quantity: batch.quantity.toString(),
           unitId: batch.unitId,
           unitName: batch.unit?.unitName || "",
           expiryDate: batch.expiryDate,
@@ -247,7 +268,15 @@ export async function GET(req: Request) {
           isNegative: batchQty < 0,
           adjustments: (batch.adjustments || []).map((adj) => ({
             id: adj.id,
-            quantityDelta: Number(adj.quantityDelta),
+            // [FIX] Same reasoning as batch.quantity above —
+            // StockAdjustment.quantityDelta is also Decimal(18,4). This
+            // field isn't part of cache-refresh.ts's ServerProductBatch
+            // contract (adjustment history isn't cached offline), but it's
+            // the same class of precision-sensitive value and is only ever
+            // displayed/summed via lib/utils/money.ts on the client, so it
+            // stays a decimal string here too rather than reintroducing a
+            // float for no reason.
+            quantityDelta: adj.quantityDelta.toString(),
             reason: adj.reason,
             adjustedByUserName:
               adj.adjustedByUser?.name || adj.adjustedByUser?.email || "مستخدم",
@@ -279,10 +308,25 @@ export async function GET(req: Request) {
         units: product.units.map((u) => ({
           id: u.id,
           unitName: u.unitName,
+          // [NOTE] conversionFactor stays a `number` here, matching
+          // cache-refresh.ts's ServerProductUnit.conversionFactor contract
+          // (also typed `number`, not `string`) and db.ts's
+          // CachedProductUnit.conversionFactor — this field was never
+          // flagged for the string-decimal treatment the way the monetary
+          // fields below were.
           conversionFactor: Number(u.conversionFactor),
           pricingCurrency: u.pricingCurrency || "SYP",
-          priceWholesale: Number(u.priceWholesale ?? 0),
-          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? Number(u.priceRetail) : null,
+          // [FIX — critical, closes the cache-refresh.ts contract gap]
+          // Previously `Number(u.priceWholesale ?? 0)` /
+          // `Number(u.priceRetail)`. Both are Decimal(18,4) columns, and
+          // cache-refresh.ts's ServerProductUnit contract requires both as
+          // decimal strings ("a deliberate contract with
+          // /api/inventory/products: it must serialize every monetary
+          // field with .toString()") — this route was silently violating
+          // that documented contract. `.toString()` on the raw Prisma
+          // Decimal preserves the exact stored value.
+          priceWholesale: u.priceWholesale.toString(),
+          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? u.priceRetail.toString() : null,
           barcode: u.barcode,
           barcodeSource: u.barcodeSource,
           imageUrl: u.imageUrl,
