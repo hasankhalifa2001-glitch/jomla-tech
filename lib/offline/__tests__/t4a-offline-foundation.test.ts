@@ -26,7 +26,6 @@ import {
   clearCachedSession,
   saveOfflineInvoiceWithBalance,
   saveOfflinePaymentWithBalance,
-  LAST_USER_ID_STORAGE_KEY,
 } from "@/lib/offline";
 import {
   serializeMoney,
@@ -490,10 +489,11 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
 
       // A cached rate alone is not enough for T4b's POS to function — it
       // still needs products and customers. hasCachedData is true (SOME
-      // cache exists) but isReady must stay false.
+      // cache exists) but isReady must stay false and status is PARTIAL.
       expect(status.hasCachedData).toBe(true);
       expect(status.isReady).toBe(false);
-      expect(status.status).toBe("NO_CACHED_DATA");
+      expect(status.status).toBe("PARTIAL");
+      expect(status.missing).toEqual(["products", "customers"]);
     });
 
     it("reports 'READY' and isReady: true only once products, customers, AND the rate are all cached", async () => {
@@ -591,21 +591,27 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(cached?.cachedAt).toBeInstanceOf(Date);
     });
 
-    it("isolates multiple users and resolves the last known user when userId is omitted", async () => {
+    it("isolates multiple users and returns null when userId is omitted/empty", async () => {
       await setCachedSession({
         userId: "user-admin-1",
         tenantId: TEST_TENANT_ID,
+        tenantName: "محل تجريبي",
+        tenantSlug: "test-shop",
         role: "ADMIN",
         isPlatformAdmin: true,
         name: "مدير النظام",
+        subscriptionStatus: "ACTIVE",
       });
 
       await setCachedSession({
         userId: "user-cashier-2",
         tenantId: TEST_TENANT_ID,
+        tenantName: "محل تجريبي",
+        tenantSlug: "test-shop",
         role: "CASHIER",
         isPlatformAdmin: false,
         name: "كاشير المساء",
+        subscriptionStatus: "ACTIVE",
       });
 
       // Specific lookup
@@ -617,9 +623,9 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(cashier?.role).toBe("CASHIER");
       expect(cashier?.isPlatformAdmin).toBe(false);
 
-      // Omitted userId resolves the last written user via LAST_USER_ID_STORAGE_KEY or most recent
-      const lastKnown = await getCachedSession();
-      expect(lastKnown?.userId).toBe("user-cashier-2");
+      // Omitted/empty userId returns null to prevent cross-user session leakage on shared POS devices
+      const omitted = await getCachedSession("");
+      expect(omitted).toBeNull();
     });
 
     it("clears cached session on clearCachedSession without leaving residual claims", async () => {

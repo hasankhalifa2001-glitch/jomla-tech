@@ -163,8 +163,26 @@ export function useCachedExchangeRate(tenantId?: string) {
 
 // ============================================================================
 // useSessionWithOfflineFallback — T4a's session-leak-fix gap closer.
-// (Full design rationale unchanged from prior revisions — see the
-// [FIX — this revision] notes below for what changed this pass.)
+//
+// T4a2 correctly moves session resolution client-side via next-auth's
+// useSession(), which itself resolves via a network call to
+// /api/auth/session. On a genuine offline reload, that call cannot
+// resolve — leaving the app with no tenantId to scope any Dexie read by,
+// defeating the entire point of this offline-first task. This hook tries
+// useSession() first and falls back to lib/offline/session-cache.ts's
+// cachedSession table only when the live call is genuinely unreachable —
+// never as a routine substitute for it.
+//
+// Every place in the app that reads useSession() directly for
+// tenantId/role/isPlatformAdmin should use this wrapper instead on any
+// offline-reachable screen (T4a2's own acceptance criteria).
+//
+// Like the JWT claims it mirrors (T2a) and cachedSession itself, this is
+// informational/client-routing ONLY — never trusted for the actual
+// API-mutation-layer authorization check, which always re-validates
+// server-side once connectivity returns (see auth.ts's jwt callback: a
+// client-supplied `update({ subscriptionStatus: ... })` payload is always
+// ignored and the value is re-read fresh from the database instead).
 // ============================================================================
 
 export type SessionFallbackStatus =
@@ -172,6 +190,10 @@ export type SessionFallbackStatus =
   | "authenticated"
   | "unauthenticated"
   | "offline-cached"
+  /** Genuinely offline/unreachable AND this tab never resolved a live
+   * session, so there is no known userId to look up in the cache. Not
+   * the same as "unauthenticated" — that would claim to know the user
+   * is logged out, which cannot be trusted while offline (see below). */
   | "unreachable";
 
 export interface SessionFallbackClaims {
@@ -183,6 +205,18 @@ export interface SessionFallbackClaims {
   isPlatformAdmin: boolean;
   name?: string;
   source: "live" | "cached";
+  /**
+   * DISPLAY-ONLY WHEN source === "cached". Mirrors the JWT's own
+   * short-TTL-cached claim (T2a) — never trusted for any write/navigation
+   * decision. The one place this codebase reads it (SyncWorkerInitializer)
+   * uses it purely to skip a doomed sync attempt as a performance
+   * optimization; the real security boundary is always
+   * assertTenantWritable(tenantId) on the server, which re-reads fresh
+   * from the database on every mutating request regardless of what this
+   * value says. May be stale by an arbitrary amount while offline — see
+   * the reconnect-triggered update() call below for how staleness is
+   * bounded once connectivity returns.
+   */
   subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
 }
 
@@ -191,6 +225,14 @@ export interface UseSessionWithOfflineFallbackResult {
   data: SessionFallbackClaims | null;
 }
 
+/** How long a "loading" next-auth session is allowed to hang before this
+ * hook stops waiting and treats the live call as unreachable. next-auth
+ * does not cleanly distinguish "genuinely still loading" from "the
+ * /api/auth/session fetch failed and will never resolve" — a real
+ * network partition can leave status stuck on "loading" indefinitely.
+ * This timeout is the practical way to avoid waiting forever; it is
+ * deliberately generous so it never fires on a normal, merely-slow
+ * connection. */
 const LIVE_SESSION_TIMEOUT_MS = 4000;
 
 function useIsBrowserOnline(): boolean {
@@ -217,19 +259,11 @@ function useIsBrowserOnline(): boolean {
 }
 
 /**
- * [FIX — this revision] The raw `liveSession.user` shape is normalized
- * through this ONE helper now, instead of two separately-written inline
- * type casts (one in the write-through effect, one in the "authenticated"
- * return branch) that previously disagreed on which fields were optional.
- * The effect's cast treated tenantName/tenantSlug as optional while the
- * return-branch cast asserted them as required — meaning a session object
- * genuinely missing either field (e.g. an old cached JWT from before
- * tenantName/tenantSlug were added to auth.ts) could silently pass
- * `undefined` into a field CachedSession/SessionFallbackClaims both
- * declare as a required `string`, with no runtime check catching it at
- * either site. This helper applies ONE consistent guard: every required
- * field (id, tenantId, tenantName, tenantSlug, role) must be a genuinely
- * truthy string, or the whole session is treated as not-yet-usable
+ * The raw `liveSession.user` shape is normalized through this ONE helper,
+ * instead of separately-written inline type casts that could disagree on
+ * which fields were optional. Every required field (id, tenantId,
+ * tenantName, tenantSlug, role, subscriptionStatus) must be a genuinely
+ * truthy value, or the whole session is treated as not-yet-usable
  * (returns null) rather than producing a partially-valid object with a
  * silently-wrong field.
  */
@@ -251,11 +285,18 @@ function extractValidatedUser(rawUser: unknown): {
     role?: "ADMIN" | "CASHIER";
     isPlatformAdmin?: boolean;
     name?: string | null;
-    subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+    subscriptionStatus?: "ACTIVE" | "EXPIRED" | "PENDING";
   } | null | undefined;
 
   if (!user) return null;
-  if (!user.id || !user.tenantId || !user.tenantName || !user.tenantSlug || !user.role || !user.subscriptionStatus) {
+  if (
+    !user.id ||
+    !user.tenantId ||
+    !user.tenantName ||
+    !user.tenantSlug ||
+    !user.role ||
+    !user.subscriptionStatus
+  ) {
     return null;
   }
 
@@ -272,7 +313,7 @@ function extractValidatedUser(rawUser: unknown): {
 }
 
 export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackResult {
-  const { data: liveSession, status: liveStatus } = useSession();
+  const { data: liveSession, status: liveStatus, update } = useSession();
   const currentUserId = useActiveSessionStore((s) => s.currentUserId);
   const setCurrentUserId = useActiveSessionStore((s) => s.setCurrentUserId);
   const isOnline = useIsBrowserOnline();
@@ -290,12 +331,46 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
     return () => clearTimeout(timer);
   }, [liveStatus]);
 
-  // [FIX — this revision] Now goes through extractValidatedUser() instead
-  // of a separate, more lenient inline cast — a live session missing
-  // tenantName/tenantSlug is treated the same way here as in the
-  // "authenticated" return branch below: skipped entirely, never
-  // write-through-cached with an undefined field masquerading as a
-  // required string.
+  // [FIX — reconnect handling] Connectivity returning is a strong signal
+  // that whatever caused liveStatus to hang (or the browser to report
+  // offline) may no longer apply. The moment `isOnline` flips true:
+  //   1. `timedOut` is cleared immediately, so `liveIsUnreachable` stops
+  //      being forced true purely by a stale timeout flag left over from
+  //      the outage that just ended.
+  //   2. next-auth is asked to re-resolve the live session right away via
+  //      update(), rather than passively waiting for its own refetch
+  //      schedule (window focus / refetchInterval) to eventually notice
+  //      the network is back. This is also what triggers auth.ts's jwt
+  //      callback to re-read subscriptionStatus/dailyExchangeRate fresh
+  //      from the database (trigger === "update") — without this call,
+  //      a stale subscriptionStatus could persist for an arbitrarily long
+  //      stretch after reconnection, bounded only by next-auth's own
+  //      refetch timing, not by this app's actual connectivity.
+  // Without this effect, a device that was offline long enough to hit the
+  // 4s timeout could stay on "offline-cached" for an indefinite,
+  // user-visible stretch after connectivity genuinely returns — exactly
+  // the intermittent-connection pattern this app is built around.
+  useEffect(() => {
+    if (!isOnline) return;
+    setTimedOut(false);
+    update().catch((err) => {
+      console.error(
+        "useSessionWithOfflineFallback: session re-check on reconnect failed:",
+        err
+      );
+    });
+    // Deliberately keyed on isOnline only — this should fire once per
+    // offline->online transition, not on every render where isOnline
+    // happens to already be true, and next-auth's `update` reference is
+    // stable across renders in practice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOnline]);
+
+  // On a successful LIVE resolution: remember this tab's userId (plain
+  // sessionStorage-backed Zustand — see useActiveSessionStore's own doc
+  // comment for why this must never be localStorage), and write-through
+  // to the offline cache — the same write-through pattern T2c's
+  // exchange-rate top-bar edit already follows for setCachedRate.
   useEffect(() => {
     if (liveStatus !== "authenticated") return;
     const validUser = extractValidatedUser(liveSession?.user);
@@ -316,6 +391,14 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
     });
   }, [liveStatus, liveSession, setCurrentUserId]);
 
+  // The live call is considered unreachable — not merely "still
+  // loading" — either because the browser reports it's offline, or
+  // because a "loading" status has hung past LIVE_SESSION_TIMEOUT_MS.
+  // Deliberately NOT based on liveStatus === "unauthenticated": while
+  // offline, next-auth cannot actually verify that and may report
+  // "unauthenticated" purely because the session fetch failed — trusting
+  // that while offline would treat a real, still-logged-in user as
+  // logged out the moment connectivity drops.
   const liveIsUnreachable = !isOnline || (liveStatus === "loading" && timedOut);
 
   const cacheLookupKey = liveIsUnreachable ? currentUserId : null;
@@ -338,9 +421,10 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
     };
   }, [cacheLookupKey]);
 
-  // 1. A genuinely successful live resolution always wins — now via the
-  // same extractValidatedUser() helper the write-through effect uses
-  // above, so both call sites agree on exactly which fields are required.
+  // 1. A genuinely successful live resolution always wins, even if
+  // liveIsUnreachable's onLine check is a false positive (e.g. a captive
+  // portal or flaky navigator.onLine) — if useSession() actually got a
+  // real answer, trust it over any cached guess.
   if (liveStatus === "authenticated") {
     const validUser = extractValidatedUser(liveSession?.user);
     if (validUser) {
@@ -360,13 +444,16 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
       };
     }
     // Authenticated per next-auth, but the session object is missing a
-    // required field this app depends on (e.g. stale token predating
+    // required field this app depends on (e.g. a stale token predating
     // tenantName/tenantSlug) — fall through rather than return a
     // partially-valid claims object.
   }
 
   // 2. Live is unreachable — fall back to this tab's own known identity,
-  // if it has one.
+  // if it has one. Never falls back for a tab that never resolved a live
+  // session (currentUserId === null) — that tab honestly doesn't know
+  // who's using it, and unreachable/unknown must not be papered over
+  // with someone else's cached claims.
   if (liveIsUnreachable) {
     if (!currentUserId) {
       return { status: "unreachable", data: null };
@@ -375,6 +462,8 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
       return { status: "loading", data: null };
     }
     if (cachedClaims === null) {
+      // Known userId, but nothing cached for it (e.g. first-ever login
+      // happened to fail before any write-through completed).
       return { status: "unreachable", data: null };
     }
     return {
@@ -394,7 +483,8 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
   }
 
   // 3. Live is reachable (we're online) and next-auth has definitively
-  // resolved to "not logged in".
+  // resolved to "not logged in" — this is the one case it's safe to
+  // trust that status at face value.
   if (liveStatus === "unauthenticated") {
     return { status: "unauthenticated", data: null };
   }
