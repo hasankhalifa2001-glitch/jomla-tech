@@ -2,7 +2,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,7 @@ import { toast } from "sonner";
 import { DollarSign, RefreshCw, CheckCircle2 } from "lucide-react";
 
 export function ExchangeRateTopbar() {
-    const { data: session } = useSession();
+    const { data: session } = useSessionWithOfflineFallback();
     const {
         dailyExchangeRate,
         isUpdating,
@@ -22,7 +22,7 @@ export function ExchangeRateTopbar() {
     } = useExchangeRateStore();
     const [isEditing, setIsEditing] = useState<boolean>(false);
 
-    const isAdmin = session?.user?.role === "ADMIN";
+    const isAdmin = session?.role === "ADMIN";
 
     // Registers this tab's tenantId with the store as soon as the session is
     // known. This is a genuine external-system sync (Zustand store state
@@ -37,10 +37,10 @@ export function ExchangeRateTopbar() {
     // re-registers the tenantId defensively in case this component is ever
     // rendered without the initializer mounted above it.
     useEffect(() => {
-        if (session?.user?.tenantId) {
-            setCurrentTenantId(session.user.tenantId);
+        if (session?.tenantId) {
+            setCurrentTenantId(session.tenantId);
         }
-    }, [session?.user?.tenantId, setCurrentTenantId]);
+    }, [session?.tenantId, setCurrentTenantId]);
 
     const [inputValue, setInputValue] = useState<string>("");
     const [lastSyncedRate, setLastSyncedRate] = useState<number | null>(null);
@@ -87,7 +87,7 @@ export function ExchangeRateTopbar() {
         // (this tab), Dexie (offline cache), and broadcasts it to other
         // tabs on this device. A next-auth session update() call here
         // would be a network round-trip with no reader left to serve.
-        const success = await updateExchangeRate(numericRate, session?.user?.tenantId);
+        const success = await updateExchangeRate(numericRate, session?.tenantId);
         if (success) {
             toast.success(
                 `تم تحديث سعر الصرف اليومي بنجاح (${numericRate.toLocaleString("ar-SY")} ل.س / 1$)`,

@@ -1,16 +1,16 @@
 /* SublinkLauncher.tsx */
 "use client";
 
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Store, ExternalLink } from "lucide-react";
 
 export function SublinkLauncher() {
-    const { data: session, status } = useSession();
+    const { data: session, status } = useSessionWithOfflineFallback();
 
-    if (status === "loading" || !session?.user?.tenantSlug) {
+    if (status === "loading" || !session?.tenantSlug) {
         return (
             <Button
                 variant="outline"
@@ -24,7 +24,7 @@ export function SublinkLauncher() {
         );
     }
 
-    const tenantSlug = session.user.tenantSlug;
+    const tenantSlug = session.tenantSlug;
     const sublinkUrl = `/store/${tenantSlug}`;
 
     return (

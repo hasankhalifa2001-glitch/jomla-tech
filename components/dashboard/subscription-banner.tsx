@@ -2,7 +2,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import Link from "next/link";
 import { AlertTriangle, Clock, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -10,8 +10,8 @@ import { Button } from "@/components/ui/button";
 const PENDING_POLL_INTERVAL_MS = 30_000;
 
 export function SubscriptionBanner() {
-    const { data: session, update: updateSession } = useSession();
-    const status = session?.user?.subscriptionStatus;
+    const { data: session, update: updateSession } = useSessionWithOfflineFallback();
+    const status = session?.subscriptionStatus;
     const [isChecking, setIsChecking] = useState(false);
     const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -21,7 +21,7 @@ export function SubscriptionBanner() {
             const res = await fetch("/api/tenant/status");
             if (!res.ok) return;
             const data = await res.json();
-            if (data.subscriptionStatus && data.subscriptionStatus !== status) {
+            if (data.subscriptionStatus && data.subscriptionStatus !== status && updateSession) {
                 await updateSession({ subscriptionStatus: data.subscriptionStatus });
             }
         } catch (err) {

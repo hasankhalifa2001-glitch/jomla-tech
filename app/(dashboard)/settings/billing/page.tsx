@@ -1,6 +1,6 @@
 "use client";
 
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,9 +52,9 @@ const STATUS_CONFIG: Record<
 };
 
 export default function BillingSettingsPage() {
-  const { data: session } = useSession();
+  const { data: session } = useSessionWithOfflineFallback();
   const subscriptionStatus: SubscriptionStatus =
-    (session?.user?.subscriptionStatus as SubscriptionStatus) || "ACTIVE";
+    (session?.subscriptionStatus as SubscriptionStatus) || "ACTIVE";
 
   const [receiptFile, setReceiptFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -120,19 +120,19 @@ export default function BillingSettingsPage() {
       {/* Status ribbon — full width, the one place this page uses its accent color boldly */}
       <div
         className={`flex flex-col gap-3 rounded-2xl border p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5 ${subscriptionStatus === "ACTIVE"
-            ? "border-emerald-200 bg-emerald-50/60 dark:border-emerald-900 dark:bg-emerald-950/30"
-            : subscriptionStatus === "EXPIRED"
-              ? "border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-950/30"
-              : "border-amber-200 bg-amber-50/60 dark:border-amber-900 dark:bg-amber-950/30"
+          ? "border-emerald-200 bg-emerald-50/60 dark:border-emerald-900 dark:bg-emerald-950/30"
+          : subscriptionStatus === "EXPIRED"
+            ? "border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-950/30"
+            : "border-amber-200 bg-amber-50/60 dark:border-amber-900 dark:bg-amber-950/30"
           }`}
       >
         <div className="flex items-start gap-3">
           <span
             className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white shadow-sm dark:bg-slate-900 ${subscriptionStatus === "ACTIVE"
-                ? "text-emerald-600"
-                : subscriptionStatus === "EXPIRED"
-                  ? "text-red-600"
-                  : "text-amber-600"
+              ? "text-emerald-600"
+              : subscriptionStatus === "EXPIRED"
+                ? "text-red-600"
+                : "text-amber-600"
               }`}
           >
             <StatusIcon className="h-4.5 w-4.5" />
@@ -171,7 +171,7 @@ export default function BillingSettingsPage() {
                 اسم المنشأة
               </dt>
               <dd className="font-semibold text-slate-900 dark:text-slate-100">
-                {session?.user?.tenantName || "—"}
+                {session?.tenantName || "—"}
               </dd>
             </div>
             <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-3 dark:border-slate-900">
@@ -180,7 +180,7 @@ export default function BillingSettingsPage() {
                 معرّف المتجر
               </dt>
               <dd className="font-mono text-slate-900 dark:text-slate-100" dir="ltr">
-                {session?.user?.tenantSlug || "—"}
+                {session?.tenantSlug || "—"}
               </dd>
             </div>
             <div className="flex items-center justify-between gap-3">
@@ -195,7 +195,7 @@ export default function BillingSettingsPage() {
           <p className="mt-4 rounded-xl bg-slate-50 px-3 py-2 text-[11px] leading-relaxed text-slate-500 dark:bg-slate-900 dark:text-slate-400">
             صلاحيات حسابك الحالية:{" "}
             <span className="font-semibold text-slate-700 dark:text-slate-300">
-              {session?.user?.role === "ADMIN" ? "مدير المتجر" : "كاشير"}
+              {session?.role === "ADMIN" ? "مدير المتجر" : "كاشير"}
             </span>
           </p>
         </section>

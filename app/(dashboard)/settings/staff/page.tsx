@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { Button } from "@/components/ui/button";
 import { CreateStaffModal } from "@/components/settings/create-staff-modal";
 import { ResetPasswordModal } from "@/components/settings/reset-password-modal";
@@ -20,8 +20,8 @@ export interface StaffUser {
 }
 
 export default function StaffSettingsPage() {
-  const { data: session } = useSession();
-  const currentUserId = session?.user?.id;
+  const { data: session } = useSessionWithOfflineFallback();
+  const currentUserId = session?.userId;
 
   const [staff, setStaff] = useState<StaffUser[]>([]);
   const [isLoading, setIsLoading] = useState(true);
