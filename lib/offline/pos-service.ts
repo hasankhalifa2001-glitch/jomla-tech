@@ -148,6 +148,8 @@ import {
 } from "./db";
 import { setCachedRate } from "./exchange-rate";
 import { generateOfflineId } from "./id";
+import { saveOfflineInvoiceWithBalance, saveOfflinePaymentWithBalance } from "./transaction-helpers";
+import { refreshProductCache } from "./cache-refresh";
 import {
   compareMoney,
   toDecimal,
@@ -912,7 +914,7 @@ export async function submitOfflineSale(
   });
 
   const db = getOfflineDb();
-  await db.offlineInvoices.add(invoiceRecord);
+  await saveOfflineInvoiceWithBalance(invoiceRecord, db);
 
   return invoiceRecord;
 }
@@ -1074,4 +1076,27 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
     // (rate, tenantId) wrapper meant for old call sites.
     await setCachedRate(scopedTenantId, 15000);
   }
+}
+
+/**
+ * Convenience helper for POS UI to trigger a fresh sync-down of products
+ * and report the count of updated products.
+ */
+export async function syncProductsFromServer(
+  tenantId: string
+): Promise<{ success: boolean; count: number; reason?: string }> {
+  if (!tenantId || !tenantId.trim()) {
+    return { success: false, count: 0, reason: "NO_TENANT" };
+  }
+  const result = await refreshProductCache(tenantId);
+  if (result.ok) {
+    const db = getOfflineDb();
+    const count = await db.cachedProducts.where("tenantId").equals(tenantId.trim()).count();
+    return { success: true, count };
+  }
+  return {
+    success: false,
+    count: 0,
+    reason: result.reason === "offline" ? "OFFLINE" : result.reason,
+  };
 }

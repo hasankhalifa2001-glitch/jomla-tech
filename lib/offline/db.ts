@@ -66,6 +66,18 @@ export type PaymentMethod =
 // Both factories now take an explicit `isSystemCustomer` flag and enforce
 // the rule directly, matching the defense-in-depth already applied to
 // every other financial invariant in this file.
+//
+// [FIX — review pass 4] createOfflineVoidRecord previously had no check
+// that the void's own (negated) debtAmountSYP was ever <= 0. Every other
+// financial invariant in this file is enforced directly at the factory
+// rather than trusted from the caller (see the two notes above) — this
+// closes the same class of gap for the void's debt sign. A void only
+// ever reverses debt that was already validated as >= 0 at the original
+// sale's creation (createOfflineInvoiceRecord's own debtSYP < 0 guard),
+// so a positive debtAmountSYP reaching this factory always indicates an
+// upstream bug (e.g. a caller passing an already-negated value through
+// originalDebtAmountSYP by mistake, double-negating it) — this factory no
+// longer trusts that upstream logic is correct and rejects it directly.
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -120,6 +132,8 @@ export interface OfflinePayment {
   offlineId: string;
   customerId?: string;
   offlineCustomerId?: string;
+  invoiceId?: string;
+  offlineInvoiceId?: string;
   /** AUTHORITATIVE. */
   amountSYP: string;
   /** Derived/informational. */
@@ -204,6 +218,19 @@ export interface CachedCustomer {
   isSystemGenerated?: boolean;
 }
 
+export interface CachedSession {
+  userId: string;
+  tenantId: string;
+  tenantName: string;
+  tenantSlug: string;
+  role: "ADMIN" | "CASHIER";
+  /** Required boolean — prevents ambiguous offline routing state. */
+  isPlatformAdmin: boolean;
+  name?: string;
+  subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+  cachedAt: Date;
+}
+
 export class OfflineDatabase extends Dexie {
   offlineInvoices!: Table<OfflineInvoice, number>;
   offlinePayments!: Table<OfflinePayment, number>;
@@ -211,13 +238,11 @@ export class OfflineDatabase extends Dexie {
   cachedTenantSettings!: Table<CachedTenantSettings, string>;
   cachedProducts!: Table<CachedProduct, string>;
   cachedCustomers!: Table<CachedCustomer, string>;
+  cachedSession!: Table<CachedSession, string>;
 
   constructor() {
     super("JomlaTechOffline");
 
-    // Single schema version — no prior release, no real device data to
-    // migrate. When a real shape change is needed after launch, bump to
-    // version(2) with an explicit .upgrade() for that specific change only.
     this.version(1).stores({
       offlineInvoices:
         "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
@@ -227,7 +252,19 @@ export class OfflineDatabase extends Dexie {
       cachedTenantSettings: "tenantId, cachedAt",
       cachedProducts: "id, tenantId, isActive, [tenantId+isActive]",
       cachedCustomers: "id, tenantId, phone, isSystemGenerated, [tenantId+phone]",
+      cachedSession: "userId, tenantId, cachedAt",
     });
+
+    // [NOTE — review pass 4] cachedSession currently lives inside
+    // version(1). This is only correct as long as no prior build has ever
+    // shipped to a real device with a version(1) schema that lacked this
+    // table. The moment this offline layer is deployed to even one real
+    // pilot device, ANY further table/field addition — including a future
+    // one, not just this one — must land as a NEW version(N).stores({...})
+    // block with a matching .upgrade() migration, never as an edit to an
+    // already-shipped version(N) block. Dexie will not retroactively
+    // create a table on a device that already opened this database at
+    // version 1 without it.
   }
 }
 
@@ -497,6 +534,22 @@ export function createOfflineVoidRecord(data: {
         ? serializeMoney(data.debtAmountSYP)
         : "0.0000";
 
+  // [FIX — review pass 4] A void only ever reverses debt — its own
+  // debtAmountSYP must never end up positive. The original sale this void
+  // reverses already had its debtAmountSYP validated as >= 0 at creation
+  // (createOfflineInvoiceRecord's own guard above), so after negation this
+  // value should always be <= 0. A positive value reaching this point
+  // means something upstream double-negated, or passed an already-negative
+  // originalDebtAmountSYP by mistake — reject it here directly rather than
+  // trusting the caller got the sign right, matching the defense-in-depth
+  // already applied to every other invariant in this file.
+  if (compareMoney(debtSYP, 0) > 0) {
+    throw new Error(
+      "debtAmountSYP on a void record must not be positive — a void only ever " +
+      "reverses debt, never creates it."
+    );
+  }
+
   // [FIX] Same system-customer/zero-debt rule as createOfflineInvoiceRecord
   // — see this parameter's doc comment above for why this should be
   // unreachable in normal operation but is still checked directly here.
@@ -566,6 +619,8 @@ export function createOfflinePaymentRecord(data: {
   offlineId?: string;
   customerId?: string;
   offlineCustomerId?: string;
+  invoiceId?: string;
+  offlineInvoiceId?: string;
   amountSYP: MoneyInput;
   exchangeRate: MoneyInput;
   paymentMethod: PaymentMethod;
@@ -604,6 +659,8 @@ export function createOfflinePaymentRecord(data: {
     offlineId: data.offlineId || generateOfflineId(),
     customerId: data.customerId,
     offlineCustomerId: data.offlineCustomerId,
+    invoiceId: data.invoiceId,
+    offlineInvoiceId: data.offlineInvoiceId,
     amountSYP,
     amountUSD,
     exchangeRate: rate,
@@ -736,5 +793,42 @@ export function createCachedCustomerRecord(data: {
         ? serializeMoney(data.cachedBalanceDebtUSD)
         : undefined,
     isSystemGenerated: data.isSystemGenerated,
+  };
+}
+
+export function createCachedSessionRecord(data: {
+  userId: string;
+  tenantId: string;
+  tenantName: string;
+  tenantSlug: string;
+  role: "ADMIN" | "CASHIER";
+  isPlatformAdmin: boolean;
+  name?: string;
+  subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+  cachedAt?: Date;
+}): CachedSession {
+  if (!data.userId || !data.userId.trim()) {
+    throw new Error("userId is required to create a cached session record.");
+  }
+  if (!data.tenantId || !data.tenantId.trim()) {
+    throw new Error("tenantId is required to create a cached session record.");
+  }
+  if (data.role !== "ADMIN" && data.role !== "CASHIER") {
+    throw new Error(`Invalid role '${data.role}': must be ADMIN or CASHIER.`);
+  }
+  if (typeof data.isPlatformAdmin !== "boolean") {
+    throw new Error("isPlatformAdmin is required and must be a boolean.");
+  }
+
+  return {
+    userId: data.userId.trim(),
+    tenantId: data.tenantId.trim(),
+    tenantName: data.tenantName,
+    tenantSlug: data.tenantSlug,
+    role: data.role,
+    isPlatformAdmin: data.isPlatformAdmin,
+    name: data.name,
+    subscriptionStatus: data.subscriptionStatus,
+    cachedAt: data.cachedAt ? new Date(data.cachedAt) : new Date(),
   };
 }

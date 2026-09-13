@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
 
 /**
@@ -31,13 +31,13 @@ import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
  * a real sale being priced against a stale rate before step 2 resolves.
  */
 export function ExchangeRateInitializer() {
-    const { data: session } = useSession();
+    const { data: session } = useSessionWithOfflineFallback();
     const setExchangeRate = useExchangeRateStore((state) => state.setExchangeRate);
     const hydrateFromCache = useExchangeRateStore((state) => state.hydrateFromCache);
     const setCurrentTenantId = useExchangeRateStore((state) => state.setCurrentTenantId);
 
     useEffect(() => {
-        const tenantId = session?.user?.tenantId;
+        const tenantId = session?.tenantId;
 
         // Register this tab's active tenant BEFORE any broadcast could
         // arrive — see useExchangeRateStore's currentTenantId guard
@@ -78,7 +78,7 @@ export function ExchangeRateInitializer() {
         return () => {
             cancelled = true;
         };
-    }, [session?.user?.tenantId, setExchangeRate, hydrateFromCache, setCurrentTenantId]);
+    }, [session?.tenantId, setExchangeRate, hydrateFromCache, setCurrentTenantId]);
 
     return null;
 }

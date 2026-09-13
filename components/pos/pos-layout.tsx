@@ -1,8 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { useSession } from "next-auth/react";
-import { useOfflineDbReady } from "@/lib/offline/hooks";
+import { useOfflineDbReady, useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
 import {
   getOfflineProducts,
@@ -50,8 +49,8 @@ import { toast } from "sonner";
 import { serializeMoney, formatMoney, compareMoney } from "@/lib/utils/money";
 
 export function PosLayout() {
-  const { data: session } = useSession();
-  const tenantId = session?.user?.tenantId;
+  const { data: session } = useSessionWithOfflineFallback();
+  const tenantId = session?.tenantId;
 
   const { isReady: isDbReady, status: dbStatus } = useOfflineDbReady(tenantId);
   const dailyExchangeRate = useExchangeRateStore((state) => state.dailyExchangeRate);
@@ -602,10 +601,10 @@ export function PosLayout() {
           <div className="flex items-center gap-1.5 shrink-0">
             <span
               className={`inline-block h-2 w-2 rounded-full ${isDbReady
-                  ? "bg-emerald-500"
-                  : dbStatus === "NO_CACHED_DATA"
-                    ? "bg-amber-500"
-                    : "bg-zinc-300 animate-pulse"
+                ? "bg-emerald-500"
+                : dbStatus === "NO_CACHED_DATA"
+                  ? "bg-amber-500"
+                  : "bg-zinc-300 animate-pulse"
                 }`}
               title={
                 isDbReady

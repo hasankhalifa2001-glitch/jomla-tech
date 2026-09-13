@@ -2,7 +2,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -118,8 +118,8 @@ export function InventoryClient() {
   // security boundary. "Add batch" and "FIFO preview" stay visible to both
   // roles, matching batches/route.ts and fifo-preview/route.ts, which
   // impose no role restriction.
-  const { data: session } = useSession();
-  const isAdmin = session?.user?.role === "ADMIN";
+  const { data: session } = useSessionWithOfflineFallback();
+  const isAdmin = session?.role === "ADMIN";
 
   const [products, setProducts] = useState<ProductItem[]>([]);
   const [loading, setLoading] = useState(true);

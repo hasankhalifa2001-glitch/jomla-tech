@@ -1,4 +1,3 @@
-import { auth } from "@/auth";
 import { SessionProvider } from "@/components/providers/session-provider";
 import { ExchangeRateInitializer } from "@/components/dashboard/exchange-rate-initializer";
 import { SyncWorkerInitializer } from "@/components/dashboard/sync-worker-initializer";
@@ -8,7 +7,7 @@ import { DashboardTopBar } from "@/components/dashboard/top-bar";
 import { Toaster } from "@/components/ui/sonner";
 import { OfflineCacheInitializer } from "@/components/dashboard/product-cache-initializer";
 
-export default async function DashboardLayout({
+export default function DashboardLayout({
   children,
 }: {
   children: React.ReactNode;
@@ -21,10 +20,9 @@ export default async function DashboardLayout({
   // reconnection" requirement (T4c) and the lockout banner's correctness
   // (T2) both had to wait on an extra client-side session round trip
   // before they had any real data to act on.
-  const session = await auth();
 
   return (
-    <SessionProvider session={session}>
+    <SessionProvider >
       <ExchangeRateInitializer />
       <SyncWorkerInitializer />
       <OfflineCacheInitializer />

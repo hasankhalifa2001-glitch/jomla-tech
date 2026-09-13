@@ -1,15 +1,24 @@
 "use client";
 
+import { useEffect, useState } from "react";
+import { useSession } from "next-auth/react";
 import { useLiveQuery } from "dexie-react-hooks";
-import { getOfflineDb, isOfflineDbSupported } from "./db";
+import { getOfflineDb, isOfflineDbSupported, type CachedSession } from "./db";
 import { getCachedRate } from "./exchange-rate";
+import { getCachedSession, setCachedSession } from "./session-cache";
+import { useActiveSessionStore } from "@/lib/store/useActiveSessionStore";
 
 export type OfflineDbStatus =
   | "INITIALIZING"
   | "READY"
+  /** Some, but not all, of products/customers/rate are cached yet — a
+   * genuinely different situation from NO_CACHED_DATA (nothing at all). */
+  | "PARTIAL"
   | "NO_CACHED_DATA"
   | "UNSUPPORTED"
   | "ERROR";
+
+export type MissingCachePiece = "products" | "customers" | "rate";
 
 export interface OfflineDbReadyResult {
   isReady: boolean;
@@ -17,9 +26,11 @@ export interface OfflineDbReadyResult {
   hasCachedData: boolean;
   isEmptyCache: boolean;
   status: OfflineDbStatus;
-  /** Present only when status === "ERROR". */
+  missing: MissingCachePiece[];
   error?: string;
 }
+
+const ALL_MISSING: MissingCachePiece[] = ["products", "customers", "rate"];
 
 const UNSUPPORTED_RESULT: OfflineDbReadyResult = {
   isReady: false,
@@ -27,6 +38,7 @@ const UNSUPPORTED_RESULT: OfflineDbReadyResult = {
   hasCachedData: false,
   isEmptyCache: true,
   status: "UNSUPPORTED",
+  missing: ALL_MISSING,
 };
 
 const INITIALIZING_RESULT: OfflineDbReadyResult = {
@@ -35,6 +47,7 @@ const INITIALIZING_RESULT: OfflineDbReadyResult = {
   hasCachedData: false,
   isEmptyCache: false,
   status: "INITIALIZING",
+  missing: [],
 };
 
 /**
@@ -42,33 +55,8 @@ const INITIALIZING_RESULT: OfflineDbReadyResult = {
  * TENANT. tenantId is REQUIRED — throws rather than falling back to an
  * unscoped, cross-tenant count.
  *
- * [MERGE NOTE] An earlier revision of this file made tenantId optional and,
- * when omitted, counted across `db.cachedProducts.count()` /
- * `cachedCustomers.count()` / `cachedTenantSettings.count()` with NO
- * tenantId filter at all — i.e. a sum across every tenant that has ever
- * used this device. That is exactly the class of cross-tenant leak T1's
- * isolation rules exist to prevent (the same reasoning that removed
- * exchange-rate.ts's DEFAULT_TENANT_CACHE_KEY shared fallback). A caller
- * missing tenantId is a bug and must fail loudly here, not silently
- * receive a meaningless aggregate count. Every count below is always
- * scoped to the one tenantId this call was given.
- *
  * isReady requires ALL THREE caches to be populated together — products,
  * customers, AND the exchange rate — not any single one (AND, not OR).
- * T4b's POS needs all three to function correctly: products/units/batches
- * to sell, real customer balances to record debt against, and a rate to
- * price a sale. A device with only a cached exchange rate (the most
- * likely partial state, since the rate updates and gets written most
- * often) reporting READY would let POS open onto an empty product list
- * with no explanation — exactly the silent-failure this check exists to
- * prevent.
- *
- * [MERGE NOTE] An earlier revision computed `isReady: hasCachedData` (an
- * OR across the three counts) — that is precisely the silent-failure
- * scenario the paragraph above warns against, and is NOT used here.
- * hasCachedData itself remains an OR (useful for "is there SOMETHING
- * cached at all" contexts, e.g. deciding whether to show a "no data yet"
- * vs. "partial data" message) but never drives isReady/status on its own.
  */
 export async function checkOfflineCacheStatus(tenantId: string): Promise<OfflineDbReadyResult> {
   if (!isOfflineDbSupported()) {
@@ -99,20 +87,21 @@ export async function checkOfflineCacheStatus(tenantId: string): Promise<Offline
     const hasCachedData = hasProducts || hasCustomers || hasRate;
     const isReady = hasProducts && hasCustomers && hasRate;
 
+    const missing: MissingCachePiece[] = [
+      ...(!hasProducts ? (["products"] as const) : []),
+      ...(!hasCustomers ? (["customers"] as const) : []),
+      ...(!hasRate ? (["rate"] as const) : []),
+    ];
+
     return {
       isReady,
       isDbOpen: true,
       hasCachedData,
       isEmptyCache: !hasCachedData,
-      status: isReady ? "READY" : "NO_CACHED_DATA",
+      status: isReady ? "READY" : hasCachedData ? "PARTIAL" : "NO_CACHED_DATA",
+      missing,
     };
   } catch (error) {
-    // [MERGE NOTE] A genuine runtime failure (a blocked connection, a
-    // quota error, a corrupted table) is distinguished from
-    // "UNSUPPORTED" (this browser has no IndexedDB at all) — the two call
-    // for different UI responses, so they're reported as separate
-    // statuses rather than collapsing a real error into the
-    // never-offline-capable case.
     console.error("Dexie failed to inspect database readiness:", error);
     return {
       isReady: false,
@@ -120,6 +109,7 @@ export async function checkOfflineCacheStatus(tenantId: string): Promise<Offline
       hasCachedData: false,
       isEmptyCache: true,
       status: "ERROR",
+      missing: ALL_MISSING,
       error: error instanceof Error ? error.message : String(error),
     };
   }
@@ -128,25 +118,6 @@ export async function checkOfflineCacheStatus(tenantId: string): Promise<Offline
 /**
  * Reactive Dexie readiness hook with cold empty-cache detection, scoped to
  * a single tenant.
- *
- * [MERGE NOTE — why useLiveQuery] An earlier revision used a one-shot
- * `useEffect` keyed only on `[tenantId, supported]`. That meant a cold,
- * offline app load reporting NO_CACHED_DATA would never transition to
- * READY on its own once refreshProductCache()/refreshCustomerCache()
- * populated the tables in the background after connectivity returned — a
- * screen depending on this hook (T4b's POS) would stay stuck on the
- * empty-cache message until an unrelated remount. useLiveQuery subscribes
- * directly to the underlying Dexie tables accessed inside
- * checkOfflineCacheStatus, so a write from either refresh function is
- * reflected here automatically, with no manual re-check required by any
- * caller.
- *
- * When tenantId is not yet known (e.g. session still loading), the query
- * function deliberately never calls checkOfflineCacheStatus at all —
- * calling it with an empty tenantId would throw (by design, see above) —
- * and instead resolves INITIALIZING_RESULT directly, matching the
- * pre-tenant state a caller should render as "still loading," not as an
- * error.
  */
 export function useOfflineDbReady(tenantId?: string): OfflineDbReadyResult {
   const supported = isOfflineDbSupported();
@@ -170,24 +141,7 @@ export function useOfflineDbReady(tenantId?: string): OfflineDbReadyResult {
 
 /**
  * Hook to read the cached daily exchange rate from Dexie as a decimal
- * string — never a native JS number — so any consumer doing further
- * arithmetic (T4b's cart math) stays on the decimal.js-safe path the
- * whole way through, per T1's money-handling rule.
- *
- * [MERGE NOTE] An earlier revision of this hook called the legacy
- * getCachedDailyExchangeRate(), which returns a plain `number` explicitly
- * documented (in exchange-rate.ts) as DISPLAY ONLY and "must NEVER be used
- * as an input to further monetary arithmetic" — yet this hook's own doc
- * comment at the time claimed it "enables dual-currency math," a direct
- * contradiction. A native-number exchange rate multiplied against a cart
- * total can reintroduce float drift before the value ever reaches
- * lib/utils/money.ts. This hook now calls getCachedRate() directly and
- * returns the raw decimal string; converting to a number for display is
- * the caller's job, at the point it's actually rendered, not here.
- *
- * Reactive via useLiveQuery (see useOfflineDbReady's note above) instead
- * of a one-shot effect, so a rate written by T2c's top-bar edit or by the
- * initial online cache load is picked up automatically.
+ * string — never a native JS number.
  */
 export function useCachedExchangeRate(tenantId?: string) {
   const { isReady } = useOfflineDbReady(tenantId);
@@ -201,12 +155,250 @@ export function useCachedExchangeRate(tenantId?: string) {
   );
 
   return {
-    /** Decimal-serialized string, or null if no rate is cached yet.
-     * NEVER use this for further arithmetic without going back through
-     * lib/utils/money.ts's toDecimal() first. */
     rate: cached?.rate ?? null,
     cachedAt: cached?.cachedAt ?? null,
-    /** True until the first live-query resolution (undefined = pending). */
     isLoading: cached === undefined,
   };
+}
+
+// ============================================================================
+// useSessionWithOfflineFallback — T4a's session-leak-fix gap closer.
+// (Full design rationale unchanged from prior revisions — see the
+// [FIX — this revision] notes below for what changed this pass.)
+// ============================================================================
+
+export type SessionFallbackStatus =
+  | "loading"
+  | "authenticated"
+  | "unauthenticated"
+  | "offline-cached"
+  | "unreachable";
+
+export interface SessionFallbackClaims {
+  userId: string;
+  tenantId: string;
+  tenantName: string;
+  tenantSlug: string;
+  role: "ADMIN" | "CASHIER";
+  isPlatformAdmin: boolean;
+  name?: string;
+  source: "live" | "cached";
+  subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+}
+
+export interface UseSessionWithOfflineFallbackResult {
+  status: SessionFallbackStatus;
+  data: SessionFallbackClaims | null;
+}
+
+const LIVE_SESSION_TIMEOUT_MS = 4000;
+
+function useIsBrowserOnline(): boolean {
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator === "undefined" ? true : navigator.onLine
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  return isOnline;
+}
+
+/**
+ * [FIX — this revision] The raw `liveSession.user` shape is normalized
+ * through this ONE helper now, instead of two separately-written inline
+ * type casts (one in the write-through effect, one in the "authenticated"
+ * return branch) that previously disagreed on which fields were optional.
+ * The effect's cast treated tenantName/tenantSlug as optional while the
+ * return-branch cast asserted them as required — meaning a session object
+ * genuinely missing either field (e.g. an old cached JWT from before
+ * tenantName/tenantSlug were added to auth.ts) could silently pass
+ * `undefined` into a field CachedSession/SessionFallbackClaims both
+ * declare as a required `string`, with no runtime check catching it at
+ * either site. This helper applies ONE consistent guard: every required
+ * field (id, tenantId, tenantName, tenantSlug, role) must be a genuinely
+ * truthy string, or the whole session is treated as not-yet-usable
+ * (returns null) rather than producing a partially-valid object with a
+ * silently-wrong field.
+ */
+function extractValidatedUser(rawUser: unknown): {
+  id: string;
+  tenantId: string;
+  tenantName: string;
+  tenantSlug: string;
+  role: "ADMIN" | "CASHIER";
+  isPlatformAdmin: boolean;
+  name?: string;
+  subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+} | null {
+  const user = rawUser as {
+    id?: string;
+    tenantId?: string;
+    tenantName?: string;
+    tenantSlug?: string;
+    role?: "ADMIN" | "CASHIER";
+    isPlatformAdmin?: boolean;
+    name?: string | null;
+    subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+  } | null | undefined;
+
+  if (!user) return null;
+  if (!user.id || !user.tenantId || !user.tenantName || !user.tenantSlug || !user.role || !user.subscriptionStatus) {
+    return null;
+  }
+
+  return {
+    id: user.id,
+    tenantId: user.tenantId,
+    tenantName: user.tenantName,
+    tenantSlug: user.tenantSlug,
+    role: user.role,
+    isPlatformAdmin: !!user.isPlatformAdmin,
+    name: user.name ?? undefined,
+    subscriptionStatus: user.subscriptionStatus,
+  };
+}
+
+export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackResult {
+  const { data: liveSession, status: liveStatus } = useSession();
+  const currentUserId = useActiveSessionStore((s) => s.currentUserId);
+  const setCurrentUserId = useActiveSessionStore((s) => s.setCurrentUserId);
+  const isOnline = useIsBrowserOnline();
+
+  const [timedOut, setTimedOut] = useState(false);
+  const [prevLiveStatus, setPrevLiveStatus] = useState(liveStatus);
+  if (liveStatus !== prevLiveStatus) {
+    setPrevLiveStatus(liveStatus);
+    setTimedOut(false);
+  }
+
+  useEffect(() => {
+    if (liveStatus !== "loading") return;
+    const timer = setTimeout(() => setTimedOut(true), LIVE_SESSION_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [liveStatus]);
+
+  // [FIX — this revision] Now goes through extractValidatedUser() instead
+  // of a separate, more lenient inline cast — a live session missing
+  // tenantName/tenantSlug is treated the same way here as in the
+  // "authenticated" return branch below: skipped entirely, never
+  // write-through-cached with an undefined field masquerading as a
+  // required string.
+  useEffect(() => {
+    if (liveStatus !== "authenticated") return;
+    const validUser = extractValidatedUser(liveSession?.user);
+    if (!validUser) return;
+
+    setCurrentUserId(validUser.id);
+    setCachedSession({
+      userId: validUser.id,
+      tenantId: validUser.tenantId,
+      tenantName: validUser.tenantName,
+      tenantSlug: validUser.tenantSlug,
+      role: validUser.role,
+      isPlatformAdmin: validUser.isPlatformAdmin,
+      name: validUser.name,
+      subscriptionStatus: validUser.subscriptionStatus,
+    }).catch((err) => {
+      console.error("Failed to write-through cached session claims:", err);
+    });
+  }, [liveStatus, liveSession, setCurrentUserId]);
+
+  const liveIsUnreachable = !isOnline || (liveStatus === "loading" && timedOut);
+
+  const cacheLookupKey = liveIsUnreachable ? currentUserId : null;
+
+  const [cachedClaims, setCachedClaims] = useState<CachedSession | null | undefined>(undefined);
+  const [trackedLookupKey, setTrackedLookupKey] = useState<string | null>(null);
+  if (cacheLookupKey !== trackedLookupKey) {
+    setTrackedLookupKey(cacheLookupKey);
+    setCachedClaims(undefined);
+  }
+
+  useEffect(() => {
+    if (!cacheLookupKey) return;
+    let cancelled = false;
+    getCachedSession(cacheLookupKey).then((row) => {
+      if (!cancelled) setCachedClaims(row);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [cacheLookupKey]);
+
+  // 1. A genuinely successful live resolution always wins — now via the
+  // same extractValidatedUser() helper the write-through effect uses
+  // above, so both call sites agree on exactly which fields are required.
+  if (liveStatus === "authenticated") {
+    const validUser = extractValidatedUser(liveSession?.user);
+    if (validUser) {
+      return {
+        status: "authenticated",
+        data: {
+          userId: validUser.id,
+          tenantId: validUser.tenantId,
+          tenantName: validUser.tenantName,
+          tenantSlug: validUser.tenantSlug,
+          role: validUser.role,
+          isPlatformAdmin: validUser.isPlatformAdmin,
+          name: validUser.name,
+          source: "live",
+          subscriptionStatus: validUser.subscriptionStatus,
+        },
+      };
+    }
+    // Authenticated per next-auth, but the session object is missing a
+    // required field this app depends on (e.g. stale token predating
+    // tenantName/tenantSlug) — fall through rather than return a
+    // partially-valid claims object.
+  }
+
+  // 2. Live is unreachable — fall back to this tab's own known identity,
+  // if it has one.
+  if (liveIsUnreachable) {
+    if (!currentUserId) {
+      return { status: "unreachable", data: null };
+    }
+    if (cachedClaims === undefined) {
+      return { status: "loading", data: null };
+    }
+    if (cachedClaims === null) {
+      return { status: "unreachable", data: null };
+    }
+    return {
+      status: "offline-cached",
+      data: {
+        userId: cachedClaims.userId,
+        tenantId: cachedClaims.tenantId,
+        tenantName: cachedClaims.tenantName,
+        tenantSlug: cachedClaims.tenantSlug,
+        role: cachedClaims.role,
+        isPlatformAdmin: cachedClaims.isPlatformAdmin,
+        name: cachedClaims.name,
+        source: "cached",
+        subscriptionStatus: cachedClaims.subscriptionStatus,
+      },
+    };
+  }
+
+  // 3. Live is reachable (we're online) and next-auth has definitively
+  // resolved to "not logged in".
+  if (liveStatus === "unauthenticated") {
+    return { status: "unauthenticated", data: null };
+  }
+
+  // 4. Still genuinely loading, online, within the timeout window.
+  return { status: "loading", data: null };
 }

@@ -3,7 +3,8 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useSession, signOut } from "next-auth/react";
+import { signOut } from "next-auth/react";
+import { useSessionWithOfflineFallback, clearCachedSession } from "@/lib/offline";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -46,9 +47,31 @@ export function DashboardSidebar() {
     const [collapsed, setCollapsed] = useState(false);
     const [mobileOpen, setMobileOpen] = useState(false);
     const pathname = usePathname();
-    const { data: session, status: sessionStatus } = useSession();
+    const { data: session, status: sessionStatus } = useSessionWithOfflineFallback();
 
-    const userRole = session?.user?.role || "CASHIER";
+    const handleSignOut = async () => {
+        // [FIX] clearCachedSession(userId: string) is deliberately
+        // non-optional — see session-cache.ts's own note: a logout must
+        // only ever clear the claims for the user actually logging out,
+        // never guess or fall back to clearing every cached user on a
+        // shared device. `session?.userId` is `string | undefined` here
+        // (session can be null while loading/unauthenticated/unreachable),
+        // so the clear is only attempted when we actually have a real
+        // userId to scope it to — if we don't, there is nothing this tab
+        // legitimately knows to clear, and skipping is correct (not a
+        // silently-swallowed error), since signOut() below still proceeds
+        // either way.
+        if (session?.userId) {
+            try {
+                await clearCachedSession(session.userId);
+            } catch (e) {
+                console.error("Failed to clear cached session during logout:", e);
+            }
+        }
+        await signOut({ callbackUrl: "/login" });
+    };
+
+    const userRole = session?.role || "CASHIER";
     // FIX (role flash): while the session is still resolving, we don't yet
     // know if this user is ADMIN or CASHIER. `userRole` defaults to
     // CASHIER during that window (fail-closed, unchanged), but instead of
@@ -58,9 +81,9 @@ export function DashboardSidebar() {
     // layout jump, no abrupt appearance.
     const isRoleKnown = sessionStatus !== "loading";
 
-    const userName = session?.user?.name || "المستخدم";
-    const tenantName = session?.user?.tenantName || "جملة تك";
-    const tenantSlug = session?.user?.tenantSlug || "";
+    const userName = session?.name || "المستخدم";
+    const tenantName = session?.tenantName || "جملة تك";
+    const tenantSlug = session?.tenantSlug || "";
 
     const filteredNavItems = navItems.filter((item) => {
         if (item.adminOnly && userRole === "CASHIER") {
@@ -221,7 +244,7 @@ export function DashboardSidebar() {
                                         <Button
                                             variant="ghost"
                                             size="icon"
-                                            onClick={() => signOut({ callbackUrl: "/login" })}
+                                            onClick={handleSignOut}
                                             className="h-8 w-8 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/50 shrink-0"
                                         >
                                             <LogOut className="h-4 w-4" />
@@ -238,7 +261,7 @@ export function DashboardSidebar() {
                                     <Button
                                         variant="ghost"
                                         size="icon"
-                                        onClick={() => signOut({ callbackUrl: "/login" })}
+                                        onClick={handleSignOut}
                                         className="h-9 w-9 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/50"
                                     >
                                         <LogOut className="h-4 w-4" />
@@ -376,7 +399,7 @@ export function DashboardSidebar() {
                             <Button
                                 variant="destructive"
                                 size="sm"
-                                onClick={() => signOut({ callbackUrl: "/login" })}
+                                onClick={handleSignOut}
                                 className="w-full gap-2 font-bold text-xs h-9"
                             >
                                 <LogOut className="h-4 w-4" />

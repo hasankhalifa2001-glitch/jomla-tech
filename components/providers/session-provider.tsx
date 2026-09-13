@@ -4,16 +4,23 @@ import { SessionProvider as NextAuthSessionProvider } from "next-auth/react";
 import type { Session } from "next-auth";
 
 /**
- * [FIX] Now accepts an optional `session` prop and forwards it to
- * next-auth's own SessionProvider. Server layouts (e.g.
- * app/(dashboard)/layout.tsx, app/(locked)/layout.tsx) fetch the session
- * via `await auth()` and pass it in here — this is what lets every client
- * child's `useSession()` (ExchangeRateInitializer, SyncWorkerInitializer,
- * SubscriptionBanner, etc.) have real session data on its very first
- * render instead of starting from `undefined` and fetching it again on
- * the client. Without this prop, next-auth's SessionProvider ignores the
- * server session entirely and always re-fetches — passing `session` here
- * closes that gap.
+ * Thin wrapper around next-auth's own SessionProvider.
+ *
+ * [FIX — session prop deliberately UNUSED by current callers] This still
+ * accepts an optional `session` prop for API compatibility (a future
+ * offline-fallback caller, per T4a's cachedSession work, may legitimately
+ * want to seed an initial value this way), but no server layout in this
+ * codebase currently passes one — see app/(dashboard)/layout.tsx's own
+ * fix note. Passing session server-side into this component previously
+ * meant Next.js had to serialize the full session object (email, user
+ * id, tenantId, role...) into the initial HTML/RSC payload, readable via
+ * plain "View Page Source" before any client code ran — a real
+ * information-exposure issue, not just a style preference. Every client
+ * child (ExchangeRateInitializer, SyncWorkerInitializer,
+ * SubscriptionBanner, etc.) now starts from `undefined` and resolves its
+ * own session via useSession()'s automatic client-side fetch to
+ * /api/auth/session — a single small same-origin request, not a
+ * meaningful delay for any of T2/T4c's timing requirements.
  */
 export function SessionProvider({
   children,

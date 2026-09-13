@@ -1,6 +1,6 @@
 "use client";
 
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { useSyncWorker } from "@/lib/offline/sync-worker";
 
 /**
@@ -17,9 +17,9 @@ import { useSyncWorker } from "@/lib/offline/sync-worker";
  * resolves the subscription and this session is refreshed via update().
  */
 export function SyncWorkerInitializer() {
-  const { data: session } = useSession();
+  const { data: session } = useSessionWithOfflineFallback();
   const tenantId =
-    session?.user?.subscriptionStatus === "ACTIVE" ? session.user.tenantId : undefined;
+    session?.subscriptionStatus === "ACTIVE" ? session.tenantId : undefined;
   useSyncWorker(tenantId);
   return null;
 }

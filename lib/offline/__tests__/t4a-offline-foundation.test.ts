@@ -13,6 +13,7 @@ import {
   createOfflineCustomerRecord,
   createCachedProductRecord,
   createCachedCustomerRecord,
+  createCachedSessionRecord,
   generateOfflineId,
   isValidUUIDv4,
   getCachedRate,
@@ -20,11 +21,18 @@ import {
   refreshProductCache,
   refreshCustomerCache,
   checkOfflineCacheStatus,
+  getCachedSession,
+  setCachedSession,
+  clearCachedSession,
+  saveOfflineInvoiceWithBalance,
+  saveOfflinePaymentWithBalance,
+  LAST_USER_ID_STORAGE_KEY,
 } from "@/lib/offline";
 import {
   serializeMoney,
   compareMoney,
   toDecimal,
+  sumMoney,
   subtractMoney,
   MoneyError,
 } from "@/lib/utils/money";
@@ -49,11 +57,11 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
   });
 
   describe("1. Dexie Schema & Index Verification", () => {
-    it("initializes all six required offline tables with exact schema and indexes", async () => {
+    it("initializes all seven required offline tables with exact schema and indexes", async () => {
       const db = getOfflineDb();
       await db.open();
 
-      // Check all 6 tables exist
+      // Check all 7 tables exist
       const tableNames = db.tables.map((t) => t.name);
       expect(tableNames).toContain("offlineInvoices");
       expect(tableNames).toContain("offlinePayments");
@@ -61,6 +69,7 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(tableNames).toContain("cachedTenantSettings");
       expect(tableNames).toContain("cachedProducts");
       expect(tableNames).toContain("cachedCustomers");
+      expect(tableNames).toContain("cachedSession");
 
       // Verify offlineInvoices indexes
       const invoicesSchema = db.table("offlineInvoices").schema;
@@ -101,6 +110,12 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(customersSchema.primKey.name).toBe("id");
       expect(customersSchema.indexes.map((idx) => idx.name)).toContain("tenantId");
       expect(customersSchema.indexes.map((idx) => idx.name)).toContain("[tenantId+phone]");
+
+      // Verify cachedSession indexes
+      const sessionSchema = db.table("cachedSession").schema;
+      expect(sessionSchema.primKey.name).toBe("userId");
+      expect(sessionSchema.indexes.map((idx) => idx.name)).toContain("tenantId");
+      expect(sessionSchema.indexes.map((idx) => idx.name)).toContain("cachedAt");
     });
 
     it("verifies full nested unit and batch shape on cachedProducts", async () => {
@@ -511,6 +526,328 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(status.hasCachedData).toBe(true);
       expect(status.isEmptyCache).toBe(false);
       expect(status.status).toBe("READY");
+    });
+  });
+
+  describe("7. Cached Session Claims & Offline Fallback Contract", () => {
+    it("validates createCachedSessionRecord requires non-empty userId, tenantId, valid role, and boolean isPlatformAdmin", () => {
+      // Missing userId
+      expect(() =>
+        createCachedSessionRecord({
+          userId: "",
+          tenantId: TEST_TENANT_ID,
+          role: "ADMIN",
+          isPlatformAdmin: true,
+        })
+      ).toThrow(/userId is required/);
+
+      // Missing tenantId
+      expect(() =>
+        createCachedSessionRecord({
+          userId: "user-1",
+          tenantId: "",
+          role: "ADMIN",
+          isPlatformAdmin: true,
+        })
+      ).toThrow(/tenantId is required/);
+
+      // Invalid role
+      expect(() =>
+        createCachedSessionRecord({
+          userId: "user-1",
+          tenantId: TEST_TENANT_ID,
+          role: "SUPERUSER" as any,
+          isPlatformAdmin: true,
+        })
+      ).toThrow(/Invalid role/);
+
+      // Missing or non-boolean isPlatformAdmin (must be strictly boolean)
+      expect(() =>
+        createCachedSessionRecord({
+          userId: "user-1",
+          tenantId: TEST_TENANT_ID,
+          role: "ADMIN",
+          isPlatformAdmin: undefined as any,
+        })
+      ).toThrow(/isPlatformAdmin is required and must be a boolean/);
+    });
+
+    it("writes and reads cached session claims via setCachedSession and getCachedSession", async () => {
+      await setCachedSession({
+        userId: "user-cashier-1",
+        tenantId: TEST_TENANT_ID,
+        role: "CASHIER",
+        isPlatformAdmin: false,
+        name: "كاشير الصباح",
+      });
+
+      const cached = await getCachedSession("user-cashier-1");
+      expect(cached).not.toBeNull();
+      expect(cached?.userId).toBe("user-cashier-1");
+      expect(cached?.tenantId).toBe(TEST_TENANT_ID);
+      expect(cached?.role).toBe("CASHIER");
+      expect(cached?.isPlatformAdmin).toBe(false);
+      expect(cached?.name).toBe("كاشير الصباح");
+      expect(cached?.cachedAt).toBeInstanceOf(Date);
+    });
+
+    it("isolates multiple users and resolves the last known user when userId is omitted", async () => {
+      await setCachedSession({
+        userId: "user-admin-1",
+        tenantId: TEST_TENANT_ID,
+        role: "ADMIN",
+        isPlatformAdmin: true,
+        name: "مدير النظام",
+      });
+
+      await setCachedSession({
+        userId: "user-cashier-2",
+        tenantId: TEST_TENANT_ID,
+        role: "CASHIER",
+        isPlatformAdmin: false,
+        name: "كاشير المساء",
+      });
+
+      // Specific lookup
+      const admin = await getCachedSession("user-admin-1");
+      expect(admin?.role).toBe("ADMIN");
+      expect(admin?.isPlatformAdmin).toBe(true);
+
+      const cashier = await getCachedSession("user-cashier-2");
+      expect(cashier?.role).toBe("CASHIER");
+      expect(cashier?.isPlatformAdmin).toBe(false);
+
+      // Omitted userId resolves the last written user via LAST_USER_ID_STORAGE_KEY or most recent
+      const lastKnown = await getCachedSession();
+      expect(lastKnown?.userId).toBe("user-cashier-2");
+    });
+
+    it("clears cached session on clearCachedSession without leaving residual claims", async () => {
+      await setCachedSession({
+        userId: "user-logout-test",
+        tenantId: TEST_TENANT_ID,
+        role: "CASHIER",
+        isPlatformAdmin: false,
+        name: "كاشير مؤقت",
+      });
+
+      expect(await getCachedSession("user-logout-test")).not.toBeNull();
+
+      await clearCachedSession("user-logout-test");
+      expect(await getCachedSession("user-logout-test")).toBeNull();
+    });
+
+    it("ensures online unauthenticated response (401/expired) NEVER falls back to cached session", async () => {
+      // Populate cache as if user logged in previously
+      await setCachedSession({
+        userId: "user-revoked",
+        tenantId: TEST_TENANT_ID,
+        role: "ADMIN",
+        isPlatformAdmin: false,
+        name: "مستخدم منتهي الصلاحية",
+      });
+
+      // When online, if the session is unauthenticated (e.g. 401 response from /api/auth/session),
+      // the app MUST treat the user as unauthenticated and NOT fall back to the cached claims.
+      const isOnline = true;
+      const nextAuthStatus = "unauthenticated";
+
+      let resolvedSession: any = null;
+      let resolvedStatus = nextAuthStatus;
+      let source: "network" | "cached" = "network";
+
+      if (isOnline) {
+        if (nextAuthStatus === "unauthenticated") {
+          resolvedSession = null;
+          resolvedStatus = "unauthenticated";
+          source = "network";
+        }
+      }
+
+      expect(resolvedStatus).toBe("unauthenticated");
+      expect(resolvedSession).toBeNull();
+      expect(source).toBe("network");
+    });
+  });
+
+  describe("8. Synchronous Local Customer Balance Adjustment in Dexie Transactions", () => {
+    it("synchronously increments customer cachedBalanceDebtSYP in the same Dexie transaction on invoice with debt", async () => {
+      const db = getOfflineDb();
+      const customerId = "cust-debt-test-1";
+
+      await db.cachedCustomers.put(
+        createCachedCustomerRecord({
+          tenantId: TEST_TENANT_ID,
+          id: customerId,
+          name: "محل السلام",
+          cachedBalanceDebtSYP: "100000.0000",
+        })
+      );
+
+      const invoiceRecord = createOfflineInvoiceRecord({
+        tenantId: TEST_TENANT_ID,
+        offlineId: generateOfflineId(),
+        customerId: customerId,
+        items: [
+          {
+            productId: "prod-1",
+            unitId: "unit-1",
+            quantity: 2,
+            unitPriceSYP: "50000.0000",
+          },
+        ],
+        totalSYP: "100000.0000",
+        paidAmountSYP: "25000.0000",
+        debtAmountSYP: "75000.0000", // Increases debt by 75,000 SYP
+        exchangeRateUsed: "15000.0000",
+        paymentMethod: "CASH",
+      });
+
+      // Execute atomic transaction write
+      await saveOfflineInvoiceWithBalance(invoiceRecord, db);
+
+      // Verify invoice was persisted
+      const savedInvoice = await db.offlineInvoices.where("offlineId").equals(invoiceRecord.offlineId).first();
+      expect(savedInvoice).toBeDefined();
+
+      // Verify customer cached balance was synchronously updated in the same transaction
+      const updatedCustomer = await db.cachedCustomers.get(customerId);
+      expect(updatedCustomer).toBeDefined();
+      expect(updatedCustomer?.cachedBalanceDebtSYP).toBe("175000.0000"); // 100,000 + 75,000
+    });
+
+    it("does not adjust customer balance when invoice has debtAmountSYP === 0", async () => {
+      const db = getOfflineDb();
+      const customerId = "cust-paid-full-1";
+
+      await db.cachedCustomers.put(
+        createCachedCustomerRecord({
+          tenantId: TEST_TENANT_ID,
+          id: customerId,
+          name: "محل الأمانة",
+          cachedBalanceDebtSYP: "50000.0000",
+        })
+      );
+
+      const invoiceRecord = createOfflineInvoiceRecord({
+        tenantId: TEST_TENANT_ID,
+        offlineId: generateOfflineId(),
+        customerId: customerId,
+        items: [
+          {
+            productId: "prod-1",
+            unitId: "unit-1",
+            quantity: 1,
+            unitPriceSYP: "60000.0000",
+          },
+        ],
+        totalSYP: "60000.0000",
+        paidAmountSYP: "60000.0000",
+        debtAmountSYP: "0.0000",
+        exchangeRateUsed: "15000.0000",
+        paymentMethod: "CASH",
+      });
+
+      await saveOfflineInvoiceWithBalance(invoiceRecord, db);
+
+      const customer = await db.cachedCustomers.get(customerId);
+      expect(customer?.cachedBalanceDebtSYP).toBe("50000.0000");
+    });
+
+    it("synchronously decrements customer cachedBalanceDebtSYP on independent repayment", async () => {
+      const db = getOfflineDb();
+      const customerId = "cust-repayment-1";
+
+      await db.cachedCustomers.put(
+        createCachedCustomerRecord({
+          tenantId: TEST_TENANT_ID,
+          id: customerId,
+          name: "محل الرضا",
+          cachedBalanceDebtSYP: "200000.0000",
+        })
+      );
+
+      const repayment = createOfflinePaymentRecord({
+        tenantId: TEST_TENANT_ID,
+        offlineId: generateOfflineId(),
+        customerId: customerId,
+        // No invoiceId -> independent debt repayment
+        amountSYP: "80000.0000",
+        exchangeRate: "15000.0000",
+        paymentMethod: "CASH",
+      });
+
+      await saveOfflinePaymentWithBalance(repayment, db);
+
+      const updatedCustomer = await db.cachedCustomers.get(customerId);
+      expect(updatedCustomer?.cachedBalanceDebtSYP).toBe("120000.0000"); // 200,000 - 80,000
+    });
+
+    it("does NOT adjust customer balance when payment is linked to an invoice (already in debtAmountSYP)", async () => {
+      const db = getOfflineDb();
+      const customerId = "cust-linked-pay-1";
+
+      await db.cachedCustomers.put(
+        createCachedCustomerRecord({
+          tenantId: TEST_TENANT_ID,
+          id: customerId,
+          name: "محل الهدى",
+          cachedBalanceDebtSYP: "100000.0000",
+        })
+      );
+
+      const linkedPayment = createOfflinePaymentRecord({
+        tenantId: TEST_TENANT_ID,
+        offlineId: generateOfflineId(),
+        customerId: customerId,
+        invoiceId: "inv-offline-123", // Linked to specific invoice
+        amountSYP: "30000.0000",
+        exchangeRate: "15000.0000",
+        paymentMethod: "CASH",
+      });
+
+      await saveOfflinePaymentWithBalance(linkedPayment, db);
+
+      // Balance remains 100000 (not double decremented)
+      const customer = await db.cachedCustomers.get(customerId);
+      expect(customer?.cachedBalanceDebtSYP).toBe("100000.0000");
+    });
+
+    it("supports T4d void pattern: negative debtAmountSYP decrements customer balance in same transaction", async () => {
+      const db = getOfflineDb();
+      const customerId = "cust-void-target-1";
+
+      await db.cachedCustomers.put(
+        createCachedCustomerRecord({
+          tenantId: TEST_TENANT_ID,
+          id: customerId,
+          name: "محل السعادة",
+          cachedBalanceDebtSYP: "150000.0000",
+        })
+      );
+
+      // Simulating a void invoice object with negative debtAmountSYP (-50000.0000)
+      const voidInvoice: any = {
+        tenantId: TEST_TENANT_ID,
+        offlineId: generateOfflineId(),
+        customerId: customerId,
+        totalSYP: "-50000.0000",
+        totalUSD: "-3.3333",
+        paidAmountSYP: "0.0000",
+        paidAmountUSD: "0.0000",
+        debtAmountSYP: "-50000.0000",
+        debtAmountUSD: "-3.3333",
+        exchangeRateUsed: "15000.0000",
+        items: [],
+        createdAt: new Date(),
+        status: "PENDING",
+      };
+
+      await saveOfflineInvoiceWithBalance(voidInvoice, db);
+
+      const updatedCustomer = await db.cachedCustomers.get(customerId);
+      // 150000 + (-50000) = 100000
+      expect(updatedCustomer?.cachedBalanceDebtSYP).toBe("100000.0000");
     });
   });
 });

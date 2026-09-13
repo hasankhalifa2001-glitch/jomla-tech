@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { useSession } from "next-auth/react";
+import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { refreshProductCache, refreshCustomerCache } from "@/lib/offline/cache-refresh";
 
 /**
@@ -36,10 +36,10 @@ import { refreshProductCache, refreshCustomerCache } from "@/lib/offline/cache-r
  * session, never to a client-supplied tenantId param).
  */
 export function OfflineCacheInitializer() {
-    const { data: session } = useSession();
+    const { data: session } = useSessionWithOfflineFallback();
 
     useEffect(() => {
-        const tenantId = session?.user?.tenantId;
+        const tenantId = session?.tenantId;
         if (!tenantId) return;
 
         let cancelled = false;
@@ -70,7 +70,7 @@ export function OfflineCacheInitializer() {
         return () => {
             cancelled = true;
         };
-    }, [session?.user?.tenantId]);
+    }, [session?.tenantId]);
 
     return null;
 }

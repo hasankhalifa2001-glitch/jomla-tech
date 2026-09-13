@@ -5,3 +5,5 @@ export * from "./hooks";
 export * from "./pos-service";
 export * from "./sync-worker";
 export * from "./cache-refresh";
+export * from "./session-cache";
+export * from "./transaction-helpers";

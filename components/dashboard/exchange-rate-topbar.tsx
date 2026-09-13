@@ -12,13 +12,12 @@ import { toast } from "sonner";
 import { DollarSign, RefreshCw, CheckCircle2 } from "lucide-react";
 
 export function ExchangeRateTopbar() {
-    const { data: session, update: updateSession } = useSession();
+    const { data: session } = useSession();
     const {
         dailyExchangeRate,
         isUpdating,
         error,
         updateExchangeRate,
-        setExchangeRate,
         setCurrentTenantId,
     } = useExchangeRateStore();
     const [isEditing, setIsEditing] = useState<boolean>(false);
@@ -30,87 +29,32 @@ export function ExchangeRateTopbar() {
     // living outside this component), so useEffect is the right tool here —
     // unlike the inputValue/lastSyncedRate adjustment below, which is a
     // different case (see that comment).
+    //
+    // NOTE: ExchangeRateInitializer, mounted once at the app shell root,
+    // already sets currentTenantId and bootstraps dailyExchangeRate
+    // (Dexie cache first, then a fresh fetch from the database) for every
+    // screen. This component no longer duplicates that fetch — it only
+    // re-registers the tenantId defensively in case this component is ever
+    // rendered without the initializer mounted above it.
     useEffect(() => {
         if (session?.user?.tenantId) {
             setCurrentTenantId(session.user.tenantId);
         }
     }, [session?.user?.tenantId, setCurrentTenantId]);
 
-    // [REMOVED — stale JWT source of truth] This component previously had a
-    // second effect here that seeded `dailyExchangeRate` from
-    // `session.user.dailyExchangeRate` whenever the store was still null.
-    // That violates T2a directly: the JWT can go stale mid-session on ANY
-    // device the moment a different admin/tab/account updates the rate, and
-    // this tab's token has no way to know until it's explicitly refreshed
-    // via updateSession() — which only ever happens on the editing admin's
-    // own tab after their own save. Every other open session (a CASHIER's
-    // browser, this same admin's second device, a tab that's simply been
-    // open a while) would show a stale rate with no signal anything was
-    // wrong, and pos-layout.tsx prices real invoices off this exact store
-    // value. <ExchangeRateInitializer />, mounted once at the app shell
-    // root, now owns bootstrapping this value (Dexie cache first, then an
-    // unconditional fresh fetch) for every screen — including ones that
-    // never render this component. The fetch effect directly below is kept
-    // as a defensive second read (harmless if it duplicates
-    // ExchangeRateInitializer's own fetch — both simply overwrite the store
-    // with the same live database value), in case a future route ever
-    // renders this component without the initializer mounted above it.
-    useEffect(() => {
-        if (!session?.user?.tenantId) return;
-
-        let cancelled = false;
-
-        (async () => {
-            try {
-                const res = await fetch("/api/tenant/exchange-rate", {
-                    method: "GET",
-                    cache: "no-store",
-                });
-                if (!res.ok) return;
-                const data = await res.json();
-                if (cancelled) return;
-                if (data?.success && data.dailyExchangeRate !== undefined) {
-                    // Always applied, even if it matches what's already
-                    // shown — this fetch result is what makes the value
-                    // authoritative for this mount, not a conditional
-                    // "only if different" update.
-                    setExchangeRate(data.dailyExchangeRate, session.user.tenantId);
-                }
-            } catch (err) {
-                // Network/offline failure: silently keep whatever value is
-                // already shown (initializer's cache/fetch result) rather
-                // than surfacing an error toast for a background refresh.
-                console.error("Failed to fetch fresh daily exchange rate:", err);
-            }
-        })();
-
-        return () => {
-            cancelled = true;
-        };
-        // Intentionally re-runs whenever the tenant changes (covers a
-        // session/account switch in the same tab), and once per mount
-        // otherwise — this is the fresh-read-on-load fix itself, so it must
-        // not be skipped when dailyExchangeRate is already non-null (e.g.
-        // seeded by ExchangeRateInitializer already).
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [session?.user?.tenantId]);
-
     const [inputValue, setInputValue] = useState<string>("");
     const [lastSyncedRate, setLastSyncedRate] = useState<number | null>(null);
 
-    // [FIX — reverted] This is React's officially documented pattern for
-    // "adjusting state when a value changes" (react.dev/learn/
-    // you-might-not-need-an-effect, "Adjusting some state when a prop
-    // changes"). Calling setState directly in the render body like this is
-    // intentional and safe: React detects the state change, discards the
-    // in-progress render, and re-renders immediately with the new state
-    // BEFORE committing anything to the screen or running any effects — so
-    // this never produces a visible cascading render or an infinite loop.
-    // It is also cheaper than wrapping this in useEffect, which would
-    // require a full extra render + commit + effect cycle to achieve the
-    // same result, and which React itself now warns against for this exact
-    // shape ("Calling setState synchronously within an effect can trigger
-    // cascading renders").
+    // This is React's officially documented pattern for "adjusting state
+    // when a value changes" (react.dev/learn/you-might-not-need-an-effect,
+    // "Adjusting some state when a prop changes"). Calling setState
+    // directly in the render body like this is intentional and safe: React
+    // detects the state change, discards the in-progress render, and
+    // re-renders immediately with the new state BEFORE committing anything
+    // to the screen or running any effects — so this never produces a
+    // visible cascading render or an infinite loop. It is also cheaper
+    // than wrapping this in useEffect, which would require a full extra
+    // render + commit + effect cycle to achieve the same result.
     if (dailyExchangeRate !== lastSyncedRate) {
         setLastSyncedRate(dailyExchangeRate);
         setInputValue(
@@ -136,6 +80,13 @@ export function ExchangeRateTopbar() {
             return;
         }
 
+        // No JWT/session sync here: per T2a, dailyExchangeRate must never
+        // be trusted from the session/JWT anywhere in the app, and nothing
+        // reads it that way anymore — updateExchangeRate already writes
+        // the new rate to the server (source of truth), the Zustand store
+        // (this tab), Dexie (offline cache), and broadcasts it to other
+        // tabs on this device. A next-auth session update() call here
+        // would be a network round-trip with no reader left to serve.
         const success = await updateExchangeRate(numericRate, session?.user?.tenantId);
         if (success) {
             toast.success(
@@ -143,7 +94,6 @@ export function ExchangeRateTopbar() {
                 { icon: <CheckCircle2 className="h-4 w-4 text-emerald-500" /> }
             );
             setIsEditing(false);
-            await updateSession({ dailyExchangeRate: numericRate });
         }
     };
 
