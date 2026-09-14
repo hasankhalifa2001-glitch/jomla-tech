@@ -78,6 +78,27 @@ export type PaymentMethod =
 // upstream bug (e.g. a caller passing an already-negated value through
 // originalDebtAmountSYP by mistake, double-negating it) — this factory no
 // longer trusts that upstream logic is correct and rejects it directly.
+//
+// [FIX — review pass 5] Two gaps closed:
+//   1. createOfflineVoidRecord's isSystemCustomer check previously read
+//      `compareMoney(debtSYP, 0) > 0` — but by that point in the function,
+//      the void-debt-sign guard immediately above it has already
+//      unconditionally rejected any positive debtSYP, regardless of
+//      isSystemCustomer. That made the isSystemCustomer branch dead code:
+//      it could never actually fire, despite its comment claiming to
+//      provide defense-in-depth. The one residual case actually worth
+//      catching — a NEGATIVE debtSYP paired with isSystemCustomer (the
+//      system customer must never carry debt OR credit, not just "no
+//      positive debt") — was not checked by anything. Changed to `!== 0`,
+//      which is both reachable and meaningful.
+//   2. createOfflinePaymentRecord's new invoiceId/offlineInvoiceId fields
+//      had no mutual-exclusivity check, unlike every other paired
+//      offline/synced identifier in this file (customerId/
+//      offlineCustomerId above). A payment record can legitimately
+//      reference neither (an independent repayment) or exactly one (a
+//      sale-time payment tied to either a not-yet-synced local invoice or
+//      an already-synced server one) — never both at once. Added the same
+//      guard pattern already used for customerId/offlineCustomerId.
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -384,6 +405,9 @@ export function createOfflineInvoiceRecord(data: {
   // only when debtAmountSYP = 0." Previously only checked one layer up,
   // in pos-service.ts's submitOfflineSale — see the file-header note.
   // Enforced here directly so no caller of this factory can bypass it.
+  // (debtSYP is already guaranteed >= 0 by the guard immediately above,
+  // so `> 0` here is equivalent to `!== 0` for this factory — unlike the
+  // void factory below, where debtSYP's valid range is different.)
   if (data.isSystemCustomer && compareMoney(debtSYP, 0) > 0) {
     throw new Error(
       "An invoice cannot reference the system-generated cash customer while " +
@@ -550,13 +574,18 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  // [FIX] Same system-customer/zero-debt rule as createOfflineInvoiceRecord
-  // — see this parameter's doc comment above for why this should be
-  // unreachable in normal operation but is still checked directly here.
-  if (data.isSystemCustomer && compareMoney(debtSYP, 0) > 0) {
+  // [FIX — review pass 5] Changed from `> 0` to `!== 0`. debtSYP is
+  // already guaranteed <= 0 by the guard immediately above, so a `> 0`
+  // condition here could never actually fire — it was dead code despite
+  // claiming to provide defense-in-depth. The one residual case actually
+  // worth catching is a NEGATIVE debtSYP paired with isSystemCustomer:
+  // the system-generated cash customer must never carry debt OR credit,
+  // not merely "no positive debt" — `!== 0` is both reachable and
+  // actually enforces that.
+  if (data.isSystemCustomer && compareMoney(debtSYP, 0) !== 0) {
     throw new Error(
       "A void record cannot reference the system-generated cash customer while " +
-      "debtAmountSYP > 0 — a sale carrying debt requires a real, identified customer."
+      "debtAmountSYP is nonzero — the system customer must never carry debt or credit."
     );
   }
 
@@ -640,6 +669,15 @@ export function createOfflinePaymentRecord(data: {
     throw new Error(
       "Offline payment must reference a customer via either customerId or offlineCustomerId."
     );
+  }
+  // [FIX — review pass 5] Same mutual-exclusivity guard as
+  // customerId/offlineCustomerId above, now applied to invoiceId/
+  // offlineInvoiceId. A payment record legitimately references neither
+  // (an independent repayment) or exactly one (a sale-time payment tied
+  // to a not-yet-synced local invoice, or an already-synced server one)
+  // — never both at once.
+  if (data.invoiceId && data.offlineInvoiceId) {
+    throw new Error("Offline payment cannot have both invoiceId and offlineInvoiceId.");
   }
 
   const rate = serializeMoney(data.exchangeRate);

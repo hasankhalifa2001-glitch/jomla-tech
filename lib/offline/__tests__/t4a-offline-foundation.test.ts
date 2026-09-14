@@ -536,7 +536,10 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
         createCachedSessionRecord({
           userId: "",
           tenantId: TEST_TENANT_ID,
+          tenantName: "محل تجريبي",
+          tenantSlug: "test-shop",
           role: "ADMIN",
+          subscriptionStatus: "ACTIVE",
           isPlatformAdmin: true,
         })
       ).toThrow(/userId is required/);
@@ -546,7 +549,10 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
         createCachedSessionRecord({
           userId: "user-1",
           tenantId: "",
+          tenantName: "محل تجريبي",
+          tenantSlug: "test-shop",
           role: "ADMIN",
+          subscriptionStatus: "ACTIVE",
           isPlatformAdmin: true,
         })
       ).toThrow(/tenantId is required/);
@@ -556,7 +562,10 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
         createCachedSessionRecord({
           userId: "user-1",
           tenantId: TEST_TENANT_ID,
+          tenantName: "محل تجريبي",
+          tenantSlug: "test-shop",
           role: "SUPERUSER" as any,
+          subscriptionStatus: "ACTIVE",
           isPlatformAdmin: true,
         })
       ).toThrow(/Invalid role/);
@@ -566,7 +575,10 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
         createCachedSessionRecord({
           userId: "user-1",
           tenantId: TEST_TENANT_ID,
+          tenantName: "محل تجريبي",
+          tenantSlug: "test-shop",
           role: "ADMIN",
+          subscriptionStatus: "ACTIVE",
           isPlatformAdmin: undefined as any,
         })
       ).toThrow(/isPlatformAdmin is required and must be a boolean/);
@@ -576,9 +588,12 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       await setCachedSession({
         userId: "user-cashier-1",
         tenantId: TEST_TENANT_ID,
+        tenantName: "محل تجريبي",
+        tenantSlug: "test-shop",
         role: "CASHIER",
         isPlatformAdmin: false,
         name: "كاشير الصباح",
+        subscriptionStatus: "ACTIVE",
       });
 
       const cached = await getCachedSession("user-cashier-1");
@@ -632,9 +647,12 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       await setCachedSession({
         userId: "user-logout-test",
         tenantId: TEST_TENANT_ID,
+        tenantName: "محل تجريبي",
+        tenantSlug: "test-shop",
         role: "CASHIER",
         isPlatformAdmin: false,
         name: "كاشير مؤقت",
+        subscriptionStatus: "ACTIVE",
       });
 
       expect(await getCachedSession("user-logout-test")).not.toBeNull();
@@ -648,9 +666,12 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       await setCachedSession({
         userId: "user-revoked",
         tenantId: TEST_TENANT_ID,
+        tenantName: "محل تجريبي",
+        tenantSlug: "test-shop",
         role: "ADMIN",
         isPlatformAdmin: false,
         name: "مستخدم منتهي الصلاحية",
+        subscriptionStatus: "ACTIVE",
       });
 
       // When online, if the session is unauthenticated (e.g. 401 response from /api/auth/session),

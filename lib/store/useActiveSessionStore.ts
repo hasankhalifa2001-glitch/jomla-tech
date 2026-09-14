@@ -52,26 +52,72 @@ import { persist, createJSONStorage } from "zustand/middleware";
  * never persisted anything to its own sessionStorage), currentUserId
  * stays null and the fallback correctly reports "identity unknown"
  * rather than assuming any cached row belongs to it.
+ *
+ * [FIX — hydration timing] zustand's persist middleware reads from
+ * sessionStorage ASYNCHRONOUSLY after the store is first created — on
+ * the very first render (including the first render after a reload while
+ * offline, the exact scenario this store exists for), currentUserId is
+ * still its in-memory initial value (null), even if a real value is
+ * about to be rehydrated from sessionStorage a moment later. Without a
+ * way to distinguish "haven't checked sessionStorage yet" from
+ * "genuinely no id was ever stored here," a consumer reading
+ * currentUserId === null on that first render cannot tell those two
+ * cases apart, and could briefly (and incorrectly) treat a real, known
+ * identity as unknown. hasHydrated flips true exactly once, via
+ * onRehydrateStorage below, the moment rehydration actually completes —
+ * consumers (see hooks.ts's useSessionWithOfflineFallback) should treat
+ * `!hasHydrated` as "still checking," not as "no id."
  */
 interface ActiveSessionState {
     currentUserId: string | null;
+    hasHydrated: boolean;
     setCurrentUserId: (userId: string | null) => void;
+    setHasHydrated: (value: boolean) => void;
 }
 
 export const useActiveSessionStore = create<ActiveSessionState>()(
     persist(
         (set) => ({
             currentUserId: null,
+            // [FIX — hydration timing] Starts false; persist's rehydration
+            // (triggered automatically on store creation) flips it to true
+            // via onRehydrateStorage below once sessionStorage has actually
+            // been read — whether or not it contained a value.
+            hasHydrated: false,
             setCurrentUserId: (userId) => set({ currentUserId: userId }),
+            setHasHydrated: (value) => set({ hasHydrated: value }),
         }),
         {
             name: "jomla-active-session-tab", // sessionStorage key
             storage: createJSONStorage(() => sessionStorage),
-            // Only currentUserId is ever persisted — this store has no other
-            // fields today, but if one is added later that should NOT survive
-            // a reload (e.g. a transient UI flag), partialize here rather than
-            // assuming "whatever's in state" is safe to persist.
+            // Only currentUserId is ever persisted — hasHydrated is
+            // deliberately excluded (it must always start false in a fresh
+            // JS heap and be recomputed by an actual rehydration, never
+            // restored as `true` from a previous stretch's stored value,
+            // which would defeat its own purpose). This store has no other
+            // fields today, but if one is added later that should NOT
+            // survive a reload (e.g. a transient UI flag), partialize here
+            // rather than assuming "whatever's in state" is safe to persist.
             partialize: (state) => ({ currentUserId: state.currentUserId }),
+            // [FIX — hydration timing] Fires once, after sessionStorage has
+            // been read and the store's in-memory state updated accordingly
+            // (whether a value was found or not). This is the only reliable
+            // signal that `currentUserId` now reflects sessionStorage's
+            // actual contents rather than the pre-hydration initial value.
+            onRehydrateStorage: () => (state, error) => {
+                if (error) {
+                    console.error("Failed to rehydrate active-session store from sessionStorage:", error);
+                }
+                // state may be undefined if rehydration itself threw (e.g. sessionStorage
+                // blocked/unavailable) — fall back to setState directly so hasHydrated
+                // still flips true and consumers stop waiting forever instead of being
+                // permanently stuck on "loading".
+                if (state) {
+                    state.setHasHydrated(true);
+                } else {
+                    useActiveSessionStore.setState({ hasHydrated: true });
+                }
+            },
         }
     )
 );

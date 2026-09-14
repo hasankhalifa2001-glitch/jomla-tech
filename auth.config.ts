@@ -11,6 +11,7 @@ import { applySessionFromToken } from "@/lib/auth/session-callback";
 // else (API routes, Server Components, Server Actions) — those run on
 // the Node.js runtime and have no such size limit.
 export const authConfig = {
+    trustHost: true,
     pages: {
         signIn: "/login",
     },

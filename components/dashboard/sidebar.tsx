@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
 import { useSessionWithOfflineFallback, clearCachedSession } from "@/lib/offline";
+import { useActiveSessionStore } from "@/lib/store/useActiveSessionStore"; // [ADD]
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -48,19 +49,20 @@ export function DashboardSidebar() {
     const [mobileOpen, setMobileOpen] = useState(false);
     const pathname = usePathname();
     const { data: session, status: sessionStatus } = useSessionWithOfflineFallback();
+    const setCurrentUserId = useActiveSessionStore((s) => s.setCurrentUserId); // [ADD]
+
 
     const handleSignOut = async () => {
-        // [FIX] clearCachedSession(userId: string) is deliberately
-        // non-optional — see session-cache.ts's own note: a logout must
-        // only ever clear the claims for the user actually logging out,
-        // never guess or fall back to clearing every cached user on a
-        // shared device. `session?.userId` is `string | undefined` here
-        // (session can be null while loading/unauthenticated/unreachable),
-        // so the clear is only attempted when we actually have a real
-        // userId to scope it to — if we don't, there is nothing this tab
-        // legitimately knows to clear, and skipping is correct (not a
-        // silently-swallowed error), since signOut() below still proceeds
-        // either way.
+        // [FIX — skip unnecessary offline-verification fetch on manual
+        // logout] Clear this tab's known identity FIRST, synchronously,
+        // before anything else. The moment liveStatus flips to
+        // "unauthenticated", useSessionWithOfflineFallback's
+        // liveIsUnreachable check reads currentUserId === null and skips
+        // its /api/auth/session verification fetch entirely — that fetch
+        // exists to distinguish a real logout from a failed network call,
+        // and a user-initiated logout while online is never ambiguous.
+        setCurrentUserId(null); // [ADD]
+
         if (session?.userId) {
             try {
                 await clearCachedSession(session.userId);

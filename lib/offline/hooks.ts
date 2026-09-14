@@ -1,18 +1,17 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { getOfflineDb, isOfflineDbSupported, type CachedSession } from "./db";
 import { getCachedRate } from "./exchange-rate";
-import { getCachedSession, setCachedSession } from "./session-cache";
+import { getCachedSession, setCachedSession, clearCachedSession } from "./session-cache";
 import { useActiveSessionStore } from "@/lib/store/useActiveSessionStore";
 
 export type OfflineDbStatus =
   | "INITIALIZING"
   | "READY"
-  /** Some, but not all, of products/customers/rate are cached yet — a
-   * genuinely different situation from NO_CACHED_DATA (nothing at all). */
   | "PARTIAL"
   | "NO_CACHED_DATA"
   | "UNSUPPORTED"
@@ -208,14 +207,10 @@ export interface SessionFallbackClaims {
   /**
    * DISPLAY-ONLY WHEN source === "cached". Mirrors the JWT's own
    * short-TTL-cached claim (T2a) — never trusted for any write/navigation
-   * decision. The one place this codebase reads it (SyncWorkerInitializer)
-   * uses it purely to skip a doomed sync attempt as a performance
-   * optimization; the real security boundary is always
+   * decision. The real security boundary is always
    * assertTenantWritable(tenantId) on the server, which re-reads fresh
    * from the database on every mutating request regardless of what this
-   * value says. May be stale by an arbitrary amount while offline — see
-   * the reconnect-triggered update() call below for how staleness is
-   * bounded once connectivity returns.
+   * value says.
    */
   subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
 }
@@ -223,16 +218,14 @@ export interface SessionFallbackClaims {
 export interface UseSessionWithOfflineFallbackResult {
   status: SessionFallbackStatus;
   data: SessionFallbackClaims | null;
+  update?: (data?: any) => Promise<any>;
 }
 
 /** How long a "loading" next-auth session is allowed to hang before this
- * hook stops waiting and treats the live call as unreachable. next-auth
- * does not cleanly distinguish "genuinely still loading" from "the
- * /api/auth/session fetch failed and will never resolve" — a real
- * network partition can leave status stuck on "loading" indefinitely.
- * This timeout is the practical way to avoid waiting forever; it is
- * deliberately generous so it never fires on a normal, merely-slow
- * connection. */
+ * hook stops waiting and treats the live call as unreachable. Also reused
+ * as the timeout for the direct /api/auth/session verification fetch
+ * below, so no path in this hook can hang longer than this single,
+ * consistent ceiling. */
 const LIVE_SESSION_TIMEOUT_MS = 4000;
 
 function useIsBrowserOnline(): boolean {
@@ -261,8 +254,7 @@ function useIsBrowserOnline(): boolean {
 /**
  * The raw `liveSession.user` shape is normalized through this ONE helper,
  * instead of separately-written inline type casts that could disagree on
- * which fields were optional. Every required field (id, tenantId,
- * tenantName, tenantSlug, role, subscriptionStatus) must be a genuinely
+ * which fields were optional. Every required field must be a genuinely
  * truthy value, or the whole session is treated as not-yet-usable
  * (returns null) rather than producing a partially-valid object with a
  * silently-wrong field.
@@ -316,6 +308,7 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
   const { data: liveSession, status: liveStatus, update } = useSession();
   const currentUserId = useActiveSessionStore((s) => s.currentUserId);
   const setCurrentUserId = useActiveSessionStore((s) => s.setCurrentUserId);
+  const hasHydrated = useActiveSessionStore((s) => s.hasHydrated);
   const isOnline = useIsBrowserOnline();
 
   const [timedOut, setTimedOut] = useState(false);
@@ -331,46 +324,60 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
     return () => clearTimeout(timer);
   }, [liveStatus]);
 
-  // [FIX — reconnect handling] Connectivity returning is a strong signal
-  // that whatever caused liveStatus to hang (or the browser to report
-  // offline) may no longer apply. The moment `isOnline` flips true:
-  //   1. `timedOut` is cleared immediately, so `liveIsUnreachable` stops
-  //      being forced true purely by a stale timeout flag left over from
-  //      the outage that just ended.
-  //   2. next-auth is asked to re-resolve the live session right away via
-  //      update(), rather than passively waiting for its own refetch
-  //      schedule (window focus / refetchInterval) to eventually notice
-  //      the network is back. This is also what triggers auth.ts's jwt
-  //      callback to re-read subscriptionStatus/dailyExchangeRate fresh
-  //      from the database (trigger === "update") — without this call,
-  //      a stale subscriptionStatus could persist for an arbitrarily long
-  //      stretch after reconnection, bounded only by next-auth's own
-  //      refetch timing, not by this app's actual connectivity.
-  // Without this effect, a device that was offline long enough to hit the
-  // 4s timeout could stay on "offline-cached" for an indefinite,
-  // user-visible stretch after connectivity genuinely returns — exactly
-  // the intermittent-connection pattern this app is built around.
+  // [FIX — reconnect handling] On a genuine offline->online transition,
+  // clear any stale timeout flag during render (not inside the effect —
+  // see the render-purity note this mirrors on prevLiveStatus above), and
+  // ask next-auth to re-resolve the live session via update() from inside
+  // the effect below, which is the only place a real network call belongs.
+  const [prevIsOnlineForReconnect, setPrevIsOnlineForReconnect] = useState(isOnline);
+  if (isOnline !== prevIsOnlineForReconnect) {
+    setPrevIsOnlineForReconnect(isOnline);
+    if (isOnline) {
+      setTimedOut(false);
+    }
+  }
+
+  // [FIX — review pass 2: real transition only, not "first time we see
+  // isOnline === true"] A prior revision gated update() behind a ref that
+  // flipped to `true` the first time the effect ran WHILE isOnline was
+  // already true — intended to skip firing update() on an ordinary mount
+  // that happens to already be online (ubiquitous case, no reconnect
+  // occurred). That logic had a real bug: if the tab mounted OFFLINE
+  // (isOnline === false), the effect's very first invocation returned
+  // early on `if (!isOnline) return;` BEFORE ever reaching the
+  // "first run" check — so the ref was never set to true during that
+  // offline mount. The very next time the effect ran with isOnline ===
+  // true (i.e. the actual, real reconnect this whole mechanism exists to
+  // detect) was then WRONGLY treated as "the first time we've seen
+  // online", swallowing the update() call on exactly the scenario this
+  // hook is built around: a tab that starts offline and later reconnects.
+  //
+  // Fixed by decoupling "is this the effect's first invocation" from
+  // "what was isOnline's value on that first invocation" — isFirstRun is
+  // set unconditionally on the effect's first run, regardless of
+  // isOnline, so only a genuine SUBSEQUENT change to isOnline (a real
+  // transition, in either direction) can ever reach the isOnline check
+  // below and fire update().
+  const isFirstRun = useRef(true);
+
   useEffect(() => {
+    if (isFirstRun.current) {
+      isFirstRun.current = false;
+      return;
+    }
     if (!isOnline) return;
-    setTimedOut(false);
     update().catch((err) => {
       console.error(
         "useSessionWithOfflineFallback: session re-check on reconnect failed:",
         err
       );
     });
-    // Deliberately keyed on isOnline only — this should fire once per
-    // offline->online transition, not on every render where isOnline
-    // happens to already be true, and next-auth's `update` reference is
-    // stable across renders in practice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOnline]);
 
-  // On a successful LIVE resolution: remember this tab's userId (plain
-  // sessionStorage-backed Zustand — see useActiveSessionStore's own doc
-  // comment for why this must never be localStorage), and write-through
-  // to the offline cache — the same write-through pattern T2c's
-  // exchange-rate top-bar edit already follows for setCachedRate.
+  // On a successful LIVE resolution: remember this tab's userId and
+  // write-through to the offline cache — the same write-through pattern
+  // T2c's exchange-rate top-bar edit already follows for setCachedRate.
   useEffect(() => {
     if (liveStatus !== "authenticated") return;
     const validUser = extractValidatedUser(liveSession?.user);
@@ -391,17 +398,129 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
     });
   }, [liveStatus, liveSession, setCurrentUserId]);
 
-  // The live call is considered unreachable — not merely "still
-  // loading" — either because the browser reports it's offline, or
-  // because a "loading" status has hung past LIVE_SESSION_TIMEOUT_MS.
-  // Deliberately NOT based on liveStatus === "unauthenticated": while
-  // offline, next-auth cannot actually verify that and may report
-  // "unauthenticated" purely because the session fetch failed — trusting
-  // that while offline would treat a real, still-logged-in user as
-  // logged out the moment connectivity drops.
-  const liveIsUnreachable = !isOnline || (liveStatus === "loading" && timedOut);
+  // ==========================================================================
+  // [FIX — real logout verification] next-auth can report "unauthenticated"
+  // within milliseconds of a FAILED /api/auth/session fetch (a flaky
+  // connection, a captive portal, a DNS blip) — not only after a genuine
+  // server-confirmed "no session" response. navigator.onLine can easily
+  // still read `true` in that exact scenario. Trusting "unauthenticated" at
+  // face value here would silently sign out a real, still-logged-in user.
+  //
+  // The moment liveStatus flips to "unauthenticated" AND this tab
+  // previously knew a real identity (currentUserId is set), independently
+  // confirm it with a direct, timeout-bounded fetch to the session
+  // endpoint:
+  //   - resolves with no user  -> genuinely logged out server-side. Trust
+  //     it, and clean up this tab's cached identity.
+  //   - resolves with a user   -> next-auth's client state was out of
+  //     sync; ask it to re-resolve via update(), NOT a logout.
+  //   - throws OR times out (AbortController, same LIVE_SESSION_TIMEOUT_MS
+  //     ceiling used everywhere else in this hook) -> never a confirmed
+  //     logout, just unreachable/too-slow. Falls through to the
+  //     offline-cached path instead of hanging indefinitely on a merely
+  //     slow (not dead) connection.
+  // A tab that never had a known identity (currentUserId is null) has
+  // nothing to verify — trust "unauthenticated" immediately, same as
+  // before.
+  //
+  // NOTE: a real, user-initiated logout button should call
+  // setCurrentUserId(null) itself before signOut() runs, so this
+  // verification path is skipped entirely for the single most common
+  // "unauthenticated" case — see the Logout button implementation.
+  //
+  // [FIX — render-purity] The two "obvious, no-fetch-needed" outcomes are
+  // knowable synchronously from this render's own liveStatus/currentUserId:
+  //   - liveStatus isn't "unauthenticated" at all -> verifiedLogout should
+  //     just be false (irrelevant/reset).
+  //   - it IS "unauthenticated", but this tab never knew a real userId to
+  //     begin with -> trivially "verified" (nothing to lose, nothing to
+  //     check).
+  // Neither needs an effect, and definitely not a synchronous setState as
+  // the first statement inside one (same class of issue already fixed
+  // above for prevLiveStatus/prevIsOnlineForReconnect — see React's
+  // "Avoid calling setState() directly within an effect" warning). Only
+  // the genuinely ambiguous case — unauthenticated AND a known
+  // currentUserId — needs a real async side effect (the fetch below),
+  // which is exactly what's left inside the effect itself.
+  // ==========================================================================
+  const logoutCheckKey =
+    liveStatus === "unauthenticated" ? currentUserId ?? "" : null;
 
-  const cacheLookupKey = liveIsUnreachable ? currentUserId : null;
+  const [verifiedLogout, setVerifiedLogout] = useState(false);
+  const [prevLogoutCheckKey, setPrevLogoutCheckKey] = useState<string | null>(
+    logoutCheckKey
+  );
+  if (logoutCheckKey !== prevLogoutCheckKey) {
+    setPrevLogoutCheckKey(logoutCheckKey);
+    if (liveStatus !== "unauthenticated") {
+      // Not in the unauthenticated case at all right now — reset.
+      setVerifiedLogout(false);
+    } else if (!currentUserId) {
+      // Unauthenticated, and this tab never knew a real identity to
+      // begin with — trivially verified, no fetch needed.
+      setVerifiedLogout(true);
+    } else {
+      // The genuinely ambiguous case: unauthenticated AND a known prior
+      // identity. Not yet verified — the effect below will confirm it.
+      setVerifiedLogout(false);
+    }
+  }
+
+  useEffect(() => {
+    // Only the ambiguous case needs the actual network round-trip.
+    if (liveStatus !== "unauthenticated" || !currentUserId) return;
+
+    let cancelled = false;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), LIVE_SESSION_TIMEOUT_MS);
+
+    fetch("/api/auth/session", { cache: "no-store", signal: controller.signal })
+      .then(async (res) => {
+        if (cancelled) return;
+        if (!res.ok) {
+          setVerifiedLogout(false);
+          return;
+        }
+        const body = await res.json().catch(() => null);
+        const reallyLoggedOut = !body || !body.user;
+        setVerifiedLogout(reallyLoggedOut);
+        if (reallyLoggedOut) {
+          setCurrentUserId(null);
+          clearCachedSession(currentUserId).catch((err) => {
+            console.error("Failed to clear cached session on confirmed logout:", err);
+          });
+        } else {
+          update().catch(() => { });
+        }
+      })
+      .catch(() => {
+        // Covers both a genuine network failure AND the AbortController
+        // timeout firing — either way, never a confirmed logout, just
+        // unreachable/too-slow. Falls through to offline-cached instead
+        // of hanging indefinitely.
+        if (!cancelled) setVerifiedLogout(false);
+      })
+      .finally(() => {
+        clearTimeout(timeoutId);
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearTimeout(timeoutId);
+    };
+  }, [liveStatus, currentUserId, setCurrentUserId, update]);
+
+  // liveIsUnreachable also covers an UNVERIFIED "unauthenticated" while a
+  // known prior identity exists — until the check above confirms it one
+  // way or the other (bounded by LIVE_SESSION_TIMEOUT_MS), treat it the
+  // same as offline rather than as a confirmed logout.
+  const liveIsUnreachable =
+    !isOnline ||
+    (liveStatus === "loading" && timedOut) ||
+    (liveStatus === "unauthenticated" && !!currentUserId && !verifiedLogout);
+
+  const cacheLookupKey = liveIsUnreachable && hasHydrated ? currentUserId : null;
 
   const [cachedClaims, setCachedClaims] = useState<CachedSession | null | undefined>(undefined);
   const [trackedLookupKey, setTrackedLookupKey] = useState<string | null>(null);
@@ -421,10 +540,7 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
     };
   }, [cacheLookupKey]);
 
-  // 1. A genuinely successful live resolution always wins, even if
-  // liveIsUnreachable's onLine check is a false positive (e.g. a captive
-  // portal or flaky navigator.onLine) — if useSession() actually got a
-  // real answer, trust it over any cached guess.
+  // 1. A genuinely successful live resolution always wins.
   if (liveStatus === "authenticated") {
     const validUser = extractValidatedUser(liveSession?.user);
     if (validUser) {
@@ -441,30 +557,25 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
           source: "live",
           subscriptionStatus: validUser.subscriptionStatus,
         },
+        update,
       };
     }
-    // Authenticated per next-auth, but the session object is missing a
-    // required field this app depends on (e.g. a stale token predating
-    // tenantName/tenantSlug) — fall through rather than return a
-    // partially-valid claims object.
   }
 
-  // 2. Live is unreachable — fall back to this tab's own known identity,
-  // if it has one. Never falls back for a tab that never resolved a live
-  // session (currentUserId === null) — that tab honestly doesn't know
-  // who's using it, and unreachable/unknown must not be papered over
-  // with someone else's cached claims.
+  // 2. Live is unreachable (or an unconfirmed "unauthenticated") — fall
+  // back to this tab's own known identity, if it has one.
   if (liveIsUnreachable) {
+    if (!hasHydrated) {
+      return { status: "loading", data: null, update };
+    }
     if (!currentUserId) {
-      return { status: "unreachable", data: null };
+      return { status: "unreachable", data: null, update };
     }
     if (cachedClaims === undefined) {
-      return { status: "loading", data: null };
+      return { status: "loading", data: null, update };
     }
     if (cachedClaims === null) {
-      // Known userId, but nothing cached for it (e.g. first-ever login
-      // happened to fail before any write-through completed).
-      return { status: "unreachable", data: null };
+      return { status: "unreachable", data: null, update };
     }
     return {
       status: "offline-cached",
@@ -479,16 +590,17 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
         source: "cached",
         subscriptionStatus: cachedClaims.subscriptionStatus,
       },
+      update,
     };
   }
 
-  // 3. Live is reachable (we're online) and next-auth has definitively
-  // resolved to "not logged in" — this is the one case it's safe to
-  // trust that status at face value.
+  // 3. liveStatus === "unauthenticated" reaches here ONLY when there was
+  // never a known identity, or the direct check above confirmed it — a
+  // real, trustworthy logout either way.
   if (liveStatus === "unauthenticated") {
-    return { status: "unauthenticated", data: null };
+    return { status: "unauthenticated", data: null, update };
   }
 
   // 4. Still genuinely loading, online, within the timeout window.
-  return { status: "loading", data: null };
+  return { status: "loading", data: null, update };
 }
