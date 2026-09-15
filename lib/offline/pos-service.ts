@@ -131,6 +131,36 @@
  *      non-empty tenantId in scope, so there's no reason to go through
  *      the (rate, tenantId) legacy argument order meant for old call
  *      sites.
+ *
+ * [FIX — review pass 4, T4b]
+ *   1. submitOfflineSale() previously rejected ANY sale where
+ *      exchangeRateUsed was missing or <= 0, unconditionally — even for a
+ *      cart composed entirely of SYP-priced units, which never needed a
+ *      rate to resolve in the first place (see cartNeedsExchangeRate()
+ *      and resolveUnitPriceSYP() below). That directly contradicted T4b's
+ *      own acceptance criterion: "checkout blocks only for a USD-priced
+ *      item with no cached rate, never for SYP-only carts." The check is
+ *      now conditional on cartNeedsExchangeRate(payload.items) — a
+ *      SYP-only cart may submit with exchangeRateUsed: null.
+ *      OfflineSalePayload.exchangeRateUsed is now `MoneyInput | null`
+ *      accordingly, and the resolved `requiresExchangeRate` flag is
+ *      passed through to createOfflineInvoiceRecord (db.ts), which must
+ *      apply the same conditional logic at its own layer rather than
+ *      trusting this check alone — same defense-in-depth pattern already
+ *      used for isSystemCustomer.
+ *   2. Offline credit-sale gate replaced/extended: previously the only
+ *      debt-eligibility check was "not the system cash customer." That
+ *      missed a real gap — a freshly-created WALK_IN customer (no
+ *      documented history with the merchant at all) could be extended
+ *      debt in the very same sale that created them. The new
+ *      isEligibleForCredit() requires CachedCustomer.hasPriorInvoices
+ *      (db.ts) — populated by /api/customers from the customer's real
+ *      invoice history — to be explicitly true, which structurally
+ *      excludes BOTH a WALK_IN customer (no CachedCustomer row exists for
+ *      them at all) AND a synced EXISTING customer who has a customer
+ *      record but has never actually had an invoice. See
+ *      isEligibleForCredit()'s own doc comment below for the full
+ *      reasoning.
  */
 
 import {
@@ -178,6 +208,17 @@ export interface SelectedCustomer {
   // [v3.6] Derived/informational, when available.
   balanceDebtUSD?: number;
   isSystemGenerated?: boolean;
+  /**
+   * [T4b — offline credit-sale gate] Mirrors
+   * CachedCustomer.hasPriorInvoices (db.ts) — true only when this
+   * customer has at least one real Invoice on the server. undefined means
+   * "unknown from this source" (e.g. a WALK_IN customer, which has no
+   * CachedCustomer row at all, or an ONLINE phone-lookup match, which
+   * doesn't carry this field) and must NEVER be treated as eligible for
+   * credit — see isEligibleForCredit() below, which only ever accepts an
+   * explicit `true`.
+   */
+  hasPriorInvoices?: boolean;
 }
 
 export interface CartLineItem {
@@ -192,6 +233,12 @@ export interface CartLineItem {
   // [v3.6] Derived/informational — null if no exchange rate was cached
   // when this line was added to the cart.
   unitPriceUSD: string | null;
+  // [T4b] The merchant's own pricing denomination for this specific unit —
+  // does NOT mean USD is authoritative on the cart; SYP always is.
+  // Used by cartNeedsExchangeRate() to determine whether checkout can
+  // proceed without a cached rate (SYP-only carts can; USD-priced items
+  // need a rate to resolve their unitPriceSYP in the first place).
+  pricingCurrency: "USD" | "SYP";
   priceRetailSYP?: string;
   priceRetailUSD?: string | null;
 }
@@ -223,7 +270,15 @@ export interface OfflineSalePayload {
   // supplied numbers drifting apart (see the removed cross-check note in
   // submitOfflineSale below).
   totalSYP: MoneyInput;
-  exchangeRateUsed: MoneyInput;
+  /**
+   * [FIX — review pass 4, T4b] Now nullable. A cart composed entirely of
+   * SYP-priced units (cartNeedsExchangeRate(items) === false) has no rate
+   * to give — pass `null` rather than inventing a placeholder value. When
+   * the cart DOES contain a USD-priced item, this must be a real,
+   * strictly-positive rate or submitOfflineSale rejects the sale before
+   * ever constructing an invoice record.
+   */
+  exchangeRateUsed: MoneyInput | null;
   paidAmountSYP: MoneyInput;
   debtAmountSYP: MoneyInput;
   paymentMethod?: PaymentMethod;
@@ -326,6 +381,40 @@ export function isSystemCashCustomer(customer?: SelectedCustomer | null): boolea
   return customer.type === "SYSTEM" || !!customer.isSystemGenerated;
 }
 
+/**
+ * [FIX — review pass 4, T4b] A sale may carry debt (debtAmountSYP > 0)
+ * ONLY against a customer with a documented, verifiable prior
+ * relationship with the merchant — a real Invoice already exists for
+ * them on the server. Deliberately requires `hasPriorInvoices === true`
+ * explicitly (never `!!customer.hasPriorInvoices` alone would be enough
+ * to document the intent, but the strict `=== true` check is what
+ * actually matters): any other value — `undefined`, `false`, or a stale
+ * client that never carried this field — is treated as NOT eligible.
+ *
+ * This structurally covers two distinct risky cases with one check:
+ *   1. A WALK_IN customer — created moments ago by this same cashier,
+ *      with no CachedCustomer row and therefore no hasPriorInvoices value
+ *      at all. Extending credit to an identity this device (or the
+ *      server, until the next sync) has never verified defeats the whole
+ *      point of tracking who owes what.
+ *   2. A synced EXISTING customer whose row exists in cachedCustomers but
+ *      who has never actually had an invoice — e.g. a customer record an
+ *      ADMIN created ahead of time from a different screen. Their `type`
+ *      reads "EXISTING," which an earlier, narrower check
+ *      (type !== "WALK_IN") would have wrongly treated as sufficient on
+ *      its own.
+ *
+ * The system-generated cash customer is handled separately by
+ * isSystemCashCustomer() and is never even offered a debt path in the UI
+ * — this function is only ever consulted once that case has already been
+ * ruled out by the caller.
+ */
+export function isEligibleForCredit(customer: SelectedCustomer | null | undefined): boolean {
+  if (!customer) return false;
+  if (isSystemCashCustomer(customer)) return false;
+  return customer.hasPriorInvoices === true;
+}
+
 export function normalizeCustomerPhone(phone: string): string {
   return phone.trim().replace(/\s+/g, "");
 }
@@ -352,6 +441,9 @@ function cachedCustomerToSelected(c: CachedCustomer): SelectedCustomer {
     balanceDebtUSD:
       c.cachedBalanceDebtUSD !== undefined ? toDecimal(c.cachedBalanceDebtUSD).toNumber() : undefined,
     isSystemGenerated: c.isSystemGenerated,
+    // [FIX — review pass 4, T4b] Carried through from the cached record so
+    // isEligibleForCredit() can inspect it without a second lookup.
+    hasPriorInvoices: c.hasPriorInvoices === true,
   };
 }
 
@@ -526,20 +618,40 @@ export function resolveCartLinePrices(
 ): {
   unitPriceSYP: string;
   unitPriceUSD: string | null;
+  // [T4b] Merchant's denomination for THIS unit — included so callers can
+  // call cartNeedsExchangeRate() without re-inspecting CachedProductUnit.
+  pricingCurrency: "USD" | "SYP";
   priceRetailSYP?: string;
   priceRetailUSD?: string | null;
 } {
   const unitPriceSYP = resolveUnitPriceSYP(unit, product, exchangeRate);
   const unitPriceUSD = resolveUnitPriceUSD(unit, product, exchangeRate);
+  const pricingCurrency: "USD" | "SYP" =
+    unit.pricingCurrency === "USD" ? "USD" : "SYP";
 
   if (unit.priceRetail === undefined || unit.priceRetail === null || unit.priceRetail === "") {
-    return { unitPriceSYP, unitPriceUSD };
+    return { unitPriceSYP, unitPriceUSD, pricingCurrency };
   }
 
   const retailUnit = { ...unit, priceWholesale: unit.priceRetail };
   const priceRetailSYP = resolveUnitPriceSYP(retailUnit, product, exchangeRate);
   const priceRetailUSD = resolveUnitPriceUSD(retailUnit, product, exchangeRate);
-  return { unitPriceSYP, unitPriceUSD, priceRetailSYP, priceRetailUSD };
+  return { unitPriceSYP, unitPriceUSD, pricingCurrency, priceRetailSYP, priceRetailUSD };
+}
+
+/**
+ * Returns true when at least one cart line item was priced in USD,
+ * meaning a valid cached exchange rate is REQUIRED for checkout.
+ *
+ * A cart composed entirely of SYP-priced units resolves fully without a
+ * rate (resolveUnitPriceSYP returns the price directly); checkout for
+ * such a cart must never be blocked solely because no rate is cached.
+ *
+ * T4b acceptance criteria: "checkout blocks only for a USD-priced item
+ * with no cached rate, never for SYP-only carts."
+ */
+export function cartNeedsExchangeRate(items: CartLineItem[]): boolean {
+  return items.some((item) => item.pricingCurrency === "USD");
 }
 
 export async function getOfflineProducts(
@@ -636,6 +748,10 @@ export async function getOfflineCustomers(
       shopName: c.shopName,
       balanceDebtSYP: 0,
       isSystemGenerated: false,
+      // [FIX — review pass 4, T4b] Explicit false — a WALK_IN customer has
+      // no CachedCustomer row and therefore no documented invoice history
+      // this device can verify. See isEligibleForCredit().
+      hasPriorInvoices: false,
     })),
   ];
 
@@ -693,6 +809,8 @@ export async function findMatchingCustomerByPhone(
           shopName: offlineMatch.shopName,
           balanceDebtSYP: 0,
           isSystemGenerated: false,
+          // [FIX — review pass 4, T4b] Same reasoning as getOfflineCustomers above.
+          hasPriorInvoices: false,
         },
         source: "OFFLINE",
       };
@@ -727,6 +845,13 @@ export async function findMatchingCustomerByPhone(
               // actually owe money.
               balanceDebtSYP: undefined,
               isSystemGenerated: data.customer.isSystemGenerated,
+              // [FIX — review pass 4, T4b] /api/customers/lookup does not
+              // currently return hasPriorInvoices either — left undefined
+              // (unknown), never assumed true. isEligibleForCredit() only
+              // ever accepts an explicit `true`, so this ONLINE match is
+              // correctly treated as not-yet-eligible for an offline
+              // credit sale until the customer cache actually syncs it.
+              hasPriorInvoices: undefined,
             },
             source: "ONLINE",
           };
@@ -794,6 +919,8 @@ export async function createOfflineWalkInCustomer(
     shopName: newCustomerRecord.shopName,
     balanceDebtSYP: 0,
     isSystemGenerated: false,
+    // [FIX — review pass 4, T4b] Same reasoning as getOfflineCustomers above.
+    hasPriorInvoices: false,
   };
 }
 
@@ -814,8 +941,22 @@ export async function submitOfflineSale(
     throw new Error("لا يمكن إتمام عملية البيع لسلة فارغة.");
   }
 
-  if (compareMoney(payload.exchangeRateUsed, 0) <= 0) {
-    throw new Error("لا يمكن إتمام البيع بدون تحديد سعر الصرف اليومي.");
+  // [FIX — review pass 4, T4b] Conditional exchange-rate requirement — a
+  // rate is only ever needed to resolve a USD-priced item's SYP price. A
+  // cart composed entirely of SYP-priced units must never be blocked
+  // here just because no rate is cached yet (T4b acceptance criteria).
+  // requiresExchangeRate is passed through to createOfflineInvoiceRecord
+  // (db.ts) below, which must enforce the same conditional rule at its
+  // own layer rather than trusting this check alone — matching the
+  // defense-in-depth already applied to isSystemCustomer.
+  const requiresExchangeRate = cartNeedsExchangeRate(payload.items);
+  if (
+    requiresExchangeRate &&
+    (payload.exchangeRateUsed === null || compareMoney(payload.exchangeRateUsed, 0) <= 0)
+  ) {
+    throw new Error(
+      "لا يمكن إتمام البيع بدون تحديد سعر الصرف اليومي — مطلوب لعناصر مسعّرة بالدولار في السلة."
+    );
   }
 
   // [FIX — ADDED, review pass] Recompute the expected total directly from
@@ -840,8 +981,18 @@ export async function submitOfflineSale(
   const hasDebt = compareMoney(payload.debtAmountSYP, 0) > 0;
   let customer = payload.customer ?? null;
 
-  if (hasDebt && (!customer || isSystemCashCustomer(customer))) {
-    throw new Error("البيع على الحساب أو الدفع الجزئي يتطلب اختيار أو تسجيل زبون حقيقي.");
+  if (hasDebt) {
+    if (!customer || isSystemCashCustomer(customer)) {
+      throw new Error("البيع على الحساب أو الدفع الجزئي يتطلب اختيار أو تسجيل زبون حقيقي.");
+    }
+    // [FIX — review pass 4, T4b] Replaces the old "not WALK_IN" check,
+    // which missed an EXISTING-but-never-invoiced customer — see
+    // isEligibleForCredit()'s own doc comment for the full reasoning.
+    if (!isEligibleForCredit(customer)) {
+      throw new Error(
+        "البيع بالدين يتطلب زبونًا موثّقًا بفاتورة سابقة على السيرفر — يرجى مزامنة بيانات الزبائن أو اختيار زبون آخر."
+      );
+    }
   }
 
   if (!customer || isSystemCashCustomer(customer)) {
@@ -903,9 +1054,15 @@ export async function submitOfflineSale(
     customerId,
     offlineCustomerId,
     isSystemCustomer,
+    // [FIX — review pass 4, T4b] Passed through so db.ts's factory applies
+    // the same conditional exchange-rate rule at its own layer — see this
+    // file's header note and db.ts's matching parameter (REQUIRES the
+    // corresponding db.ts update; this call will not type-check until
+    // createOfflineInvoiceRecord accepts requiresExchangeRate).
+    requiresExchangeRate,
     items: invoiceItems,
     totalSYP: payload.totalSYP,
-    exchangeRateUsed: payload.exchangeRateUsed,
+    exchangeRateUsed: payload.exchangeRateUsed ?? undefined,
     paidAmountSYP: payload.paidAmountSYP,
     debtAmountSYP: payload.debtAmountSYP,
     paymentMethod: normalizedPaymentMethod,
@@ -1060,10 +1217,15 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
   if (customerCount === 0) {
     const sampleCustomers: CachedCustomer[] = [
       createCachedCustomerRecord({ tenantId: scopedTenantId, id: "sys-cust-1", name: "زبون نقدي عام", phone: "0000000000", cachedBalanceDebtSYP: 0, cachedBalanceDebtUSD: 0, isSystemGenerated: true }),
-      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-1", name: "سوبرماركت الأمانة", phone: "0944111222", shopName: "فرع الميدان", cachedBalanceDebtSYP: 5250000, cachedBalanceDebtUSD: 350.0 }),
-      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-2", name: "بقالية النور والبركة", phone: "0933222333", shopName: "فرع القصاع", cachedBalanceDebtSYP: 1807500, cachedBalanceDebtUSD: 120.5 }),
-      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-3", name: "ميني ماركت الشام الحديث", phone: "0955444555", shopName: "شارع بغداد", cachedBalanceDebtSYP: 0, cachedBalanceDebtUSD: 0.0 }),
-      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-4", name: "مستودع الفجر للمواد الغذائية", phone: "0988777666", shopName: "سوق الهال", cachedBalanceDebtSYP: 13350000, cachedBalanceDebtUSD: 890.0 }),
+      // [FIX — review pass 4, T4b] hasPriorInvoices: true on the demo
+      // customers below — the seeded balances imply real invoice history,
+      // so their eligibility for an offline credit sale should reflect
+      // that in the demo data, matching what /api/customers would
+      // actually report for an equivalent real customer.
+      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-1", name: "سوبرماركت الأمانة", phone: "0944111222", shopName: "فرع الميدان", cachedBalanceDebtSYP: 5250000, cachedBalanceDebtUSD: 350.0, hasPriorInvoices: true }),
+      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-2", name: "بقالية النور والبركة", phone: "0933222333", shopName: "فرع القصاع", cachedBalanceDebtSYP: 1807500, cachedBalanceDebtUSD: 120.5, hasPriorInvoices: true }),
+      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-3", name: "ميني ماركت الشام الحديث", phone: "0955444555", shopName: "شارع بغداد", cachedBalanceDebtSYP: 0, cachedBalanceDebtUSD: 0.0, hasPriorInvoices: true }),
+      createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-4", name: "مستودع الفجر للمواد الغذائية", phone: "0988777666", shopName: "سوق الهال", cachedBalanceDebtSYP: 13350000, cachedBalanceDebtUSD: 890.0, hasPriorInvoices: true }),
     ];
     await db.cachedCustomers.bulkPut(sampleCustomers);
   }

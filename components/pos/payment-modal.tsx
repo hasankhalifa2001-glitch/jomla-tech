@@ -58,6 +58,11 @@ interface PaymentModalProps {
   totalUSD?: MoneyInput | null;
   exchangeRate: number;
   selectedCustomer: SelectedCustomer | null;
+  // [T4b] When false, checkout is NOT gated on exchangeRate > 0 — i.e.
+  // the cart contains only SYP-priced items and resolves without a rate.
+  // Defaults to true for backward compatibility with any caller that
+  // doesn't inspect the cart's pricingCurrency mix.
+  requiresExchangeRate?: boolean;
   onPaymentModeChange?: (mode: PaymentMode) => void;
   onOpenCustomerModal: () => void;
   onConfirmCheckout: (paymentData: {
@@ -86,6 +91,7 @@ export function PaymentModal({
   totalSYP,
   exchangeRate,
   selectedCustomer,
+  requiresExchangeRate = true,
   onPaymentModeChange,
   onOpenCustomerModal,
   onConfirmCheckout,
@@ -330,11 +336,18 @@ export function PaymentModal({
   const isDebtBlockedBySystemCustomer =
     compareMoney(computedDebtSYP, 0) > 0 && (!hasCustomer || isSystemCustomer);
 
+  // [T4b] A missing rate blocks checkout only when at least one cart item
+  // is priced in USD (requiresExchangeRate === true). A SYP-only cart
+  // resolves without any rate and must never be blocked here.
+  // Acceptance criteria: "checkout blocks only for a USD-priced item with
+  // no cached rate, never for SYP-only carts."
+  const rateIsBlocking = requiresExchangeRate && exchangeRate <= 0;
+
   const canConfirm =
     totalSYPValue !== null &&
     !paidValidationError &&
     !isDebtBlockedBySystemCustomer &&
-    exchangeRate > 0;
+    !rateIsBlocking;
 
   async function handleConfirm() {
     setErrorMessage(null);
@@ -359,8 +372,12 @@ export function PaymentModal({
       return;
     }
 
-    if (exchangeRate <= 0) {
-      setErrorMessage("لا يمكن إتمام البيع بدون سعر صرف يومي محدد.");
+    // [T4b] Only block on a missing rate when the cart contains USD-priced
+    // items — mirrors the rateIsBlocking logic computed at render time.
+    if (rateIsBlocking) {
+      setErrorMessage(
+        "لا يمكن إتمام البيع: يوجد في السلة صنف مسعّر بالدولار ولا يوجد سعر صرف يومي محفوظ."
+      );
       return;
     }
 
@@ -442,8 +459,15 @@ export function PaymentModal({
               <Receipt className="h-5 w-5 text-emerald-600 shrink-0" />
               إتمام الدفع واختيار وسيلة التحصيل
             </span>
-            <Badge variant="outline" className="text-xs shrink-0">
-              سعر الصرف: {formatMoney(exchangeRate, "SYP")} ل.س
+            <Badge
+              variant="outline"
+              className={`text-xs shrink-0 ${rateIsBlocking ? "border-red-400 text-red-600 dark:text-red-400" : ""}`}
+            >
+              {exchangeRate > 0
+                ? `سعر الصرف: ${formatMoney(exchangeRate, "SYP")} ل.س`
+                : requiresExchangeRate
+                  ? "⚠ سعر الصرف غير محدد"
+                  : "أسعار الليرة — لا يلزم سعر صرف"}
             </Badge>
           </DialogTitle>
           <DialogDescription className="text-xs text-zinc-500">

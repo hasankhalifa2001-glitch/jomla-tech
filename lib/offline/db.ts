@@ -99,6 +99,48 @@ export type PaymentMethod =
 //      sale-time payment tied to either a not-yet-synced local invoice or
 //      an already-synced server one) — never both at once. Added the same
 //      guard pattern already used for customerId/offlineCustomerId.
+//
+// [ADDED — offline credit-sale gate] CachedCustomer.hasPriorInvoices and
+// createCachedCustomerRecord's matching parameter are new in this
+// revision — see CachedCustomer.hasPriorInvoices's own doc comment below
+// for the full reasoning. Consumed by lib/offline/pos-service.ts's
+// submitOfflineSale() to decide whether a customer may be extended
+// offline credit at all.
+//
+// [FIX — review pass 6, closes a real compile/runtime break] pos-service.ts's
+// submitOfflineSale() (T4b) computes `requiresExchangeRate =
+// cartNeedsExchangeRate(payload.items)` and, for a cart composed entirely
+// of SYP-priced units, calls this factory with `exchangeRateUsed:
+// undefined` and `requiresExchangeRate: false` — matching T4b's own
+// acceptance criterion: "checkout blocks only for a USD-priced item with
+// no cached rate, never for SYP-only carts." Neither factory below
+// previously accepted a `requiresExchangeRate` parameter at all, and both
+// UNCONDITIONALLY required `exchangeRateUsed` to serialize to a
+// strictly-positive value — so a SYP-only cart's `exchangeRateUsed:
+// undefined` hit `serializeMoney(undefined)` and threw immediately,
+// failing the exact scenario this whole conditional design exists to
+// support. Fixed by:
+//   1. Adding `requiresExchangeRate?: boolean` to both factories, default
+//      `true` when omitted — this preserves the OLD, stricter behavior
+//      for every existing caller that doesn't pass it explicitly (a rate
+//      is still mandatory unless a caller deliberately opts out).
+//   2. `exchangeRateUsed` is now `MoneyInput | null` (optional) on both
+//      factories. When absent/null AND requiresExchangeRate is false, no
+//      rate is required and every USD-derived field (totalUSD,
+//      paidAmountUSD, debtAmountUSD, each item's unitPriceUSD, and
+//      exchangeRateUsed itself) is stored as `null` — genuinely "no rate
+//      was available or needed," never a fabricated placeholder number.
+//   3. OfflineInvoice.exchangeRateUsed/totalUSD/paidAmountUSD/
+//      debtAmountUSD and OfflineInvoiceItem.unitPriceUSD are now
+//      `string | null` accordingly. This is a TypeScript-level shape
+//      change only — none of these fields are part of any Dexie index key
+//      (see the version(1).stores() indexes below), so this does NOT
+//      require a Dexie version() bump/.upgrade() migration; it only
+//      requires every consumer of these fields (T4c's sync engine, T4f's
+//      receipt rendering, any future ledger/report screen) to handle a
+//      `null` USD figure the same way the UI already must for a live
+//      cart line with no cached rate (T1: "omitted entirely, not shown as
+//      an error").
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -115,8 +157,13 @@ export interface OfflineInvoiceItem {
   quantity: string;
   /** AUTHORITATIVE. */
   unitPriceSYP: string;
-  /** Derived/informational — unitPriceSYP converted at exchangeRateUsed. */
-  unitPriceUSD: string;
+  /**
+   * Derived/informational — unitPriceSYP converted at exchangeRateUsed.
+   * [FIX — review pass 6] Now nullable: null whenever the parent
+   * invoice's exchangeRateUsed is null (a SYP-only sale that never needed
+   * a rate) — see the file-header FIX note above.
+   */
+  unitPriceUSD: string | null;
 }
 
 export interface OfflineInvoice {
@@ -128,17 +175,19 @@ export interface OfflineInvoice {
   items: OfflineInvoiceItem[];
   /** AUTHORITATIVE. */
   totalSYP: string;
-  /** Derived/informational. */
-  totalUSD: string;
-  exchangeRateUsed: string;
+  /** Derived/informational. [FIX — review pass 6] Now nullable — see file-header note. */
+  totalUSD: string | null;
+  /** [FIX — review pass 6] Now nullable — null for a SYP-only sale that
+   * never needed a rate to resolve. See the file-header FIX note above. */
+  exchangeRateUsed: string | null;
   /** AUTHORITATIVE. */
   paidAmountSYP: string;
-  /** Derived/informational. */
-  paidAmountUSD: string;
+  /** Derived/informational. [FIX — review pass 6] Now nullable. */
+  paidAmountUSD: string | null;
   /** AUTHORITATIVE. */
   debtAmountSYP: string;
-  /** Derived/informational. */
-  debtAmountUSD: string;
+  /** Derived/informational. [FIX — review pass 6] Now nullable. */
+  debtAmountUSD: string | null;
   paymentMethod?: PaymentMethod;
   voidsOfflineInvoiceId?: string;
   voidReason?: string;
@@ -237,6 +286,33 @@ export interface CachedCustomer {
   /** Derived/informational, optional — display cache only. */
   cachedBalanceDebtUSD?: string;
   isSystemGenerated?: boolean;
+  /**
+   * [ADDED — offline credit-sale gate] True when this customer has at
+   * least one Invoice on the server, of any status — i.e. an established,
+   * documented relationship with the merchant, not merely a row that
+   * exists in the customer table. Populated by /api/customers (which
+   * already fetches each customer's invoices to compute
+   * cachedBalanceDebtSYP, so this costs no extra query) and consumed by
+   * lib/offline/pos-service.ts's submitOfflineSale(): an offline credit
+   * sale (debtAmountSYP > 0) is only permitted against a customer where
+   * this is true. See pos-service.ts's isEligibleForCredit() for the full
+   * commercial reasoning (credit is extended to known, documented
+   * customers — never to a customer this device cannot yet verify has
+   * ever transacted with the merchant at all, walk-in or otherwise).
+   *
+   * This is a monotonic fact once true (a customer's first invoice
+   * doesn't un-happen), so a stale cached copy can only ever be wrong in
+   * the safe direction: a genuinely-established customer whose very
+   * first invoice hasn't reached this device's cache yet would show
+   * false here and be temporarily blocked from an offline credit sale —
+   * an over-cautious false negative, never an under-cautious false
+   * positive that would incorrectly allow credit.
+   *
+   * Optional/undefined only for backward compatibility with any
+   * previously-cached row written before this field existed; treated as
+   * `false` (no credit) wherever it's read, never as "unknown, allow it."
+   */
+  hasPriorInvoices?: boolean;
 }
 
 export interface CachedSession {
@@ -286,6 +362,16 @@ export class OfflineDatabase extends Dexie {
     // already-shipped version(N) block. Dexie will not retroactively
     // create a table on a device that already opened this database at
     // version 1 without it.
+    //
+    // [NOTE — review pass 6] This does NOT apply to review pass 6's
+    // OfflineInvoice/OfflineInvoiceItem USD-field nullability change
+    // above — those fields are not part of any index key in the
+    // stores({...}) call above (only offlineId/tenantId/customerId/
+    // offlineCustomerId/status/createdAt are indexed on offlineInvoices),
+    // so Dexie's physical schema is completely unaffected. Only a change
+    // to an INDEXED key ever requires a version bump; a plain value
+    // field's TypeScript type (or even its presence/absence on a given
+    // record) is something Dexie has never enforced.
   }
 }
 
@@ -336,6 +422,18 @@ export function createOfflineInvoiceRecord(data: {
    * it upstream. Defaults to false (an ordinary real-customer invoice).
    */
   isSystemCustomer?: boolean;
+  /**
+   * [ADDED — review pass 6] True when at least one line item was priced
+   * in USD, meaning a real, strictly-positive exchangeRateUsed is
+   * mandatory to resolve it. Defaults to `true` when omitted — this
+   * preserves the OLD, stricter behavior (a rate was always required) for
+   * every existing/future caller that doesn't explicitly pass `false`.
+   * pos-service.ts's submitOfflineSale() computes this via
+   * cartNeedsExchangeRate(payload.items) and passes it through explicitly
+   * — see the file-header FIX note above for the full scenario this
+   * unblocks (a SYP-only cart submitting with no cached rate).
+   */
+  requiresExchangeRate?: boolean;
   items: Array<{
     productId: string;
     unitId: string;
@@ -343,7 +441,15 @@ export function createOfflineInvoiceRecord(data: {
     unitPriceSYP: MoneyInput;
   }>;
   totalSYP: MoneyInput;
-  exchangeRateUsed: MoneyInput;
+  /**
+   * [FIX — review pass 6] Now optional/nullable. Required to be a real,
+   * strictly-positive value ONLY when requiresExchangeRate is true (the
+   * default). When requiresExchangeRate is explicitly false and this is
+   * omitted/null, every USD-derived field on the resulting record
+   * (totalUSD, paidAmountUSD, debtAmountUSD, each item's unitPriceUSD,
+   * and this field itself) is stored as `null`.
+   */
+  exchangeRateUsed?: MoneyInput | null;
   paidAmountSYP: MoneyInput;
   debtAmountSYP: MoneyInput;
   paymentMethod?: PaymentMethod;
@@ -379,9 +485,25 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("Every line item on a sale must have a strictly positive quantity.");
   }
 
-  const rateUsed = serializeMoney(data.exchangeRateUsed);
-  if (compareMoney(rateUsed, 0) <= 0) {
-    throw new Error("exchangeRateUsed must be strictly greater than 0.");
+  // [FIX — review pass 6] Conditional exchange-rate requirement — see
+  // this parameter's doc comment and the file-header FIX note above.
+  // requiresExchangeRate defaults to true (old, stricter behavior) unless
+  // a caller explicitly opts out for a cart that never needed a rate.
+  const requiresExchangeRate = data.requiresExchangeRate ?? true;
+
+  let rateUsed: string | null = null;
+  if (data.exchangeRateUsed !== undefined && data.exchangeRateUsed !== null) {
+    rateUsed = serializeMoney(data.exchangeRateUsed);
+    if (compareMoney(rateUsed, 0) <= 0) {
+      throw new Error("exchangeRateUsed must be strictly greater than 0 when provided.");
+    }
+  }
+
+  if (requiresExchangeRate && rateUsed === null) {
+    throw new Error(
+      "exchangeRateUsed is required — this sale contains at least one USD-priced item " +
+      "(or requiresExchangeRate was not explicitly disabled)."
+    );
   }
 
   const paidSYP = serializeMoney(data.paidAmountSYP);
@@ -433,9 +555,14 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("debtAmountSYP must equal totalSYP − paidAmountSYP (SYP is authoritative).");
   }
 
-  const totalUSD = convertCurrency(totalSYP, rateUsed, "SYP", "USD");
-  const paidAmountUSD = convertCurrency(paidSYP, rateUsed, "SYP", "USD");
-  const debtAmountUSD = convertCurrency(debtSYP, rateUsed, "SYP", "USD");
+  // [FIX — review pass 6] Every USD-derived figure is now conditional on
+  // rateUsed actually being available — null (never a fabricated number)
+  // when this is a SYP-only sale that opted out via requiresExchangeRate.
+  const totalUSD = rateUsed !== null ? convertCurrency(totalSYP, rateUsed, "SYP", "USD") : null;
+  const paidAmountUSD =
+    rateUsed !== null ? convertCurrency(paidSYP, rateUsed, "SYP", "USD") : null;
+  const debtAmountUSD =
+    rateUsed !== null ? convertCurrency(debtSYP, rateUsed, "SYP", "USD") : null;
 
   return {
     tenantId: data.tenantId,
@@ -447,7 +574,8 @@ export function createOfflineInvoiceRecord(data: {
       unitId: item.unitId,
       quantity: item.quantity,
       unitPriceSYP: item.unitPriceSYP,
-      unitPriceUSD: convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD"),
+      unitPriceUSD:
+        rateUsed !== null ? convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD") : null,
     })),
     totalSYP,
     totalUSD,
@@ -483,6 +611,15 @@ export function createOfflineVoidRecord(data: {
    * can cheaply check itself.
    */
   isSystemCustomer?: boolean;
+  /**
+   * [ADDED — review pass 6] Mirrors createOfflineInvoiceRecord's own
+   * parameter — a void of a SYP-only original sale never needed a rate
+   * either, and must be voidable without one. Defaults to `true` (old,
+   * stricter behavior) when omitted. A caller voiding an invoice should
+   * pass through whatever the ORIGINAL invoice's own requirement was
+   * (e.g. `originalInvoice.exchangeRateUsed !== null`).
+   */
+  requiresExchangeRate?: boolean;
   items: Array<{
     productId: string;
     unitId: string;
@@ -491,7 +628,12 @@ export function createOfflineVoidRecord(data: {
   }>;
   originalTotalSYP?: MoneyInput;
   totalSYP?: MoneyInput;
-  exchangeRateUsed: MoneyInput;
+  /**
+   * [FIX — review pass 6] Now optional/nullable — see
+   * createOfflineInvoiceRecord's matching parameter doc comment above for
+   * the full reasoning.
+   */
+  exchangeRateUsed?: MoneyInput | null;
   originalPaidAmountSYP?: MoneyInput;
   originalDebtAmountSYP?: MoneyInput;
   paidAmountSYP?: MoneyInput;
@@ -536,9 +678,25 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  const rateUsed = serializeMoney(data.exchangeRateUsed);
-  if (compareMoney(rateUsed, 0) <= 0) {
-    throw new Error("exchangeRateUsed must be strictly greater than 0.");
+  // [FIX — review pass 6] Same conditional exchange-rate logic as
+  // createOfflineInvoiceRecord — see that function's matching block for
+  // the full reasoning.
+  const requiresExchangeRate = data.requiresExchangeRate ?? true;
+
+  let rateUsed: string | null = null;
+  if (data.exchangeRateUsed !== undefined && data.exchangeRateUsed !== null) {
+    rateUsed = serializeMoney(data.exchangeRateUsed);
+    if (compareMoney(rateUsed, 0) <= 0) {
+      throw new Error("exchangeRateUsed must be strictly greater than 0 when provided.");
+    }
+  }
+
+  if (requiresExchangeRate && rateUsed === null) {
+    throw new Error(
+      "exchangeRateUsed is required to void this invoice — the original sale " +
+      "contained at least one USD-priced item (or requiresExchangeRate was not " +
+      "explicitly disabled to match the original invoice)."
+    );
   }
 
   const totalSYP =
@@ -611,9 +769,13 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  const totalUSD = convertCurrency(totalSYP, rateUsed, "SYP", "USD");
-  const paidAmountUSD = convertCurrency(paidSYP, rateUsed, "SYP", "USD");
-  const debtAmountUSD = convertCurrency(debtSYP, rateUsed, "SYP", "USD");
+  // [FIX — review pass 6] Conditional on rateUsed, same as
+  // createOfflineInvoiceRecord above.
+  const totalUSD = rateUsed !== null ? convertCurrency(totalSYP, rateUsed, "SYP", "USD") : null;
+  const paidAmountUSD =
+    rateUsed !== null ? convertCurrency(paidSYP, rateUsed, "SYP", "USD") : null;
+  const debtAmountUSD =
+    rateUsed !== null ? convertCurrency(debtSYP, rateUsed, "SYP", "USD") : null;
 
   return {
     tenantId: data.tenantId,
@@ -625,7 +787,8 @@ export function createOfflineVoidRecord(data: {
       unitId: item.unitId,
       quantity: item.quantity,
       unitPriceSYP: item.unitPriceSYP,
-      unitPriceUSD: convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD"),
+      unitPriceUSD:
+        rateUsed !== null ? convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD") : null,
     })),
     totalSYP,
     totalUSD,
@@ -680,6 +843,12 @@ export function createOfflinePaymentRecord(data: {
     throw new Error("Offline payment cannot have both invoiceId and offlineInvoiceId.");
   }
 
+  // [NOTE] A payment record's own exchangeRate is deliberately left
+  // REQUIRED and non-nullable, unlike the invoice/void factories above.
+  // A repayment is always collected and logged at a real, known moment in
+  // time — it is never assembled from a cart that might contain zero
+  // USD-priced lines — so there is no equivalent "this specific record
+  // never needed a rate" case to accommodate here.
   const rate = serializeMoney(data.exchangeRate);
   if (compareMoney(rate, 0) <= 0) {
     throw new Error("exchangeRate must be strictly greater than 0.");
@@ -814,6 +983,11 @@ export function createCachedCustomerRecord(data: {
   cachedBalanceDebtSYP: MoneyInput;
   cachedBalanceDebtUSD?: MoneyInput;
   isSystemGenerated?: boolean;
+  /** [ADDED — offline credit-sale gate] See CachedCustomer.hasPriorInvoices's
+   * doc comment above. Defaults to false (no credit) rather than true if
+   * omitted — never assume prior usage that wasn't explicitly confirmed
+   * by the caller. */
+  hasPriorInvoices?: boolean;
 }): CachedCustomer {
   if (!data.tenantId || !data.tenantId.trim()) {
     throw new Error("tenantId is required to create a cached customer record.");
@@ -831,6 +1005,7 @@ export function createCachedCustomerRecord(data: {
         ? serializeMoney(data.cachedBalanceDebtUSD)
         : undefined,
     isSystemGenerated: data.isSystemGenerated,
+    hasPriorInvoices: data.hasPriorInvoices === true,
   };
 }
 

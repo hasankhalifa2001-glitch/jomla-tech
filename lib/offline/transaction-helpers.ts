@@ -26,6 +26,16 @@
  * common T4b sale scenario. Fixed by using addMoney(a, b), the function
  * actually designed for two-value addition; sumMoney is reserved for
  * summing an already-built array (e.g. cart line totals).
+ *
+ * [REVIEWED — review pass 6, no change needed] db.ts's OfflineInvoice now
+ * carries nullable USD-derived fields (totalUSD/paidAmountUSD/
+ * debtAmountUSD/exchangeRateUsed can be `string | null` for a SYP-only
+ * sale — see db.ts's own file-header FIX note). Nothing in this file is
+ * affected: both helpers below read and write ONLY the SYP-authoritative
+ * fields (debtAmountSYP, amountSYP, cachedBalanceDebtSYP), which remain
+ * required, non-nullable strings regardless of whether a rate was
+ * available for that sale's USD figures. This file was re-reviewed
+ * specifically for that ripple effect and requires no changes.
  */
 
 import { getOfflineDb, type OfflineDatabase, type OfflineInvoice, type OfflinePayment } from "./db";

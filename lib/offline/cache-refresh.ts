@@ -97,6 +97,10 @@ interface ServerCustomer {
   cachedBalanceDebtSYP?: string;
   cachedBalanceDebtUSD?: string;
   isSystemGenerated?: boolean;
+  /** [ADDED — offline credit-sale gate] See
+   * CachedCustomer.hasPriorInvoices's doc comment in db.ts — true when
+   * /api/customers found at least one Invoice for this customer. */
+  hasPriorInvoices?: boolean;
 }
 
 interface ServerCustomersResponse {
@@ -224,6 +228,7 @@ export async function refreshCustomerCache(tenantId: string): Promise<CacheRefre
         cachedBalanceDebtSYP: c.cachedBalanceDebtSYP ?? "0.0000",
         cachedBalanceDebtUSD: c.cachedBalanceDebtUSD,
         isSystemGenerated: c.isSystemGenerated ?? false,
+        hasPriorInvoices: c.hasPriorInvoices === true,
       })
     );
   } catch (error) {

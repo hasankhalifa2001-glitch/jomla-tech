@@ -13,6 +13,7 @@ import {
   getSystemCashCustomer,
   isSystemCashCustomer,
   resolveCartLinePrices,
+  cartNeedsExchangeRate,
   type PosProductItem,
   type CachedProductUnit,
   type CartLineItem,
@@ -244,6 +245,14 @@ export function PosLayout() {
     return calculateCartTotals(cartItems, dailyExchangeRate);
   }, [cartItems, dailyExchangeRate]);
 
+  // [T4b] True only when at least one cart line is USD-priced — the only
+  // case where checkout legitimately requires a cached exchange rate.
+  // A SYP-only cart must never be blocked by a missing rate.
+  const rateRequired = useMemo(
+    () => cartNeedsExchangeRate(cartItems),
+    [cartItems]
+  );
+
   // 2. Keyboard Shortcuts (F2: Search, F4: Customer, F9: Checkout, Esc: Close)
   useEffect(() => {
     function handleGlobalKeyDown(e: KeyboardEvent) {
@@ -265,10 +274,18 @@ export function PosLayout() {
         setIsCustomerModalOpen(true);
       } else if (e.key === "F9") {
         e.preventDefault();
-        if (cartItems.length > 0 && dailyExchangeRate && compareMoney(dailyExchangeRate, 0) > 0) {
-          setIsPaymentModalOpen(true);
-        } else if (!dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0) {
-          toast.error("لا يمكن إتمام البيع بدون تحديد سعر الصرف اليومي.");
+        if (cartItems.length > 0) {
+          // [T4b] Only block checkout for a missing rate when the cart
+          // actually contains USD-priced items. A SYP-only cart checks
+          // out with no rate at all.
+          const needsRate = cartNeedsExchangeRate(cartItems);
+          if (needsRate && (!dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0)) {
+            toast.error(
+              "لا يمكن إتمام البيع: يوجد في السلة صنف مسعّر بالدولار ولا يوجد سعر صرف يومي محفوظ."
+            );
+          } else {
+            setIsPaymentModalOpen(true);
+          }
         }
       }
     }
@@ -304,12 +321,14 @@ export function PosLayout() {
 
     let unitPriceSYP: string;
     let unitPriceUSD: string | null;
+    let pricingCurrency: "USD" | "SYP";
     let priceRetailSYP: string | undefined;
     let priceRetailUSD: string | null | undefined;
     try {
       const prices = resolveCartLinePrices(unit, product, dailyExchangeRate);
       unitPriceSYP = prices.unitPriceSYP;
       unitPriceUSD = prices.unitPriceUSD;
+      pricingCurrency = prices.pricingCurrency;
       priceRetailSYP = prices.priceRetailSYP;
       priceRetailUSD = prices.priceRetailUSD;
     } catch (err) {
@@ -341,6 +360,9 @@ export function PosLayout() {
         quantity: 1,
         unitPriceSYP,
         unitPriceUSD,
+        // [T4b] Preserved from resolveCartLinePrices so cartNeedsExchangeRate
+        // can inspect items without re-reading the unit from the catalog.
+        pricingCurrency,
         priceRetailSYP,
         priceRetailUSD,
       };
@@ -397,6 +419,9 @@ export function PosLayout() {
                 conversionFactor: selectedUnit.conversionFactor,
                 unitPriceSYP: prices.unitPriceSYP,
                 unitPriceUSD: prices.unitPriceUSD,
+                // [T4b] Keep pricingCurrency up to date when the cashier
+                // switches a line item to a different unit mid-sale.
+                pricingCurrency: prices.pricingCurrency,
                 priceRetailSYP: prices.priceRetailSYP,
                 priceRetailUSD: prices.priceRetailUSD,
               };
@@ -446,8 +471,18 @@ export function PosLayout() {
     debtAmountSYP: string;
     paymentMethod?: PaymentMethod;
   }) {
-    if (!dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0) {
-      throw new Error("سعر الصرف غير محدد في الذاكرة المحلية.");
+    // [T4b] If any cart item is priced in USD, a valid dailyExchangeRate is mandatory.
+    // For SYP-only carts, an exchange rate is optional; if none is cached, fallback to "1.0000"
+    // so the Dexie offline invoice record can be durably saved.
+    const effectiveRate =
+      dailyExchangeRate && compareMoney(dailyExchangeRate, 0) > 0
+        ? dailyExchangeRate
+        : rateRequired
+          ? null
+          : "1.0000";
+
+    if (!effectiveRate) {
+      throw new Error("سعر الصرف غير محدد في الذاكرة المحلية (مطلوب للأصناف المسعرة بالدولار).");
     }
 
     let customer = selectedCustomer;
@@ -457,14 +492,14 @@ export function PosLayout() {
         : await getSystemCashCustomer(tenantId);
     }
 
-    const { totalSYP } = calculateCartTotals(cartItems, dailyExchangeRate);
+    const { totalSYP } = calculateCartTotals(cartItems, effectiveRate);
 
     // Save offline invoice strictly into Dexie
     const savedInvoice = await submitOfflineSale(tenantId, {
       customer,
       items: cartItems,
       totalSYP,
-      exchangeRateUsed: serializeMoney(dailyExchangeRate),
+      exchangeRateUsed: serializeMoney(effectiveRate),
       paidAmountSYP: paymentData.paidAmountSYP,
       debtAmountSYP: paymentData.debtAmountSYP,
       paymentMethod: paymentData.paymentMethod,
@@ -905,6 +940,10 @@ export function PosLayout() {
         totalUSD={cartTotals.totalUSD}
         exchangeRate={dailyExchangeRate || 0}
         selectedCustomer={selectedCustomer}
+        // [T4b] Only block checkout on a missing rate when the cart
+        // actually contains USD-priced items. A SYP-only cart must be
+        // allowed through even with no cached rate.
+        requiresExchangeRate={rateRequired}
         onPaymentModeChange={(mode) => {
           const allow = mode === "FULL_CASH";
           setAllowSystemCustomer(allow);
