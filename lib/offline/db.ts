@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /* db.ts */
 import Dexie, { type Table } from "dexie";
 import { generateOfflineId } from "./id";

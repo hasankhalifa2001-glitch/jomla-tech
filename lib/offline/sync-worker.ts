@@ -9,6 +9,28 @@
  * 3. Enforces that FAILED items are NEVER automatically retried (they remain in
  *    the FAILED state until manual reconciliation / T4e ledger resolution).
  * 4. Listens for network reconnection (`online` event) and triggers sync within 5 seconds.
+ *
+ * [FIX — critical, payload was sending the wrong currency fields] This
+ * file previously built its /api/sync payload around unitPriceUSD/
+ * totalUSD/paidAmountUSD/debtAmountUSD only — a leftover from the
+ * pre-v3.6 USD-authoritative currency model. db.ts and schema.prisma have
+ * since re-anchored to SYP as the sole authoritative currency (see
+ * db.ts's CURRENCY MODEL note and schema.prisma's v3.6 CURRENCY
+ * RE-ANCHORING note): unitPriceSYP/totalSYP/paidAmountSYP/debtAmountSYP
+ * are what every validation and business rule actually reads, and the
+ * USD fields are informational-only and NULLABLE (a SYP-only cart that
+ * never needed a rate has unitPriceUSD/totalUSD/etc. stored as `null` —
+ * see db.ts's review-pass-6 note). The old payload never sent the SYP
+ * fields at all, so:
+ *   - A SYP-only sale (unitPriceUSD/totalUSD/etc. all null) sent a
+ *     payload with NO usable price/total/debt figures whatsoever.
+ *   - Even a USD-priced sale sent only the derived, informational USD
+ *     figures — never the authoritative SYP figures the server is
+ *     required to validate (debtAmountSYP ≈ totalSYP − paidAmountSYP)
+ *     and persist as the source of truth.
+ * Every authoritative SYP field is now included alongside its
+ * informational USD counterpart, matching OfflineInvoice/
+ * OfflineInvoiceItem's actual shape in db.ts exactly.
  */
 
 import { getOfflineDb, isOfflineDbSupported } from "./db";
@@ -114,6 +136,10 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       shopName: c.shopName,
       createdAt: c.createdAt,
     })),
+    // [FIX] Every field below now matches OfflineInvoice/OfflineInvoiceItem's
+    // actual shape in db.ts — SYP fields (authoritative) sent alongside
+    // their USD counterparts (informational, possibly null for a
+    // SYP-only sale that never needed a rate).
     invoices: pendingInvoices.map((inv) => ({
       offlineId: inv.offlineId,
       customerId: inv.customerId,
@@ -122,12 +148,15 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
         productId: it.productId,
         unitId: it.unitId,
         quantity: it.quantity,
+        unitPriceSYP: it.unitPriceSYP,
         unitPriceUSD: it.unitPriceUSD,
       })),
-      totalUSD: inv.totalUSD,
       totalSYP: inv.totalSYP,
+      totalUSD: inv.totalUSD,
       exchangeRateUsed: inv.exchangeRateUsed,
+      paidAmountSYP: inv.paidAmountSYP,
       paidAmountUSD: inv.paidAmountUSD,
+      debtAmountSYP: inv.debtAmountSYP,
       debtAmountUSD: inv.debtAmountUSD,
       paymentMethod: inv.paymentMethod,
       voidsOfflineInvoiceId: inv.voidsOfflineInvoiceId,
@@ -138,8 +167,10 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       offlineId: p.offlineId,
       customerId: p.customerId,
       offlineCustomerId: p.offlineCustomerId,
-      amountUSD: p.amountUSD,
+      invoiceId: p.invoiceId,
+      offlineInvoiceId: p.offlineInvoiceId,
       amountSYP: p.amountSYP,
+      amountUSD: p.amountUSD,
       exchangeRate: p.exchangeRate,
       paymentMethod: p.paymentMethod,
       receiptNo: p.receiptNo,
@@ -187,9 +218,16 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
               name: localCustomer.name,
               phone: localCustomer.phone,
               shopName: localCustomer.shopName,
-              cachedBalanceDebtUSD: "0.0000",
               cachedBalanceDebtSYP: "0.0000",
+              cachedBalanceDebtUSD: "0.0000",
               isSystemGenerated: false,
+              // [NOTE] Explicitly false: a walk-in customer synced just
+              // now has no documented invoice history yet — matches
+              // pos-service.ts's isEligibleForCredit(), which only ever
+              // accepts an explicit `true`. This customer becomes
+              // credit-eligible once a real /api/customers refresh
+              // reports a real prior invoice for them.
+              hasPriorInvoices: false,
             });
           }
         } else {

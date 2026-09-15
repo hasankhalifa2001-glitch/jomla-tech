@@ -200,6 +200,18 @@ export function CheckoutSuccessModal({
             are authoritative and always present (db.ts derives USD from
             them, never the reverse) — SYP is now the primary figure on
             every row, USD the secondary "≈" one.
+
+            [FIX — build] totalUSD/paidAmountUSD/debtAmountUSD/
+            exchangeRateUsed are all typed `string | null` on
+            OfflineInvoice (db.ts's review-pass-6 nullability change: a
+            SYP-only sale that never needed an exchange rate stores every
+            USD-derived field, and the rate itself, as `null` rather than
+            a fabricated placeholder). Each is now guarded with the same
+            `!== null` pattern already used above for
+            item.unitPriceUSD, instead of being passed to formatMoney()
+            unguarded — that previously threw a MoneyError the first time
+            a genuinely SYP-only invoice reached this modal, and failed
+            the TypeScript build regardless.
           */}
           <div className="space-y-1 pt-2 border-t border-zinc-200 dark:border-zinc-800">
             <div className="flex justify-between text-xs font-bold">
@@ -210,16 +222,20 @@ export function CheckoutSuccessModal({
                 <span className="text-emerald-700 dark:text-emerald-400 font-extrabold ml-2 font-mono">
                   {formatMoney(invoice.totalSYP, "SYP")} ل.س
                 </span>
-                <span className="text-purple-600 dark:text-purple-400 text-[11px]">
-                  (≈ ${formatMoney(invoice.totalUSD, "USD")})
-                </span>
+                {invoice.totalUSD !== null && (
+                  <span className="text-purple-600 dark:text-purple-400 text-[11px]">
+                    (≈ ${formatMoney(invoice.totalUSD, "USD")})
+                  </span>
+                )}
               </div>
             </div>
 
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">سعر الصرف المعتمد:</span>
               <span className="font-mono text-zinc-600 dark:text-zinc-400">
-                {formatMoney(invoice.exchangeRateUsed, "SYP")} ل.س / $
+                {invoice.exchangeRateUsed !== null
+                  ? `${formatMoney(invoice.exchangeRateUsed, "SYP")} ل.س / $`
+                  : "—"}
               </span>
             </div>
 
@@ -229,9 +245,11 @@ export function CheckoutSuccessModal({
                 <span className="font-bold text-emerald-600 font-mono">
                   {formatMoney(invoice.paidAmountSYP, "SYP")} ل.س
                 </span>
-                <span className="text-purple-600 dark:text-purple-400 text-[10px] mr-1">
-                  (≈ ${formatMoney(invoice.paidAmountUSD, "USD")})
-                </span>
+                {invoice.paidAmountUSD !== null && (
+                  <span className="text-purple-600 dark:text-purple-400 text-[10px] mr-1">
+                    (≈ ${formatMoney(invoice.paidAmountUSD, "USD")})
+                  </span>
+                )}
               </div>
             </div>
 
@@ -242,9 +260,11 @@ export function CheckoutSuccessModal({
                   <span className="font-mono">
                     {formatMoney(invoice.debtAmountSYP, "SYP")} ل.س
                   </span>
-                  <span className="text-[10px] font-semibold mr-1 opacity-80">
-                    (≈ ${formatMoney(invoice.debtAmountUSD, "USD")})
-                  </span>
+                  {invoice.debtAmountUSD !== null && (
+                    <span className="text-[10px] font-semibold mr-1 opacity-80">
+                      (≈ ${formatMoney(invoice.debtAmountUSD, "USD")})
+                    </span>
+                  )}
                 </div>
               </div>
             )}
