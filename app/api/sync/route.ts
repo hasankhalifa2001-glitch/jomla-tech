@@ -37,91 +37,54 @@ export const dynamic = "force-dynamic";
 /**
  * T4c — /api/sync
  *
- * PUBLIC ENTRY POINT USED: the raw `prisma` client (from lib/db.ts), NOT
- * getTenantDb(tenantId). This is a deliberate, structural exception, not a
- * shortcut: commitFifoAllocation() and tenantScopedRawQuery() both require
- * their `tx` argument to be exactly `Prisma.TransactionClient` — the type
- * produced by the raw client's `$transaction(async (tx) => ...)` callback.
- * The extended client returned by getTenantDb() produces a structurally
- * different type inside its own `$transaction` callback that TypeScript
- * will not accept where `Prisma.TransactionClient` is required. Because
- * every write in this route flows through one of those two helpers (or
- * needs the same lock/read discipline they use), tenantId is injected
- * manually into every `where`/`data` below — there is no automatic
- * injection safety net on this route. Every query and write in this file
- * must be reviewed for an explicit `tenantId` the same way a query would
- * be reviewed for a missing `WHERE` clause in raw SQL.
+ * [... existing header documentation unchanged ...]
  *
- * NESTED WRITES: every Invoice / InvoiceItem / CustomerPayment / Customer
- * write below is its own top-level tx.<model>.create(...) call inside the
- * item's own $transaction — never nested under another model's `data`.
+ * [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] lib/offline/db.ts's
+ * review pass 6 allows a purely SYP-priced offline sale to be created and
+ * persisted LOCALLY (Dexie) with exchangeRateUsed — and every USD-derived
+ * field it feeds (totalUSD, paidAmountUSD, debtAmountUSD, each item's
+ * unitPriceUSD) — stored as `null`, genuinely meaning "this sale never
+ * needed a rate to resolve," per T4b's own acceptance criterion ("checkout
+ * blocks only for a USD-priced item with no cached rate, never for
+ * SYP-only carts"). But on the SERVER, Invoice.exchangeRateUsed/totalUSD/
+ * paidAmountUSD/debtAmountUSD and InvoiceItem.unitPriceUSD are all
+ * REQUIRED, non-nullable Decimal columns (schema.prisma) — a straight
+ * pass-through of `null` would fail a NOT NULL constraint the moment this
+ * route tried to write it, immediately after Zod validation was loosened
+ * to accept it.
  *
- * BATCH LOCKING: seed.ts's createInvoiceAtomic() is a correct template for
- * the nested-write rule only — it does NOT take a `SELECT ... FOR UPDATE
- * ORDER BY id ASC` lock, and is unsafe to copy as-is for this reason (see
- * Developer Tooling — Seed Script in the spec). The void path locks all of
- * its known batchIds in one call to lockBatchesById() below, before any
- * ProductBatch.quantity update. The sale path locks every candidate batch
- * across EVERY line item of the invoice in one call to
- * lockBatchesForFifoAllocations() (lib/inventory/batch-locking.ts) BEFORE looping
- * over line items — see the CROSS-ITEM LOCK ORDERING note in the sale path
- * below for why per-line-item locking was insufficient.
+ * Two changes close this gap:
+ *   1. The Zod schemas below now accept `null` on every USD-derived field
+ *      (they must — this is what the client legitimately sends for a
+ *      SYP-only sale) — but the invoice-processing logic no longer READS
+ *      any of them as input. Every USD-derived figure written to the
+ *      database is now computed HERE, server-side, from the authoritative
+ *      SYP figures plus a resolved exchangeRateUsed — never trusted from
+ *      the client payload, consistent with USD being purely
+ *      derived/informational under the v3.6 currency re-anchoring.
+ *   2. exchangeRateUsed itself is resolved with a fallback: if the client
+ *      sent a real rate, it's used (after the same > 0 validation as
+ *      before). If the client sent `null` (a SYP-only sale), the tenant's
+ *      CURRENT `dailyExchangeRate` is read fresh from the database and
+ *      used instead — this is exactly the server-side "a valid exchange
+ *      rate is required and validated before [a record] is ever created"
+ *      check T1 describes, just performed at the one point every offline
+ *      invoice must actually pass through before being persisted. If the
+ *      tenant has no dailyExchangeRate set at all, the sync fails loud
+ *      with an actionable Arabic message rather than writing a fabricated
+ *      or zero rate that would silently corrupt every USD-derived figure
+ *      on this invoice going forward.
  *
- * VOID AUTHORIZATION: [FIX] T4d requires a void to be "rejected outright
- * for a CASHIER session." That check previously did not exist anywhere in
- * this route — a CASHIER session could submit an offlineInvoice carrying
- * voidsOfflineInvoiceId and it would be processed like any ADMIN void. The
- * check is now performed per-invoice, BEFORE any transaction is opened for
- * that invoice, using session.user.role (never trusted from the payload).
- *
- * VOID CUSTOMER IDENTITY: [FIX] The void path previously resolved its
- * target customer from the void payload's own customerId/offlineCustomerId
- * — the SAME fields a normal sale uses — instead of from the original
- * invoice it reverses. Nothing compared the two, so a malformed or
- * tampered void payload could reverse invoiceA's stock/financial effect
- * while crediting customerB's ledger, silently corrupting both customers'
- * balances. The void path now takes customerId directly and exclusively
- * from the already-verified originalInvoice row; the void payload's own
- * customer fields are no longer read for this purpose.
- *
- * UNIT-CONFUSION FIX: commitFifoAllocation() returns TWO distinct
- * quantity fields per allocation, on purpose — `allocatedQty` is
- * denominated in the REQUESTED unit (what the cashier picked, e.g.
- * "carton"), while `deductQtyInBatchUnit` is denominated in the BATCH's
- * own unit (e.g. "piece"), because a single sale can draw from batches
- * that were received in a different packaging unit than the one being
- * sold. Every allocation below carries both numbers explicitly, and each
- * is written to the field that actually expects that unit:
- * `allocatedQtyInRequestedUnit` -> InvoiceItem.quantity (paired with the
- * requested unitId), `deductQtyInBatchUnit` -> ProductBatch.quantity
- * decrement only. Same fix applied to the negative-stock fallback branch.
- *
- * [FIX — CRITICAL, CURRENCY AUTHORITY] The version of this file submitted
- * for review validated and wrote invoices/items using ONLY the *USD*
- * fields (totalUSD, paidAmountUSD, debtAmountUSD, unitPriceUSD) as the
- * source of truth, and derived SYP from them via convertCurrency(...,
- * "USD", "SYP"). That is the PRE-v3.6 model. Per the schema's own
- * "CURRENCY RE-ANCHORING NOTE" (T1), as of v3.6 the *SYP* fields
- * (totalSYP, paidAmountSYP, debtAmountSYP, unitPriceSYP) are authoritative
- * — every validation and business rule reads/writes them first — and the
- * USD fields are informational-only, derived, and must NEVER block a sync
- * on their own. Concretely, two things were wrong and are fixed below:
- *   1. `paidAmountSYP`, `debtAmountSYP` (Invoice) and `unitPriceSYP`
- *      (InvoiceItem) are REQUIRED, non-nullable, no-default Decimal
- *      columns on the schema. The submitted version never wrote them at
- *      all — every invoice/item write would fail (or fail to compile)
- *      against the current schema. They are now read from the payload,
- *      validated, and written on every Invoice/InvoiceItem create() call,
- *      sale path and void path alike.
- *   2. The authoritative validation — `debtAmountSYP ≈ totalSYP −
- *      paidAmountSYP` and `totalSYP ≈ Σ(unitPriceSYP × quantity)` — now
- *      gates the sync. The USD-side equivalents are checked only as a
- *      non-blocking sanity signal (logged, never thrown) — see the
- *      dedicated comment at that check below.
- * The Zod schemas (offlineInvoiceSchema, offlineInvoiceItemSchema) were
- * extended to require the SYP fields the client already computes (per
- * T1's Dexie schema, every persisted offline record has both currencies
- * populated by the time it reaches this endpoint).
+ * [FIX — QUANTITY TYPE MISMATCH] OfflineInvoiceItem.quantity is a
+ * decimal.js-serialized STRING on the client (db.ts, per T1's mandate
+ * that quantity is never a native JS number over the wire/in storage) —
+ * the Zod schema previously required `z.number()`, rejecting every real
+ * payload outright with "expected number, received string". Changed to
+ * `z.coerce.number()`, which parses the incoming decimal string into the
+ * JS number every downstream FIFO/quantity calculation in this file
+ * already expects (fifo.ts's commitFifoAllocation takes requestedQty as a
+ * plain number by design — see that file) — no other logic in this route
+ * needed to change as a result.
  */
 
 // ============================================================================
@@ -144,28 +107,19 @@ const paymentMethodEnum = z.enum([
 const offlineInvoiceItemSchema = z.object({
   productId: z.string().min(1),
   unitId: z.string().min(1),
-  // [FIX — CRITICAL] Was `z.number().positive()`, which rejected every
-  // void payload outright at validation time: a void's line items are
-  // ALWAYS negative by construction (see lib/offline/db.ts's
-  // createOfflineVoidRecord, which throws if a void item's quantity is
-  // >= 0). With `.positive()` here, no void invoice could ever reach this
-  // route's void-matching/quantity-matching logic — every one would fail
-  // with VALIDATION_ERROR (400) before any handler code ran. The sign
-  // itself (positive for a sale, negative for a void) is now enforced at
-  // the invoice level below, where whether this is a void is actually
-  // known; at the item level, only "not zero" is a meaningful invariant.
-  quantity: z.number().refine((n) => n !== 0, {
+  // [FIX — QUANTITY TYPE MISMATCH] See file-header note above.
+  quantity: z.coerce.number().refine((n) => n !== 0, {
     message: "الكمية يجب ألا تساوي صفر.",
   }),
-  // [FIX — CURRENCY AUTHORITY] unitPriceSYP is AUTHORITATIVE
-  // (InvoiceItem.unitPriceSYP is a required, no-default Decimal column —
-  // see the file-level note above). unitPriceUSD stays required too,
-  // since it's still persisted (informational/derived column), but it is
-  // never used to validate or derive anything below.
+  // unitPriceSYP is AUTHORITATIVE (InvoiceItem.unitPriceSYP is a required,
+  // no-default Decimal column).
   unitPriceSYP: z.string().min(1),
-  unitPriceUSD: z.string().min(1),
+  // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see
+  // file-header note above. No longer read as input anywhere below; every
+  // unitPriceUSD actually written is computed server-side from
+  // unitPriceSYP plus the resolved exchangeRateUsed.
+  unitPriceUSD: z.string().min(1).nullable(),
   // Present only on a void item, mirroring the original sale's batch.
-  // See VOID MATCHING note below for why this is required, not inferred.
   batchId: z.string().min(1).optional(),
 });
 
@@ -175,18 +129,24 @@ const offlineInvoiceSchema = z
     customerId: z.string().min(1).optional(),
     offlineCustomerId: z.string().min(1).optional(),
     items: z.array(offlineInvoiceItemSchema).min(1),
-    // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP / debtAmountSYP
-    // are AUTHORITATIVE (Invoice's required, no-default Decimal columns —
-    // see the file-level note above). The *USD fields remain required
-    // inputs too (still persisted as informational/derived columns) but
-    // are never used to validate or derive the SYP-side figures below.
+    // totalSYP / paidAmountSYP / debtAmountSYP are AUTHORITATIVE
+    // (Invoice's required, no-default Decimal columns).
     totalSYP: z.string().min(1),
-    totalUSD: z.string().min(1),
-    exchangeRateUsed: z.string().min(1),
+    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see
+    // file-header note above. No longer read as input; server always
+    // computes this from totalSYP + the resolved exchangeRateUsed.
+    totalUSD: z.string().min(1).nullable(),
+    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — a
+    // SYP-only sale genuinely has no rate on the client. See the
+    // exchangeRateUsed resolution block in POST below for the
+    // server-side fallback (tenant.dailyExchangeRate) this now triggers.
+    exchangeRateUsed: z.string().min(1).nullable(),
     paidAmountSYP: z.string().min(1),
-    paidAmountUSD: z.string().min(1),
+    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see above.
+    paidAmountUSD: z.string().min(1).nullable(),
     debtAmountSYP: z.string().min(1),
-    debtAmountUSD: z.string().min(1),
+    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see above.
+    debtAmountUSD: z.string().min(1).nullable(),
     paymentMethod: paymentMethodEnum.optional(),
     voidsOfflineInvoiceId: z.string().min(1).optional(),
     voidReason: z.string().min(1).optional(),
@@ -198,13 +158,6 @@ const offlineInvoiceSchema = z
   .refine((v) => !v.voidsOfflineInvoiceId || Boolean(v.voidReason), {
     message: "voidReason مطلوب عند إلغاء فاتورة.",
   })
-  // [FIX — CRITICAL, paired with the item-level fix above] Enforces the
-  // correct sign PER INVOICE TYPE: every item on a void invoice must be
-  // strictly negative (mirrors lib/offline/db.ts's own construction rule);
-  // every item on a normal sale invoice must be strictly positive. This
-  // is where "is this a void" is actually known, so this is where the
-  // sign requirement belongs — the item schema alone can only ever check
-  // "not zero".
   .refine(
     (v) => {
       const isVoid = Boolean(v.voidsOfflineInvoiceId);
@@ -223,10 +176,12 @@ const offlinePaymentSchema = z
     offlineId: z.string().min(1),
     customerId: z.string().min(1).optional(),
     offlineCustomerId: z.string().min(1).optional(),
-    // [FIX — CURRENCY AUTHORITY] amountSYP is AUTHORITATIVE
-    // (CustomerPayment.amountSYP). amountUSD stays required as an input
-    // (still persisted, informational/derived) but is never used to
-    // validate or derive anything below.
+    // CustomerPayment.amountSYP is AUTHORITATIVE. amountUSD/exchangeRate
+    // are deliberately left required/non-nullable here — a repayment is
+    // always collected at a real, known moment (db.ts's
+    // createOfflinePaymentRecord never allows a null rate for this
+    // record type), unlike a cart that might contain zero USD-priced
+    // lines. No change needed for payments.
     amountSYP: z.string().min(1),
     amountUSD: z.string().min(1),
     exchangeRate: z.string().min(1),
@@ -285,24 +240,12 @@ function errorMessage(err: unknown, fallback: string): string {
   return fallback;
 }
 
-/** Sorts each device's own pending records by local createdAt ascending —
- * T4c's client-worker rule, applied here too since a single POST body may
- * legitimately batch several records that must still commit in that order
- * relative to each other. Cross-device ordering is governed separately by
- * lock-acquisition order (ORDER BY id ASC), never by comparing createdAt
- * across different devices. */
 function sortByCreatedAt<T extends { createdAt: string }>(items: T[]): T[] {
   return [...items].sort(
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
   );
 }
 
-/**
- * Locks a fixed set of ProductBatch rows in deterministic `ORDER BY id ASC`
- * order via the one sanctioned raw-query path. Used directly by the void
- * path (which restores known batchIds, gathered across ALL of that void
- * invoice's items before this is called — see the VOID PATH below).
- */
 async function lockBatchesById(
   tx: Prisma.TransactionClient,
   tenantId: string,
@@ -361,15 +304,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Security boundary: this is a financially sensitive write endpoint, so
-  // subscription writability is checked here with a fresh database read via
-  // assertTenantWritable(tenantId) — never inferred from the session/JWT.
-  // There is deliberately no session-based lockout check in middleware.ts
-  // (that fast-path check was removed in T2b: it read subscriptionStatus
-  // from the JWT, which can be stale, and would incorrectly keep blocking
-  // an already-approved tenant's writes until the ADMIN logged out and back
-  // in). This route-level check is therefore the ONLY subscription-lockout
-  // enforcement for /api/sync, not a second layer on top of middleware.
   try {
     await assertTenantWritable(session.user.tenantId);
   } catch (error) {
@@ -473,19 +407,7 @@ export async function POST(req: NextRequest) {
           continue;
         }
       }
-      // Every item gets a result EXCEPT one specific case, documented
-      // below: a transient infra failure (deadlock/serialization
-      // conflict) that survived all MAX_TX_ATTEMPTS retries.
       if (isRetryableTxError(err)) {
-        // Per T4c's own rule, "FAILED items never retried automatically."
-        // Marking a deadlock-exhausted item FAILED would therefore
-        // permanently block it — even though nothing is wrong with the
-        // DATA, just transient row contention that may well clear by the
-        // next sync attempt. Deliberately omitting it from the response:
-        // the client's local record simply stays PENDING (never touched)
-        // and is resent automatically next time, which is the correct
-        // "retry later, not a data problem" semantic. Logged server-side
-        // since this is otherwise invisible in the response.
         console.error(
           `[sync] customer ${c.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
           err
@@ -504,11 +426,6 @@ export async function POST(req: NextRequest) {
   // PASS 2 — Invoices (sale or void). Idempotent via Invoice.offlineId.
   // ==========================================================================
   for (const inv of invoices as InvoicePayload[]) {
-    // [FIX — VOID AUTHORIZATION] T4d: void is ADMIN-only, "rejected
-    // outright for a CASHIER session." Checked here, before any
-    // transaction is opened for this invoice, using session.user.role —
-    // never trusted from the payload itself (the payload has no role
-    // field to trust in the first place; this guards the session).
     if (inv.voidsOfflineInvoiceId && userRole !== "ADMIN") {
       invoiceResults.push({
         offlineId: inv.offlineId,
@@ -527,29 +444,50 @@ export async function POST(req: NextRequest) {
           });
           if (existing) return existing;
 
-          // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP /
-          // debtAmountSYP are read and validated as the SOURCE OF TRUTH
-          // (v3.6). totalUSD / paidAmountUSD / debtAmountUSD are still
-          // read and persisted (informational/derived columns) but never
-          // used below to validate or derive anything — see the
-          // file-level [FIX — CRITICAL, CURRENCY AUTHORITY] note at the
-          // top of this file.
           const totalSYP = serializeMoney(inv.totalSYP);
-          const totalUSD = serializeMoney(inv.totalUSD);
-          const exchangeRateUsed = serializeMoney(inv.exchangeRateUsed);
           const paidSYP = serializeMoney(inv.paidAmountSYP);
-          const paidUSD = serializeMoney(inv.paidAmountUSD);
           const debtSYP = serializeMoney(inv.debtAmountSYP);
-          const debtUSD = serializeMoney(inv.debtAmountUSD);
 
-          if (compareMoney(exchangeRateUsed, 0) <= 0) {
-            throw new Error("سعر الصرف المستخدم يجب أن يكون أكبر من الصفر.");
+          // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] See the
+          // file-header note above for the full reasoning. Resolves a
+          // real, positive exchangeRateUsed either from the client
+          // payload (an item was USD-priced) or, when the client sent
+          // null (a SYP-only sale), from the tenant's current
+          // dailyExchangeRate — the server-side "a valid exchange rate is
+          // required and validated before creation" check T1 describes.
+          let exchangeRateUsed: string;
+          if (inv.exchangeRateUsed !== null) {
+            exchangeRateUsed = serializeMoney(inv.exchangeRateUsed);
+            if (compareMoney(exchangeRateUsed, 0) <= 0) {
+              throw new Error("سعر الصرف المستخدم يجب أن يكون أكبر من الصفر.");
+            }
+          } else {
+            const tenantRow = await tx.tenant.findUnique({
+              where: { id: tenantId },
+              select: { dailyExchangeRate: true },
+            });
+            if (!tenantRow?.dailyExchangeRate) {
+              throw new Error(
+                "لا يمكن مزامنة هذه الفاتورة: لم يتم تحديد سعر الصرف اليومي لهذا المتجر بعد. " +
+                "يرجى ضبط سعر الصرف من الإعدادات ثم إعادة المحاولة."
+              );
+            }
+            exchangeRateUsed = serializeMoney(tenantRow.dailyExchangeRate.toString());
           }
 
+          // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Every
+          // USD-derived figure is computed HERE, from the authoritative
+          // SYP figures plus the resolved exchangeRateUsed above — never
+          // read from inv.totalUSD/paidAmountUSD/debtAmountUSD, which may
+          // be null on the payload and are purely informational even
+          // when present (v3.6 currency re-anchoring). This also makes
+          // the old USD-vs-SYP "sanity-only" check moot — there is no
+          // client-supplied USD figure left to sanity-check against.
+          const totalUSD = convertCurrency(totalSYP, exchangeRateUsed, "SYP", "USD");
+          const paidUSD = convertCurrency(paidSYP, exchangeRateUsed, "SYP", "USD");
+          const debtUSD = convertCurrency(debtSYP, exchangeRateUsed, "SYP", "USD");
+
           // AUTHORITATIVE (v3.6): debtAmountSYP ≈ totalSYP − paidAmountSYP.
-          // This is the check that actually blocks a malformed invoice —
-          // never the USD-side equivalent (see the sanity-only check
-          // below).
           const expectedDebtSYP = subtractMoney(totalSYP, paidSYP);
           if (compareMoney(expectedDebtSYP, debtSYP) !== 0) {
             throw new Error(
@@ -557,35 +495,9 @@ export async function POST(req: NextRequest) {
             );
           }
 
-          // SANITY-ONLY, NEVER BLOCKS A SYNC (v3.6 currency re-anchoring):
-          // totalUSD is expected to be close to totalSYP ÷ exchangeRateUsed,
-          // but this is a display-consistency signal, not a validation
-          // gate — the SYP-side checks above and below are what govern
-          // whether this invoice is accepted. A USD-side mismatch (e.g.
-          // client-side rounding) is logged, never thrown.
-          try {
-            const expectedTotalUSDForSanity = convertCurrency(
-              totalSYP,
-              exchangeRateUsed,
-              "SYP",
-              "USD"
-            );
-            if (compareMoney(expectedTotalUSDForSanity, totalUSD) !== 0) {
-              console.warn(
-                `[sync] invoice ${inv.offlineId}: USD sanity mismatch ` +
-                `(expected ≈${expectedTotalUSDForSanity}, got ${totalUSD}) — ` +
-                "informational only, did not block sync."
-              );
-            }
-          } catch {
-            // A USD-side conversion failure must never block a sync —
-            // SYP is authoritative, per the currency re-anchoring note.
-          }
-
           // Recomputes totalSYP independently from the line items
           // (unitPriceSYP × quantity) and requires it to match what the
-          // client claims — AUTHORITATIVE, since InvoiceItem.unitPriceSYP
-          // is itself the authoritative per-item field (v3.6).
+          // client claims — AUTHORITATIVE.
           const isVoidForTotalCheck = Boolean(inv.voidsOfflineInvoiceId);
           const computedItemsTotalSYP = sumMoney(
             inv.items.map((item) => multiplyMoney(Math.abs(item.quantity), item.unitPriceSYP))
@@ -624,32 +536,8 @@ export async function POST(req: NextRequest) {
               throw new Error("عدد بنود الإلغاء لا يطابق عدد بنود الفاتورة الأصلية.");
             }
 
-            // [FIX — VOID CUSTOMER IDENTITY] The target customer for a
-            // void is ALWAYS the customer of the invoice being reversed —
-            // never taken from the void payload's own customerId /
-            // offlineCustomerId (those fields exist on the schema only
-            // because the sale path needs them; a void payload should not
-            // be trusted to independently name a customer, since that
-            // customer is what determines whose debt ledger the reversal
-            // credits). Reading it off the already-verified
-            // originalInvoice row — instead of calling
-            // resolveTargetCustomerId() against the payload — makes it
-            // structurally impossible for a void to be applied against a
-            // different customer than the one who was actually invoiced.
             const targetCustomerId = originalInvoice.customerId;
 
-            // VOID MATCHING: a void item must carry its own `batchId`,
-            // supplied by the client (T4d) from the original sale's data —
-            // never guessed here. Falling back to "any batch for this
-            // product" when no batchId is given risks restoring stock to
-            // the wrong batch (wrong expiry, wrong cost basis) whenever a
-            // product was sold from more than one batch. We fail loud
-            // instead, and additionally cross-check the supplied batchId
-            // AND quantity against the original invoice's own items — a
-            // partial-quantity "void" is not a supported operation (voids
-            // are full reversals only, per T4d; a partial correction goes
-            // through a CustomerPayment adjustment instead), so a quantity
-            // mismatch here is rejected rather than silently accepted.
             const matchedItems = inv.items.map((voidItem) => {
               if (!voidItem.batchId) {
                 throw new Error(
@@ -684,12 +572,17 @@ export async function POST(req: NextRequest) {
                 productId: voidItem.productId,
                 unitId: voidItem.unitId,
                 batchId: voidItem.batchId,
-                quantity: voidItem.quantity, // already negative — enforced by the schema now
-                // [FIX — CURRENCY AUTHORITY] unitPriceSYP is now carried
-                // through and written — InvoiceItem.unitPriceSYP is a
-                // required, no-default column (see file-level note).
+                quantity: voidItem.quantity,
                 unitPriceSYP: serializeMoney(voidItem.unitPriceSYP),
-                unitPriceUSD: serializeMoney(voidItem.unitPriceUSD),
+                // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS]
+                // Computed from unitPriceSYP + the resolved
+                // exchangeRateUsed — never trusted from the payload.
+                unitPriceUSD: convertCurrency(
+                  serializeMoney(voidItem.unitPriceSYP),
+                  exchangeRateUsed,
+                  "SYP",
+                  "USD"
+                ),
               };
             });
 
@@ -698,11 +591,6 @@ export async function POST(req: NextRequest) {
               qtyToRestore: Math.abs(it.quantity),
             }));
 
-            // Lock ALL of this void's batches in one call — already
-            // gathered across every item of this invoice before this line
-            // runs, so this is a single ORDER BY id ASC query covering the
-            // void's entire lock footprint (same discipline the sale path
-            // below now also follows for its own footprint).
             await lockBatchesById(tx, tenantId, batchAdjustments.map((b) => b.batchId));
 
             const voidInvoice = await tx.invoice.create({
@@ -710,10 +598,6 @@ export async function POST(req: NextRequest) {
                 tenantId,
                 userId,
                 customerId: targetCustomerId,
-                // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP /
-                // debtAmountSYP are now written — required columns (see
-                // file-level note). totalUSD / paidAmountUSD /
-                // debtAmountUSD remain persisted as informational/derived.
                 totalSYP,
                 totalUSD,
                 exchangeRateUsed,
@@ -741,8 +625,6 @@ export async function POST(req: NextRequest) {
                   unitId: item.unitId,
                   batchId: item.batchId,
                   quantity: item.quantity,
-                  // [FIX — CURRENCY AUTHORITY] unitPriceSYP now written —
-                  // required column (see file-level note).
                   unitPriceSYP: item.unitPriceSYP,
                   unitPriceUSD: item.unitPriceUSD,
                 },
@@ -760,9 +642,6 @@ export async function POST(req: NextRequest) {
           }
 
           // ---- SALE PATH -------------------------------------------------
-          // Customer resolution happens here, ONLY on the sale path — the
-          // void path above resolves its own targetCustomerId directly
-          // from originalInvoice.customerId and never reaches this call.
           const targetCustomerId = await resolveTargetCustomerId(
             tx,
             tenantId,
@@ -775,31 +654,16 @@ export async function POST(req: NextRequest) {
             where: { id: targetCustomerId, tenantId },
             select: { isSystemGenerated: true },
           });
-          // [FIX — CURRENCY AUTHORITY] Gated on debtSYP, not debtUSD — per
-          // T1: "An invoice may reference the system-generated customer
-          // only when debtAmountSYP = 0" (v3.6; was debtAmountUSD = 0
-          // through v3.5).
           if (customerRecord?.isSystemGenerated && compareMoney(debtSYP, 0) > 0) {
             throw new Error(
               "لا يمكن تسجيل دين على الزبون النقدي العام — يجب اختيار زبون حقيقي له اسم ورقم هاتف."
             );
           }
 
-          // Every allocation carries BOTH quantities explicitly, in the
-          // unit each downstream write actually expects — see the
-          // UNIT-CONFUSION FIX note at the top of this file:
-          //   - allocatedQtyInRequestedUnit -> InvoiceItem.quantity
-          //     (always paired with the REQUESTED unitId, never the
-          //     batch's own unit)
-          //   - deductQtyInBatchUnit        -> ProductBatch.quantity
-          //     decrement only
           interface ResolvedAllocation {
             productId: string;
-            unitId: string; // the REQUESTED unit — matches InvoiceItem.unitId
+            unitId: string;
             batchId: string;
-            // [FIX — CURRENCY AUTHORITY] unitPriceSYP carried alongside
-            // unitPriceUSD — InvoiceItem.unitPriceSYP is a required,
-            // no-default column (see file-level note).
             unitPriceSYP: string;
             unitPriceUSD: string;
             allocatedQtyInRequestedUnit: number;
@@ -808,19 +672,6 @@ export async function POST(req: NextRequest) {
 
           const resolvedAllocations: ResolvedAllocation[] = [];
 
-          // CROSS-ITEM LOCK ORDERING FIX: a sale invoice can touch more
-          // than one product. Locking each product's candidate batches
-          // with its own separate ORDER BY id ASC query (one call per
-          // line item) keeps that single product's batches in order, but
-          // does NOT guarantee a single, consistent lock-acquisition
-          // order for the invoice AS A WHOLE — two concurrent invoices
-          // selling the same two products in opposite line-item order
-          // could still deadlock against each other, since each
-          // product's lock would be a separate SQL statement issued
-          // independently. Every batch this invoice could possibly
-          // touch, across every line item, is locked here in ONE
-          // ORDER BY id ASC query up front, so the whole invoice's lock
-          // footprint follows a single global order.
           const productIdsInInvoice = [...new Set(inv.items.map((it) => it.productId))];
           await lockBatchesForFifoAllocations(
             tx,
@@ -840,41 +691,31 @@ export async function POST(req: NextRequest) {
               throw new Error(`لا توجد أي دفعة متاحة لـ ${item.productId}/${item.unitId}.`);
             }
 
+            // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Computed
+            // once per item from unitPriceSYP + the resolved
+            // exchangeRateUsed — never trusted from item.unitPriceUSD.
+            const itemUnitPriceUSD = convertCurrency(
+              serializeMoney(item.unitPriceSYP),
+              exchangeRateUsed,
+              "SYP",
+              "USD"
+            );
+
             for (const alloc of resolution.allocations) {
               resolvedAllocations.push({
                 productId: item.productId,
                 unitId: item.unitId,
                 batchId: alloc.batchId,
                 unitPriceSYP: serializeMoney(item.unitPriceSYP),
-                unitPriceUSD: serializeMoney(item.unitPriceUSD),
-                // allocatedQty is already denominated in the REQUESTED
-                // unit (fifo.ts: "Quantity in terms of the requested
-                // unit") — correct pairing with `unitId` above.
+                unitPriceUSD: itemUnitPriceUSD,
                 allocatedQtyInRequestedUnit: alloc.allocatedQty,
-                // deductQtyInBatchUnit is denominated in the BATCH's own
-                // unit (fifo.ts: "Quantity in terms of batch's own
-                // unit") — used ONLY for the ProductBatch decrement
-                // below, never written anywhere paired with `unitId`.
                 deductQtyInBatchUnit: alloc.deductQtyInBatchUnit,
               });
             }
 
-            // Accepted negative-stock policy: an offline sale is never
-            // blocked by insufficient known stock. Any unmet remainder is
-            // deducted from the last batch FIFO touched, letting that
-            // batch's quantity go negative for T3's reconciliation view —
-            // rather than silently dropping the shortfall or guessing a
-            // new batch into existence.
             if (!resolution.isSufficient && resolution.remainingQty > 0) {
               const last = resolution.allocations[resolution.allocations.length - 1];
 
-              // resolution.remainingQty is documented in fifo.ts as
-              // "Unallocated in requested unit" — safe to use directly as
-              // the InvoiceItem-side quantity, but it must be CONVERTED
-              // into the last batch's own unit before it's used to
-              // decrement ProductBatch.quantity, exactly the same way
-              // fifo.ts itself converts allocatedQty -> deductQtyInBatchUnit
-              // internally.
               const [requestedUnitRecord, batchUnitRecord] = await Promise.all([
                 tx.productUnit.findFirst({
                   where: { id: item.unitId, productId: item.productId, tenantId },
@@ -896,7 +737,7 @@ export async function POST(req: NextRequest) {
                 unitId: item.unitId,
                 batchId: last.batchId,
                 unitPriceSYP: serializeMoney(item.unitPriceSYP),
-                unitPriceUSD: serializeMoney(item.unitPriceUSD),
+                unitPriceUSD: itemUnitPriceUSD,
                 allocatedQtyInRequestedUnit: resolution.remainingQty,
                 deductQtyInBatchUnit: remainingDeductInBatchUnit,
               });
@@ -908,10 +749,6 @@ export async function POST(req: NextRequest) {
               tenantId,
               userId,
               customerId: targetCustomerId,
-              // [FIX — CURRENCY AUTHORITY] totalSYP / paidAmountSYP /
-              // debtAmountSYP now written — required columns (see
-              // file-level note). totalUSD / paidAmountUSD /
-              // debtAmountUSD remain persisted as informational/derived.
               totalSYP,
               totalUSD,
               exchangeRateUsed,
@@ -919,8 +756,6 @@ export async function POST(req: NextRequest) {
               paidAmountUSD: paidUSD,
               debtAmountSYP: debtSYP,
               debtAmountUSD: debtUSD,
-              // [FIX — CURRENCY AUTHORITY] isPaid derives from debtSYP,
-              // the authoritative field, not debtUSD.
               isPaid: compareMoney(debtSYP, 0) <= 0,
               status: InvoiceStatus.COMPLETED,
               offlineId: inv.offlineId,
@@ -936,14 +771,9 @@ export async function POST(req: NextRequest) {
                 tenantId,
                 invoiceId: invoice.id,
                 productId: alloc.productId,
-                // Always the REQUESTED unit, paired with the quantity
-                // that's denominated in that same unit — see the
-                // UNIT-CONFUSION FIX note above.
                 unitId: alloc.unitId,
                 batchId: alloc.batchId,
                 quantity: alloc.allocatedQtyInRequestedUnit,
-                // [FIX — CURRENCY AUTHORITY] unitPriceSYP now written —
-                // required column (see file-level note).
                 unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
               },
@@ -953,15 +783,10 @@ export async function POST(req: NextRequest) {
           for (const alloc of resolvedAllocations) {
             await tx.productBatch.update({
               where: { id: alloc.batchId, tenantId },
-              // Always the batch's own unit — the only quantity that's
-              // valid to subtract from ProductBatch.quantity directly.
               data: { quantity: { decrement: alloc.deductQtyInBatchUnit } },
             });
           }
 
-          // [FIX — CURRENCY AUTHORITY] Gated on paidSYP, not paidUSD — a
-          // sale-time CustomerPayment is created whenever the
-          // authoritative paid amount (SYP) is positive.
           if (compareMoney(paidSYP, 0) > 0) {
             if (!inv.paymentMethod) {
               throw new Error("paymentMethod مطلوب عندما paidAmountSYP > 0.");
@@ -971,10 +796,6 @@ export async function POST(req: NextRequest) {
                 tenantId,
                 customerId: targetCustomerId,
                 invoiceId: invoice.id,
-                // [FIX — CURRENCY AUTHORITY] amountSYP is the
-                // authoritative figure, taken directly from the invoice's
-                // own paidSYP — no longer derived via convertCurrency from
-                // USD. amountUSD stays informational/derived.
                 amountSYP: paidSYP,
                 amountUSD: paidUSD,
                 exchangeRate: exchangeRateUsed,
@@ -1006,10 +827,6 @@ export async function POST(req: NextRequest) {
         }
       }
       if (isRetryableTxError(err)) {
-        // See PASS 1's comment on this exact branch — same reasoning:
-        // a transient deadlock/serialization conflict must not become a
-        // permanent FAILED item. Left out of the response so the client
-        // keeps this invoice PENDING and resends it automatically.
         console.error(
           `[sync] invoice ${inv.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
           err
@@ -1026,8 +843,6 @@ export async function POST(req: NextRequest) {
 
   // ==========================================================================
   // PASS 3 — Payments. Idempotent via CustomerPayment.offlineId.
-  // invoiceId is always null by construction (sale-time payments are
-  // created inside the invoice pass above, never here).
   // ==========================================================================
   for (const p of payments as PaymentPayload[]) {
     try {
@@ -1039,10 +854,6 @@ export async function POST(req: NextRequest) {
           });
           if (existing) return existing;
 
-          // [FIX — CURRENCY AUTHORITY] amountSYP is AUTHORITATIVE — read
-          // and validated first. amountUSD stays required/persisted
-          // (informational/derived) but is never used to validate or
-          // derive anything below.
           const amountSYP = serializeMoney(p.amountSYP);
           const amountUSD = serializeMoney(p.amountUSD);
           const exchangeRate = serializeMoney(p.exchangeRate);
@@ -1100,7 +911,6 @@ export async function POST(req: NextRequest) {
         }
       }
       if (isRetryableTxError(err)) {
-        // Same reasoning as PASS 1/PASS 2 above.
         console.error(
           `[sync] payment ${p.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
           err

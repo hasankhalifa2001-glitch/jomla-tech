@@ -395,6 +395,7 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
         name: "عمر الفاروق",
         phone: "0933555777",
         balanceDebtSYP: 100000,
+        hasPriorInvoices: true,
       };
 
       const product = createCachedProductRecord({
