@@ -1,5 +1,5 @@
 /**
- * POS Service for Offline Operations (T4b)
+* POS Service for Offline Operations (T4b)
  *
  * Interacts directly and exclusively with Dexie IndexedDB tables:
  * - cachedProducts: Product catalog with units and batch quantities
@@ -105,62 +105,6 @@
  *      on a paidAmountSYP === 0 sale; this normalization makes that
  *      invariant hold here regardless of what the UI passed in.
  *
- * [FIX — review pass 3]
- *   1. submitOfflineSale() now resolves whether the sale's customer is
- *      the system-generated cash customer and passes that explicitly to
- *      createOfflineInvoiceRecord as `isSystemCustomer`. Previously the
- *      system-customer/zero-debt rule was enforced ONLY here, one layer
- *      above db.ts's factory — a gap of exactly the same shape as the
- *      totalSYP-matches-items check fixed in review pass 1, just for a
- *      different invariant. db.ts now enforces the rule directly too;
- *      this call site is updated to actually supply the information that
- *      enforcement needs.
- *   2. findMatchingCustomerByPhone()'s ONLINE branch previously returned
- *      a hardcoded `balanceDebtSYP: 0` for a server-matched customer,
- *      indistinguishable from a customer that genuinely has a zero
- *      balance. A cashier acting on that figure (e.g. deciding whether a
- *      credit sale is reasonable) could be shown "0 debt" for a customer
- *      who actually owes a real balance the API response never carried.
- *      Changed to `undefined` (balance genuinely unknown from this
- *      lookup) so a caller/UI can distinguish "confirmed zero" from
- *      "not fetched" and avoid displaying a misleading confirmed-zero
- *      figure.
- *   3. seedSampleOfflineData() now calls setCachedRate(tenantId, rate)
- *      directly instead of the legacy setCachedDailyExchangeRate(rate,
- *      tenantId) wrapper — this is new code with an already-validated,
- *      non-empty tenantId in scope, so there's no reason to go through
- *      the (rate, tenantId) legacy argument order meant for old call
- *      sites.
- *
- * [FIX — review pass 4, T4b]
- *   1. submitOfflineSale() previously rejected ANY sale where
- *      exchangeRateUsed was missing or <= 0, unconditionally — even for a
- *      cart composed entirely of SYP-priced units, which never needed a
- *      rate to resolve in the first place (see cartNeedsExchangeRate()
- *      and resolveUnitPriceSYP() below). That directly contradicted T4b's
- *      own acceptance criterion: "checkout blocks only for a USD-priced
- *      item with no cached rate, never for SYP-only carts." The check is
- *      now conditional on cartNeedsExchangeRate(payload.items) — a
- *      SYP-only cart may submit with exchangeRateUsed: null.
- *      OfflineSalePayload.exchangeRateUsed is now `MoneyInput | null`
- *      accordingly, and the resolved `requiresExchangeRate` flag is
- *      passed through to createOfflineInvoiceRecord (db.ts), which must
- *      apply the same conditional logic at its own layer rather than
- *      trusting this check alone — same defense-in-depth pattern already
- *      used for isSystemCustomer.
- *   2. Offline credit-sale gate replaced/extended: previously the only
- *      debt-eligibility check was "not the system cash customer." That
- *      missed a real gap — a freshly-created WALK_IN customer (no
- *      documented history with the merchant at all) could be extended
- *      debt in the very same sale that created them. The new
- *      isEligibleForCredit() requires CachedCustomer.hasPriorInvoices
- *      (db.ts) — populated by /api/customers from the customer's real
- *      invoice history — to be explicitly true, which structurally
- *      excludes BOTH a WALK_IN customer (no CachedCustomer row exists for
- *      them at all) AND a synced EXISTING customer who has a customer
- *      record but has never actually had an invoice. See
- *      isEligibleForCredit()'s own doc comment below for the full
- *      reasoning.
  */
 
 import {
@@ -184,10 +128,10 @@ import {
   compareMoney,
   toDecimal,
   multiplyMoney,
+  subtractMoney,
   sumMoney,
   convertCurrency,
   serializeMoney,
-  subtractMoney,
   type MoneyInput,
 } from "../utils/money";
 
@@ -301,6 +245,8 @@ export interface DuplicatePhoneMatch {
 // unit's conversionFactor BEFORE summing — never sum raw `quantity`
 // values across batches blindly, since that silently treats "5 كرتونة"
 // and "5 قطعة" as the same 5.
+//
+
 // ============================================================================
 
 export interface StockBreakdownPart {
@@ -344,26 +290,61 @@ export function breakdownStockByUnits(
     (a, b) => (Number(b.conversionFactor) || 1) - (Number(a.conversionFactor) || 1)
   );
 
-  let remaining = totalBaseQuantity;
+  // [FIX — review pass 5] `remaining` is now tracked as a decimal.js
+  // instance throughout the entire loop, never as a native JS number
+  // that gets multiplied/subtracted with `*`/`-`. Every step — the
+  // division to find how many whole packaging units fit, and the
+  // subtraction of what was just allocated — happens in exact decimal
+  // arithmetic. `Number(...)` is applied only once per emitted part,
+  // to the already decimal-exact string, purely for display.
+  let remaining = toDecimal(totalBaseQuantity);
   const parts: StockBreakdownPart[] = [];
 
   for (const unit of sortedUnits) {
     const factor = Number(unit.conversionFactor) || 1;
     if (factor <= 1) continue; // base unit is handled explicitly below
-    const count = Math.floor(remaining / factor);
+
+    const count = Math.floor(toDecimal(remaining.dividedBy(factor).toFixed(10)).toNumber());
     if (count > 0) {
       parts.push({ unitName: unit.unitName, count });
-      remaining -= count * factor;
+      remaining = toDecimal(subtractMoney(remaining, multiplyMoney(count, factor)));
     }
   }
 
   // Whatever's left over is expressed in the base unit — even if that's
   // the whole quantity (product has no packaging unit above factor 1).
   const baseUnit = sortedUnits.find((u) => (Number(u.conversionFactor) || 1) === 1);
-  if (remaining > 0 || parts.length === 0) {
+  const rawRemainingCount = remaining.toNumber();
+
+  // [FIX — precision display] `rawRemainingCount` can carry a tiny
+  // rounding artifact (e.g. 22.0008 instead of a clean 22) that
+  // originates upstream in getOfflineProducts — converting a batch
+  // quantity stored in a NON-base unit (e.g. 3.9167 طرد) into the base
+  // unit (× conversionFactor) necessarily reproduces whatever rounding
+  // ProductBatch.quantity's own Decimal(18,4) precision already forced
+  // at write time (2 ÷ 24 has no exact 4-decimal representation — see
+  // fifo.ts's own FIX note on this same limit). That artifact is always
+  // FAR smaller than any real-world countable unit (a merchant never
+  // legitimately sells 0.0008 of a single قطعة).
+  //
+  // A genuinely fractional base-unit quantity DOES exist for the
+  // opposite reason — a weighed/measured product (e.g. 2.75 كغ) — and
+  // must never be silently rounded away; the whole point of storing
+  // quantity as Decimal(18,4) is to keep that fraction exact.
+  //
+  // The two cases are distinguishable by SIZE alone: a rounding artifact
+  // from a unit-conversion is always well under 0.01 of a single base
+  // unit; a real, deliberately fractional quantity is not. Snapping only
+  // when within this tight epsilon of the nearest whole number corrects
+  // the display artifact without ever touching a real fraction.
+  const nearestWhole = Math.round(rawRemainingCount);
+  const isRoundingArtifact = Math.abs(rawRemainingCount - nearestWhole) < 0.001;
+  const remainingCount = isRoundingArtifact ? nearestWhole : rawRemainingCount;
+
+  if (remainingCount > 0 || parts.length === 0) {
     parts.push({
       unitName: baseUnit ? baseUnit.unitName : "قطعة",
-      count: remaining,
+      count: remainingCount,
     });
   }
 
@@ -680,12 +661,16 @@ export async function getOfflineProducts(
     // are blocked (see getSellableUnits/resolveUnitPriceSYP above). Total
     // stock accuracy and "can this unit still be sold" are independent
     // questions.
+    //
+
     const unitById = new Map(p.units.map((u) => [u.id, u]));
-    const totalStock = (p.batches || []).reduce((acc, b) => {
+    const perBatchBaseQuantities = (p.batches || []).map((b) => {
       const unit = unitById.get(b.unitId);
-      const factor = unit ? Number(unit.conversionFactor) || 1 : 1;
-      return acc + (Number(b.quantity) || 0) * factor;
-    }, 0);
+      const factor = unit ? unit.conversionFactor || 1 : 1;
+      return multiplyMoney(b.quantity || "0", factor);
+    });
+    const totalStock = toDecimal(sumMoney(perBatchBaseQuantities)).toNumber();
+
     return {
       ...p,
       totalCachedStock: totalStock,
@@ -1026,7 +1011,6 @@ export async function submitOfflineSale(
   // rather than trusting the caller to have already cleared it for a
   // fully-on-credit sale. createOfflineInvoiceRecord (db.ts) throws if
   // paymentMethod is set while paidAmountSYP === 0 — this makes that
-  // invariant hold here regardless of what the POS UI actually passed.
   const normalizedPaymentMethod =
     compareMoney(payload.paidAmountSYP, 0) === 0 ? undefined : payload.paymentMethod;
 

@@ -35,7 +35,7 @@ import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal"
 import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
-import { validatePackagingUnits } from "@/lib/inventory/conversions";
+import { validatePackagingUnits } from "@/lib/inventory/packaging-unit-validation";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import type { ProductItem, UnitItem } from "@/components/inventory/ProductTable";
 

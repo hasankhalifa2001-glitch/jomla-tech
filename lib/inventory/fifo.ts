@@ -1,14 +1,78 @@
 import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
 import { getTenantDb } from "@/lib/db/tenant-scope";
-import { convertUnitQuantity } from "@/lib/inventory/conversions";
+import { requireBaseUnit } from "@/lib/inventory/base-unit";
+
+/**
+ * lib/inventory/fifo.ts (T3b)
+ *
+ * ============================================================================
+ * CORRECTION NOTE (v4.0 alignment fix):
+ * The previous version of this file imported `convertUnitQuantity` from
+ * `lib/inventory/conversions.ts` and used it, inside `allocateBatches`, to
+ * convert between "the requested sale unit" and "each batch's own unit"
+ * via each side's `conversionFactor`. That assumed a ProductBatch could be
+ * tracked in a unit other than the product's base unit — exactly the
+ * pre-v4.0 design MASTER-SPEC v4.0 replaced (T1's Rejected Approach #10:
+ * "Allowing ProductBatch.unitId to reference any ProductUnit belonging to
+ * the product"). Under the current schema, ProductBatch.unitId is ALWAYS
+ * Product.baseUnitId, and that unit's conversionFactor is ALWAYS 1 — so
+ * there was nothing left to legitimately convert, and the old code
+ * directly violated T3b's own Acceptance Criteria:
+ *   "fifo.ts itself contains no reference to conversionFactor in any
+ *    form — verified by static analysis of every call site in the file."
+ *
+ * FIX: this file no longer imports or references conversionFactor / any
+ * unit-conversion function anywhere. `previewFifoAllocation` and
+ * `commitFifoAllocation` operate purely on ProductBatch.quantity figures,
+ * which are base-unit numbers by construction (T3b, MASTER-SPEC v4.0).
+ *
+ * `params.requestedQty` is now ALWAYS assumed to already be expressed in
+ * the product's base unit — converting a sale/order quantity from a
+ * non-base sale unit (e.g. "packs") into the base unit is the CALLER's
+ * responsibility (T4b's POS / T4c's sync engine / T5's B2B approval),
+ * performed via `toBaseUnit()` (lib/inventory/units.ts) BEFORE this
+ * function is ever invoked — never inside this file.
+ *
+ * `params.unitId` is retained in the public signature for backward
+ * compatibility with existing call sites, but its role changed: it is now
+ * asserted to equal the product's actual base unit id (resolved via
+ * `requireBaseUnit()`), never used to fetch or apply a conversionFactor.
+ * A mismatch throws immediately — that is a caller/integration bug (a
+ * forgotten toBaseUnit() conversion upstream), never a case to silently
+ * paper over.
+ * ============================================================================
+ *
+ * Sorting Rules (unchanged from the original design):
+ * 1. `expiryDate ASC NULLS LAST` (earliest expiring batches consumed first; batches without expiry last)
+ * 2. `id ASC`, compared by raw code-point order (not `localeCompare`, whose
+ *    result depends on the runtime's ICU/locale configuration and is not
+ *    guaranteed identical across environments) — this must match Postgres's
+ *    own `ORDER BY id ASC` byte-order comparison exactly, since this is the
+ *    same tie-break the database uses when locking these rows.
+ *
+ * All quantity math is done via decimal.js directly on ProductBatch.quantity
+ * figures — there is no conversion step left to perform. ProductBatch.quantity
+ * is a Decimal(18,4) column; per T1's mandate, precision must be exact from
+ * the source, never float-then-converted. Every quantity-shaped output field
+ * below is a decimal-serialized STRING (`.toFixed(4)`), rounded to the
+ * column's real 4-decimal precision limit exactly once, and never re-wrapped
+ * in a native JS `Number(...)`.
+ */
 
 export interface AllocationPlanItem {
   batchId: string;
   batchNumber: string;
   expiryDate: Date | null;
-  allocatedQty: number; // Quantity in terms of the requested unit (e.g. Packs)
-  deductQtyInBatchUnit: number; // Quantity in terms of batch's own unit (e.g. Pieces or Cartons)
+  // Decimal-serialized STRING, never a rounded JS number. Base-unit
+  // quantity drawn from this specific batch.
+  allocatedQty: string;
+  // [v4.0, corrected] Always identical to allocatedQty. Kept as a
+  // separate field only for shape/backward-compatibility with existing
+  // callers that read it — the batch's own unit is, by construction,
+  // always the product's base unit (see CORRECTION NOTE above), so there
+  // is no longer a distinct "batch unit" quantity to compute.
+  deductQtyInBatchUnit: string;
   batchUnitId: string;
   batchUnitName: string;
 }
@@ -17,11 +81,13 @@ export type FifoAllocationItem = AllocationPlanItem;
 
 export interface AllocationPlan {
   productId: string;
+  // [v4.0, corrected] Always the product's base unit — see CORRECTION
+  // NOTE above. Field name kept for backward compatibility.
   requestedUnitId: string;
   requestedUnitName: string;
   requestedQty: number;
-  totalAllocatedQty: number; // In requested unit
-  remainingQty: number; // Unallocated in requested unit
+  totalAllocatedQty: string; // In the base unit
+  remainingQty: string; // Unallocated, in the base unit
   isSufficient: boolean;
   allocations: AllocationPlanItem[];
 }
@@ -31,6 +97,10 @@ export type FifoResolution = AllocationPlan;
 export interface PreviewFifoParams {
   tenantId: string;
   productId: string;
+  // [v4.0, corrected] MUST be the product's base unit id — asserted
+  // against requireBaseUnit()'s result, not trusted blindly. The caller
+  // is responsible for having already converted requestedQty into this
+  // unit via toBaseUnit() before calling this function.
   unitId: string;
   requestedQty: number;
 }
@@ -44,17 +114,6 @@ export interface CommitFifoParams {
 
 export type FifoRequest = CommitFifoParams;
 
-// [FIX — TypeScript build error, same root cause as lib/inventory/
-// conversions.ts] `Decimal.Value` does not resolve under this project's
-// TypeScript/module configuration (Next.js 16 + Turbopack, "moduleResolution":
-// "bundler") — the default import `import Decimal from "decimal.js"` only
-// carries the VALUE binding, not decimal.js's merged namespace/type, so
-// every `as Decimal.Value` cast below failed to compile (TS2833). `Decimal`
-// still works perfectly fine as a VALUE (constructing instances via `new
-// Decimal(...)` is unaffected) — only its use as a standalone type name is
-// broken in this config. Fixed the same way as conversions.ts: a local type
-// alias derived from `typeof Decimal`, which TypeScript can always compute
-// from a value regardless of whether that value's own type name resolves.
 type DecimalInstance = InstanceType<typeof Decimal>;
 type DecimalValue = number | string | DecimalInstance;
 
@@ -63,48 +122,25 @@ interface BatchRecord {
   batchNumber: string;
   quantity: unknown;
   expiryDate: Date | null | string;
-  createdAt: Date | string;
-  unitId: string;
-  unit?: {
-    conversionFactor: unknown;
-    unitName: string;
-  } | null;
 }
 
-interface UnitRecord {
+interface BaseUnitRef {
   id: string;
   unitName: string;
-  conversionFactor: unknown;
 }
 
 /**
- * Shared, unexported FIFO core allocation math and deterministic sorting engine.
- *
- * Sorting Rules:
- * 1. `expiryDate ASC NULLS LAST` (earliest expiring batches consumed first; batches without expiry last)
- * 2. `id ASC`, compared by raw code-point order (not `localeCompare`, whose
- *    result depends on the runtime's ICU/locale configuration and is not
- *    guaranteed identical across environments) — this must match Postgres's
- *    own `ORDER BY id ASC` byte-order comparison exactly, since this is the
- *    same tie-break the database uses when locking these rows.
- *
- * All quantity math is done via decimal.js — through convertUnitQuantity()
- * in lib/inventory/conversions.ts, the single shared module for unit
- * conversion — rather than reimplementing the same multiplication/division
- * with native Number here. ProductBatch.quantity is a Decimal(18,4) column;
- * per T1's mandate, precision must be exact from the source, never
- * float-then-converted. Output fields are rounded to 4 decimal places only
- * at the very end, when producing the display/allocation-plan value.
+ * Shared, unexported FIFO core allocation math and deterministic sorting
+ * engine. See the file-header CORRECTION NOTE for why this no longer
+ * performs (or references) any unit conversion.
  */
 function allocateBatches(
   batches: BatchRecord[],
-  requestedUnit: UnitRecord,
+  baseUnit: BaseUnitRef,
   requestedQty: number,
   productId: string
 ): AllocationPlan {
-  const requestedFactor = new Decimal((requestedUnit.conversionFactor as DecimalValue) || 1);
-  // Base-unit equivalent of the requested quantity (base unit == factor 1).
-  const requestedQtyInBase = convertUnitQuantity(requestedQty, requestedFactor, 1);
+  const requestedQtyDecimal = new Decimal(requestedQty);
 
   // Deterministic sorting: expiryDate ASC NULLS LAST, id ASC tie-break.
   const sortedBatches = [...batches].sort((a: BatchRecord, b: BatchRecord) => {
@@ -123,51 +159,58 @@ function allocateBatches(
   });
 
   const allocations: AllocationPlanItem[] = [];
-  let remainingNeededInBase = requestedQtyInBase;
+  // Full-precision Decimal across every loop iteration — never rounded
+  // mid-loop, only each individual batch's OUTPUT is (once, at push-time).
+  let remainingNeeded = requestedQtyDecimal;
 
   for (const batch of sortedBatches) {
-    if (remainingNeededInBase.lte(0)) break;
+    if (remainingNeeded.lte(0)) break;
 
-    const batchUnitFactor = new Decimal((batch.unit?.conversionFactor as DecimalValue) || 1);
-    const batchAvailableInBatchUnit = new Decimal(batch.quantity as DecimalValue);
-    const batchAvailableInBase = convertUnitQuantity(batchAvailableInBatchUnit, batchUnitFactor, 1);
+    const batchAvailable = new Decimal(batch.quantity as DecimalValue);
+    if (batchAvailable.lte(0)) continue;
 
-    if (batchAvailableInBase.lte(0)) continue;
-
-    const allocatedBase = Decimal.min(remainingNeededInBase, batchAvailableInBase);
-    const allocatedInReqUnit = convertUnitQuantity(allocatedBase, 1, requestedFactor);
-    const deductInBatchUnit = convertUnitQuantity(allocatedBase, 1, batchUnitFactor);
+    const allocated = Decimal.min(remainingNeeded, batchAvailable);
 
     allocations.push({
       batchId: batch.id,
       batchNumber: batch.batchNumber,
       expiryDate: batch.expiryDate ? new Date(batch.expiryDate) : null,
-      allocatedQty: Number(allocatedInReqUnit.toFixed(4)),
-      deductQtyInBatchUnit: Number(deductInBatchUnit.toFixed(4)),
-      batchUnitId: batch.unitId,
-      batchUnitName: batch.unit?.unitName || "",
+      allocatedQty: allocated.toFixed(4),
+      deductQtyInBatchUnit: allocated.toFixed(4),
+      batchUnitId: baseUnit.id,
+      batchUnitName: baseUnit.unitName,
     });
 
-    remainingNeededInBase = remainingNeededInBase.minus(allocatedBase);
+    // Subtracted using the full-precision `allocated`, not a rounded
+    // value — this is what keeps cross-batch accumulation error-free.
+    remainingNeeded = remainingNeeded.minus(allocated);
   }
 
-  const totalAllocatedBase = requestedQtyInBase.minus(Decimal.max(0, remainingNeededInBase));
-  const totalAllocatedQty = Number(convertUnitQuantity(totalAllocatedBase, 1, requestedFactor).toFixed(4));
-  const remainingQty = Number(
-    convertUnitQuantity(Decimal.max(0, remainingNeededInBase), 1, requestedFactor).toFixed(4)
-  );
-  const isSufficient = remainingNeededInBase.lte(0);
+  const totalAllocated = requestedQtyDecimal.minus(Decimal.max(0, remainingNeeded));
+  const isSufficient = remainingNeeded.lte(0);
 
   return {
     productId,
-    requestedUnitId: requestedUnit.id,
-    requestedUnitName: requestedUnit.unitName,
+    requestedUnitId: baseUnit.id,
+    requestedUnitName: baseUnit.unitName,
     requestedQty,
-    totalAllocatedQty,
-    remainingQty,
+    totalAllocatedQty: totalAllocated.toFixed(4),
+    remainingQty: Decimal.max(0, remainingNeeded).toFixed(4),
     isSufficient,
     allocations,
   };
+}
+
+function assertUnitIsBaseUnit(baseUnit: BaseUnitRef, suppliedUnitId: string, productId: string): void {
+  if (baseUnit.id !== suppliedUnitId) {
+    throw new Error(
+      `Unit mismatch: productId ${productId}'s base unit is ${baseUnit.id}, but ` +
+      `${suppliedUnitId} was supplied. requestedQty must already be converted to ` +
+      `the base unit (via toBaseUnit(), lib/inventory/units.ts) before calling ` +
+      `previewFifoAllocation/commitFifoAllocation — see T3b, MASTER-SPEC v4.0. ` +
+      `This is a caller/integration bug, never a case to silently route around.`
+    );
+  }
 }
 
 /**
@@ -197,21 +240,15 @@ export async function previewFifoAllocation(
 
   const db = getTenantDb(tenantId);
 
-  const requestedUnit = await db.productUnit.findFirst({
-    where: { id: unitId, productId },
-    select: { id: true, unitName: true, conversionFactor: true },
-  });
-
-  if (!requestedUnit) {
-    throw new Error("وحدة القياس المطلوبة غير موجودة لهذا المنتج.");
-  }
+  const baseUnit = await requireBaseUnit(db, tenantId, productId);
+  assertUnitIsBaseUnit(baseUnit, unitId, productId);
 
   const candidateBatches = (await db.productBatch.findMany({
     where: { productId, quantity: { gt: 0 } },
-    include: { unit: true },
+    select: { id: true, batchNumber: true, quantity: true, expiryDate: true },
   })) as unknown as BatchRecord[];
 
-  return allocateBatches(candidateBatches, requestedUnit, requestedQty, productId);
+  return allocateBatches(candidateBatches, baseUnit, requestedQty, productId);
 }
 
 /**
@@ -242,19 +279,13 @@ export async function commitFifoAllocation(
     throw new Error("Tenant isolation error: tenantId is required to commit a FIFO allocation.");
   }
 
-  const requestedUnit = await tx.productUnit.findFirst({
-    where: { id: unitId, productId, tenantId },
-    select: { id: true, unitName: true, conversionFactor: true },
-  });
-
-  if (!requestedUnit) {
-    throw new Error("وحدة القياس المطلوبة غير موجودة لهذا المنتج.");
-  }
+  const baseUnit = await requireBaseUnit(tx, tenantId, productId);
+  assertUnitIsBaseUnit(baseUnit, unitId, productId);
 
   const candidateBatches = (await tx.productBatch.findMany({
     where: { tenantId, productId, quantity: { gt: 0 } },
-    include: { unit: true },
+    select: { id: true, batchNumber: true, quantity: true, expiryDate: true },
   })) as unknown as BatchRecord[];
 
-  return allocateBatches(candidateBatches, requestedUnit, requestedQty, productId);
+  return allocateBatches(candidateBatches, baseUnit, requestedQty, productId);
 }

@@ -1,7 +1,7 @@
 import Papa from "papaparse";
 import { Prisma } from "@prisma/client";
 import type { getTenantDb } from "@/lib/db/tenant-scope";
-import { validatePackagingUnits, type PackagingUnit } from "./conversions";
+import { validatePackagingUnits, type PackagingUnit } from "./packaging-unit-validation";
 
 export interface CsvRowRaw {
   [key: string]: string | undefined;

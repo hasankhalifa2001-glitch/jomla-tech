@@ -5,7 +5,7 @@ import {
   convertUnitCost,
   calculateBatchDeductions,
   validatePackagingUnits,
-} from "../conversions";
+} from "../packaging-unit-validation";
 
 // [FIX — TypeScript build error] Same root cause as documented atop
 // conversions.ts: decimal.js's own namespace-merged `Decimal` type does

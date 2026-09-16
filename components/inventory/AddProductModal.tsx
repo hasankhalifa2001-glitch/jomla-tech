@@ -13,7 +13,7 @@ import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { validatePackagingUnits } from "@/lib/inventory/conversions";
+import { validatePackagingUnits } from "@/lib/inventory/packaging-unit-validation";
 
 // [FIX] products/route.ts's POST now requires conversionFactor/
 // priceWholesale/priceRetail/initialBatch.quantity as validated DECIMAL

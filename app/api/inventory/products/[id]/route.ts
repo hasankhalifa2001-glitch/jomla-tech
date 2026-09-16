@@ -12,19 +12,13 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { validatePackagingUnits } from "@/lib/inventory/conversions";
+import { validatePackagingUnits, type PackagingUnit } from "@/lib/inventory/packaging-unit-validation";
+// [v4.0] Sole gateway for reading Product.baseUnitId.
+import { requireBaseUnit, MissingBaseUnitError } from "@/lib/inventory/base-unit";
 import { Prisma } from "@prisma/client";
+import Decimal from "decimal.js";
 import { z } from "zod";
 
-// [FIX] Matches products/route.ts POST's own DECIMAL_STRING_REGEX exactly
-// (18,4) — kept as a separate literal here rather than importing it from
-// that file, per the decision not to introduce a shared decimal-format
-// module for this pass. conversionFactor/priceWholesale/priceRetail are
-// all backed by Decimal(18,4) columns; accepting them as native JS
-// numbers (the previous schema) risks the exact same float-precision loss
-// this project's decimal.js-everywhere rule (T1) exists to prevent — this
-// PATCH route was the one remaining write path still doing that after
-// POST was already fixed.
 const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
 
 const positiveDecimalString = (message: string) =>
@@ -43,15 +37,9 @@ const unitSchema = z
   .object({
     id: z.string().optional(),
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-    // [FIX] Was `z.number().positive(...)` — switched to a validated
-    // decimal string, matching POST's unitSchema. Fractional factors
-    // remain fully supported (a quarter/half carton) — this only changes
-    // HOW the exact value is transmitted, not what values are allowed.
     conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
-    // [FIX] Was `z.number().min(0, ...)`.
     priceWholesale: nonNegativeDecimalString("سعر الجملة لا يمكن أن يكون سالباً"),
-    // [FIX] Was `z.number().min(0, ...).optional().nullable()`.
     priceRetail: nonNegativeDecimalString("سعر التجزئة لا يمكن أن يكون سالباً")
       .optional()
       .nullable(),
@@ -79,45 +67,31 @@ const updateProductSchema = z.object({
   isActive: z.boolean().optional(),
   isPublic: z.boolean().optional(),
   units: z.array(unitSchema).min(1, "يجب أن يحتوي المنتج على وحدة قياس واحدة على الأقل").optional(),
+  // [v4.0] Required whenever this PATCH would actually change WHICH unit
+  // is the base unit (only possible when the product has zero batches —
+  // see the immutability check below). Backs the BaseUnitChangeLog audit
+  // row — a base-unit correction is never a silent field edit.
+  baseUnitChangeReason: z.string().optional(),
 });
 
-// [FIX — TYPE ERROR] checkProductPublishable<T>() infers T from the shape
-// of the `units` array it's given. The PATCH handler below builds that
-// array via a ternary — `data.units ? data.units.map(...) : existingProduct
-// .units.map(...)` — and the two branches previously produced two
-// STRUCTURALLY DIFFERENT element shapes: the `data.units` branch has
-// `priceRetail: string | null | undefined` (Zod's validated decimal
-// string), while the `existingProduct.units` branch used to convert its
-// Prisma.Decimal via `Number(...)` into `priceRetail: number | null`.
-// A ternary whose two branches produce different array element types
-// gives the variable a UNION of two array types (`A[] | B[]`), not a
-// single array of a union element type (`(A|B)[]`) — and TypeScript's
-// generic inference does not reliably unify that into one T when the
-// argument itself is such a union, which is exactly the compile error
-// this produced ("Type ... priceRetail: number | null ... is not
-// assignable to ... priceRetail: string | null | undefined").
-//
-// Fixed two ways together:
-//   1. `candidateUnits` below is given ONE explicit, concrete type
-//      annotation, so both ternary branches are contextually checked
-//      against that same declared type instead of each inferring its own
-//      shape independently.
-//   2. The `existingProduct.units` branch no longer converts via
-//      `Number(...)` at all — it passes the live `Prisma.Decimal | null`
-//      straight through. This is not just a type-checking convenience:
-//      `checkProductPublishable`'s own `PriceRetailValue` type already
-//      accepts anything with a `.toNumber()` method (a `Prisma.Decimal`
-//      qualifies structurally), and `isUnitPublishable` already branches
-//      on exactly that case internally. Passing the Decimal through
-//      avoids an unnecessary premature float coercion here, consistent
-//      with T1's decimal.js-everywhere rule — even though this is only a
-//      read-time gate check (not a value that gets persisted), there is
-//      no reason to convert earlier than the one place that actually
-//      needs a plain number for its `> 0` comparison.
 interface PublishabilityCandidateUnit {
   isActive: boolean;
   imageUrl: string | null | undefined;
   priceRetail: string | number | Prisma.Decimal | null | undefined;
+}
+
+// [v4.0] The full merged shape used both for the effective-units
+// validation below and for the publishing-gate candidate check, so both
+// checks see the SAME resulting state — not just whatever subset of units
+// happened to be included in this particular PATCH payload.
+interface EffectiveUnit {
+  id?: string;
+  unitName: string;
+  conversionFactor: string;
+  priceWholesale?: string | number | Prisma.Decimal;
+  priceRetail?: string | number | Prisma.Decimal | null;
+  imageUrl?: string | null;
+  isActive?: boolean;
 }
 
 export async function GET(
@@ -164,7 +138,6 @@ export async function PATCH(
     }
 
     assertRolePermission(session.user.role, "inventory:mutate");
-
     await assertTenantWritable(session.user.tenantId);
 
     const { id } = await params;
@@ -179,6 +152,30 @@ export async function PATCH(
     if (!existingProduct) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
+
+    // [v4.0] Resolve the CURRENT base unit through the sole sanctioned
+    // gateway — never by reading existingProduct.baseUnitId directly
+    // (blocked by this project's ESLint rule) and never by re-deriving it
+    // via conversionFactor === 1.
+    let currentBaseUnit;
+    try {
+      currentBaseUnit = await requireBaseUnit(db, tenantId, id);
+    } catch (e) {
+      if (e instanceof MissingBaseUnitError) {
+        // Pre-v4.0 legacy row that still needs a one-time baseUnitId
+        // backfill migration — fail loud rather than guess.
+        return NextResponse.json(
+          {
+            error: "MISSING_BASE_UNIT",
+            message: "هذا المنتج بدون وحدة أساسية محددة (بيانات قديمة تحتاج تصحيح) — الرجاء التواصل مع الدعم الفني.",
+          },
+          { status: 409 }
+        );
+      }
+      throw e;
+    }
+
+    const batchCount = await db.productBatch.count({ where: { productId: id, tenantId } });
 
     const body = await req.json();
     const parsed = updateProductSchema.safeParse(body);
@@ -195,13 +192,79 @@ export async function PATCH(
 
     const data = parsed.data;
 
+    // [v4.0] Build the EFFECTIVE resulting unit list — existing units not
+    // mentioned in data.units stay as they are; units with a matching
+    // `id` are replaced by their submitted values; units with no `id` are
+    // additions. Every check below runs against this merged list, not
+    // just the submitted subset — otherwise a partial update that simply
+    // omits the current base unit from data.units could silently evade
+    // the "exactly one conversionFactor === 1" / base-unit-immutability
+    // rules.
+    let effectiveUnits: EffectiveUnit[] = existingProduct.units.map((u) => ({
+      id: u.id,
+      unitName: u.unitName,
+      conversionFactor: u.conversionFactor.toString(),
+      priceWholesale: u.priceWholesale,
+      priceRetail: u.priceRetail,
+      imageUrl: u.imageUrl,
+      isActive: u.isActive,
+    }));
+
     if (data.units) {
-      const packagingCheck = validatePackagingUnits(data.units);
+      for (const submitted of data.units) {
+        if (submitted.id) {
+          const idx = effectiveUnits.findIndex((u) => u.id === submitted.id);
+          if (idx >= 0) {
+            effectiveUnits[idx] = { ...effectiveUnits[idx], ...submitted };
+          } else {
+            // A submitted id that doesn't belong to this product — let
+            // the per-unit write loop below surface that naturally
+            // (Prisma's update on a non-existent id fails).
+            effectiveUnits.push(submitted);
+          }
+        } else {
+          effectiveUnits.push(submitted);
+        }
+      }
+    }
+
+    let baseUnitWouldChange = false;
+    let effectiveBaseUnitId = currentBaseUnit.id;
+
+    if (data.units) {
+      const packagingCheck = validatePackagingUnits(effectiveUnits as PackagingUnit[]);
       if (!packagingCheck.valid) {
         return NextResponse.json(
+          { error: "INVALID_PACKAGING_UNITS", message: packagingCheck.error },
+          { status: 400 }
+        );
+      }
+
+      // [v4.0] Base-unit immutability (T1's Unit Conversion Architecture).
+      // validatePackagingUnits above already guarantees exactly one unit
+      // in effectiveUnits has conversionFactor === 1.
+      const effectiveBaseUnit = effectiveUnits.find((u) =>
+        new Decimal(u.conversionFactor).equals(1)
+      )!;
+      effectiveBaseUnitId = effectiveBaseUnit.id ?? "__NEW_UNIT__"; // real id resolved after creation inside the transaction
+      baseUnitWouldChange =
+        !effectiveBaseUnit.id || effectiveBaseUnit.id !== currentBaseUnit.id;
+
+      if (baseUnitWouldChange && batchCount > 0) {
+        return NextResponse.json(
           {
-            error: "INVALID_PACKAGING_UNITS",
-            message: packagingCheck.error,
+            error: "BASE_UNIT_LOCKED",
+            message: "لا يمكن تغيير الوحدة الأساسية أو معامل تحويلها لمنتج لديه دفعات مخزون مسجلة.",
+          },
+          { status: 400 }
+        );
+      }
+
+      if (baseUnitWouldChange && batchCount === 0 && !data.baseUnitChangeReason?.trim()) {
+        return NextResponse.json(
+          {
+            error: "BASE_UNIT_CHANGE_REASON_REQUIRED",
+            message: "يجب إدخال سبب لتغيير الوحدة الأساسية.",
           },
           { status: 400 }
         );
@@ -213,10 +276,7 @@ export async function PATCH(
         const lowerName = u.unitName.trim().toLowerCase();
         if (names.has(lowerName)) {
           return NextResponse.json(
-            {
-              error: "DUPLICATE_UNIT_NAME",
-              message: `اسم الوحدة "${u.unitName}" مكرر لهذا المنتج`,
-            },
+            { error: "DUPLICATE_UNIT_NAME", message: `اسم الوحدة "${u.unitName}" مكرر لهذا المنتج` },
             { status: 400 }
           );
         }
@@ -227,28 +287,18 @@ export async function PATCH(
 
           if (barcodesInRequest.has(barcodeTrim)) {
             return NextResponse.json(
-              {
-                error: "DUPLICATE_BARCODE",
-                message: `الباركود ${barcodeTrim} مكرر لأكثر من وحدة ضمن نفس الطلب.`,
-              },
+              { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مكرر لأكثر من وحدة ضمن نفس الطلب.` },
               { status: 400 }
             );
           }
           barcodesInRequest.add(barcodeTrim);
 
           const duplicate = await db.productUnit.findFirst({
-            where: {
-              barcode: barcodeTrim,
-              product: { tenantId },
-              NOT: { productId: id },
-            },
+            where: { barcode: barcodeTrim, product: { tenantId }, NOT: { productId: id } },
           });
           if (duplicate) {
             return NextResponse.json(
-              {
-                error: "DUPLICATE_BARCODE",
-                message: `الباركود ${barcodeTrim} مستخدم مسبقاً في منتج آخر لديك.`,
-              },
+              { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مستخدم مسبقاً في منتج آخر لديك.` },
               { status: 400 }
             );
           }
@@ -262,41 +312,26 @@ export async function PATCH(
     if (data.isPublic === true) {
       if (!nextIsActive) {
         return NextResponse.json(
-          {
-            error: "PRODUCT_INACTIVE",
-            message: "لا يمكن نشر منتج موقوف في المتجر.",
-          },
+          { error: "PRODUCT_INACTIVE", message: "لا يمكن نشر منتج موقوف في المتجر." },
           { status: 400 }
         );
       }
 
-      // [FIX — TYPE ERROR, see the PublishabilityCandidateUnit comment
-      // above for the full explanation] Both ternary branches are now
-      // contextually typed against the SAME explicit annotation, and the
-      // `existingProduct.units` branch passes its Prisma.Decimal straight
-      // through instead of pre-converting via Number(...).
-      const candidateUnits: PublishabilityCandidateUnit[] = data.units
-        ? data.units.map((u) => ({
-          isActive: u.isActive !== false,
-          imageUrl: u.imageUrl,
-          priceRetail: u.priceRetail,
-        }))
-        : existingProduct.units.map((u) => ({
-          isActive: u.isActive !== false,
-          imageUrl: u.imageUrl,
-          priceRetail: u.priceRetail,
-        }));
+      // [v4.0] Now built from effectiveUnits (the full merged state), not
+      // just data.units OR existingProduct.units — a partial update that
+      // e.g. only edits one unit's price no longer loses visibility into
+      // every OTHER unit's isActive/imageUrl/priceRetail for this gate
+      // check.
+      const candidateUnits: PublishabilityCandidateUnit[] = effectiveUnits.map((u) => ({
+        isActive: u.isActive !== false,
+        imageUrl: u.imageUrl,
+        priceRetail: u.priceRetail,
+      }));
 
-      const gateCheck = checkProductPublishable({
-        isActive: nextIsActive,
-        units: candidateUnits,
-      });
+      const gateCheck = checkProductPublishable({ isActive: nextIsActive, units: candidateUnits });
       if (!gateCheck.publishable) {
         return NextResponse.json(
-          {
-            error: "PUBLISH_GATE_BLOCKED",
-            message: gateCheck.reason,
-          },
+          { error: "PUBLISH_GATE_BLOCKED", message: gateCheck.reason },
           { status: 400 }
         );
       }
@@ -313,16 +348,21 @@ export async function PATCH(
         },
       });
 
+      // [v4.0] Tracks which unit ends up with conversionFactor === 1 as
+      // we actually write each row — starts at the current base unit (no
+      // change) and is overwritten only if a unit written below turns out
+      // to carry factor 1.
+      let resolvedBaseUnitId = currentBaseUnit.id;
+
       if (data.units) {
         for (const u of data.units) {
+          let writtenUnitId: string;
+
           if (u.id) {
-            await tx.productUnit.update({
+            const updated = await tx.productUnit.update({
               where: { id: u.id },
               data: {
                 unitName: u.unitName,
-                // [FIX] These three are now validated decimal strings —
-                // Prisma parses each directly into an exact Decimal(18,4),
-                // matching POST's write path. No Number(...) conversion.
                 conversionFactor: u.conversionFactor,
                 pricingCurrency: u.pricingCurrency,
                 priceWholesale: u.priceWholesale,
@@ -333,8 +373,9 @@ export async function PATCH(
                 isActive: u.isActive !== undefined ? u.isActive : true,
               },
             });
+            writtenUnitId = updated.id;
           } else {
-            await tx.productUnit.create({
+            const created = await tx.productUnit.create({
               data: {
                 tenantId,
                 productId: id,
@@ -349,6 +390,11 @@ export async function PATCH(
                 isActive: u.isActive !== undefined ? u.isActive : true,
               },
             });
+            writtenUnitId = created.id;
+          }
+
+          if (new Decimal(u.conversionFactor).equals(1)) {
+            resolvedBaseUnitId = writtenUnitId;
           }
 
           if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
@@ -368,13 +414,6 @@ export async function PATCH(
                   },
                 });
               } catch (catalogError) {
-                // [FIX] Same benign cross-tenant race guard as
-                // products/route.ts's POST — a P2002 here means another
-                // tenant's request won the race to create this exact
-                // shared catalog entry a moment earlier, which is a
-                // harmless, expected outcome for a platform-wide,
-                // write-once-per-barcode table, never a real conflict for
-                // THIS tenant's own product/unit write.
                 const isBenignRace =
                   catalogError instanceof Prisma.PrismaClientKnownRequestError &&
                   catalogError.code === "P2002";
@@ -387,11 +426,36 @@ export async function PATCH(
         }
       }
 
+      // [v4.0] If the base unit actually changed (only reachable when
+      // batchCount === 0 — already blocked above otherwise), log it via
+      // BaseUnitChangeLog and update Product.baseUnitId — both as their
+      // own top-level calls in this same transaction (T1's nested-write
+      // rule). A base-unit correction is never a silent field edit.
+      if (resolvedBaseUnitId !== currentBaseUnit.id) {
+        await tx.baseUnitChangeLog.create({
+          data: {
+            tenantId,
+            productId: id,
+            oldBaseUnitId: currentBaseUnit.id,
+            newBaseUnitId: resolvedBaseUnitId,
+            // NOTE: assumes `session.user.id` is populated on the JWT
+            // session per T2a — please confirm this field name matches
+            // your actual auth callback (role/tenantId/isPlatformAdmin
+            // were the three explicitly documented; user id wasn't
+            // called out by name).
+            changedByUserId: session.user.id,
+            reason: data.baseUnitChangeReason!.trim(),
+          },
+        });
+        await tx.product.update({
+          where: { id },
+          data: { baseUnitId: resolvedBaseUnitId },
+        });
+      }
+
       return tx.product.findFirst({
         where: { id },
-        include: {
-          units: { orderBy: { conversionFactor: "asc" } },
-        },
+        include: { units: { orderBy: { conversionFactor: "asc" } } },
       });
     });
 
@@ -429,16 +493,13 @@ export async function DELETE(
     }
 
     assertRolePermission(session.user.role, "inventory:mutate");
-
     await assertTenantWritable(session.user.tenantId);
 
     const { id } = await params;
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    const existingProduct = await db.product.findFirst({
-      where: { id },
-    });
+    const existingProduct = await db.product.findFirst({ where: { id } });
 
     if (!existingProduct) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
@@ -446,15 +507,10 @@ export async function DELETE(
 
     await db.product.update({
       where: { id },
-      data: {
-        isActive: false,
-      },
+      data: { isActive: false },
     });
 
-    return NextResponse.json({
-      success: true,
-      message: "تم تعطيل المنتج بنجاح.",
-    });
+    return NextResponse.json({ success: true, message: "تم تعطيل المنتج بنجاح." });
   } catch (error) {
     if (error instanceof SubscriptionLockedError) {
       return subscriptionLockedResponse(error);

@@ -1,27 +1,52 @@
 /**
- * Multi-Unit Conversion Engine (T3a §1)
+ * lib/inventory/packaging-unit-validation.ts
+ * (renamed from the original "Multi-Unit Conversion Engine" — see
+ * CORRECTION NOTE below for why)
  *
- * Implements packaging unit conversions (base, secondary, tertiary units)
- * with conversion factors, cost calculations, and inventory deduction math.
+ * Validates packaging-unit rules for a product at creation/edit time
+ * (T3a §0 / §1). This file does NOT perform any base-unit conversion
+ * arithmetic — that is the exclusive job of lib/inventory/units.ts
+ * (toBaseUnit / fromBaseUnit / breakdownForDisplay), per T1's Unit
+ * Conversion Architecture (MASTER-SPEC v4.0). See the CORRECTION NOTE
+ * below for what was removed from this file and why.
  *
- * All monetary and quantity math goes through decimal.js — never native JS
- * numbers — per T1's mandate: "decimal.js — mandatory for every monetary
- * calculation that happens client-side before a value reaches the Prisma
- * Decimal boundary." Quantity outputs also route through decimal.js since
- * they feed ProductBatch.quantity, a Decimal(18,4) column — precision must
- * be exact from the source, never float-then-converted.
+ * ============================================================================
+ * CORRECTION NOTE (v4.0 alignment fix):
+ * The original version of this file additionally exported
+ * `convertUnitQuantity(qty, fromFactor, toFactor)`,
+ * `convertUnitCost(cost, fromFactor, toFactor)`, and
+ * `calculateBatchDeductions(requestedQty, requestedFactor, batchFactor)` —
+ * generic "convert between any two arbitrary packaging units" functions.
+ * `calculateBatchDeductions` in particular assumed a ProductBatch could be
+ * tracked in a non-base unit (its own docstring example: "Batch is tracked
+ * in Boxes (factor 24): deduction = 18 / 24 = 0.75 boxes").
  *
- * PERMANENT SPEC ENFORCEMENT NOTE (T3a §5 / schema.prisma BarcodeSource):
- * No function anywhere in this module or the entire codebase may infer
- * or guess `barcodeSource` ("GS1" vs "INTERNAL") from digit length, checksum,
- * or known GS1 prefix patterns. The barcodeSource decision is ALWAYS human
- * and must be confirmed explicitly by the merchant via the mandatory
- * BarcodeSourceModal. Any attempt to automate or infer barcodeSource is
- * strictly forbidden by the Master Technical Specification.
+ * That is exactly the pre-v4.0 design MASTER-SPEC v4.0 explicitly replaced
+ * (Rejected Approach #10): ProductBatch.quantity is now ALWAYS expressed
+ * in the product's single designated base unit — never "boxes," never
+ * whatever unit happened to be on screen. Keeping those three functions
+ * around risked two concrete failures:
+ *   1. A write path (POS/T4c, B2B approval/T5, reconciliation/T3c) could
+ *      call calculateBatchDeductions instead of toBaseUnit() and silently
+ *      compute a deduction against a non-base "batch unit" that, per the
+ *      current schema, no longer exists — reintroducing the accumulated
+ *      rounding-error bug ("21.9984 قطعة" instead of "24 قطعة") v4.0 was
+ *      built specifically to eliminate.
+ *   2. Performing conversionFactor arithmetic outside lib/inventory/
+ *      units.ts violates the project's dedicated ESLint rule (identical
+ *      mechanism to the $queryRaw / nested-write rules) that blocks any
+ *      multiply/divide by a conversionFactor-like value outside that one
+ *      sanctioned file.
+ *
+ * All three functions have been removed from this file. Only
+ * `validatePackagingUnits` (creation/edit-time validation, not a
+ * conversion) remains. Any code that needs an actual base-unit
+ * conversion must import toBaseUnit()/fromBaseUnit()/breakdownForDisplay()
+ * from lib/inventory/units.ts instead.
+ * ============================================================================
  *
  * VALIDATION SCOPE NOTE (confirmed business rules — do not weaken without
- * explicit confirmation, mirroring the caution this same note used to urge
- * in the opposite direction):
+ * explicit confirmation):
  * validatePackagingUnits enforces exactly these packaging-unit rules:
  *   1. At least one unit must be provided.
  *   2. unitName is required (non-empty) — matches the non-nullable schema field.
@@ -30,11 +55,15 @@
  *      sell a quarter- or half-carton at a prorated wholesale price, so
  *      conversionFactor is NEVER restricted to integers.
  *   4. Exactly ONE unit per product must have conversionFactor === 1 — the
- *      designated "base" unit. This is required, not optional: every
- *      conversion function in this module (convertUnitQuantity,
- *      convertUnitCost, calculateBatchDeductions) computes through a common
- *      base reference, and with zero or multiple base units that reference
- *      point becomes ambiguous or undefined.
+ *      base unit. Under T3a §0 (v4.0), this is not a free choice among
+ *      several editable units: the FIRST unit entered at product creation
+ *      automatically becomes the base unit, and the UI locks its
+ *      conversionFactor to 1 without even exposing an editable field for
+ *      it. This validation function is therefore a defensive safety net
+ *      (e.g. catching a bug in a batch-edit or CSV-import path that
+ *      shouldn't be able to produce zero or multiple factor-1 units in
+ *      the first place) rather than the primary mechanism that "chooses"
+ *      the base unit.
  *   5. No two units on the same product may share the same
  *      conversionFactor — a duplicate factor creates ambiguity in FIFO
  *      allocation display and POS/storefront unit pickers (which unit is
@@ -77,100 +106,11 @@ export interface PackagingUnit {
   isActive?: boolean;
 }
 
-function toPositiveDecimal(value: DecimalValue, label: string): DecimalInstance {
-  const d = new Decimal(value);
-  if (d.lte(0)) {
-    throw new Error(`${label} يجب أن يكون رقماً موجباً أكبر من الصفر.`);
-  }
-  return d;
-}
-
-/**
- * Converts a quantity from one packaging unit to another using their conversion factors.
- * All conversion factors are defined relative to a base reference (whichever unit's
- * conversionFactor is smallest / treated as 1 in the merchant's own configuration).
- *
- * Example:
- * 1 Carton = 12 Pieces (carton factor = 12, piece factor = 1)
- * convertUnitQuantity(2, 12, 1) -> 24 (2 cartons = 24 pieces)
- * convertUnitQuantity(24, 1, 12) -> 2 (24 pieces = 2 cartons)
- */
-export function convertUnitQuantity(
-  quantity: DecimalValue,
-  fromConversionFactor: DecimalValue,
-  toConversionFactor: DecimalValue
-): DecimalInstance {
-  const from = toPositiveDecimal(fromConversionFactor, "معامل التحويل المصدر");
-  const to = toPositiveDecimal(toConversionFactor, "معامل التحويل الهدف");
-  const qty = new Decimal(quantity);
-
-  if (qty.isZero()) return new Decimal(0);
-
-  // Convert to the common base quantity first, then to the target unit.
-  const qtyInBase = qty.times(from);
-  return qtyInBase.dividedBy(to);
-}
-
-/**
- * Converts cost or price from one unit to another.
- * If 1 Piece costs $1, 1 Carton (factor 12) equivalent base cost is $12.
- *
- * convertUnitCost(12, 12, 1) -> 1 ($12 per carton = $1 per piece)
- * convertUnitCost(1, 1, 12) -> 12 ($1 per piece = $12 per carton)
- */
-export function convertUnitCost(
-  cost: DecimalValue,
-  fromConversionFactor: DecimalValue,
-  toConversionFactor: DecimalValue
-): DecimalInstance {
-  const from = toPositiveDecimal(fromConversionFactor, "معامل التحويل المصدر");
-  const to = toPositiveDecimal(toConversionFactor, "معامل التحويل الهدف");
-  const c = new Decimal(cost);
-
-  if (c.isZero()) return new Decimal(0);
-
-  const costPerBase = c.dividedBy(from);
-  return costPerBase.times(to);
-}
-
-/**
- * Calculates how many units must be deducted from a batch unit when
- * a sale occurs in a requested packaging unit.
- *
- * Example:
- * Requested: 3 Packs (factor 6) = 18 base items.
- * Batch is tracked in Pieces (factor 1):
- * deduction = 18 pieces.
- * Batch is tracked in Boxes (factor 24):
- * deduction = 18 / 24 = 0.75 boxes.
- */
-export function calculateBatchDeductions(
-  requestedQty: DecimalValue,
-  requestedConversionFactor: DecimalValue,
-  batchConversionFactor: DecimalValue
-): {
-  allocatedInRequestedUnit: DecimalInstance;
-  deductedInBatchUnit: DecimalInstance;
-  quantityInBaseUnit: DecimalInstance;
-} {
-  const qty = toPositiveDecimal(requestedQty, "الكمية المطلوبة");
-  const reqFactor = toPositiveDecimal(requestedConversionFactor, "معامل تحويل الوحدة المطلوبة");
-  const batchFactor = toPositiveDecimal(batchConversionFactor, "معامل تحويل وحدة الدفعة");
-
-  const quantityInBaseUnit = qty.times(reqFactor);
-  const deductedInBatchUnit = quantityInBaseUnit.dividedBy(batchFactor);
-
-  return {
-    allocatedInRequestedUnit: qty,
-    deductedInBatchUnit,
-    quantityInBaseUnit,
-  };
-}
-
 /**
  * Validates packaging unit rules for a product. See the VALIDATION SCOPE
  * NOTE at the top of this file for the full, confirmed rule set and the
- * reasoning behind each rule.
+ * reasoning behind each rule. This function performs no base-unit
+ * conversion arithmetic itself — see lib/inventory/units.ts for that.
  */
 export function validatePackagingUnits(units: PackagingUnit[]): {
   valid: boolean;

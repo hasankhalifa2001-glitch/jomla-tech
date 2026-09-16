@@ -23,6 +23,7 @@ import {
   subtractMoney,
   serializeMoney,
   multiplyMoney,
+  divideMoney,
   sumMoney,
   MoneyError,
 } from "@/lib/utils/money";
@@ -85,6 +86,19 @@ export const dynamic = "force-dynamic";
  * already expects (fifo.ts's commitFifoAllocation takes requestedQty as a
  * plain number by design — see that file) — no other logic in this route
  * needed to change as a result.
+ *
+ * [FIX — DOUBLE-ROUNDING PRECISION BUG] fifo.ts's commitFifoAllocation now
+ * returns allocatedQty/deductQtyInBatchUnit (and remainingQty) as
+ * decimal-serialized STRINGS, not rounded JS numbers — see that file's own
+ * FIX note for the full reasoning. Every place below that previously did
+ * native JS arithmetic on those fields (Number(...), *, /, Math.abs on a
+ * FIFO-derived quantity) now goes through lib/utils/money.ts's decimal.js-
+ * backed helpers instead, so a quantity requiring more precision than a
+ * clean 4-decimal value (e.g. 2 pieces ÷ a 24-piece carton factor) is
+ * rounded to the database column's real 4-decimal limit exactly ONCE, at
+ * the point fifo.ts itself produces it — never re-touched by IEEE-754
+ * float arithmetic on its way into ProductBatch.quantity's decrement or
+ * InvoiceItem.quantity's write.
  */
 
 // ============================================================================
@@ -480,9 +494,7 @@ export async function POST(req: NextRequest) {
           // SYP figures plus the resolved exchangeRateUsed above — never
           // read from inv.totalUSD/paidAmountUSD/debtAmountUSD, which may
           // be null on the payload and are purely informational even
-          // when present (v3.6 currency re-anchoring). This also makes
-          // the old USD-vs-SYP "sanity-only" check moot — there is no
-          // client-supplied USD figure left to sanity-check against.
+          // when present (v3.6 currency re-anchoring).
           const totalUSD = convertCurrency(totalSYP, exchangeRateUsed, "SYP", "USD");
           const paidUSD = convertCurrency(paidSYP, exchangeRateUsed, "SYP", "USD");
           const debtUSD = convertCurrency(debtSYP, exchangeRateUsed, "SYP", "USD");
@@ -660,14 +672,20 @@ export async function POST(req: NextRequest) {
             );
           }
 
+          // [FIX — precision] Both quantity fields are now decimal-
+          // serialized STRINGS, matching fifo.ts's own output type — see
+          // that file's FIX note. Never re-wrapped in Number(...)
+          // anywhere below; every arithmetic operation on them (the
+          // negative-stock conversion fallback) uses lib/utils/money.ts's
+          // decimal.js-backed helpers.
           interface ResolvedAllocation {
             productId: string;
             unitId: string;
             batchId: string;
             unitPriceSYP: string;
             unitPriceUSD: string;
-            allocatedQtyInRequestedUnit: number;
-            deductQtyInBatchUnit: number;
+            allocatedQtyInRequestedUnit: string;
+            deductQtyInBatchUnit: string;
           }
 
           const resolvedAllocations: ResolvedAllocation[] = [];
@@ -708,12 +726,17 @@ export async function POST(req: NextRequest) {
                 batchId: alloc.batchId,
                 unitPriceSYP: serializeMoney(item.unitPriceSYP),
                 unitPriceUSD: itemUnitPriceUSD,
+                // [FIX — precision] alloc.allocatedQty / .deductQtyInBatchUnit
+                // are already decimal-serialized strings from fifo.ts —
+                // passed through directly, never Number()-wrapped.
                 allocatedQtyInRequestedUnit: alloc.allocatedQty,
                 deductQtyInBatchUnit: alloc.deductQtyInBatchUnit,
               });
             }
 
-            if (!resolution.isSufficient && resolution.remainingQty > 0) {
+            // [FIX — precision] resolution.remainingQty is a string now —
+            // compared via compareMoney, never coerced to number first.
+            if (!resolution.isSufficient && compareMoney(resolution.remainingQty, 0) > 0) {
               const last = resolution.allocations[resolution.allocations.length - 1];
 
               const [requestedUnitRecord, batchUnitRecord] = await Promise.all([
@@ -727,10 +750,17 @@ export async function POST(req: NextRequest) {
                 }),
               ]);
 
-              const requestedFactor = Number(requestedUnitRecord?.conversionFactor) || 1;
-              const batchFactor = Number(batchUnitRecord?.conversionFactor) || 1;
-              const remainingInBaseUnits = resolution.remainingQty * requestedFactor;
-              const remainingDeductInBatchUnit = remainingInBaseUnits / batchFactor;
+              // [FIX — precision] Converts the leftover requested-unit
+              // quantity into the last batch's own unit using
+              // lib/utils/money.ts's decimal.js-backed multiplyMoney/
+              // divideMoney — the exact same conversion fifo.ts itself
+              // performs internally, kept in string/Decimal form the
+              // entire way instead of round-tripping through native JS
+              // `*`/`/` on floats.
+              const requestedFactor = requestedUnitRecord?.conversionFactor?.toString() ?? "1";
+              const batchFactor = batchUnitRecord?.conversionFactor?.toString() ?? "1";
+              const remainingInBaseUnits = multiplyMoney(resolution.remainingQty, requestedFactor);
+              const remainingDeductInBatchUnit = divideMoney(remainingInBaseUnits, batchFactor);
 
               resolvedAllocations.push({
                 productId: item.productId,
@@ -773,6 +803,9 @@ export async function POST(req: NextRequest) {
                 productId: alloc.productId,
                 unitId: alloc.unitId,
                 batchId: alloc.batchId,
+                // [FIX — precision] Prisma's Decimal columns accept a
+                // decimal string directly — no native-number conversion
+                // needed or wanted here.
                 quantity: alloc.allocatedQtyInRequestedUnit,
                 unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
@@ -783,6 +816,10 @@ export async function POST(req: NextRequest) {
           for (const alloc of resolvedAllocations) {
             await tx.productBatch.update({
               where: { id: alloc.batchId, tenantId },
+              // [FIX — precision] `decrement` accepts a decimal string
+              // directly — this is the single point the fully-precise
+              // deduction value actually reaches the database, with no
+              // intervening float arithmetic.
               data: { quantity: { decrement: alloc.deductQtyInBatchUnit } },
             });
           }

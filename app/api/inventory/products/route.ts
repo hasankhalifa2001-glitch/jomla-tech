@@ -12,20 +12,21 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { validatePackagingUnits } from "@/lib/inventory/conversions";
+import { validatePackagingUnits } from "@/lib/inventory/packaging-unit-validation";
+// [v4.0] The sole gateway for reading Product.baseUnitId — see
+// lib/inventory/base-unit.ts. requireBaseUnits() is the batch variant,
+// used here for the product list so we don't issue one lookup per
+// product. FAIL-LOUD BY DESIGN: see the comment at its call site below.
+import { requireBaseUnits } from "@/lib/inventory/base-unit";
+// [v4.0] The sole gateway for any conversionFactor arithmetic. Used here
+// only in POST, to convert an initial batch's entered quantity (possibly
+// in a non-base sale unit) into the base unit before it is ever written
+// to ProductBatch.quantity.
+import { toBaseUnit } from "@/lib/inventory/units";
 import { Prisma } from "@prisma/client";
+import Decimal from "decimal.js";
 import { z } from "zod";
 
-// [FIX] Every field below backed by a Prisma Decimal(18,4) column
-// (conversionFactor, priceWholesale, priceRetail, and initialBatch.quantity
-// further down) is now accepted as a validated decimal STRING, never a
-// native JS `number`. Same reasoning as the standalone batch-creation
-// route's `quantity` fix: a JS double cannot exactly represent every value
-// a Decimal(18,4) column can hold, and this project's decimal.js-everywhere
-// rule (T1) exists precisely to keep numbers like these from ever passing
-// through an IEEE-754 float on their way into a Decimal column. Prisma
-// accepts a numeric string directly for a Decimal field and constructs an
-// exact Prisma.Decimal from it with no float in between.
 const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
 
 const positiveDecimalString = (message: string) =>
@@ -43,6 +44,13 @@ const nonNegativeDecimalString = (message: string) =>
 const unitSchema = z
   .object({
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
+    // [v4.0] Still validated generically here (any positive value) — the
+    // UI is what locks the FIRST unit's factor to "1" and hides the field
+    // for it (T3a §0). The backend's guarantee that exactly ONE submitted
+    // unit has conversionFactor === 1 (and that THAT unit becomes
+    // Product.baseUnitId) is enforced below via validatePackagingUnits +
+    // the base-unit designation step in the transaction, not by this
+    // per-field schema rule.
     conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
     priceWholesale: positiveDecimalString("سعر الجملة يجب أن يكون أكبر من صفر"),
@@ -74,9 +82,12 @@ const createProductSchema = z.object({
   units: z.array(unitSchema).min(1, "يجب تقديم وحدة قياس واحدة على الأقل"),
   initialBatch: z
     .object({
+      // [v4.0] This is now "which unit did the admin enter the quantity
+      // in?" — a display/entry convenience only. It is NEVER written
+      // directly as ProductBatch.unitId anymore (see the transaction
+      // below) — that field is always resolved to the base unit.
       unitIndex: z.number().default(0),
       batchNumber: z.string().min(1, "رقم الدفعة مطلوب"),
-      // [FIX] was z.number() — see the file-header note.
       quantity: nonNegativeDecimalString("الكمية يجب أن تكون صفراً أو أكثر"),
       expiryDate: z.string().optional().nullable(),
     })
@@ -87,7 +98,7 @@ const createProductSchema = z.object({
 type ProductUnitRow = {
   id: string;
   unitName: string;
-  conversionFactor: Prisma.Decimal | number;
+  conversionFactor: Prisma.Decimal | number | string;
   pricingCurrency: string;
   priceWholesale: Prisma.Decimal | number;
   priceRetail: Prisma.Decimal | number | null;
@@ -132,6 +143,11 @@ type ProductRow = {
   createdAt: Date;
   units: ProductUnitRow[];
   batches: ProductBatchRow[];
+  // NOTE: baseUnitId IS present on the raw Prisma result (Product's own
+  // scalar field), but per the ESLint rule this file must never read it
+  // directly — see the requireBaseUnits() call below. It's intentionally
+  // left off this type so a future edit can't casually reach for
+  // `product.baseUnitId` here.
 };
 
 export async function GET(req: Request) {
@@ -154,13 +170,9 @@ export async function GET(req: Request) {
     } else if (status === "inactive" || filter === "inactive_products") {
       whereClause.isActive = false;
     }
-    // NOTE (still flagged, unresolved — left as-is pending a product
-    // decision, not a bug fix): unlike an earlier version of this route,
-    // an omitted `status` param no longer defaults to "active" — a bare
-    // GET now returns products regardless of isActive. Whether the
-    // inventory screen's default (no filter selected) should show active
-    // products only or everything is a product decision, not something
-    // this pass changes unilaterally.
+    // NOTE (still flagged, unresolved — unrelated to v4.0): an omitted
+    // `status` param no longer defaults to "active"; left as-is pending a
+    // product decision.
 
     const products = (await db.product.findMany({
       where: whereClause,
@@ -172,52 +184,57 @@ export async function GET(req: Request) {
             adjustments: {
               include: {
                 adjustedByUser: {
-                  select: {
-                    id: true,
-                    name: true,
-                    email: true,
-                  },
+                  select: { id: true, name: true, email: true },
                 },
               },
-              orderBy: {
-                createdAt: "desc",
-              },
+              orderBy: { createdAt: "desc" },
             },
-            _count: {
-              select: {
-                invoiceItems: true,
-                adjustments: true,
-              },
-            },
+            _count: { select: { invoiceItems: true, adjustments: true } },
           },
         },
       },
-      orderBy: {
-        createdAt: "desc",
-      },
+      orderBy: { createdAt: "desc" },
     })) as unknown as ProductRow[];
+
+    // [v4.0] Batch-resolve every listed product's base unit through the
+    // sole sanctioned gateway. THIS CALL IS FAIL-LOUD: it throws
+    // MissingBaseUnitError the moment it hits any product whose
+    // baseUnitId doesn't resolve. If this route starts 500ing right after
+    // deploying v4.0, that almost certainly means there are pre-v4.0
+    // product rows still needing a one-time baseUnitId backfill — that is
+    // the intended signal, not a bug to route around by silently falling
+    // back to the old "guess by conversionFactor === 1" heuristic. Do
+    // NOT wrap this in a try/catch that swallows MissingBaseUnitError and
+    // substitutes a guess.
+    const baseUnitsByProduct = await requireBaseUnits(
+      db,
+      tenantId,
+      products.map((p) => p.id)
+    );
 
     const now = new Date();
 
     const processedProducts = products.map((product) => {
-      const baseUnit = product.units.find((u) => Number(u.conversionFactor) === 1) || product.units[0];
-      const baseFactor = baseUnit ? Number(baseUnit.conversionFactor) : 1;
+      // [v4.0] Product.baseUnitId is the authoritative source now — never
+      // re-derived by scanning units for conversionFactor === 1.
+      const baseUnit = baseUnitsByProduct.get(product.id)!; // guaranteed present — requireBaseUnits already threw otherwise
 
       let totalBaseStock = 0;
       let hasExpiringSoonBatch = false;
       let hasNegativeStockBatch = false;
 
       const processedBatches = product.batches.map((batch) => {
-        const batchUnitFactor = batch.unit ? Number(batch.unit.conversionFactor) : 1;
-        // [NOTE] `batchQty` (a native number) is used ONLY for this route's
-        // own internal, display-oriented arithmetic below (total base
-        // stock, out-of-stock/expiry-badge derivation) — none of which is
-        // itself a value persisted anywhere or fed back into a Decimal
-        // column. It is deliberately kept separate from the `quantity`
-        // field actually returned in the JSON response (see [FIX] below),
-        // which must stay a decimal string all the way to the client.
         const batchQty = Number(batch.quantity);
-        totalBaseStock += batchQty * batchUnitFactor;
+        // [v4.0 — REMOVED conversionFactor arithmetic] Previously:
+        // `totalBaseStock += batchQty * batchUnitFactor`, converting via
+        // the batch's own unit's factor. That's no longer needed OR
+        // permitted here: ProductBatch.quantity is now ALWAYS already
+        // expressed in the base unit (batch.unitId is always the base
+        // unit going forward), so summing batch quantities directly IS
+        // the total base-unit stock — no conversion, no
+        // conversionFactor arithmetic outside lib/inventory/units.ts
+        // (blocked by this project's ESLint rule).
+        totalBaseStock += batchQty;
 
         if (batchQty < 0) {
           hasNegativeStockBatch = true;
@@ -245,20 +262,6 @@ export async function GET(req: Request) {
         return {
           id: batch.id,
           batchNumber: batch.batchNumber,
-          // [FIX — critical, closes the cache-refresh.ts contract gap]
-          // Previously returned `batchQty` (a native `number`, derived via
-          // `Number(batch.quantity)` above). ProductBatch.quantity is a
-          // Decimal(18,4) column — converting it to a JS double here, before
-          // it ever leaves the server, is exactly the precision-loss path
-          // T1's decimal.js-everywhere rule exists to prevent, and directly
-          // contradicts lib/offline/cache-refresh.ts's documented contract
-          // for ServerProductBatch.quantity ("Expected as a decimal string
-          // from the server... never a native JS number"). refreshProductCache()
-          // reads this exact field into `createCachedProductRecord`, so a
-          // `number` here meant the precision was already lost by the time
-          // it reached the offline cache — no downstream fix could recover
-          // it. `.toString()` on the raw Prisma Decimal preserves the exact
-          // stored value with no float round-trip.
           quantity: batch.quantity.toString(),
           unitId: batch.unitId,
           unitName: batch.unit?.unitName || "",
@@ -268,14 +271,6 @@ export async function GET(req: Request) {
           isNegative: batchQty < 0,
           adjustments: (batch.adjustments || []).map((adj) => ({
             id: adj.id,
-            // [FIX] Same reasoning as batch.quantity above —
-            // StockAdjustment.quantityDelta is also Decimal(18,4). This
-            // field isn't part of cache-refresh.ts's ServerProductBatch
-            // contract (adjustment history isn't cached offline), but it's
-            // the same class of precision-sensitive value and is only ever
-            // displayed/summed via lib/utils/money.ts on the client, so it
-            // stays a decimal string here too rather than reintroducing a
-            // float for no reason.
             quantityDelta: adj.quantityDelta.toString(),
             reason: adj.reason,
             adjustedByUserName:
@@ -289,9 +284,30 @@ export async function GET(req: Request) {
         };
       });
 
-      const totalStockInBase = totalBaseStock / baseFactor;
+      // [v4.0] No more epsilon-rounding hack needed: the previous
+      // near-integer noise (e.g. 93.9992 instead of 94) came specifically
+      // from converting through a fractional conversionFactor, which no
+      // longer happens here (see the removed multiplication above). A
+      // light rounding guard is kept only as defensive protection against
+      // ordinary floating-point summation noise across many JS-number
+      // additions — not against unit-conversion remainder.
+      const totalStockInBase =
+        Math.abs(totalBaseStock - Math.round(totalBaseStock)) < 0.0001
+          ? Math.round(totalBaseStock)
+          : totalBaseStock;
+
       const isOutOfStock = totalStockInBase <= 0;
 
+      // [FLAGGED — open question, not resolved here] Under v3.9, a
+      // deactivated NON-base unit could still carry its own batches
+      // (ProductBatch.unitId could be any unit), so this flag made sense.
+      // Under v4.0, ProductBatch.unitId is always the base unit — so for
+      // any NEW batch, this condition can only ever be true if the BASE
+      // unit itself is deactivated (a scenario T3a §4's original spec
+      // text doesn't explicitly address for v4.0). Left functionally
+      // unchanged pending a product decision on whether deactivating the
+      // base unit should even be allowed, and if so what this badge
+      // should say in that case.
       const hasDiscontinuedUnitStock = product.units.some(
         (u) =>
           !u.isActive &&
@@ -305,36 +321,29 @@ export async function GET(req: Request) {
         isPublic: product.isPublic,
         isActive: product.isActive,
         createdAt: product.createdAt,
+        // [v4.0] Surfaced for the UI (base-unit badge, locking the base
+        // unit's factor field in edit screens) — resolved via the trusted
+        // baseUnit above, never via product.baseUnitId directly.
+        baseUnitId: baseUnit.id,
         units: product.units.map((u) => ({
           id: u.id,
           unitName: u.unitName,
-          // [NOTE] conversionFactor stays a `number` here, matching
-          // cache-refresh.ts's ServerProductUnit.conversionFactor contract
-          // (also typed `number`, not `string`) and db.ts's
-          // CachedProductUnit.conversionFactor — this field was never
-          // flagged for the string-decimal treatment the way the monetary
-          // fields below were.
           conversionFactor: Number(u.conversionFactor),
           pricingCurrency: u.pricingCurrency || "SYP",
-          // [FIX — critical, closes the cache-refresh.ts contract gap]
-          // Previously `Number(u.priceWholesale ?? 0)` /
-          // `Number(u.priceRetail)`. Both are Decimal(18,4) columns, and
-          // cache-refresh.ts's ServerProductUnit contract requires both as
-          // decimal strings ("a deliberate contract with
-          // /api/inventory/products: it must serialize every monetary
-          // field with .toString()") — this route was silently violating
-          // that documented contract. `.toString()` on the raw Prisma
-          // Decimal preserves the exact stored value.
           priceWholesale: u.priceWholesale.toString(),
           priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? u.priceRetail.toString() : null,
           barcode: u.barcode,
           barcodeSource: u.barcodeSource,
           imageUrl: u.imageUrl,
           isActive: u.isActive !== false,
+          // [v4.0] Lets the edit UI lock this specific unit's
+          // conversionFactor field to "1" / non-editable once the product
+          // has any batch, per T1's Immutability rule.
+          isBaseUnit: u.id === baseUnit.id,
         })),
         batches: processedBatches,
         totalStockInBase,
-        baseUnitName: baseUnit?.unitName || "قطعة",
+        baseUnitName: baseUnit.unitName,
         hasExpiringSoonBatch,
         hasNegativeStockBatch,
         hasDiscontinuedUnitStock,
@@ -376,10 +385,7 @@ export async function GET(req: Request) {
       filtered = filtered.filter((p) => !p.isActive);
     }
 
-    return NextResponse.json({
-      success: true,
-      products: filtered,
-    });
+    return NextResponse.json({ success: true, products: filtered });
   } catch (error) {
     console.error("Error fetching inventory products:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء جلب المنتجات." }, { status: 500 });
@@ -394,7 +400,6 @@ export async function POST(req: Request) {
     }
 
     assertRolePermission(session.user.role, "inventory:mutate");
-
     await assertTenantWritable(session.user.tenantId);
 
     const tenantId = session.user.tenantId;
@@ -417,24 +422,16 @@ export async function POST(req: Request) {
     const packagingCheck = validatePackagingUnits(units);
     if (!packagingCheck.valid) {
       return NextResponse.json(
-        {
-          error: "INVALID_PACKAGING_UNITS",
-          message: packagingCheck.error,
-        },
+        { error: "INVALID_PACKAGING_UNITS", message: packagingCheck.error },
         { status: 400 }
       );
     }
 
-    // PUBLISHING GATE: delegates to the single shared implementation in
-    // lib/inventory/publishing-gate.ts.
     if (isPublic) {
       const gateCheck = checkProductPublishable({ isActive: true, units });
       if (!gateCheck.publishable) {
         return NextResponse.json(
-          {
-            error: "PUBLISH_GATE_BLOCKED",
-            message: gateCheck.reason,
-          },
+          { error: "PUBLISH_GATE_BLOCKED", message: gateCheck.reason },
           { status: 400 }
         );
       }
@@ -453,15 +450,8 @@ export async function POST(req: Request) {
 
     for (const barcode of incomingBarcodes) {
       const existingBarcode = await db.productUnit.findUnique({
-        where: {
-          tenantId_barcode: {
-            tenantId,
-            barcode,
-          },
-        },
-        include: {
-          product: { select: { name: true } },
-        },
+        where: { tenantId_barcode: { tenantId, barcode } },
+        include: { product: { select: { name: true } } },
       });
       if (existingBarcode) {
         const statusText = existingBarcode.isActive ? "نشطة" : "متوقفة";
@@ -476,6 +466,8 @@ export async function POST(req: Request) {
     }
 
     const createdProduct = await db.$transaction(async (tx) => {
+      // [v4.0] Write 1 of 3 in the product-creation transaction (see T1's
+      // Unit Conversion Architecture, "Product creation atomicity").
       const product = await tx.product.create({
         data: {
           tenantId,
@@ -488,15 +480,13 @@ export async function POST(req: Request) {
       const unitIds: string[] = [];
       const createdUnits: ProductUnitRow[] = [];
       for (const u of units) {
+        // [v4.0] Write 2 of 3 (for each unit; exactly one of these will
+        // have conversionFactor === 1, per validatePackagingUnits above).
         const createdUnit = await tx.productUnit.create({
           data: {
             tenantId,
             productId: product.id,
             unitName: u.unitName,
-            // [FIX] These four fields are now validated decimal strings
-            // (see unitSchema above) — Prisma parses each directly into an
-            // exact Decimal(18,4). No `Number(...)` conversion happens
-            // anywhere on this write path.
             conversionFactor: u.conversionFactor,
             pricingCurrency: u.pricingCurrency || "SYP",
             priceWholesale: u.priceWholesale,
@@ -510,28 +500,6 @@ export async function POST(req: Request) {
         unitIds.push(createdUnit.id);
         createdUnits.push(createdUnit as unknown as ProductUnitRow);
 
-        // [FIX — closes a real cross-tenant race condition] ProductCatalogEntry
-        // is a platform-wide (not tenant-scoped) table, and two entirely
-        // unrelated tenants creating a product under the same real GS1
-        // barcode at close to the same moment is an explicitly legitimate
-        // case per schema.prisma's own note on ProductUnit.barcode
-        // ("two different tenants can legitimately sell the same imported
-        // item under the same barcode"). The previous
-        // findUnique-then-create pattern had a TOCTOU race: both
-        // transactions could see `existingCatalog === null`, then both
-        // attempt `create`, and the loser would hit the table's `@unique`
-        // constraint on `barcode` with a raw Prisma P2002 — which the
-        // outer catch block below was written to interpret as "this
-        // TENANT tried to reuse a barcode," failing the entire product
-        // creation for a tenant who did nothing wrong. A P2002 on THIS
-        // specific insert means only "another tenant's request won the
-        // race to create the shared catalog convenience entry a moment
-        // earlier" — an entirely expected, harmless outcome per this
-        // table's own "never read again after creation, one-time
-        // convenience" design (see schema.prisma's ProductCatalogEntry
-        // note) — never a real conflict for the current tenant's own
-        // product. It is caught and swallowed right here, not allowed to
-        // propagate to the transaction's outer catch.
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
           const barcodeTrim = u.barcode.trim();
           try {
@@ -549,35 +517,58 @@ export async function POST(req: Request) {
               catalogError instanceof Prisma.PrismaClientKnownRequestError &&
               catalogError.code === "P2002";
             if (!isBenignRace) {
-              // Anything other than the specific race above is a real,
-              // unexpected failure — let it propagate and abort the
-              // transaction normally.
               throw catalogError;
             }
-            // Otherwise: another tenant's request already created this
-            // exact catalog entry a moment earlier. Nothing to do — this
-            // tenant's own Product/ProductUnit creation proceeds
-            // completely unaffected.
           }
         }
       }
 
+      // [v4.0] Identify the base unit: validatePackagingUnits already
+      // guaranteed exactly one submitted unit has conversionFactor === 1
+      // before this transaction ever started.
+      const baseUnitRow = createdUnits.find((u) =>
+        new Decimal(u.conversionFactor).equals(1)
+      );
+      if (!baseUnitRow) {
+        // Structurally unreachable — validatePackagingUnits already
+        // rejected the request otherwise. Never proceed with a null
+        // baseUnitId if this somehow happens.
+        throw new Error("لم يتم العثور على الوحدة الأساسية (معامل تحويل = 1) بعد الإنشاء.");
+      }
+
+      // [v4.0] Write 3 of 3 — designate the base unit. A required
+      // top-level call (T1's nested-write rule), never nested inside the
+      // product.create() call above.
+      await tx.product.update({
+        where: { id: product.id },
+        data: { baseUnitId: baseUnitRow.id },
+      });
+
       if (initialBatch) {
-        const selectedUnitId = unitIds[initialBatch.unitIndex] ?? unitIds[0];
+        // [v4.0] ProductBatch.unitId is ALWAYS the base unit — never the
+        // unit the admin picked via `initialBatch.unitIndex` (that's an
+        // ENTRY convenience only: the admin may still type "10 packs").
+        // The entered quantity is converted to the base unit via
+        // toBaseUnit(), using the ENTERED unit's own conversionFactor —
+        // never the base unit's (which is always 1 and would apply no
+        // conversion at all) — exactly once, here, before it ever reaches
+        // ProductBatch.quantity.
+        const enteredUnit = createdUnits[initialBatch.unitIndex] ?? createdUnits[0];
+        const baseQuantity = toBaseUnit(initialBatch.quantity, enteredUnit.conversionFactor);
+
         await tx.productBatch.create({
           data: {
             tenantId,
             productId: product.id,
-            unitId: selectedUnitId,
+            unitId: baseUnitRow.id,
             batchNumber: initialBatch.batchNumber,
-            // [FIX] validated decimal string — see createProductSchema above.
-            quantity: initialBatch.quantity,
+            quantity: baseQuantity.toString(),
             expiryDate: initialBatch.expiryDate ? new Date(initialBatch.expiryDate) : null,
           },
         });
       }
 
-      return { ...product, units: createdUnits };
+      return { ...product, units: createdUnits, baseUnitId: baseUnitRow.id };
     });
 
     const responseProduct = {
@@ -603,11 +594,6 @@ export async function POST(req: Request) {
       return subscriptionLockedResponse(error);
     }
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      // With the ProductCatalogEntry race now caught and swallowed inside
-      // the transaction above, a P2002 reaching this outer catch can only
-      // come from this tenant's OWN unique constraints (e.g.
-      // ProductUnit's (tenantId, barcode) unique) — the case this message
-      // was originally written for.
       return NextResponse.json(
         { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لمنتج آخر." },
         { status: 400 }

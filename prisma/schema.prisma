@@ -8,6 +8,43 @@ datasource db {
 }
 
 // ============================================================================
+// [v4.0] UNIT ARCHITECTURE FIX — BASE-UNIT MODEL (see UNIT-ARCHITECTURE.md
+// for the full narrative). Replaces the v3.x design where ProductBatch.unitId
+// could point at ANY ProductUnit (طرد, قطعة, كرتونة...) and every read/write
+// path had to convert quantities back and forth between whichever units
+// happened to be involved, using native JS math. That repeated conversion
+// accumulated floating-point error (e.g. "21.9984 قطعة" instead of "24
+// قطعة" for a single طرد) and had no single source of truth for "how much
+// physical stock actually exists."
+//
+// THE FIX: every Product now has exactly ONE physical base unit
+// (Product.baseUnitId). ProductBatch.quantity is ALWAYS expressed in that
+// base unit — never in "طرد", never in whatever unit the merchant happened
+// to be typing into at that moment. Every other ProductUnit for that
+// product (طرد, كرتونة, etc.) is a pure PRESENTATION/SALE convenience: its
+// conversionFactor states "how many base units equal ONE of this unit."
+// Conversion into/out of the base unit happens exactly once, at the moment
+// of sale/adjustment/report — never chained, never stored as an
+// intermediate value, and never computed with a native JS number. See
+// lib/inventory/units.ts (documented in UNIT-ARCHITECTURE.md) — the single
+// sanctioned place in the codebase allowed to call conversionFactor.
+//
+// [v4.0, corrected] IMPORTANT: requireBaseUnit() (lib/inventory/base-unit.ts)
+// resolves the BASE unit only (conversionFactor always 1). It is NEVER the
+// source of the conversion factor used to convert a sold/ordered quantity
+// into base units — that factor always comes from the actually-sold/ordered
+// ProductUnit row itself (looked up via its own unitId, e.g. on InvoiceItem
+// or B2BOrderRequestItem). requireBaseUnit()'s only job in a write path is
+// telling the caller which unitId every ProductBatch is scoped under, for
+// locking/FIFO purposes. See T4c/T5 in the spec for the corrected write-path
+// description.
+//
+// Also new in this revision: BaseUnitChangeLog (see below, near
+// StockAdjustment/BatchDeletionLog) — the append-only audit trail for the
+// rare, zero-batch-only correction of a product's designated base unit.
+// ============================================================================
+
+// ============================================================================
 // v3.4 TENANT ISOLATION NOTE (see lib/db/tenant-scope.ts, not represented in
 // this file since Prisma has no schema-level construct for it):
 //
@@ -29,168 +66,25 @@ datasource db {
 // that one file. CI fails the build on violation.
 //
 // [v3.4] NESTED WRITES — PROJECT-WIDE RULE, NOT JUST T4:
-// The Client Extension intercepts direct model.method calls
-// (prisma.invoice.create(...)) but does NOT intercept nested writes buried
-// inside another model's `data` (e.g. `prisma.invoice.create({ data: {
-// items: { create: [...] } } })`). A nested create/update/upsert/set/
-// disconnect targeting a tenant-scoped model bypasses the extension's
-// injection entirely — if tenantId is required-with-no-default on that
-// model (as it is on InvoiceItem, ProductUnit, ProductBatch, etc.), this
-// either throws, or — worse — silently succeeds if a caller supplied their
-// own tenantId from an untrusted payload.
+// NO nested create/update/upsert/set/disconnect targeting a tenant-scoped
+// model, anywhere in the codebase. Every write to a tenant-scoped model is
+// its own top-level prisma.model.<method>(...) call, issued inside the same
+// $transaction as any related writes it must stay atomic with. Enforced via
+// an ESLint rule; CI fails the build on violation.
 //
-// This is NOT scoped to T4 specifically: any future write path (T5's B2B
-// order intake, T6's subscription billing) is equally exposed the moment
-// it uses a nested write on a tenant-scoped model. The rule therefore lives
-// here, next to the raw-query rule, not in any single task's spec:
-//   NO nested create/update/upsert/set/disconnect targeting a tenant-scoped
-//   model, anywhere in the codebase. Every write to a tenant-scoped model
-//   is its own top-level prisma.model.<method>(...) call, issued inside the
-//   same $transaction as any related writes it must stay atomic with.
-// Enforced the same way as the raw-query rule: an ESLint rule flags nested
-// `create`/`update`/`upsert`/`set`/`disconnect` keys inside another tenant-
-// scoped model's `data`/`include` object, and CI fails the build on
-// violation. T4c's existing design (Invoice + InvoiceItem written as
-// separate top-level calls inside one $transaction) already follows this
-// rule — it should be the template every later task copies, not a T4-only
-// pattern. [v3.7] B2BOrderRequest's approval flow (below) follows the exact
-// same template: approving an order writes Invoice + InvoiceItem(s) +
-// (if applicable) a new Customer, each as its own top-level call inside one
-// $transaction, then a final top-level update on B2BOrderRequest itself
-// setting resultingInvoiceId/status — never a nested write chained off any
-// of those creates. [v3.9] T3c's stock reconciliation (the ProductBatch
-// quantity update plus the new StockAdjustment row) and batch deletion (the
-// ProductBatch delete plus the new BatchDeletionLog row) follow the exact
-// same template.
-//
-// PHASE 2 (hardening, before scaling past the pilot merchant set): real
-// Postgres RLS. Requires, per tenant-scoped table below:
-//   ALTER TABLE "<Table>" ENABLE ROW LEVEL SECURITY;
-//   ALTER TABLE "<Table>" FORCE ROW LEVEL SECURITY;  -- ENABLE alone exempts
-//                                                     -- the table owner.
-//   CREATE POLICY tenant_isolation ON "<Table>"
-//     USING (tenant_id = current_setting('app.tenant_id')::text);
-// PLUS: the application's DB connection must use a role that is NOT the
-// table owner (the migration role typically is the owner, and owners bypass
-// RLS regardless of FORCE). PLUS: every DB call — reads included — must run
-// inside a `tenantTransaction(tenantId, cb)` wrapper that issues
-// `SET LOCAL app.tenant_id = $1` first (safe with pgbouncer transaction-mode
-// pooling; SET LOCAL is scoped to transaction lifetime, no cross-transaction
-// leak). These policies are hand-written raw SQL migrations, NOT expressible
-// in this schema.prisma file — `prisma db push` will silently skip them, so
-// an automated cross-tenant integration test suite (T7) is the compensating
-// control, not code review alone. [v3.4] That T7 suite must cover nested-
-// write bypass attempts specifically, not just direct-query isolation.
-// [v3.7] B2BOrderRequest and B2BOrderRequestItem are tenant-scoped models
-// like any other and must be included in that T7 suite and in the Phase 2
-// RLS rollout — they carry no special exemption. [v3.9] StockAdjustment and
-// BatchDeletionLog carry no special exemption either.
+// PHASE 2 (hardening): real Postgres RLS — see prior revisions for the full
+// rollout plan (ENABLE/FORCE ROW LEVEL SECURITY, a non-owner runtime DB
+// role, tenantTransaction() issuing SET LOCAL app.tenant_id, hand-written
+// migration policies, T7's cross-tenant test suite as compensating control).
 // ============================================================================
 
 // ============================================================================
-// [v3.6] CURRENCY RE-ANCHORING NOTE — reverses the v3.0 USD-anchor decision.
-//
-// Through v3.5, USD was the authoritative currency for every financial
-// record (Invoice.totalUSD/paidAmountUSD/debtAmountUSD, CustomerPayment.
-// amountUSD) — SYP was tracked alongside purely as a courtesy display
-// conversion, frozen per-transaction via exchangeRateUsed/exchangeRate. The
-// stated reason was inflation-hedging: a USD-denominated debt holds its
-// value regardless of what happens to the Lira between the sale and
-// repayment.
-//
-// As of v3.6, that's reversed: SYP is now the authoritative currency for
-// every financial record below. USD is retained on every model purely as a
-// derived, informational figure (still computed via the same frozen
-// exchangeRateUsed/exchangeRate, just no longer load-bearing). This is a
-// deliberate trade-off, not an oversight — a SYP-denominated debt can lose
-// real value to inflation between sale and repayment, same risk the v3.0
-// design existed to avoid. It was made because this platform serves one
-// market (Syria) whose merchants think, price, and settle in Lira day to
-// day, and forcing USD-primary bookkeeping fought that reality rather than
-// serving it.
-//
-// Concretely, this means:
-//   - Invoice.totalSYP / paidAmountSYP / debtAmountSYP are the fields every
-//     validation, ledger balance, and business rule reads and writes
-//     first. totalUSD / paidAmountUSD / debtAmountUSD are derived
-//     (SYP ÷ exchangeRateUsed) and shown for merchant reference only —
-//     never validated against, never gate any action.
-//   - CustomerPayment.amountSYP is authoritative; amountUSD is derived the
-//     same way via exchangeRate.
-//   - InvoiceItem.unitPriceSYP is authoritative; unitPriceUSD is derived.
-//   - Subscription.amountUSD is UNCHANGED and intentionally stays USD —
-//     that's the platform's own SaaS revenue from the merchant, a separate
-//     business decision from how a merchant tracks their own customers'
-//     debt.
-//   - No `settlementCurrency`-style per-tenant configurability was
-//     introduced (that flexible approach was considered and rejected back
-//     in v3.4 for unrelated reasons). This re-anchoring is uniform and
-//     unconditional across every tenant, since the platform targets one
-//     market rather than needing per-tenant currency choice.
-// ============================================================================
-
-// ============================================================================
-// [v3.7] FOUR GAPS CLOSED IN THIS REVISION (see accompanying notes at each
-// model below for the full reasoning):
-//   1. B2BOrderRequest / B2BOrderRequestItem — a B2B storefront submission
-//      (T5) has no User session and no committed stock allocation yet, so it
-//      cannot be represented as an Invoice/InvoiceItem row (both fields are
-//      required-non-null there). A dedicated pre-invoice holding model closes
-//      this without weakening Invoice's existing guarantees.
-//   2. CustomerMergeLog — T4e requires the customer-merge action to be
-//      logged for audit purposes; no model previously captured that.
-//   3. Subscription.tier / Subscription.referenceCode — T6 requires tier
-//      selection and a unique payment reference code; neither field existed.
-//   4. ProductUnit.isActive — T3 needs a way to retire a single packaging
-//      unit without hard-deleting it (which would collide with the
-//      ProductBatch Restrict/Cascade interaction, the same class of problem
-//      already documented for Tenant/Customer above).
-// ============================================================================
-
-// ============================================================================
-// [v3.8] THREE GAPS CLOSED IN THIS REVISION:
-//   1. Double-approval race condition on B2BOrderRequest. Nothing previously
-//      stopped two concurrent approval attempts on the SAME still-pending
-//      order (a double-click, two open tabs, a retried request) from both
-//      reading status = PENDING_REVIEW, both running resolveFifoAllocation,
-//      and both writing a real Invoice — decrementing ProductBatch.quantity
-//      TWICE for one order. resultingInvoiceId's @unique constraint only
-//      catches this at the very last step (linking the SECOND invoice back
-//      to the order), by which point the double stock deduction and the
-//      orphaned extra Invoice have already happened. FIX (application-layer,
-//      no schema change needed): the approval handler's FIRST write, inside
-//      the same $transaction as everything else, must be a conditional
-//      update — `UPDATE "B2BOrderRequest" SET status = 'APPROVED' WHERE id =
-//      $1 AND status = 'PENDING_REVIEW'` — and the handler must check that
-//      exactly one row was affected before proceeding to resolveFifoAllocation
-//      or any Invoice/InvoiceItem write. Zero rows affected means another
-//      request already claimed this order; abort immediately with no side
-//      effects. This mirrors the void-of-void prohibition's own combination
-//      of a DB-level constraint (resultingInvoiceId's @unique) plus an
-//      explicit application-level guard that catches the problem BEFORE the
-//      unique constraint would, not instead of it. See T5 and T7.
-//   2. CustomerMergeLog.mergedCustomerId lacked a uniqueness guarantee — see
-//      the model below.
-//   3. B2B order approval's payment fields were previously undocumented. See
-//      the Invoice model note below for the resolved decision.
-// ============================================================================
-
-// ============================================================================
-// [v3.9] TWO GAPS CLOSED IN THIS REVISION (T3c — see the two new models
-// below for full reasoning):
-//   1. StockAdjustment — the sole append-only correction path for a
-//      ProductBatch's quantity once any invoice has ever drawn from it (or,
-//      in practice, once it exists at all — direct field writes to
-//      ProductBatch.quantity are never permitted anywhere in this system).
-//      Pairs with an atomic Prisma `increment` update on ProductBatch.
-//      quantity, never a read-then-write, to stay race-safe against T4c's
-//      sync engine and T5's B2B approval decrementing the same row
-//      concurrently.
-//   2. BatchDeletionLog — the audit trail for the one narrow case where a
-//      hard DELETE of a ProductBatch row is actually permitted: a batch
-//      with zero InvoiceItem references. Snapshot fields only, deliberately
-//      NOT live foreign keys back to the batch being deleted — see the
-//      model's own note for why a real FK here would be self-defeating.
+// [v3.6] CURRENCY RE-ANCHORING NOTE: SYP is authoritative for every merchant-
+// facing financial record (Invoice.totalSYP/paidAmountSYP/debtAmountSYP,
+// CustomerPayment.amountSYP, InvoiceItem.unitPriceSYP). USD counterparts are
+// derived/informational only, computed via the frozen exchangeRateUsed/
+// exchangeRate — never validated against, never gate any action. The one
+// exception is Subscription.amountUSD (the platform's own SaaS revenue).
 // ============================================================================
 
 enum UserRole {
@@ -198,10 +92,6 @@ enum UserRole {
   CASHIER
 }
 
-// A void/refund is never an edit to the original invoice (that would break
-// the append-only guarantee everything else here relies on). Instead it's
-// a new Invoice row that references the one it reverses — see
-// `voidsInvoiceId` below. VOIDED marks that new row itself.
 enum InvoiceStatus {
   COMPLETED
   PENDING_REVIEW
@@ -220,10 +110,6 @@ enum SubscriptionRecordStatus {
   EXPIRED
 }
 
-// The platform SOW names Sham Cash, Syriatel Cash, and Office Transfer as
-// the three real payment rails merchants use — all three must be
-// distinguishable in reporting, never collapsed into a free-text field or
-// silently bucketed under OTHER.
 enum PaymentMethod {
   CASH
   SHAM_CASH
@@ -232,73 +118,28 @@ enum PaymentMethod {
   OTHER
 }
 
-// v3.1 ADDITION (amendment #1+#2 — sticky manual pricing).
-// A ProductUnit's real price is a number the merchant sets by hand, in
-// whichever currency they think in for that specific item — never derived
-// automatically from Tenant.dailyExchangeRate. Two different products can
-// sit in two different currencies at the same time (e.g. rice priced in
-// SYP, sugar priced in USD) with zero coupling between them. Changing the
-// exchange rate in T2's top bar must NEVER move this number; the top bar
-// rate is only used (a) for display of the *other* currency as a courtesy
-// conversion, and (b) frozen per-sale into Invoice.exchangeRateUsed so the
-// debt ledger keeps working exactly as originally designed.
-//
-// [v3.6] Note this enum's default was already SYP before the currency
-// re-anchoring above — most products already flowed through this pipeline
-// correctly. The re-anchoring mainly changes how a USD-priced unit's sale
-// gets recorded (converted INTO SYP for the authoritative fields), the
-// reverse of the old direction.
 enum PricingCurrency {
   USD
   SYP
 }
 
-// v3.1 ADDITION (amendment #6 — real GS1 barcodes vs internally generated
-// ones). Syria is registered with GS1 under prefix 621, so any barcode
-// starting with it is a real, shareable identifier. A product with no
-// printed barcode gets one generated in the 20–29 prefix range, which GS1
-// reserves specifically for internal/restricted use — that generated code
-// must never be pushed into the shared ProductCatalogEntry table, since
-// two unrelated tenants' internally generated codes can collide.
 enum BarcodeSource {
   GS1
   INTERNAL
 }
 
-// v3.1 ADDITION (amendment #5 — shared catalog correction flow).
-// A report against a ProductCatalogEntry never edits it directly (see the
-// ownership note on ProductCatalogEntry below) — it queues a suggested
-// correction for a human (platform super-admin) to apply or dismiss.
 enum ReportStatus {
   PENDING
   RESOLVED
   DISMISSED
 }
 
-// [v3.7] ADDITION — see the B2BOrderRequest note below for the full
-// reasoning. Deliberately mirrors InvoiceStatus's PENDING_REVIEW naming for
-// conceptual continuity, but is its own enum: a B2BOrderRequest never
-// reaches COMPLETED or VOIDED itself — once APPROVED it hands off to a real
-// Invoice row, which then carries its own independent lifecycle.
 enum B2BOrderStatus {
   PENDING_REVIEW
   APPROVED
   REJECTED
 }
 
-// [v3.5] LIFECYCLE NOTE: Tenant rows are never hard-deleted anywhere in this
-// system — subscriptionStatus (ACTIVE | EXPIRED | PENDING) plus expiresAt is
-// the sole lockout mechanism (T2/T6), and no API route, admin action, or
-// scheduled job in this spec issues a real DELETE against a Tenant row. This
-// matters specifically because of the Cascade/Restrict interaction below:
-// Customer.tenant cascades (deleting a Tenant would delete all its Customers,
-// including its own system-generated one), while Tenant.systemCustomer is
-// Restrict (a Customer wired up as a system customer can't be deleted while
-// referenced). If a real hard-delete path is ever introduced, revisit
-// Customer.tenant's onDelete — Cascade may attempt to delete the very
-// Customer row Restrict is protecting, in the same operation, which is at
-// minimum undefined-feeling behavior worth testing explicitly before relying
-// on it.
 model Tenant {
   id                 String                   @id @default(cuid())
   name               String
@@ -311,36 +152,22 @@ model Tenant {
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
 
-  users             User[]
-  products          Product[]
-  productUnits      ProductUnit[]
-  productBatches    ProductBatch[]
-  customers         Customer[]
-  invoices          Invoice[]
-  invoiceItems      InvoiceItem[]
-  customerPayments  CustomerPayment[]
-  subscriptions     Subscription[]
-  // [v3.7] ADDITION — see B2BOrderRequest / CustomerMergeLog notes below.
-  b2bOrderRequests  B2BOrderRequest[]
-  customerMergeLogs CustomerMergeLog[]
-  // [v3.9] ADDITION — see StockAdjustment / BatchDeletionLog notes below.
-  stockAdjustments  StockAdjustment[]
-  batchDeletionLogs BatchDeletionLog[]
+  users              User[]
+  products           Product[]
+  productUnits       ProductUnit[]
+  productBatches     ProductBatch[]
+  customers          Customer[]
+  invoices           Invoice[]
+  invoiceItems       InvoiceItem[]
+  customerPayments   CustomerPayment[]
+  subscriptions      Subscription[]
+  b2bOrderRequests   B2BOrderRequest[]
+  customerMergeLogs  CustomerMergeLog[]
+  stockAdjustments   StockAdjustment[]
+  batchDeletionLogs  BatchDeletionLog[]
+  // [v4.0]
+  baseUnitChangeLogs BaseUnitChangeLog[]
 
-  // [v3.3, corrected] The tenant's single "Walk-in Cash Customer," seeded
-  // at onboarding (T2). A plain 1:1 relation via a nullable scalar FK is
-  // what actually enforces "at most one system customer per tenant" — a
-  // single field can only ever hold one value, so the invariant is
-  // structural, not a constraint that can be misapplied. An earlier draft
-  // considered `@@unique([tenantId, isSystemGenerated])` on Customer
-  // instead; that was wrong (isSystemGenerated is a two-valued boolean,
-  // so it would have also capped every tenant at exactly ONE real
-  // customer with isSystemGenerated = false, breaking the model for
-  // every wholesaler who needs many real customers). This relation
-  // replaces that idea entirely — Customer.isSystemGenerated remains only
-  // as a fast filter flag, carrying no uniqueness enforcement itself.
-  // @unique here additionally prevents the same Customer row from ever
-  // being wired up as the system customer for more than one Tenant.
   systemCustomerId     String?               @unique
   systemCustomer       Customer?             @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
   b2bOrderRequestItems B2BOrderRequestItem[]
@@ -354,9 +181,6 @@ model User {
   passwordHash    String
   role            UserRole
   isPlatformAdmin Boolean  @default(false)
-  // Soft-delete flag. A departing cashier/admin gets deactivated, never
-  // hard-deleted — see the Restrict note on Invoice.user below for why a
-  // real DELETE on this row must never be allowed to succeed anyway.
   isActive        Boolean  @default(true)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
@@ -364,43 +188,79 @@ model User {
   tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
 
-  // [v3.7] ADDITION — the admin who approved/rejected a B2B order request,
-  // and the admin who performed a customer merge. Restrict, same reasoning
-  // as Invoice.user: deactivating a User must never silently erase which
-  // admin took a given action.
   reviewedB2BOrderRequests B2BOrderRequest[]
   customerMergeLogs        CustomerMergeLog[]
-
-  // [v3.9] ADDITION — the admin who performed a stock reconciliation
-  // (StockAdjustment.adjustedByUser) or a zero-history batch hard-delete
-  // (BatchDeletionLog.deletedByUser). Both Restrict, same reasoning as
-  // every other "who did this financial/audit action" relation above:
-  // deactivating a User must never silently erase which admin acted.
-  stockAdjustments  StockAdjustment[]
-  batchDeletionLogs BatchDeletionLog[]
+  stockAdjustments         StockAdjustment[]
+  batchDeletionLogs        BatchDeletionLog[]
+  // [v4.0]
+  baseUnitChangeLogs       BaseUnitChangeLog[]
 
   @@index([tenantId])
 }
 
 model Product {
-  id        String   @id @default(cuid())
-  tenantId  String
-  name      String
-  category  String?
-  isPublic  Boolean  @default(false)
-  // Soft-delete flag, same reasoning as User.isActive — a discontinued
-  // product's historical InvoiceItems must stay intact.
-  isActive  Boolean  @default(true)
+  id       String  @id @default(cuid())
+  tenantId String
+  name     String
+  category String?
+  isPublic Boolean @default(false)
+  isActive Boolean @default(true)
+
+  // [v4.0] ADDITION — the structural guarantee of "exactly one physical
+  // base unit per product." Every ProductBatch.quantity for this product is
+  // expressed in this unit and this unit alone. @unique because a
+  // ProductUnit can be the base unit of at most one Product (mirrors the
+  // Tenant.systemCustomerId pattern used elsewhere in this schema for the
+  // exact same "structural, not just conventional, one-to-one" reason).
+  //
+  // TYPE-LEVEL HONESTY, NOT A LOOPHOLE: this field is String? because
+  // Prisma has no way to express "non-null after row creation" — but that
+  // does NOT mean application code is free to treat it as usually-present.
+  // Product.create() and Product.update({ baseUnitId }) both happen inside
+  // ONE $transaction (see lib/inventory/product-create.ts) — a concurrent
+  // reader outside that transaction never observes a committed Product row
+  // with baseUnitId still null; a crash mid-transaction rolls back the
+  // whole thing, leaving no row at all rather than a half-built one (same
+  // pattern as T2a's four-write onboarding transaction). The ONLY place
+  // permitted to read `.baseUnitId` / `.baseUnit` directly off a Prisma
+  // result is lib/inventory/base-unit.ts's requireBaseUnit() — every other
+  // call site (POS, inventory screen, sync, B2B approval, CSV import) goes
+  // through that function, which returns a non-null ProductUnit or throws
+  // MissingBaseUnitError loud and immediately. This mirrors T1's own
+  // tenantScopedRawQuery() pattern: the schema stays honest about what CAN
+  // happen (a bug), while exactly one guarded chokepoint is what the rest
+  // of the codebase is allowed to trust. An ESLint rule (identical
+  // mechanism to the $queryRaw and nested-write rules) blocks any direct
+  // `.baseUnitId` / `.baseUnit` property access outside that one file; CI
+  // fails the build on violation. See UNIT-ARCHITECTURE.md §9 for the
+  // full guard code and required tests.
+  //
+  // [v4.0, corrected] requireBaseUnit() never supplies a conversionFactor
+  // for anything other than the base unit itself (always 1). Converting a
+  // sold/ordered quantity into base units always uses that sold/ordered
+  // unit's OWN conversionFactor, fetched via its own unitId — see
+  // InvoiceItem.unitId / B2BOrderRequestItem.unitId below.
+  baseUnitId String? @unique
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  units                ProductUnit[]
+  tenant   Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Restrict: a base unit can never be silently detached by a cascading
+  // delete — a Product with any batch history depends on this relation to
+  // know what physical unit its stock is even counted in. Changing which
+  // unit is the base unit after creation is not supported for a product
+  // with any ProductBatch (see UNIT-ARCHITECTURE.md, "Why the base unit is
+  // immutable"); for a zero-batch product, a correction is possible but
+  // must write a BaseUnitChangeLog row (see below).
+  baseUnit ProductUnit? @relation("ProductBaseUnit", fields: [baseUnitId], references: [id], onDelete: Restrict)
+
+  units                ProductUnit[]         @relation("ProductUnits")
   batches              ProductBatch[]
   invoiceItems         InvoiceItem[]
-  // [v3.7] ADDITION — see B2BOrderRequestItem below. Restrict on that side,
-  // so this array is purely informational/navigational here.
   b2bOrderRequestItems B2BOrderRequestItem[]
+  // [v4.0]
+  baseUnitChangeLogs   BaseUnitChangeLog[]
 
   @@index([tenantId])
   @@index([tenantId, isPublic])
@@ -408,166 +268,92 @@ model Product {
 
 model ProductUnit {
   id        String @id @default(cuid())
-  // Denormalized from Product so this table is directly reachable by
-  // tenantId — needed both for RLS to apply to it directly (see the v3.4
-  // Tenant Isolation note at the top of this file for what actually
-  // enforces that today vs. what's planned) and to scope barcode
-  // uniqueness per tenant below.
   tenantId  String
   productId String
   unitName  String
 
+  // [v4.0] REDEFINED (was: "conversion factor relative to some other unit
+  // of the same product, meaning implicit and inconsistent"). Now has one
+  // fixed, explicit meaning for every ProductUnit in the system:
+  //   "How many of this product's BASE UNIT equal exactly ONE of this
+  //    ProductUnit?"
+  // The base unit's own row is FORCED to conversionFactor = 1 at creation
+  // and can never be edited afterward (enforced at the application layer;
+  // see UNIT-ARCHITECTURE.md). Example: base unit = "قطعة" (1); "طرد" = 24
+  // means one طرد equals 24 قطعة. This is the ONLY conversion arithmetic
+  // permitted anywhere in the codebase — see lib/inventory/units.ts.
+  //
+  // [v4.0, corrected] When converting a sale/order line into base units,
+  // ALWAYS use THIS row's own conversionFactor (the unit actually sold in),
+  // never the base unit's (which is always 1 and would apply no conversion
+  // at all). requireBaseUnit() is not involved in this arithmetic.
   conversionFactor Decimal @db.Decimal(18, 4)
 
-  // --- v3.1 PRICING MODEL (amendments #1 + #2) -----------------------
-  // `priceUSD` (v3.0) is REMOVED. It forced every product's price to move
-  // automatically with Tenant.dailyExchangeRate, which does not match how
-  // merchants actually set prices in this market (a manual decision per
-  // item, not a live peg). Replaced with:
   pricingCurrency PricingCurrency @default(SYP)
-  // The real, wholesale, charged price — in `pricingCurrency`. This is the
-  // ONLY number ever used to compute a sale, on POS (T4b) and on the B2B
-  // storefront (T5) alike. Changed only by explicit merchant action on
-  // this exact ProductUnit; never recalculated in bulk when the daily
-  // exchange rate changes.
   priceWholesale  Decimal         @db.Decimal(18, 4)
-  // A suggested retail price, shown ALONGSIDE priceWholesale as a
-  // marketing/profit-margin hint for the buying retailer — it is never
-  // charged and never written to any Invoice/InvoiceItem. Nullable
-  // because plenty of wholesale-only merchants never set one; nullable
-  // independently per ProductUnit, not per tenant, because a single
-  // merchant can sell some items pure-wholesale and others retail-and-
-  // wholesale at the same time.
   priceRetail     Decimal?        @db.Decimal(18, 4)
-  // ---------------------------------------------------------------------
+  isActive        Boolean         @default(true)
+  imageUrl        String?
+  barcode         String?
+  barcodeSource   BarcodeSource?
 
-  // [v3.7] ADDITION (gap #4). Soft-delete flag, same reasoning as
-  // Product.isActive above, added at the ProductUnit level specifically
-  // because a single packaging variant (e.g. "كرتونة" for one product)
-  // can need retiring independently of its parent Product or its sibling
-  // units (e.g. "قطعة" for the same product staying on sale). A hard
-  // DELETE here was never viable: ProductBatch.unit is onDelete: Cascade
-  // from ProductUnit, but ProductBatch rows with sales history are
-  // protected from deletion by InvoiceItem.batch's onDelete: Restrict —
-  // the exact same Cascade/Restrict collision already documented for
-  // Tenant/Customer above, just one level deeper in the graph. Deactivate
-  // instead; a deactivated unit is simply hidden from POS/storefront
-  // "add" pickers going forward while every historical InvoiceItem/
-  // ProductBatch referencing it stays fully intact.
-  isActive Boolean @default(true)
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product Product @relation("ProductUnits", fields: [productId], references: [id], onDelete: Cascade)
 
-  // Storefront product photo. Nullable at the DB level (an internal,
-  // POS-only product never needs one) but enforced as REQUIRED at the
-  // application layer before `Product.isPublic` may be set true — same
-  // enforcement pattern as priceRetail's optionality, just the opposite
-  // requirement direction. See ProductCatalogEntry below for where a
-  // suggested photo can come from at creation time.
-  imageUrl String?
+  // [v4.0] Reverse side of Product.baseUnitId — lets a ProductUnit row know
+  // it is wired up as its product's base unit, if it is. At most one
+  // Product can point back here, enforced by @unique on Product.baseUnitId.
+  isBaseUnitOf Product? @relation("ProductBaseUnit")
 
-  barcode       String?
-  // v3.1 ADDITION (amendment #6). Deliberately nullable with NO default —
-  // a silent default of GS1 would make an unreviewed barcode eligible for
-  // the shared catalog by accident. This must be set explicitly by the
-  // merchant answering "printed by the factory, or a number you typed
-  // in?" at the moment of entry, never guessed from the digit pattern.
-  barcodeSource BarcodeSource?
-
-  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  product              Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
   batches              ProductBatch[]
   invoiceItems         InvoiceItem[]
-  // [v3.7] ADDITION — see B2BOrderRequestItem below.
   b2bOrderRequestItems B2BOrderRequestItem[]
+  // [v4.0] the two sides of a base-unit correction event — see
+  // BaseUnitChangeLog below.
+  baseUnitChangesFrom  BaseUnitChangeLog[]   @relation("BaseUnitChangeOld")
+  baseUnitChangesTo    BaseUnitChangeLog[]   @relation("BaseUnitChangeNew")
 
-  // Barcodes are a global standard — two different tenants can legitimately
-  // sell the same imported item under the same barcode. Uniqueness is
-  // scoped per tenant, not platform-wide. Postgres treats NULL as distinct
-  // from every other NULL in a unique constraint, so this does not block
-  // multiple products from having no barcode at all.
   @@unique([tenantId, barcode])
   @@index([tenantId])
   @@index([productId])
-  // [v3.7] ADDITION — supports the POS/storefront "active units only" list
-  // query without a full per-product scan.
   @@index([tenantId, isActive])
 }
 
 model ProductBatch {
-  id          String    @id @default(cuid())
-  // Same reasoning as ProductUnit.tenantId above.
-  tenantId    String
-  productId   String
+  id        String @id @default(cuid())
+  tenantId  String
+  productId String
+
+  // [v4.0] REDEFINED — no longer "whichever unit the merchant was entering
+  // stock in." This now ALWAYS equals Product.baseUnitId for the same
+  // productId, enforced at the application layer on every write path
+  // (batch creation, CSV import, seed script) — never accepted as a free
+  // choice from the client. Every write path resolves this value via
+  // requireBaseUnit(tx, tenantId, productId) (lib/inventory/base-unit.ts) —
+  // never a client-supplied unitId, and never a direct baseUnitId field
+  // read (see the guard note on Product.baseUnitId above). The relation
+  // itself still points at ProductUnit (not duplicated as a denormalized
+  // flag) so existing joins (FIFO ordering, InvoiceItem.batch.unit
+  // displays) keep working unchanged; what changed is the WRITE-TIME
+  // GUARANTEE on which unit that relation is allowed to reference.
   unitId      String
   batchNumber String
-  // Can legitimately go negative: if two cashiers sell the last unit of a
-  // batch while both offline, we let the sale through and flag it for the
-  // merchant to reconcile on sync, rather than blocking a sale a paper
-  // ledger would never have blocked either. Do not add a non-negative
-  // constraint or a @default(0) validation on this field without revisiting
-  // that decision first.
-  //
-  // [v3.3] Deliberately still no stored `isNegative`/`needsReconciliation`
-  // flag — same "derive, don't store" preference used for Customer debt
-  // below. T3's inventory UI queries `WHERE quantity < 0` directly to
-  // render the "يحتاج تسوية" badge/filter tab; a stored flag would risk
-  // drifting from the true quantity if a later batch write forgot to
-  // update it.
-  //
-  // [v3.9] Never edited by a direct field write once created (T3c). Every
-  // correction — positive or negative — flows either through a
-  // StockAdjustment row (atomic `increment` update, below) or, for a batch
-  // with zero sales history, a hard delete logged via BatchDeletionLog
-  // (below).
+  // Always expressed in the product's base unit — see the note on
+  // Product.baseUnitId above. Never a "طرد" count, never a "كرتونة" count.
   quantity    Decimal   @db.Decimal(18, 4)
   expiryDate  DateTime?
-  // resolveFifoAllocation's tie-break (when two batches share the same
-  // expiryDate, or both have none) sorts on this column explicitly,
-  // instead of falling back to comparing `id` as a string — an
-  // implementation detail of cuid's embedded timestamp, not a documented
-  // ordering guarantee. fifo.ts (T3) depends on this column directly.
-  //
-  // [v3.3] LOCK ORDERING: every code path that takes `SELECT ... FOR
-  // UPDATE` locks across more than one ProductBatch row (T4c, at sync)
-  // MUST acquire those locks `ORDER BY id ASC` — a fixed, stable order
-  // applied identically regardless of which invoice or line item triggered
-  // the lock. Without this, two concurrent sync transactions locking the
-  // same two batches in opposite order can deadlock; Postgres aborts one
-  // of them with an error rather than resolving it gracefully. This is
-  // enforced in `lib/inventory/fifo.ts`, not at the schema level.
-  //
-  // [v3.7] Same lock-ordering rule applies when a B2B order approval
-  // (B2BOrderRequest → Invoice) resolves FIFO allocation across batches —
-  // it uses the exact same `resolveFifoAllocation` function and the exact
-  // same lock-acquisition path as T4c, not a parallel implementation.
-  //
-  // [v3.8] This lock ordering protects against two DIFFERENT order
-  // approvals racing over an overlapping set of batches. It does NOT by
-  // itself protect against the SAME order being approved twice
-  // concurrently — that is a distinct failure mode closed by the
-  // conditional-update guard on B2BOrderRequest.status documented at the
-  // top of this file and on that model below. Both guards are required;
-  // neither substitutes for the other.
   createdAt   DateTime  @default(now())
 
   tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   product      Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
   unit         ProductUnit       @relation(fields: [unitId], references: [id], onDelete: Cascade)
   invoiceItems InvoiceItem[]
-  // [v3.9] ADDITION — reverse side of StockAdjustment.batch. The full,
-  // append-only reconciliation history for this specific batch, shown as
-  // an expandable log in T3c's UI (transparency on why a quantity changed,
-  // rather than a silent flip). Restrict on the other side — see
-  // StockAdjustment's own note for why a batch carrying any adjustment
-  // history is not eligible for T3c's hard-delete path either, even with
-  // zero InvoiceItem references.
   adjustments  StockAdjustment[]
 
   @@index([tenantId])
   @@index([productId])
   @@index([unitId])
   @@index([expiryDate])
-  // [v3.3] Supports T3's "يحتاج تسوية" filter tab querying negative-quantity
-  // batches per tenant without a full table scan.
   @@index([tenantId, quantity])
 }
 
@@ -577,178 +363,48 @@ model Customer {
   name      String
   phone     String?
   shopName  String?
-  // Soft-delete flag — a customer with any invoice/payment history must
-  // never be hard-deletable (see Restrict notes below).
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // [v3.3] ADDITION. Exactly one row per tenant is seeded at onboarding
-  // (T2) as the "Walk-in Cash Customer" — a placeholder for fully-paid,
-  // identity-irrelevant cash sales, so the cashier isn't forced to collect
-  // a name/phone for a simple cash transaction. APPLICATION-LEVEL RULE
-  // (not a DB constraint): an Invoice may reference a customer with
-  // isSystemGenerated = true ONLY when that invoice's debtAmountSYP = 0.
-  // [v3.6] Was debtAmountUSD = 0 through v3.5 — see the currency
-  // re-anchoring note at the top of this file. Any invoice carrying a
-  // nonzero debt — full or partial — MUST reference a real Customer row
-  // with name + phone, because the whole point of recording a customer
-  // here is knowing who owes the money back. [v3.8] This is precisely why
-  // every B2B-approval Invoice (see the Invoice model note below) must
-  // reference a real Customer, never the system-generated one — a B2B
-  // order is expected to carry debt in the ordinary case.
-  //
-  // "At most one per tenant" is NOT enforced by this field or any index on
-  // it — a composite index/unique on (tenantId, isSystemGenerated) would be
-  // wrong here, since isSystemGenerated only has two values and that would
-  // also cap every tenant at exactly one real (isSystemGenerated = false)
-  // customer, breaking the model for every wholesaler with more than one
-  // customer. The actual "exactly one" guarantee lives on Tenant's side —
-  // see `Tenant.systemCustomerId`, a single nullable scalar field that by
-  // construction can only ever point at one Customer row. This field
-  // remains purely a fast filter flag (e.g. excluding the system customer
-  // from T4e's ledger customer list without a join to Tenant).
   isSystemGenerated      Boolean @default(false)
-  // Reverse side of Tenant.systemCustomerId — lets a Customer row know
-  // it's wired up as its tenant's system customer, if it is.
   tenantAsSystemCustomer Tenant? @relation("TenantSystemCustomer")
 
-  // T4 walk-in customer sync: mirrors the offlineId pattern already used
-  // on Invoice and CustomerPayment. A walk-in customer created on the POS
-  // while offline is assigned a client-generated UUID at creation time
-  // (Dexie's offlineCustomers.offlineId) — /api/sync MUST look up an
-  // existing Customer by this value BEFORE creating a new row, across
-  // separate sync requests over time, not just within one request's
-  // in-memory map. This @unique constraint is the last line of defense
-  // against a duplicate.
-  //
-  // [v3.4] NOTE — deliberately NOT paired with a strict @@unique on phone
-  // (see below): a hard unique on (tenantId, phone) would break the
-  // legitimate case of one family shop legitimately registering several
-  // Customer rows under the same phone number. The chosen mitigation for
-  // accidental duplicate-customer debt-splitting is a soft duplicate
-  // check in the customer-creation UI (both online and, critically,
-  // against Dexie's cachedCustomers offline — this is a T4b/T4e concern,
-  // not a schema one) plus an admin merge path in T4e if a duplicate slips
-  // through anyway. Left undocumented at the schema level on purpose: it's
-  // a product/application-layer decision, not a constraint this table can
-  // express.
   offlineId String? @unique
-
-  // Deliberately no stored balance column here — net debt is always
-  // computed on-the-fly, never cached, to avoid a stored balance drifting
-  // from the transaction history.
-  // [v3.6] SUM(Invoice.debtAmountSYP) - SUM(CustomerPayment.amountSYP WHERE
-  // invoiceId IS NULL) — was the USD equivalent of this formula through
-  // v3.5; see the currency re-anchoring note at the top of this file.
 
   tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
   payments CustomerPayment[]
 
-  // [v3.7] ADDITION — see CustomerMergeLog and B2BOrderRequest below.
-  // Two distinctly-named relations to CustomerMergeLog are required
-  // because this model can appear on either side of a merge (as the
-  // surviving row or as the one merged away) within the same log table.
   mergesAsSurvivor          CustomerMergeLog[] @relation("MergeSurviving")
   mergesAsMerged            CustomerMergeLog[] @relation("MergeMerged")
   matchedByB2BOrderRequests B2BOrderRequest[]
 
   @@index([tenantId])
   @@index([offlineId])
-  // v3.1 ADDITION: supports both the abuse-prevention lookup ("how many
-  // PENDING_REVIEW orders already exist for this phone across my
-  // customers?") and cross-checking against VerifiedRetailer.phone below.
-  // Deliberately NOT @@unique([tenantId, phone]) — see the note on
-  // offlineId above for why a hard unique here is the wrong tool.
-  //
-  // [v3.5] Composite, not a lone `phone` index — the stated use case
-  // ("how many PENDING_REVIEW orders already exist for this phone across
-  // my customers?") is inherently per-tenant, so (tenantId, phone) serves
-  // it directly instead of relying on Postgres filtering a residual
-  // tenantId condition after a phone-only index scan.
   @@index([tenantId, phone])
-  // [v3.3] Supports onboarding/lookup of a tenant's system-generated
-  // customer without a full scan.
   @@index([tenantId, isSystemGenerated])
 }
 
-// v3.1 ADDITION (amendment #4 — B2B storefront trust, final decision).
-// Deliberately NOT an OTP/SMS/missed-call verification. Real-time phone
-// verification for Syrian numbers runs into the same sanctions-related
-// routing uncertainty as WhatsApp Business API did — an external
-// dependency this platform should not be built around in its first phase,
-// especially for a problem (a wasted PENDING_REVIEW review) that a human
-// wholesaler already absorbs cheaply via T5's existing manual approval
-// step.
-//
-// [v3.3] Reminder: the per-IP/per-phone rate limits gating order
-// submission (T5) are a deterrent layer, not a substitute for this manual
-// approval step — they reduce noise reaching this trust mechanism, they
-// don't replace it.
-//
-// Trust here is platform-wide and behavioral, not per-tenant and
-// declarative: once ANY wholesaler on the platform approves a first order
-// from a given phone number, that number is "known good" for every OTHER
-// wholesaler too — a retailer should not have to rebuild trust from zero
-// with every new supplier. Deliberately holds no relation to any specific
-// Tenant or Customer row (a retailer's phone is not owned by any one
-// wholesaler), and deliberately exposes nothing about WHICH wholesaler(s)
-// verified it or what was ordered — just a yes/no signal — so competing
-// wholesalers never leak business relationships to each other through
-// this table.
 model VerifiedRetailer {
   id                String   @id @default(cuid())
   phone             String   @unique
   shopName          String?
   firstVerifiedAt   DateTime @default(now())
-  // Incremented (not just re-set) every time a different wholesaler
-  // approves a first order from this phone — a light signal of how
-  // widely trusted the number is, for potential future use (e.g.
-  // surfacing "verified by N wholesalers" instead of a flat badge).
   verificationCount Int      @default(1)
 
   @@index([phone])
 }
 
-// v3.1 ADDITION (amendments #5 + #6 — shared product catalog).
-// A lightweight, cross-tenant lookup table that lets a merchant scanning a
-// barcode nobody at THIS tenant has entered yet still get a suggested
-// name/category/photo if some OTHER tenant already entered the same real
-// (GS1) product. This is a one-time fill-in-the-form convenience only —
-// it is NEVER read again after creation time, and never silently pulls a
-// tenant's own already-saved Product/ProductUnit data into sync with it.
-// Editing a tenant's local copy after the fact never touches this table,
-// and this table being edited/deleted later never touches any tenant's
-// already-created local copy either. Only GS1-sourced barcodes should
-// ever be written here (enforced at the application layer using
-// ProductUnit.barcodeSource, not by a DB constraint — see BarcodeSource).
 model ProductCatalogEntry {
-  id       String  @id @default(cuid())
-  barcode  String  @unique
-  name     String
-  category String?
-  // Optional by design (amendment discussion): a merchant is never
-  // blocked from creating a shared catalog entry just because they didn't
-  // take a photo. A missing photo here simply means the next tenant who
-  // scans this barcode gets no suggested photo and takes their own — see
-  // ProductUnit.imageUrl for the SEPARATE, unrelated rule that a photo
-  // IS required before THAT tenant's own product can go public.
-  imageUrl String?
-
-  // Simple ownership model: whichever tenant's scan created this row is
-  // its "owner" and the only one who may edit it directly going forward.
-  // Any other tenant that finds it wrong instead files a
-  // ProductCatalogEntryReport (below) for a human to review — this avoids
-  // both an edit war between unrelated merchants and the need for any
-  // voting/permission system. Deliberately a plain String, not a Prisma
-  // relation to Tenant: this row must survive untouched even if the
-  // owning tenant is later deleted, and must never be blocked from
-  // deletion by a Restrict/Cascade tie to a tenant's lifecycle.
+  id              String   @id @default(cuid())
+  barcode         String   @unique
+  name            String
+  category        String?
+  imageUrl        String?
   addedByTenantId String
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   reports ProductCatalogEntryReport[]
 
@@ -756,13 +412,6 @@ model ProductCatalogEntry {
   @@index([addedByTenantId])
 }
 
-// v3.1 ADDITION. A suggested correction against a ProductCatalogEntry,
-// filed by a tenant who is NOT its owner. Reviewed and applied (or
-// dismissed) manually by the platform super-admin — same "no automated
-// content moderation in phase one" decision as everywhere else this SOW
-// takes that stance. Resolving or dismissing a report never touches any
-// tenant's own local Product/ProductUnit copy (see the isolation note on
-// ProductCatalogEntry above).
 model ProductCatalogEntryReport {
   id                 String       @id @default(cuid())
   catalogEntryId     String
@@ -786,24 +435,12 @@ model Invoice {
   tenantId         String
   userId           String
   customerId       String
-  // [v3.6] AUTHORITATIVE as of this revision — see the currency
-  // re-anchoring note at the top of this file. Every validation, the
-  // ledger balance, and every business rule below reads/writes this field
-  // first.
   totalSYP         Decimal       @db.Decimal(18, 4)
-  // [v3.6] Informational only from this revision forward — derived as
-  // totalSYP ÷ exchangeRateUsed at write time. Kept for merchant reference
-  // and historical continuity; never validated against, never gates any
-  // action. Was the authoritative field through v3.5.
   totalUSD         Decimal       @db.Decimal(18, 4)
   exchangeRateUsed Decimal       @db.Decimal(18, 4)
-  // [v3.6] AUTHORITATIVE. New in this revision.
   paidAmountSYP    Decimal       @db.Decimal(18, 4)
-  // [v3.6] Informational only — derived (paidAmountSYP ÷ exchangeRateUsed).
   paidAmountUSD    Decimal       @db.Decimal(18, 4)
-  // [v3.6] AUTHORITATIVE. New in this revision.
   debtAmountSYP    Decimal       @db.Decimal(18, 4)
-  // [v3.6] Informational only — derived (debtAmountSYP ÷ exchangeRateUsed).
   debtAmountUSD    Decimal       @db.Decimal(18, 4)
   isPaid           Boolean       @default(false)
   status           InvoiceStatus @default(COMPLETED)
@@ -812,162 +449,66 @@ model Invoice {
   syncedAt         DateTime?
   receiptPdfUrl    String?
   createdAt        DateTime      @default(now())
-  // No updatedAt: invoices are append-only. Corrections happen via a new
-  // void/refund invoice (below) or a new CustomerPayment, never by editing
-  // a past invoice in place.
-  //
-  // Unaffected by the v3.1 pricing change: whatever currency/price a
-  // ProductUnit is set in, the SALE ITSELF still resolves to a single
-  // exchangeRateUsed per invoice, and InvoiceItem.unitPriceSYP is still
-  // always stored in SYP (converted at sync time from priceWholesale in
-  // whichever pricingCurrency it was set in — [v3.6] was unitPriceUSD/USD
-  // through v3.5, see the currency re-anchoring note at the top of this
-  // file). [v3.6] `debtAmountSYP ≈ totalSYP − paidAmountSYP` is the
-  // authoritative validation at sync (T4c); the USD-side equivalent
-  // (`totalUSD ≈ totalSYP ÷ exchangeRateUsed`) is checked only as a
-  // sanity/display consistency signal and never fails a sync on its own.
-  // Through v3.5 this was the reverse: `totalSYP ≈ totalUSD ×
-  // exchangeRateUsed` was the authoritative check.
-  //
-  // [v3.3] customerId may point at a tenant's isSystemGenerated customer
-  // ONLY when debtAmountSYP = 0 for this row ([v3.6] was debtAmountUSD = 0
-  // through v3.5) — enforced at the API layer when an invoice is
-  // created/synced, not by a DB constraint (a DB-level CHECK spanning two
-  // tables isn't practical here). Every other invoice must reference a
-  // real, identified Customer.
-  //
-  // DELIBERATELY NO `paymentMethod` COLUMN HERE (T4 decision): the method
-  // used for the amount paid at sale time (paidAmountSYP) is NOT stored on
-  // Invoice directly. Instead, /api/sync inserts a matching CustomerPayment
-  // row.
-  //
-  // [v3.7] A B2B order approval (T5) writes this row through the EXACT
-  // SAME path as a POS sale or an /api/sync invoice — userId is the
-  // approving ADMIN (not any account belonging to the retailer, who never
-  // has one), and every InvoiceItem's batchId is resolved via
-  // resolveFifoAllocation at approval time, not at order-submission time.
-  // See the B2BOrderRequest model below for why the order itself cannot be
-  // represented as an Invoice row until that approval happens.
-  //
-  // [v3.8] PAYMENT-MODE DECISION FOR B2B APPROVAL (previously
-  // undocumented): the approval screen reuses the exact same three-way
-  // payment step already built for the POS (T4b) — نقدي بالكامل / على
-  // الحساب بالكامل / دفع جزئي — rather than inventing a separate payment
-  // model for this one write path. Practically, an online B2B submission
-  // has no cash physically changing hands at the moment of approval the
-  // way a POS sale does, so a wholesaler extending trade credit to a
-  // known retailer is the ordinary case here, not the exception — "على
-  // الحساب بالكامل" (paidAmountSYP = 0, debtAmountSYP = totalSYP) is the
-  // suggested/default selection on this screen. The admin can still mark
-  // the order as paid or partially paid if the retailer already
-  // transferred funds before approval (e.g. a confirmed bank/wallet
-  // transfer) — same PARTIAL/FULL_CASH toggle, same validation, same
-  // CustomerPayment side-effect as T4b, nothing new to build. Because a
-  // B2B invoice is expected to carry debt in the ordinary case, its
-  // customerId must always be a real Customer — never the tenant's
-  // system-generated cash customer (see the note on Customer.
-  // isSystemGenerated above).
 
-  // A void/refund is its own Invoice row with status VOIDED, whose amounts
-  // reverse the original. This field is set ONLY on that reversing row,
-  // and points back at the invoice it voids. The original invoice is
-  // never edited or flagged itself — its debt contribution is simply
-  // offset once the reversing row's amounts are included in the SUM()
-  // that computes customer debt. @unique here also means, at the DB
-  // level, an invoice can be voided at most once.
   voidsInvoiceId String?  @unique
   voidsInvoice   Invoice? @relation("InvoiceVoid", fields: [voidsInvoiceId], references: [id], onDelete: Restrict)
   voidedBy       Invoice? @relation("InvoiceVoid")
 
-  // Free-text reason captured at the moment of voiding (T4 Scope 4:
-  // "Requires a reason (free text, audit trail) at the time of voiding").
-  // Populated only on a VOIDED-status row; always null on a normal sale.
   voidReason String?
 
   tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  // Restrict, not Cascade: deleting a cashier/admin must never silently
-  // delete every invoice they ever created. Deactivate the user
-  // (User.isActive = false) instead.
   user     User          @relation(fields: [userId], references: [id], onDelete: Restrict)
-  // Restrict, not Cascade: same reasoning — a customer's debt and purchase
-  // history is exactly the record this platform exists to preserve.
-  // Deactivate (Customer.isActive = false) instead of deleting.
   customer Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
   items    InvoiceItem[]
 
-  // The sale-time payment CustomerPayment.invoiceId (below) points back
-  // at, if paidAmountSYP > 0 on this invoice. Nullable/optional because a
-  // fully-on-credit invoice (paidAmountSYP = 0) has none.
   payment CustomerPayment?
 
-  // [v3.7] ADDITION — reverse side of B2BOrderRequest.resultingInvoiceId.
-  // Optional/nullable because the overwhelming majority of invoices come
-  // from the POS (T4b), not a B2B approval — this is populated only on
-  // the invoice a B2B order approval produced.
   b2bOrderRequest B2BOrderRequest?
 
   @@index([tenantId])
   @@index([customerId])
   @@index([offlineId])
-  // [v3.4] ADDITION. Serves two real, already-planned read paths, not a
-  // hypothetical one: (a) the dashboard's "invoices this period" KPI
-  // queries (T1 folder structure's dashboard/page.tsx), which without
-  // this would fall back to a per-tenant scan sorted after the fact; and
-  // (b) T4c's own sync-conflict resolution, which orders a tenant's
-  // invoices by createdAt. Cheap to add now, expensive to retrofit once
-  // the table has real transaction volume.
   @@index([tenantId, createdAt])
 }
 
 model InvoiceItem {
-  id           String  @id @default(cuid())
-  // Same reasoning as ProductUnit.tenantId above.
-  tenantId     String
-  invoiceId    String
-  productId    String
-  unitId       String
-  // Every line item must record exactly which physical batch its stock
-  // came from. This is what makes FIFO deduction traceable, what a VOIDED
-  // invoice's reversal writes stock back to, and it's the column
-  // resolveFifoAllocation's result (T3/T4) is written into.
+  id        String @id @default(cuid())
+  tenantId  String
+  invoiceId String
+  productId String
+
+  // [v4.0] NOTE — this still records the ProductUnit that was actually SOLD
+  // (e.g. "طرد"), NOT necessarily the product's base unit. This is
+  // deliberate and unchanged: a customer buys and is billed in whichever
+  // unit they chose at the register. What changed is only how `quantity`
+  // here relates to ProductBatch.quantity: the sale-time conversion from
+  // "N of this sold unit" into "N × conversionFactor of the batch's base
+  // unit" happens exactly once, through lib/inventory/units.ts, at the
+  // moment stock is drawn down (T4c/T5's commitFifoAllocation call) — see
+  // UNIT-ARCHITECTURE.md, "Selling in a non-base unit."
   //
-  // BUSINESS RULE: if a sold quantity spans more than one batch (the
-  // nearest batch doesn't have enough left), split it into multiple
-  // InvoiceItem rows on the SAME invoice — one per batch — never a single
-  // row spanning batches.
-  //
-  // [v3.3] When a single sale's allocation spans multiple ProductBatch
-  // rows, the locks acquired on those rows at sync time (T4c) follow the
-  // fixed `ORDER BY id ASC` rule documented on ProductBatch above.
-  //
-  // [v3.4] Written as its own top-level prisma.invoiceItem.create(...)
-  // call inside the same $transaction as the parent Invoice — never as a
-  // nested `items: { create: [...] }` under Invoice.create(...). See the
-  // NESTED WRITES note at the top of this file for why.
+  // [v4.0, corrected] The conversionFactor used for that conversion is
+  // ALWAYS read from THIS unit row (via this unitId) — never from
+  // requireBaseUnit(), which resolves an unrelated base-unit row whose
+  // conversionFactor is always 1.
+  unitId String
+
   batchId      String
+  // Quantity SOLD, expressed in `unitId` above (the unit the customer
+  // actually bought) — e.g. "3" meaning 3 طرد. NOT automatically the same
+  // number as how much was deducted from ProductBatch.quantity, which is
+  // always in the batch's base unit. The relationship between the two is
+  // always: batchQuantityDeducted = quantity × unitId.conversionFactor,
+  // computed once via decimal.js at commit time and never re-derived
+  // afterward from anything other than this stored quantity + unit.
   quantity     Decimal @db.Decimal(18, 4)
-  // [v3.6] AUTHORITATIVE as of this revision — see the currency
-  // re-anchoring note at the top of this file. Always SYP regardless of
-  // the ProductUnit's pricingCurrency at sale time — converted server-side
-  // at sync (T4c) using that invoice's own exchangeRateUsed if the unit's
-  // priceWholesale was set in USD. This is what keeps every historical
-  // invoice comparable regardless of what currency a product happened to
-  // be priced in on the day it was sold.
   unitPriceSYP Decimal @db.Decimal(18, 4)
-  // [v3.6] Informational only — derived (unitPriceSYP ÷ exchangeRateUsed)
-  // at the same sync step. Was the authoritative field (always USD,
-  // converted from SYP) through v3.5.
   unitPriceUSD Decimal @db.Decimal(18, 4)
 
   tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoice Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-  // Restrict, not Cascade: deleting a product must never erase line items
-  // on past invoices — that would silently corrupt historical invoice
-  // totals. Deactivate (Product.isActive = false) instead.
   product Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
   unit    ProductUnit  @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  // Restrict, matching product/unit above — a batch with sales history
-  // attached must never be hard-deletable, even once fully depleted.
   batch   ProductBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
 
   @@index([tenantId])
@@ -979,13 +520,7 @@ model CustomerPayment {
   id            String        @id @default(cuid())
   tenantId      String
   customerId    String
-  // [v3.6] AUTHORITATIVE as of this revision — see the currency
-  // re-anchoring note at the top of this file. No schema change was
-  // needed for this model: both currency fields already existed side by
-  // side; only which one is treated as the source of truth changed.
   amountSYP     Decimal       @db.Decimal(18, 4)
-  // [v3.6] Informational only from this revision forward — derived
-  // (amountSYP ÷ exchangeRate). Was the authoritative field through v3.5.
   amountUSD     Decimal       @db.Decimal(18, 4)
   exchangeRate  Decimal       @db.Decimal(18, 4)
   paymentMethod PaymentMethod
@@ -995,37 +530,10 @@ model CustomerPayment {
   offlineId     String?       @unique
   syncedAt      DateTime?
   createdAt     DateTime      @default(now())
-  // Same reasoning as Invoice: append-only by design, no updatedAt.
 
-  // FIX (critical — double-counting bug): distinguishes a payment made AT
-  // sale time (auto-created by /api/sync alongside a new Invoice, per T4c
-  // — or, per [v3.8], alongside a B2B order approval, T5) from an
-  // independent repayment logged later against existing debt.
-  //
-  // Invoice.debtAmountSYP is ALREADY computed as totalSYP - paidAmountSYP
-  // — i.e., a sale-time payment is already reflected in that number. If
-  // the ledger's balance formula (T4e) also subtracted every
-  // CustomerPayment row unconditionally, a sale-time payment would be
-  // subtracted TWICE: once implicitly (inside debtAmountSYP) and once
-  // explicitly (summing CustomerPayment.amountSYP). This column is what
-  // lets the ledger tell the two kinds of row apart:
-  //   SUM(Invoice.debtAmountSYP)
-  //     - SUM(CustomerPayment.amountSYP WHERE invoiceId IS NULL)
-  // [v3.6] This formula summed debtAmountUSD/amountUSD through v3.5 — see
-  // the currency re-anchoring note at the top of this file.
-  //
-  // @unique also gives a DB-level guarantee that at most one
-  // CustomerPayment can ever be linked to a given invoice.
-  //
-  // [v3.4] Written as its own top-level prisma.customerPayment.create(...)
-  // call inside the same $transaction as the Invoice/InvoiceItem writes —
-  // never nested under Invoice.create(...). See the NESTED WRITES note at
-  // the top of this file.
   invoiceId String? @unique
 
   tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  // Restrict, not Cascade: a customer's payment history is financial
-  // record, not disposable — same reasoning as Invoice.customer.
   customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
   invoice  Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
 
@@ -1034,31 +542,12 @@ model CustomerPayment {
   @@index([offlineId])
 }
 
-// [v3.6] Deliberately UNCHANGED by the currency re-anchoring above.
-// amountUSD here is the platform's own SaaS revenue from the merchant —
-// a separate business decision from how a merchant tracks their own
-// customers' debt (which is what got re-anchored to SYP). Revisit only if
-// that separate decision changes too.
 model Subscription {
   id              String                   @id @default(cuid())
   tenantId        String
-  // [v3.7] ADDITION (gap #3). T6 names "tier options" as part of merchant
-  // checkout but no field previously captured which tier was selected.
-  // Kept as a plain String rather than an enum deliberately: the specific
-  // tier lineup (and its pricing) is a commercial decision expected to
-  // change independently of the schema, and an enum change requires a
-  // migration on every deploy whereas a String does not. Validated at the
-  // application layer against whatever the current tier list is.
   tier            String
   receiptImageURL String?
   amountUSD       Decimal                  @db.Decimal(18, 4)
-  // [v3.7] ADDITION (gap #3). T6 names a "unique Payment Reference Code"
-  // the merchant is shown at checkout and writes on their manual transfer,
-  // which the Super-Admin then matches against the incoming payment when
-  // reviewing the receipt. @unique both prevents two different
-  // Subscription rows from accidentally sharing a code and gives the
-  // admin dashboard a direct lookup path instead of a manual scan through
-  // pending receipts.
   referenceCode   String                   @unique
   status          SubscriptionRecordStatus @default(PENDING_APPROVAL)
   expiresAt       DateTime?
@@ -1071,100 +560,21 @@ model Subscription {
   @@index([status])
 }
 
-// [v3.7] ADDITION (gap #1). Represents a B2B storefront order (T5) from
-// the moment a retailer submits it until a wholesaler ADMIN approves or
-// rejects it. This is deliberately a SEPARATE model from Invoice, not an
-// Invoice row created early with status PENDING_REVIEW, for two concrete
-// schema-level reasons:
-//
-//   1. Invoice.userId is required-non-null, referencing a real User who
-//      created the sale. A B2B storefront submission has no User session
-//      at all — the retailer submitting it is a member of the public, not
-//      an authenticated account on this platform. There is no honest value
-//      to put in that column at submission time.
-//   2. InvoiceItem.batchId is required-non-null, because every InvoiceItem
-//      that exists must be traceable to the exact physical batch its stock
-//      came from — that traceability is what makes a void's stock reversal
-//      correct. But T5 explicitly commits inventory only at APPROVAL time,
-//      not at submission time (a pending order must never reserve or
-//      decrement stock that a wholesaler might reject hours later). Until
-//      approval, there is no batch allocation to record.
-//
-// Forcing either column to accept a placeholder value (a synthetic "system"
-// User, a fabricated batchId) would create exactly the kind of "untested,
-// undefined-feeling" edge case this spec already explicitly avoids doing
-// for Tenant hard-deletes elsewhere (see the Tenant Lifecycle & Deletion
-// Policy note above) — so a dedicated pre-invoice holding model is used
-// instead. On approval, the ADMIN who approves becomes Invoice.userId, and
-// resolveFifoAllocation runs for the first time (via the identical
-// lock-ordering and Preview/Commit-sharing rules as T4c) to assign real
-// batchIds — at which point a real Invoice + InvoiceItem(s) are written via
-// the standard top-level-calls-in-one-$transaction pattern, and this row is
-// updated (its own top-level call) to APPROVED with resultingInvoiceId set.
-//
-// A rejection never creates any Invoice row at all — it only updates this
-// row's own status and rejectionReason, leaving inventory untouched.
-//
-// [v3.8] CONCURRENCY GUARD (closes a real gap — see the [v3.8] note at the
-// top of this file for the full failure mode this prevents): the approval
-// handler's FIRST write, inside the same $transaction as everything else
-// it does, MUST be:
-//   UPDATE "B2BOrderRequest" SET status = 'APPROVED', ...
-//   WHERE id = $1 AND status = 'PENDING_REVIEW'
-// and the handler must verify exactly one row was affected before calling
-// resolveFifoAllocation or writing any Invoice/InvoiceItem row. Zero rows
-// affected means another concurrent request already claimed this order —
-// abort immediately, no side effects, surface a clear "already
-// reviewed" message rather than a generic error. The existing
-// resultingInvoiceId @unique constraint remains as a second, DB-level
-// backstop — it is not a substitute for this guard, since without this
-// guard the double stock deduction and orphaned extra Invoice would
-// already have happened by the time that constraint is even reached.
-// Rejection follows the identical pattern (`WHERE status = 'PENDING_REVIEW'`
-// before writing REJECTED), since a request already approved must never be
-// rejected out from under it, or vice versa.
 model B2BOrderRequest {
   id               String         @id @default(cuid())
   tenantId         String
-  // The submitting retailer's own details, captured directly on this row
-  // rather than requiring a pre-existing Customer — most first-time B2B
-  // submitters have never bought from this tenant before and have no
-  // Customer row yet. If approval finds or creates a matching real
-  // Customer, that relationship is recorded on the resulting Invoice
-  // (Invoice.customerId), not retrofitted onto this row.
   retailerName     String
   retailerPhone    String
   retailerShopName String?
   status           B2BOrderStatus @default(PENDING_REVIEW)
-  // Populated only when status = REJECTED — mirrors the free-text
-  // reasoning pattern already used for Invoice.voidReason.
   rejectionReason  String?
 
-  // [v3.7] Optional convenience link: if the submitting phone already
-  // matches an existing real Customer for this tenant, the approval
-  // screen can show that match to the admin before deciding whether to
-  // reuse it or create a new Customer row — same soft-duplicate spirit as
-  // T4b's walk-in customer check, just surfaced earlier in this flow.
-  // SetNull (not Restrict): this is a hint, not a financial record: if the
-  // matched Customer is ever deactivated, this order request should not
-  // be blocked from anything as a result.
   matchedCustomerId String?
   matchedCustomer   Customer? @relation(fields: [matchedCustomerId], references: [id], onDelete: SetNull)
 
-  // Set only once, at the moment of approval — see the model-level note
-  // above for why this cannot simply be an Invoice row from the start.
-  // @unique guarantees an order request can only ever produce one
-  // Invoice, mirroring Invoice.voidsInvoiceId's "at most once" pattern.
-  // [v3.8] This constraint is a second-line backstop, not the primary
-  // defense against double-approval — see the concurrency guard note
-  // above the model.
   resultingInvoiceId String?  @unique
   resultingInvoice   Invoice? @relation(fields: [resultingInvoiceId], references: [id], onDelete: Restrict)
 
-  // Which ADMIN approved or rejected this, and when — required for the
-  // wholesaler's own accountability trail, same reasoning as
-  // CustomerMergeLog capturing "by which admin" below. Nullable because a
-  // freshly submitted, still-PENDING_REVIEW row has neither yet.
   reviewedByUserId String?
   reviewedByUser   User?     @relation(fields: [reviewedByUserId], references: [id], onDelete: Restrict)
   reviewedAt       DateTime?
@@ -1176,42 +586,31 @@ model B2BOrderRequest {
 
   @@index([tenantId])
   @@index([tenantId, status])
-  // [v3.7] Supports T5's per-phone abuse guard directly: "how many
-  // PENDING_REVIEW order requests already exist for this phone at this
-  // tenant?" without a full table scan — the complementary check to the
-  // per-IP @upstash/ratelimit guard, served at the database layer rather
-  // than the rate-limiter's own store.
   @@index([tenantId, retailerPhone, status])
 }
 
-// [v3.7] ADDITION (gap #1, continued). A single requested line item on a
-// still-pending B2B order. Deliberately holds NO batchId (see the
-// B2BOrderRequest model-level note for why) — only a snapshot of what was
-// requested and at what price, taken at submission time.
 model B2BOrderRequestItem {
-  id                      String          @id @default(cuid())
-  tenantId                String
-  orderRequestId          String
-  productId               String
-  unitId                  String
-  quantity                Decimal         @db.Decimal(18, 4)
-  // Snapshot of ProductUnit.priceWholesale / pricingCurrency AT THE MOMENT
-  // OF SUBMISSION. A merchant may edit priceWholesale on the live
-  // ProductUnit row at any time — including in the window between a
-  // retailer submitting this order and an admin reviewing it — so the
-  // review screen must show what the retailer actually saw and agreed to,
-  // not whatever the price happens to be right now. On approval, THIS
-  // snapshot (not the live ProductUnit price) is what gets written into
-  // the resulting InvoiceItem.unitPriceSYP/unitPriceUSD.
+  id             String  @id @default(cuid())
+  tenantId       String
+  orderRequestId String
+  productId      String
+  // [v4.0] NOTE — same meaning as InvoiceItem.unitId: the unit the retailer
+  // actually selected to order in, not necessarily the base unit. The
+  // snapshot below freezes price only; the quantity→base-unit conversion
+  // still happens once, at approval time, via lib/inventory/units.ts.
+  //
+  // [v4.0, corrected] The conversionFactor used for that conversion is
+  // ALWAYS read from THIS unit row (via this unitId) — never from
+  // requireBaseUnit(), and never from priceWholesaleSnapshot /
+  // pricingCurrencySnapshot below, which cover pricing only.
+  unitId         String
+  quantity       Decimal @db.Decimal(18, 4)
+
   priceWholesaleSnapshot  Decimal         @db.Decimal(18, 4)
   pricingCurrencySnapshot PricingCurrency
 
   tenant       Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orderRequest B2BOrderRequest @relation(fields: [orderRequestId], references: [id], onDelete: Cascade)
-  // Restrict, not Cascade: same reasoning as InvoiceItem.product/unit —
-  // a still-pending or already-approved order request referencing a
-  // product must never have that reference silently erased by a product
-  // deletion. Products are soft-deleted (isActive = false) instead.
   product      Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
   unit         ProductUnit     @relation(fields: [unitId], references: [id], onDelete: Restrict)
 
@@ -1219,40 +618,15 @@ model B2BOrderRequestItem {
   @@index([orderRequestId])
 }
 
-// [v3.7] ADDITION (gap #2). T4e requires that a duplicate-customer merge
-// be "logged (which two customer IDs, by which admin, when) for audit
-// purposes, append-only" — no prior model captured this. Deliberately
-// separate from Customer itself (not, say, a `mergedIntoId` column on
-// Customer) so that a merge remains a first-class, queryable event in its
-// own right, and so a customer could theoretically be merged away and
-// still leave a clean audit row behind even though the Customer row
-// itself is never hard-deleted (only deactivated) regardless.
 model CustomerMergeLog {
   id                  String   @id @default(cuid())
   tenantId            String
-  // The Customer row that remains active and now owns every re-pointed
-  // Invoice/CustomerPayment row.
   survivingCustomerId String
-  // The Customer row that was merged away and deactivated
-  // (isActive = false) as part of this same operation.
-  //
-  // [v3.8] @unique — a real gap in v3.7: nothing previously stopped the
-  // SAME Customer row from being merged away more than once (e.g. a
-  // retried admin action, or two admins independently merging the same
-  // duplicate into two different survivors). A Customer that has already
-  // been merged away is deactivated and should never be eligible to be
-  // merged again — this constraint makes that a DB-level guarantee
-  // instead of depending solely on the application UI excluding
-  // deactivated customers from the merge picker.
   mergedCustomerId    String   @unique
   performedByUserId   String
   createdAt           DateTime @default(now())
 
   tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  // Restrict on both sides: this log is itself a financial-audit record
-  // and must never be silently orphaned by a later, unrelated data
-  // change — consistent with every other financial-record Restrict
-  // pattern in this schema (Invoice.customer, CustomerPayment.customer).
   survivingCustomer Customer @relation("MergeSurviving", fields: [survivingCustomerId], references: [id], onDelete: Restrict)
   mergedCustomer    Customer @relation("MergeMerged", fields: [mergedCustomerId], references: [id], onDelete: Restrict)
   performedByUser   User     @relation(fields: [performedByUserId], references: [id], onDelete: Restrict)
@@ -1261,58 +635,20 @@ model CustomerMergeLog {
   @@index([survivingCustomerId])
 }
 
-// [v3.9] ADDITION (T3c). The sole append-only correction path for a
-// ProductBatch's quantity — see the "never edited by a direct field write"
-// note on ProductBatch.quantity above. Reconciling a negative or otherwise
-// incorrect quantity writes ONE StockAdjustment row here, and updates
-// ProductBatch.quantity as a direct consequence, both as separate top-level
-// calls inside the same $transaction (see the NESTED WRITES note at the top
-// of this file). The ProductBatch.quantity update MUST use Prisma's atomic
-// increment operator —
-//   prisma.productBatch.update({
-//     where: { id: batchId },
-//     data: { quantity: { increment: quantityDelta } },
-//   })
-// — never a read-then-write (read current quantity into application code,
-// compute the new value in JS, write it back). A read-then-write here races
-// against T4c's sync engine and T5's B2B approval, both of which can be
-// decrementing this exact row via commitFifoAllocation at the same moment a
-// reconciliation is applied. Because the increment itself is atomic at the
-// database level, no additional SELECT ... FOR UPDATE lock is required for
-// this specific write — Postgres's own row-level atomicity on a single
-// UPDATE ... SET quantity = quantity + $1 is sufficient. ADMIN-only.
-//
-// [v3.9] `batch` is deliberately Restrict, not Cascade, even though this
-// narrows the spec's literal "a batch with zero InvoiceItem references may
-// be hard-deleted" rule (T3c) to, in practice, "zero InvoiceItem references
-// AND zero StockAdjustment references." A batch that has been reconciled at
-// least once carries real audit history here; unlike BatchDeletionLog
-// (below), StockAdjustment has no snapshot mechanism to preserve that
-// history once its parent ProductBatch row is gone, so hard-deleting a
-// reconciled batch would silently discard part of the audit trail this
-// model exists to keep. This is the same "never silently lose audit
-// history" principle already applied throughout this schema (see the
-// Cascade/Restrict notes on Tenant/ProductUnit/Product above) — Restrict
-// simply extends it one step further than the spec's literal wording, on
-// the conservative side.
 model StockAdjustment {
   id               String   @id @default(cuid())
   tenantId         String
   batchId          String
   adjustedByUserId String
-  // Signed — positive to add stock back, negative to remove it. The
-  // resulting ProductBatch.quantity after this adjustment is always the
-  // live, authoritative figure (inclusive of every past adjustment); this
-  // row itself is never edited or reversed in place — a mistaken
-  // adjustment is corrected by writing a new, opposite-signed
-  // StockAdjustment row, never by mutating this one (append-only, same as
-  // Invoice/CustomerPayment elsewhere in this schema).
+  // [v4.0] NOTE — always in the batch's base unit, same as
+  // ProductBatch.quantity itself. A reconciliation screen that lets an
+  // ADMIN type the correction in a non-base unit (e.g. "طرد ناقص واحد")
+  // must convert it to the base unit via lib/inventory/units.ts BEFORE
+  // writing this row — quantityDelta itself is never stored in any unit
+  // other than the base unit.
   quantityDelta    Decimal  @db.Decimal(18, 4)
-  // Required free text — "why did this quantity change" must always be
-  // answerable from this table alone, never inferred from context.
   reason           String
   createdAt        DateTime @default(now())
-  // No updatedAt: append-only, same reasoning as Invoice/CustomerPayment.
 
   tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   batch          ProductBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
@@ -1322,45 +658,19 @@ model StockAdjustment {
   @@index([batchId])
 }
 
-// [v3.9] ADDITION (T3c). The audit trail for the one narrow case where a
-// ProductBatch row may actually be hard-deleted: a mistaken batch entry
-// with zero InvoiceItem references (and, per the note on StockAdjustment
-// above, zero StockAdjustment references either). This is a true DELETE,
-// not a StockAdjustment — the batch never should have existed as entered
-// — restricted to ADMIN.
 model BatchDeletionLog {
   id       String @id @default(cuid())
   tenantId String
 
-  // [v3.9] Deliberately a PLAIN SCALAR FIELD, NOT a Prisma relation to
-  // ProductBatch. The row this references is deleted in the exact same
-  // operation that creates this log row. If this were a live FK instead:
-  //   - onDelete: Restrict would make the batch's own hard-delete
-  //     impossible outright — a direct contradiction, since this log's
-  //     entire purpose is to record that very deletion.
-  //   - onDelete: Cascade would mean deleting the ProductBatch row
-  //     cascades into deleting this audit row too, which defeats the
-  //     point of an audit log that must outlive the row it documents —
-  //     the log could then only ever prove a deletion happened while it
-  //     still existed, never afterward, which is precisely backwards.
-  // productId, unitId, batchNumber, and quantityAtDeletion below are the
-  // same kind of plain snapshot field, for the identical reason: they
-  // capture the batch's state at the moment of deletion, since the
-  // batch's own foreign keys and fields disappear along with it. Without
-  // these four snapshot fields, this log could only prove that SOME
-  // deletion happened, never what was actually lost.
   batchId            String
   productId          String
   unitId             String
   batchNumber        String
+  // [v4.0] NOTE — snapshot is in the base unit, consistent with the batch's
+  // own quantity field at the moment it existed.
   quantityAtDeletion Decimal  @db.Decimal(18, 4)
   deletedByUserId    String
-  // Required free text, same reasoning as StockAdjustment.reason and
-  // Invoice.voidReason above.
   reason             String
-  // The single timestamp for this append-only row — no separate
-  // deletedAt field, since createdAt IS the moment of deletion (the log
-  // row and the delete happen inside the same $transaction).
   createdAt          DateTime @default(now())
 
   tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -1368,4 +678,35 @@ model BatchDeletionLog {
 
   @@index([tenantId])
   @@index([batchId])
+}
+
+// ============================================================================
+// [v4.0, new] BaseUnitChangeLog — append-only audit trail for the rare,
+// zero-batch-only correction of a product's designated base unit (see
+// UNIT-ARCHITECTURE.md's Immutability rule). Same pattern as
+// StockAdjustment/BatchDeletionLog: append-only, no updatedAt, every
+// relation Restrict. ADMIN-only per T2b's Role Capability Matrix.
+//
+// This model exists specifically to back the audit-logging promise made in
+// the spec's Unit Conversion Architecture section — a base-unit correction
+// on a zero-batch product is never a silent field edit.
+// ============================================================================
+model BaseUnitChangeLog {
+  id              String   @id @default(cuid())
+  tenantId        String
+  productId       String
+  oldBaseUnitId   String
+  newBaseUnitId   String
+  changedByUserId String
+  reason          String
+  createdAt       DateTime @default(now())
+
+  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  oldBaseUnit   ProductUnit @relation("BaseUnitChangeOld", fields: [oldBaseUnitId], references: [id], onDelete: Restrict)
+  newBaseUnit   ProductUnit @relation("BaseUnitChangeNew", fields: [newBaseUnitId], references: [id], onDelete: Restrict)
+  changedByUser User        @relation(fields: [changedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([productId])
 }
