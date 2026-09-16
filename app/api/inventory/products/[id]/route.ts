@@ -200,7 +200,7 @@ export async function PATCH(
     // omits the current base unit from data.units could silently evade
     // the "exactly one conversionFactor === 1" / base-unit-immutability
     // rules.
-    let effectiveUnits: EffectiveUnit[] = existingProduct.units.map((u) => ({
+    const effectiveUnits: EffectiveUnit[] = existingProduct.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
       conversionFactor: u.conversionFactor.toString(),
