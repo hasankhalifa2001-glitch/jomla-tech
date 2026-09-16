@@ -272,16 +272,14 @@ model ProductUnit {
   productId String
   unitName  String
 
-  // [v4.0] REDEFINED (was: "conversion factor relative to some other unit
-  // of the same product, meaning implicit and inconsistent"). Now has one
-  // fixed, explicit meaning for every ProductUnit in the system:
-  //   "How many of this product's BASE UNIT equal exactly ONE of this
-  //    ProductUnit?"
-  // The base unit's own row is FORCED to conversionFactor = 1 at creation
-  // and can never be edited afterward (enforced at the application layer;
-  // see UNIT-ARCHITECTURE.md). Example: base unit = "قطعة" (1); "طرد" = 24
-  // means one طرد equals 24 قطعة. This is the ONLY conversion arithmetic
-  // permitted anywhere in the codebase — see lib/inventory/units.ts.
+  // conversionFactor — [v4.0] one fixed, uniform meaning for every row: "how
+  // many base units (Product.baseUnitId) equal ONE of this ProductUnit?" The
+  // base unit's own row is forced to conversionFactor = 1 always, and can
+  // never be edited after creation as long as the product has any ProductBatch.
+  // Any conversion using this field goes exclusively through lib/inventory/units.ts
+  // (toBaseUnit/fromBaseUnit/breakdownForDisplay) — no direct quantity *
+  // conversionFactor computation is permitted anywhere else, enforced by a
+  // dedicated ESLint rule using the same mechanism as the tenant-scope rules.
   //
   // [v4.0, corrected] When converting a sale/order line into base units,
   // ALWAYS use THIS row's own conversionFactor (the unit actually sold in),

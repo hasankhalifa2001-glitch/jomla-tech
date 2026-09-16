@@ -33,12 +33,32 @@
  * warning — so that even a future refactor of this file itself can't
  * accidentally let `baseUnitId` / `conversionFactor` leak into a generic
  * "update anything" helper exported from here.
+ *
+ * ============================================================================
+ * [FIX — TypeScript build error] `Decimal.Value` (the namespace-merged type
+ * decimal.js's own .d.ts declares alongside the `Decimal` class) does not
+ * resolve under this project's TypeScript/module configuration (Next.js 16
+ * + Turbopack, "moduleResolution": "bundler") — the default import
+ * `import Decimal from "decimal.js"` only carries the VALUE binding here,
+ * not the merged namespace/type. `data.conversionFactor as Decimal.Value`
+ * therefore failed to compile (TS2749/TS2833). `Decimal` still works fine
+ * as a VALUE (`new Decimal(...)` is unaffected) — only the type name is
+ * broken in this config.
+ *
+ * FIX: same pattern applied in lib/inventory/units.ts and
+ * lib/inventory/packaging-unit-validation.ts — a local `DecimalValue`
+ * type alias derived from `typeof Decimal` instead of decimal.js's own
+ * namespace declaration. No runtime behavior changes; this is a
+ * type-only fix.
+ * ============================================================================
  */
 
 import Decimal from "decimal.js";
 import type { Prisma, Product, ProductUnit } from "@prisma/client";
 import { commitBaseUnitLink } from "@/lib/inventory/base-unit";
 import { assertIsValidBaseUnitFactor } from "@/lib/inventory/units";
+
+type DecimalValue = number | string | InstanceType<typeof Decimal>;
 
 // ----------------------------------------------------------------------------
 // Safe types — excess-property checking on object literals typed as these
@@ -133,7 +153,7 @@ export function createAdditionalUnit(
     tx: Prisma.TransactionClient,
     data: Prisma.ProductUnitCreateInput
 ): Promise<ProductUnit> {
-    if (new Decimal(data.conversionFactor as Decimal.Value).equals(1)) {
+    if (new Decimal(data.conversionFactor as DecimalValue).equals(1)) {
         throw new Error(
             "createAdditionalUnit: conversionFactor of exactly 1 is reserved " +
             "for a product's base unit — use createProductWithBaseUnit() if " +

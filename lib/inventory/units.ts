@@ -28,11 +28,33 @@
  *                       is never written back to any table. Used for
  *                       showing a batch's remaining stock in a
  *                       human-friendly unit on the inventory/POS screen.
+ *
+ * ============================================================================
+ * [FIX — TypeScript build error] `Decimal.Value` / bare `Decimal` used as a
+ * TYPE name (not as a value/constructor) do not resolve under this
+ * project's TypeScript/module configuration (Next.js 16 + Turbopack,
+ * "moduleResolution": "bundler") — the default import `import Decimal from
+ * "decimal.js"` only carries the VALUE binding here, not the namespace-
+ * merged type declaration decimal.js's own .d.ts exposes under other
+ * resolution modes. Every use of `Decimal` or `Decimal.Value` as a
+ * standalone type (return types, interface fields) previously failed to
+ * compile (TS2749/TS2833). `Decimal` still works perfectly fine as a VALUE
+ * — `new Decimal(...)` is unaffected — only its use as a type name is
+ * broken in this config.
+ *
+ * FIX: same pattern already applied in lib/inventory/packaging-unit-
+ * validation.ts — a local `DecimalInstance` type alias derived from
+ * `typeof Decimal` (which TypeScript can always compute from a value
+ * regardless of whether that value's own type name resolves), used
+ * everywhere a bare `Decimal` type was previously written. No runtime
+ * behavior changes; this is a type-only fix.
+ * ============================================================================
  */
 
 import Decimal from "decimal.js";
 
-type Numeric = string | number | Decimal;
+type DecimalInstance = InstanceType<typeof Decimal>;
+type Numeric = string | number | DecimalInstance;
 
 /**
  * Converts a quantity expressed in a sale/display unit into the
@@ -53,7 +75,7 @@ type Numeric = string | number | Decimal;
 export function toBaseUnit(
     quantityInSoldUnit: Numeric,
     soldUnitConversionFactor: Numeric
-): Decimal {
+): DecimalInstance {
     return new Decimal(quantityInSoldUnit).times(soldUnitConversionFactor);
 }
 
@@ -71,7 +93,7 @@ export function toBaseUnit(
 export function fromBaseUnit(
     quantityInBaseUnit: Numeric,
     targetUnitConversionFactor: Numeric
-): Decimal {
+): DecimalInstance {
     return new Decimal(quantityInBaseUnit).dividedBy(targetUnitConversionFactor);
 }
 
@@ -84,7 +106,7 @@ export interface DisplayUnit {
 export interface UnitBreakdownEntry {
     unitId: string;
     unitName: string;
-    count: Decimal;
+    count: DecimalInstance;
 }
 
 /**
@@ -137,9 +159,10 @@ export function breakdownForDisplay(
  * Convenience guard for the base unit's own row: throws if a
  * conversionFactor other than exactly 1 is ever supplied for what's being
  * treated as a base unit. Call this at the point a base ProductUnit is
- * created (see lib/inventory/product-create.ts) — it exists to catch a
- * programming mistake immediately rather than let a wrong value slip into
- * the database and corrupt every downstream conversion for that product.
+ * created (see lib/data/products.ts's createProductWithBaseUnit()) — it
+ * exists to catch a programming mistake immediately rather than let a
+ * wrong value slip into the database and corrupt every downstream
+ * conversion for that product.
  */
 export function assertIsValidBaseUnitFactor(conversionFactor: Numeric): void {
     if (!new Decimal(conversionFactor).equals(1)) {
