@@ -31,19 +31,99 @@
  * function argument, never by reading `.conversionFactor` off a
  * Prisma-typed object in this file's own source.
  *
- * [NOTE — this file never SHAPES conversionFactor-bearing output either]
- * listActiveUnitsForProduct()/listAllUnitsForProduct() below return raw
- * ProductUnit rows, which structurally still carry a `conversionFactor`
- * column (there's no `select` narrowing it out — narrowing it out would
- * itself require naming the field, the exact thing this file avoids).
- * That's fine for a caller that only reads non-restricted fields
- * (unitName, priceWholesale, barcode...) directly off the result. A
- * caller that needs conversionFactor-bearing output in a specific shape
- * (T4a's offline cache payload, T3c/T3e's breakdownForDisplay() input)
- * must pass these raw rows into lib/inventory/units.ts's
- * toOfflineCacheUnits()/toDisplayUnits() — never reshape them here or in
- * the calling route itself, since either would require naming
- * `conversionFactor` outside units.ts.
+ * [FIX 2 — tenant isolation on writes] Every READ below already scopes
+ * its `where` by `tenantId`, matching T1's tenant-isolation architecture
+ * (the Prisma Client Extension is Phase 1's primary guard, but every
+ * query in this codebase is also written defensively as if the
+ * extension were absent — the same double-layered posture T1's
+ * tenantScopedRawQuery() takes for raw queries). Every WRITE helper below
+ * (updateProduct / updateProductUnit / setProductActive /
+ * createAdditionalUnit) verifies the target row actually belongs to the
+ * calling tenant BEFORE writing, via assertProductBelongsToTenant() /
+ * assertProductUnitBelongsToTenant() — AND the actual `update()`/
+ * `create()` call itself is also scoped by `tenantId` directly in its
+ * own `where`, not just guarded by the earlier check. Two independent
+ * layers, not one: a check-then-write pattern alone still has a (tiny,
+ * but real) window between the check and the write, and scoping the
+ * write's own `where` closes that window structurally rather than by
+ * timing. This mirrors the same posture
+ * `updateNonBaseUnitConversionFactor()` in lib/inventory/base-unit.ts
+ * already applies to its own writes.
+ *
+ * [FIX 2b — createAdditionalUnit() previously had NO tenant check at
+ * all] Unlike every other write helper in this file,
+ * createAdditionalUnit() connected `productId` into a new ProductUnit
+ * row without ever confirming that product belongs to `tenantId` first.
+ * A caller passing a productId belonging to a different tenant (bad
+ * input, a compromised route, or a future caller that forgets to
+ * re-derive productId from a tenant-scoped read first) would silently
+ * create a ProductUnit row whose own `tenantId` field is correct but
+ * whose `productId` points at another tenant's Product — a real
+ * cross-tenant data-contamination path. Fixed: this function now calls
+ * assertProductBelongsToTenant() up front, identically to
+ * createProductWithBaseUnit()'s implicit guarantee (it always creates
+ * its OWN product in the same call, so there was never a cross-tenant
+ * risk there).
+ *
+ * [FIX 3 — conversionFactor leak via listProductsWithInventoryDetails]
+ * The inventory-listing query previously included `unit: true` (a full,
+ * unnarrowed ProductUnit row) inside each batch, and returned raw
+ * `Product.units` arrays straight from Prisma — both routes around this
+ * file's own conversionFactor restriction, since it's a bare relation
+ * name (`unit`/`units`), not `.product`/`.productUnit`, so the model-level
+ * ESLint rule never saw it, and the calling route files
+ * (app/api/products/route.ts, app/api/products/[id]/route.ts) have the
+ * conversionFactor ban deliberately LIFTED on the assumption that they
+ * can never hold a raw fetched relation containing that field — an
+ * assumption this function was quietly violating. Fixed: `batch.unit` is
+ * now `select`-narrowed to exclude conversionFactor, and `Product.units`
+ * is reshaped via lib/inventory/units.ts's toDisplayUnits() before
+ * leaving this file, so the literal field name — and any raw Prisma
+ * relation carrying it — never crosses this file's boundary. Callers
+ * that need more display fields than DisplayUnit currently carries
+ * (priceWholesale, pricingCurrency, etc.) should extend toDisplayUnits()
+ * / toOfflineCacheUnits() in units.ts rather than reading the raw row
+ * here or in the route.
+ *
+ * [FIX 4 — raw baseUnitId no longer leaves this file] `findProductWithUnits()`
+ * and `listProductsWithInventoryDetails()` previously typed their return
+ * value as `Omit<Product, never> & {...}` — `Omit<T, never>` omits
+ * nothing, so the raw `Product.baseUnitId` scalar FK was still present on
+ * every object this file handed back to a route, even though the
+ * ESLint model-level ban stops those route files from ever NAMING
+ * `.baseUnitId` in their own source. That's a real gap: a route that
+ * does `return NextResponse.json(product)` (spreading the whole object
+ * into an HTTP response) would leak the raw baseUnitId value to the
+ * client regardless of what the route's own source code names — the
+ * lint rule guards against a route READING the field, not against this
+ * file continuing to CARRY it downstream.
+ *
+ * [FIX 4b — the stripping/annotating itself must NOT happen in this
+ * file] The first pass at this fix wrote `const { baseUnitId, units,
+ * ...rest } = product` directly in THIS file — which is exactly the
+ * `.baseUnitId` destructuring access `BASE_UNIT_ID_RULES` bans, and this
+ * file's own per-file ESLint override deliberately does NOT lift that
+ * ban (see the header note above: "baseUnitId/isBaseUnitOf also stays
+ * fully banned — this file only ever touches it indirectly, via
+ * base-unit.ts's commitBaseUnitLink()"). The linter correctly caught
+ * this as a real violation, not a false positive: this file has no
+ * standing exemption to read that field itself, even for the good
+ * purpose of stripping it back out. Fixed properly: the
+ * destructure-and-annotate logic now lives entirely in
+ * lib/inventory/base-unit.ts's `toSafeProductWithUnits()` — the
+ * sanctioned file for touching `baseUnitId` — which takes a raw fetched
+ * product+units result and hands back a value that already has
+ * `baseUnitId` stripped and each unit annotated with `isBaseUnit`. This
+ * file (products.ts) never names `.baseUnitId` anywhere in its own
+ * source; it only calls the helper and gets safe data back, exactly the
+ * same posture it already has toward `.conversionFactor` via
+ * units.ts's `buildConversionFactorField()`/`isReservedBaseUnitFactor()`.
+ *
+ * [NOTE — this file never SHAPES conversionFactor-bearing output itself]
+ * Any conversionFactor-bearing payload this file returns is always built
+ * by calling into lib/inventory/units.ts's toDisplayUnits()/
+ * toOfflineCacheUnits() — never assembled by hand here, since doing so
+ * would require naming the field directly in this file's own source.
  *
  * The `Safe*` types below are a SECOND, independent layer on top of both
  * restrictions above — a compile-time guarantee, not just a lint
@@ -53,17 +133,29 @@
  */
 
 import type { Prisma, Product, ProductUnit } from "@prisma/client";
-import { commitBaseUnitLink } from "@/lib/inventory/base-unit";
+import {
+    commitBaseUnitLink,
+    toSafeProductWithUnits,
+    type DisplayUnitWithBaseFlag,
+} from "@/lib/inventory/base-unit";
 import {
     buildConversionFactorField,
     isReservedBaseUnitFactor,
     BASE_UNIT_CONVERSION_FACTOR,
 } from "@/lib/inventory/units";
 
+// Re-exported so existing imports of `DisplayUnitWithBaseFlag` from this
+// file keep working — the type itself is now DEFINED in
+// lib/inventory/base-unit.ts (the sanctioned file for baseUnitId), since
+// computing `isBaseUnit` requires comparing against that field, which
+// this file is (correctly) forbidden from ever naming itself. See the
+// FIX 4b note below.
+export type { DisplayUnitWithBaseFlag };
+
 // ----------------------------------------------------------------------------
 // Safe types — excess-property checking on object literals typed as these
-// catches misuse at COMPILE TIME (e.g. calling updateProduct(tx, id,
-// { baseUnitId: 'x' }) below is a TS error), independent of and in
+// catches misuse at COMPILE TIME (e.g. calling updateProduct(tx, tenantId,
+// id, { baseUnitId: 'x' }) below is a TS error), independent of and in
 // addition to whatever the ESLint rule catches. Both sensitive fields are
 // excluded from every input type this file exports, not just the ones
 // that "obviously" needed it.
@@ -72,7 +164,7 @@ export type SafeProductCreate = Omit<Prisma.ProductCreateInput, "baseUnit" | "un
 export type SafeProductUpdate = Omit<Prisma.ProductUpdateInput, "baseUnitId" | "baseUnit">;
 export type SafeProductUnitCreate = Omit<
     Prisma.ProductUnitCreateInput,
-    "product" | "isBaseUnitOf" | "conversionFactor"
+    "product" | "isBaseUnitOf" | "conversionFactor" | "tenant"
 >;
 export type SafeProductUnitUpdate = Omit<
     Prisma.ProductUnitUpdateInput,
@@ -154,21 +246,71 @@ export function listAllUnitsForProduct(
 // pricing, barcode, imageUrl...) goes through these. baseUnitId and
 // conversionFactor are structurally absent from their input types, so
 // passing either is a compile error here, not a runtime check.
+//
+// [FIX 2] Every write below verifies row ownership before writing (via
+// assertProductBelongsToTenant / assertProductUnitBelongsToTenant), AND
+// the write's own `where` is additionally scoped by `tenantId` directly
+// — not relying on the pre-check alone, and not relying solely on the
+// Client Extension to have scoped it upstream. This is the same
+// double-layered posture T1 already takes for raw queries via
+// tenantScopedRawQuery(), and the same posture
+// updateNonBaseUnitConversionFactor() in lib/inventory/base-unit.ts
+// already applies to its own write.
 // ----------------------------------------------------------------------------
-export function updateProduct(
+
+async function assertProductBelongsToTenant(
     tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string
+): Promise<void> {
+    const row = await tx.product.findUniqueOrThrow({
+        where: { id: productId },
+        select: { tenantId: true },
+    });
+    if (row.tenantId !== tenantId) {
+        throw new Error(
+            `Product ${productId} does not belong to tenant ${tenantId}.`
+        );
+    }
+}
+
+async function assertProductUnitBelongsToTenant(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    unitId: string
+): Promise<void> {
+    const row = await tx.productUnit.findUniqueOrThrow({
+        where: { id: unitId },
+        select: { tenantId: true },
+    });
+    if (row.tenantId !== tenantId) {
+        throw new Error(
+            `ProductUnit ${unitId} does not belong to tenant ${tenantId}.`
+        );
+    }
+}
+
+export async function updateProduct(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
     productId: string,
     data: SafeProductUpdate
 ): Promise<Product> {
-    return tx.product.update({ where: { id: productId }, data });
+    await assertProductBelongsToTenant(tx, tenantId, productId);
+    // [FIX 2] `where` scoped by tenantId too, not just `id` — closes the
+    // window between the check above and this write.
+    return tx.product.update({ where: { id: productId, tenantId }, data });
 }
 
-export function updateProductUnit(
+export async function updateProductUnit(
     tx: Prisma.TransactionClient,
+    tenantId: string,
     unitId: string,
     data: SafeProductUnitUpdate
 ): Promise<ProductUnit> {
-    return tx.productUnit.update({ where: { id: unitId }, data });
+    await assertProductUnitBelongsToTenant(tx, tenantId, unitId);
+    // [FIX 2] `where` scoped by tenantId too, not just `id`.
+    return tx.productUnit.update({ where: { id: unitId, tenantId }, data });
 }
 
 /**
@@ -177,12 +319,15 @@ export function updateProductUnit(
  * never accidentally bundle an isActive toggle with an isPublic change in
  * the same call.
  */
-export function setProductActive(
+export async function setProductActive(
     tx: Prisma.TransactionClient,
+    tenantId: string,
     productId: string,
     isActive: boolean
 ): Promise<Product> {
-    return tx.product.update({ where: { id: productId }, data: { isActive } });
+    await assertProductBelongsToTenant(tx, tenantId, productId);
+    // [FIX 2] `where` scoped by tenantId too, not just `id`.
+    return tx.product.update({ where: { id: productId, tenantId }, data: { isActive } });
 }
 
 /**
@@ -196,15 +341,26 @@ export function setProductActive(
  * argument, then merged into the write via
  * units.ts's buildConversionFactorField().
  *
+ * [FIX 2b] Now verifies productId belongs to tenantId BEFORE creating
+ * the unit — previously the only write helper in this file with no
+ * tenant-ownership check at all, meaning a productId belonging to a
+ * different tenant would silently succeed in creating a ProductUnit row
+ * cross-linked to it. See the file-header FIX 2b note.
+ *
+ * @throws {Error} if productId does not belong to tenantId.
  * @throws {Error} if conversionFactor equals the reserved base-unit
  *   value (1) — that value is reserved for createProductWithBaseUnit()
  *   below.
  */
-export function createAdditionalUnit(
+export async function createAdditionalUnit(
     tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string,
     conversionFactor: string,
     data: SafeProductUnitCreate
 ): Promise<ProductUnit> {
+    await assertProductBelongsToTenant(tx, tenantId, productId);
+
     if (isReservedBaseUnitFactor(conversionFactor)) {
         throw new Error(
             "createAdditionalUnit: conversionFactor of exactly 1 is reserved " +
@@ -213,7 +369,12 @@ export function createAdditionalUnit(
         );
     }
     return tx.productUnit.create({
-        data: { ...data, ...buildConversionFactorField(conversionFactor) } as Prisma.ProductUnitCreateInput,
+        data: {
+            ...data,
+            ...buildConversionFactorField(conversionFactor),
+            tenant: { connect: { id: tenantId } },
+            product: { connect: { id: productId } },
+        } as Prisma.ProductUnitCreateInput,
     });
 }
 
@@ -231,7 +392,10 @@ export function createAdditionalUnit(
  * codebase — there is no separate "create bare product, add base unit
  * later" path, since a Product without a resolvable base unit is not a
  * valid state outside this function's own transaction window (see
- * requireBaseUnit()'s MissingBaseUnitError in base-unit.ts).
+ * requireBaseUnit()'s MissingBaseUnitError in base-unit.ts). No
+ * tenant-ownership pre-check is needed here (unlike createAdditionalUnit)
+ * since this function always creates its OWN product in the same call —
+ * there is no pre-existing productId to cross-wire against.
  */
 export async function createProductWithBaseUnit(
     tx: Prisma.TransactionClient,
@@ -258,4 +422,210 @@ export async function createProductWithBaseUnit(
     await commitBaseUnitLink(tx, tenantId, product.id, baseUnit.id);
 
     return { product, baseUnit };
+}
+
+// ----------------------------------------------------------------------------
+// [NEW] Missing reads referenced by app/api/products/route.ts and
+// app/api/products/[id]/route.ts after their v4.0 rewrite — added here.
+// None of these name `conversionFactor` as a literal key (no `orderBy` by
+// it either — CONVERSION_FACTOR_RULES stays fully active in this file),
+// and none leak a `.product` relation to a caller outside this file.
+// ----------------------------------------------------------------------------
+
+/**
+ * A single product plus all its units (active and inactive) — used by
+ * the [id] route's GET (to build the isBaseUnit-annotated response) and
+ * PATCH (as both the pre-update snapshot and, inside the transaction,
+ * the post-update read returned to the client).
+ *
+ * [FIX 3] `units` is reshaped via toDisplayUnits() before returning, so
+ * the raw ProductUnit rows (which carry a real conversionFactor column)
+ * never leave this file.
+ *
+ * [FIX 4] The returned Product no longer carries the raw `baseUnitId`
+ * scalar at all (`Omit<Product, "baseUnitId">`, not the previous
+ * `Omit<Product, never>`, which omitted nothing) — a route that spreads
+ * this object straight into a JSON response can no longer leak that FK
+ * regardless of what the route's own source code names. Each unit now
+ * carries a precomputed `isBaseUnit` boolean instead (see
+ * DisplayUnitWithBaseFlag above) — the route renders a "base unit" badge
+ * off that flag, never off conversionFactor === "1" or the raw FK.
+ */
+export async function findProductWithUnits(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string
+): Promise<(Omit<Product, "baseUnitId"> & { units: DisplayUnitWithBaseFlag[] }) | null> {
+    const product = await tx.product.findUnique({
+        where: { id: productId, tenantId },
+        include: { units: true },
+    });
+    if (!product) return null;
+    // [FIX 4b] Never destructure `.baseUnitId` in this file — hand the raw
+    // fetched result straight to base-unit.ts's sanctioned helper instead.
+    return toSafeProductWithUnits(product);
+}
+
+/**
+ * Cross-product barcode collision check for the [id] route's PATCH —
+ * "is this barcode already used by a DIFFERENT product's unit?"
+ */
+export function findProductUnitByBarcodeExcludingProduct(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    barcode: string,
+    excludeProductId: string
+): Promise<ProductUnit | null> {
+    return tx.productUnit.findFirst({
+        where: {
+            tenantId,
+            barcode,
+            NOT: { productId: excludeProductId },
+        },
+    });
+}
+
+/**
+ * Count of ProductBatch rows for a product — the early, informational
+ * (non-authoritative) check the [id] route's PATCH runs before deciding
+ * whether a base-unit change / conversionFactor edit is even worth
+ * attempting. The authoritative re-check still happens inside the
+ * transaction via base-unit.ts's assertBaseUnitMutable().
+ */
+export function countProductBatches(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string
+): Promise<number> {
+    return tx.productBatch.count({
+        where: { tenantId, productId },
+    });
+}
+
+export interface InventoryBatchView {
+    id: string;
+    tenantId: string;
+    productId: string;
+    unitId: string;
+    unit: { id: string; unitName: string; barcode: string | null; barcodeSource: string | null; isActive: boolean };
+    batchNumber: string;
+    quantity: Prisma.Decimal;
+    expiryDate: Date | null;
+    createdAt: Date;
+    adjustments: unknown[];
+    _count: { invoiceItems: number; adjustments: number };
+}
+
+export interface ProductWithInventoryDetails extends Omit<Product, "baseUnitId"> {
+    units: DisplayUnitWithBaseFlag[];
+    batches: InventoryBatchView[];
+}
+
+/**
+ * Full inventory-screen listing: every product matching whereClause,
+ * with its units and batches (each batch carrying its unit, its
+ * adjustment history, and invoiceItems/adjustments counts) — the shape
+ * app/api/products/route.ts's GET processes into the inventory-table
+ * response.
+ *
+ * [FIX 3] Two changes closing the conversionFactor leak this function
+ * previously had:
+ *   1. `batch.unit` is now `select`-narrowed to exclude
+ *      conversionFactor entirely (id/unitName/barcode/barcodeSource/
+ *      isActive only) — a batch's unit is always the product's base
+ *      unit under v4.0 (conversionFactor is structurally always "1"),
+ *      so the inventory table never needed the raw number here; if a
+ *      future screen genuinely does, fetch it via
+ *      lib/inventory/units.ts's getUnitConversionFactor() explicitly,
+ *      never by widening this select.
+ *   2. `Product.units` is reshaped via toDisplayUnits() before this
+ *      function returns, so the top-level `units: true` include no
+ *      longer hands the route a raw ProductUnit[] either.
+ *
+ * [FIX 4] `baseUnitId` is stripped from every returned product
+ * (`ProductWithInventoryDetails` now extends `Omit<Product,
+ * "baseUnitId">`, not `Omit<Product, never>`), and each unit carries a
+ * precomputed `isBaseUnit` flag instead — same reasoning as
+ * findProductWithUnits() above.
+ *
+ * Ordered by batch createdAt (never by conversionFactor — that field
+ * name stays banned in this file; sort by it only happens inside
+ * lib/inventory/units.ts, if ever needed).
+ */
+export async function listProductsWithInventoryDetails(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    whereClause: Omit<Prisma.ProductWhereInput, "tenantId">
+): Promise<ProductWithInventoryDetails[]> {
+    const products = await tx.product.findMany({
+        where: { ...whereClause, tenantId },
+        include: {
+            units: true,
+            batches: {
+                include: {
+                    unit: {
+                        select: {
+                            id: true,
+                            unitName: true,
+                            barcode: true,
+                            barcodeSource: true,
+                            isActive: true,
+                        },
+                    },
+                    adjustments: {
+                        include: { adjustedByUser: true },
+                        orderBy: { createdAt: "desc" },
+                    },
+                    _count: { select: { invoiceItems: true, adjustments: true } },
+                },
+                orderBy: { createdAt: "desc" },
+            },
+        },
+    });
+
+    // [FIX 4b] Never destructure `.baseUnitId` in this file — the
+    // stripping/annotating happens entirely inside base-unit.ts's
+    // toSafeProductWithUnits(); this file only reshapes the untouched
+    // `batches` field afterward, which is not a restricted name.
+    return products.map((p) => {
+        const safe = toSafeProductWithUnits(p);
+        return {
+            ...safe,
+            batches: safe.batches as unknown as InventoryBatchView[],
+        };
+    });
+}
+
+export interface ProductUnitBarcodeMatch {
+    id: string;
+    unitName: string;
+    isActive: boolean;
+    productId: string;
+    productName: string;
+}
+
+/**
+ * Tenant-wide barcode lookup (any product) — used by products/route.ts's
+ * POST to reject a barcode already in use anywhere for this tenant.
+ * Flattened to a plain productName field rather than returning the raw
+ * row with a nested `.product` relation — see this file's header note on
+ * why a caller must never receive that key directly.
+ */
+export async function findProductUnitByBarcode(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    barcode: string
+): Promise<ProductUnitBarcodeMatch | null> {
+    const unit = await tx.productUnit.findFirst({
+        where: { tenantId, barcode },
+        include: { product: true },
+    });
+    if (!unit) return null;
+    return {
+        id: unit.id,
+        unitName: unit.unitName,
+        isActive: unit.isActive,
+        productId: unit.productId,
+        productName: unit.product.name,
+    };
 }

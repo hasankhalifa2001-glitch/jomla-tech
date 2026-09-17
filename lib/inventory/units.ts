@@ -6,6 +6,13 @@
  * key, as a `MemberExpression` property, as a destructured binding, or in
  * any arithmetic expression built from it.
  *
+ * [NO CHANGES IN THIS FIX PASS] This file was reviewed alongside
+ * products.ts and base-unit.ts and needs no edits — it already exports
+ * toDisplayUnits(), which products.ts's fixed listProductsWithInventoryDetails()
+ * and findProductWithUnits() now call to close the conversionFactor leak
+ * (see those functions' [FIX 3] notes in products.ts). Included here
+ * unchanged so all three files ship together as a matched set.
+ *
  * [FIX — supersedes the "arithmetic-only" restriction] Earlier revisions
  * of this architecture only blocked MULTIPLYING/DIVIDING by
  * `.conversionFactor` outside this file, on the theory that a bare read
@@ -50,6 +57,19 @@
  * is this one, since only this file may write the literal key
  * `conversionFactor` into the output object.
  *
+ * [FIX #3 — packaging-unit validation merged in] validatePackagingUnits()
+ * (T3a §0/§1's creation/edit-time rule check: exactly one base unit,
+ * factor > 0, no duplicate factors) previously lived in its own file,
+ * lib/inventory/packaging-unit-validation.ts. That file directly read
+ * `.conversionFactor` off each candidate unit to validate it — which is
+ * exactly the field-name access this file's ESLint rule bans everywhere
+ * else. Rather than carve out a per-file lint exception (which would
+ * weaken the "one file only" guarantee this architecture depends on),
+ * the validation logic is moved here instead, where it belongs alongside
+ * every other conversionFactor-touching function. The standalone file
+ * has been deleted; every former importer now imports
+ * `validatePackagingUnits`/`PackagingUnit` from this file instead.
+ *
  * Every caller elsewhere in the codebase (T4b's POS, T4c's sync engine,
  * T5's B2B approval, T3c's reconciliation) that needs a specific unit's
  * conversionFactor now calls getUnitConversionFactor() below — never a
@@ -81,6 +101,12 @@
  *                       `conversionFactor`. Callers pass the raw
  *                       Prisma rows in; they get back plain objects with
  *                       conversionFactor pre-serialized to a string.
+ *   - validatePackagingUnits() → creation/edit-time RULE CHECK only
+ *                       (T3a §0/§1) — one base unit, positive factors, no
+ *                       duplicates. Performs no conversion arithmetic and
+ *                       writes nothing; operates on plain input objects
+ *                       supplied by the caller (e.g. a form payload),
+ *                       never on a fetched Prisma relation directly.
  *
  * [FIX — TypeScript build error, unchanged from prior revision] `Decimal`
  * used as a standalone TYPE name does not resolve under this project's
@@ -321,4 +347,126 @@ export function buildConversionFactorField(
     conversionFactor: Numeric
 ): { conversionFactor: string } {
     return { conversionFactor: new Decimal(conversionFactor).toString() };
+}
+
+// ============================================================================
+// [MOVED FROM lib/inventory/packaging-unit-validation.ts — see file header
+// FIX #3] Creation/edit-time packaging-unit RULE VALIDATION (T3a §0/§1).
+// Not a conversion function — performs no arithmetic beyond comparison,
+// writes nothing, and operates on plain caller-supplied objects (a form
+// payload shape), never a fetched Prisma relation. Lives here purely
+// because it must read `.conversionFactor` off each candidate unit to
+// validate it, and this is the one file allowed to do that.
+// ============================================================================
+
+/**
+ * VALIDATION SCOPE NOTE (confirmed business rules — do not weaken without
+ * explicit confirmation):
+ * validatePackagingUnits enforces exactly these packaging-unit rules:
+ *   1. At least one unit must be provided.
+ *   2. unitName is required (non-empty) — matches the non-nullable schema field.
+ *   3. conversionFactor must be a positive number. Fractional factors are
+ *      explicitly ALLOWED and intentional — a wholesaler may legitimately
+ *      sell a quarter- or half-carton at a prorated wholesale price, so
+ *      conversionFactor is NEVER restricted to integers.
+ *   4. Exactly ONE unit per product must have conversionFactor === 1 — the
+ *      base unit. Under T3a §0 (v4.0), this is not a free choice among
+ *      several editable units: the FIRST unit entered at product creation
+ *      automatically becomes the base unit, and the UI locks its
+ *      conversionFactor to 1 without even exposing an editable field for
+ *      it. This validation function is therefore a defensive safety net
+ *      (e.g. catching a bug in a batch-edit or CSV-import path that
+ *      shouldn't be able to produce zero or multiple factor-1 units in
+ *      the first place) rather than the primary mechanism that "chooses"
+ *      the base unit.
+ *   5. No two units on the same product may share the same
+ *      conversionFactor — a duplicate factor creates ambiguity in FIFO
+ *      allocation display and POS/storefront unit pickers (which unit is
+ *      "the" 12-factor unit?), so it is forbidden outright.
+ * Do not add further constraints beyond these five (integer-only factors
+ * being one that was previously and deliberately rejected) without
+ * explicit confirmation, and do not remove rules 4/5 without it either —
+ * both directions of drift have happened before on this module.
+ */
+export interface PackagingUnit {
+    id?: string;
+    unitName: string;
+    conversionFactor: Numeric; // number | string | Decimal — always normalized internally
+    priceWholesale?: Numeric;
+    priceRetail?: Numeric | null;
+    isActive?: boolean;
+}
+
+/**
+ * Validates packaging unit rules for a product. See the VALIDATION SCOPE
+ * NOTE above for the full, confirmed rule set and the reasoning behind
+ * each rule. This function performs no base-unit conversion arithmetic
+ * itself — see toBaseUnit()/fromBaseUnit() above for that.
+ */
+export function validatePackagingUnits(units: PackagingUnit[]): {
+    valid: boolean;
+    error?: string;
+} {
+    if (!units || units.length === 0) {
+        return { valid: false, error: "يجب تحديد وحدة قياس واحدة على الأقل." };
+    }
+
+    const factorsSeen = new Map<string, string>(); // normalized factor key -> unitName that used it
+    let baseUnitCount = 0;
+
+    for (const u of units) {
+        if (!u.unitName || !u.unitName.trim()) {
+            return { valid: false, error: "اسم الوحدة مطلوب لجميع الوحدات." };
+        }
+
+        let factor: DecimalInstance;
+        try {
+            factor = new Decimal(u.conversionFactor);
+        } catch {
+            return {
+                valid: false,
+                error: `معامل التحويل للوحدة "${u.unitName}" غير صالح.`,
+            };
+        }
+
+        if (factor.lte(0)) {
+            return {
+                valid: false,
+                error: `معامل التحويل للوحدة "${u.unitName}" يجب أن يكون رقماً موجباً أكبر من الصفر.`,
+            };
+        }
+
+        if (factor.equals(1)) {
+            baseUnitCount += 1;
+        }
+
+        // Normalize the factor to a canonical decimal string so that
+        // mathematically-equal values written differently (e.g. "12" vs
+        // "12.0" vs "12.00") are correctly detected as duplicates.
+        const factorKey = factor.toFixed();
+        const existingUnitName = factorsSeen.get(factorKey);
+        if (existingUnitName) {
+            return {
+                valid: false,
+                error: `معامل التحويل مكرر: الوحدتان "${existingUnitName}" و"${u.unitName}" لهما نفس معامل التحويل (${factor.toString()}).`,
+            };
+        }
+        factorsSeen.set(factorKey, u.unitName);
+    }
+
+    if (baseUnitCount === 0) {
+        return {
+            valid: false,
+            error: "يجب تحديد وحدة أساسية واحدة بمعامل تحويل يساوي 1 (مثلاً: قطعة).",
+        };
+    }
+
+    if (baseUnitCount > 1) {
+        return {
+            valid: false,
+            error: "لا يمكن تحديد أكثر من وحدة أساسية واحدة بمعامل تحويل يساوي 1.",
+        };
+    }
+
+    return { valid: true };
 }

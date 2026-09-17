@@ -4,14 +4,26 @@ import Decimal from "decimal.js";
 /**
  * ============================================================================
  * lib/utils/money.ts — single shared wrapper around decimal.js for every
- * monetary operation used by T4a (Dexie storage) / T4b (cart math) / T4c
- * (sync-time server conversion) / T4e (ledger balance computation).
+ * MONETARY operation (SYP/USD amounts — invoices, payments, debt) used by
+ * T4a (Dexie storage) / T4b (cart math) / T4c (sync-time server conversion)
+ * / T4e (ledger balance computation).
  *
- * No call site anywhere in the codebase should construct a `Decimal`
- * directly or `import Decimal from "decimal.js"` on its own — always go
- * through this module, so rounding/precision behavior (and error
- * behavior — see below) stays identical across the cart, the offline
- * queue, and the ledger.
+ * No call site handling a monetary (SYP/USD) value should construct a
+ * `Decimal` directly or `import Decimal from "decimal.js"` on its own for
+ * that value — always go through this module, so rounding/precision
+ * behavior (and error behavior — see below) stays identical across the
+ * cart, the offline queue, and the ledger.
+ *
+ * [SCOPE NOTE] This rule is specific to MONETARY values (SYP/USD). It
+ * does NOT extend to quantity/unit-conversion values — those go through
+ * lib/inventory/units.ts's own decimal.js usage instead (conversionFactor,
+ * ProductBatch.quantity, StockAdjustment.quantityDelta), which is a
+ * separate, deliberately independent decimal.js call site for a different
+ * class of value. There is currently no ESLint rule enforcing either
+ * module's decimal.js exclusivity (unlike the project's actual
+ * CI-enforced rules — $queryRaw, nested-write, conversionFactor, model-
+ * level product/productUnit access) — this is a documented convention,
+ * not a build-time guarantee.
  *
  * FAIL-LOUD, NOT FAIL-SILENT:
  * This is financial code. A silently-wrong number (a swallowed NaN, an
@@ -37,8 +49,8 @@ import Decimal from "decimal.js";
 // so it would silently change rounding/precision behavior for any other
 // code in the project that does `import Decimal from "decimal.js"`
 // directly (accidentally or otherwise), even though this file is meant to
-// be the sole owner of that configuration. `Decimal.clone()` produces an
-// independent constructor scoped to this module only.
+// be the sole owner of that configuration for monetary values. `Decimal.clone()`
+// produces an independent constructor scoped to this module only.
 const Money = (Decimal as any).clone({
   precision: 20,
   rounding: Decimal.ROUND_HALF_UP,
@@ -56,8 +68,24 @@ export class MoneyError extends Error {
   }
 }
 
+/**
+ * [FIX] Uses decimal.js's own `Decimal.isDecimal()` static check instead
+ * of `instanceof Money`. `Money` is a `.clone()`'d constructor, entirely
+ * separate from the base `Decimal` export and from any OTHER module's own
+ * clone (e.g. a future or existing independent decimal.js constructor
+ * elsewhere in the codebase, such as lib/inventory/units.ts's plain
+ * `Decimal` usage). `instanceof Money` would reject a perfectly valid
+ * Decimal instance created via any constructor other than this exact
+ * cloned one — throwing a misleading "expected string, number, or
+ * Decimal, got object" MoneyError for a value that IS a Decimal, just not
+ * from this module's own clone. `Decimal.isDecimal()` recognizes any
+ * decimal.js instance regardless of which constructor created it, which
+ * is what every call site of this function actually needs — a value
+ * still gets re-wrapped in `new Money(...)` when necessary elsewhere in
+ * this file, so precision/rounding config is still correctly applied.
+ */
 function isMoneyDecimalInstance(value: unknown): value is MoneyDecimal {
-  return value instanceof Money;
+  return Money.isDecimal(value);
 }
 
 /**
@@ -73,7 +101,11 @@ export function toDecimal(value: MoneyInput): MoneyDecimal {
         `Invalid monetary value: Decimal is not finite (${value.toString()}).`
       );
     }
-    return value;
+    // Re-wrap in this module's own Money constructor so downstream
+    // arithmetic always runs under this file's precision/rounding
+    // config, even if the input Decimal came from a different
+    // decimal.js constructor (see isMoneyDecimalInstance's doc above).
+    return new Money(value.toString());
   }
 
   if (typeof value === "number") {

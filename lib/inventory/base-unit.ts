@@ -18,6 +18,28 @@
  * creation path (see createProductWithBaseUnit()/resetProductUnits()).
  *
  * ============================================================================
+ * [NEW — toSafeProductWithUnits()] lib/data/products.ts needs to hand
+ * routes a Product+units payload that (a) never carries the raw
+ * `baseUnitId` FK, and (b) tells the caller which unit is the base unit
+ * without it having to compare against that FK itself. The first attempt
+ * at this wrote the stripping/annotating logic (a plain
+ * `const { baseUnitId, units, ...rest } = product` destructure) directly
+ * inside lib/data/products.ts — which is exactly the `.baseUnitId`
+ * destructuring access this file's own ESLint ban exists to catch, and
+ * products.ts's per-file override deliberately does NOT lift that ban
+ * (it only touches baseUnitId indirectly, via commitBaseUnitLink()). The
+ * linter correctly flagged it as a real violation.
+ *
+ * Fixed by moving the whole operation HERE instead:
+ * `toSafeProductWithUnits()` takes whatever raw fetched product+units
+ * shape lib/data/products.ts already has (via Prisma's `include: { units:
+ * true }`) and returns the same shape with `baseUnitId` removed and
+ * `units` replaced by DisplayUnitWithBaseFlag[] — so products.ts calls
+ * this function and never has to name `.baseUnitId` in its own source at
+ * all, the same posture it already has toward `.conversionFactor` via
+ * units.ts's buildConversionFactorField()/isReservedBaseUnitFactor().
+ * ============================================================================
+ *
  * [FIX — real bug closed] `resetProductUnits()` previously called
  * `tx.productUnit.deleteMany(...)` to wipe a zero-batch product's units
  * before creating a fresh base unit. This was WRONG: `ProductUnit` is
@@ -40,13 +62,24 @@
  * business-level guard (see its own updated doc below) rather than the
  * load-bearing FK-safety check it was mistakenly relied on for before.
  * ============================================================================
+ *
+ * [FIX 2 — tenant isolation on updateNonBaseUnitConversionFactor's write]
+ * The final `tx.productUnit.update()` in that function is scoped by both
+ * `{ id: params.unitId, tenantId: params.tenantId }` — the same "belt and
+ * suspenders" posture every write in lib/data/products.ts now also takes
+ * (its own writes additionally scope by tenantId in the update's own
+ * `where`, not just via the earlier ownership check), rather than leaning
+ * solely on the earlier ownership check plus the Client Extension.
  */
 
-import type { Prisma, PrismaClient, ProductUnit } from "@prisma/client";
+import type { Prisma, PrismaClient, Product, ProductUnit } from "@prisma/client";
 import type { getTenantDb } from "@/lib/db/tenant-scope";
 import {
     buildConversionFactorField,
     BASE_UNIT_CONVERSION_FACTOR,
+    isReservedBaseUnitFactor,
+    toDisplayUnits,
+    type DisplayUnit,
 } from "@/lib/inventory/units";
 
 export class MissingBaseUnitError extends Error {
@@ -156,6 +189,49 @@ export async function requireBaseUnits(
     }
 
     return result;
+}
+
+/**
+ * [NEW] A DisplayUnit annotated with whether it's the product's base
+ * unit. Defined HERE (not in units.ts, and not in products.ts) because
+ * computing it requires comparing a unit's id against
+ * `Product.baseUnitId` — this is the one file allowed to do that
+ * comparison. lib/data/products.ts imports and re-exports this type for
+ * caller convenience; it never constructs a value of this type itself.
+ */
+export interface DisplayUnitWithBaseFlag extends DisplayUnit {
+    isBaseUnit: boolean;
+}
+
+/**
+ * [NEW] The sanctioned bridge for lib/data/products.ts: takes a raw
+ * fetched Product-plus-units result (from `tx.product.findUnique({
+ * include: { units: true } })` or `.findMany(...)` with the same shape)
+ * and returns the same object with `baseUnitId` stripped and `units`
+ * replaced by DisplayUnitWithBaseFlag[] (each unit's `isBaseUnit`
+ * precomputed).
+ *
+ * This is generic over `T` so it works whether the caller's fetched
+ * object carries extra fields beyond the base Product scalars (e.g.
+ * `batches` on lib/data/products.ts's inventory-listing query) — those
+ * extra fields simply pass through untouched in `rest`.
+ *
+ * lib/data/products.ts calls this instead of ever destructuring
+ * `.baseUnitId` itself — see this file's header note on why that
+ * destructuring must not happen anywhere outside this file, even for the
+ * good purpose of stripping the field back out before it's returned.
+ */
+export function toSafeProductWithUnits<
+    T extends { baseUnitId: string | null; units: ProductUnit[] }
+>(product: T): Omit<T, "baseUnitId" | "units"> & { units: DisplayUnitWithBaseFlag[] } {
+    const { baseUnitId, units, ...rest } = product;
+    const annotatedUnits: DisplayUnitWithBaseFlag[] = toDisplayUnits(units).map((u) => ({
+        ...u,
+        isBaseUnit: u.id === baseUnitId,
+    }));
+    return { ...rest, units: annotatedUnits } as Omit<T, "baseUnitId" | "units"> & {
+        units: DisplayUnitWithBaseFlag[];
+    };
 }
 
 /**
@@ -382,6 +458,9 @@ export async function resetProductUnits(
  *
  * No BaseUnitChangeLog entry — this never changes Product.baseUnitId.
  *
+ * The final write below is scoped by BOTH `id` and `tenantId` — see the
+ * file-header FIX 2 note.
+ *
  * @throws {Error} via assertBaseUnitMutable if the product already has
  *   at least one ProductBatch.
  * @throws {Error} if unitId does not belong to productId, is the
@@ -418,7 +497,7 @@ export async function updateNonBaseUnitConversionFactor(
         );
     }
 
-    if (Number(params.newConversionFactor) === 1) {
+    if (isReservedBaseUnitFactor(params.newConversionFactor)) {
         throw new Error(
             `updateNonBaseUnitConversionFactor: a conversionFactor of exactly ` +
             `1 is reserved for the base unit — this would create a duplicate ` +
@@ -428,7 +507,7 @@ export async function updateNonBaseUnitConversionFactor(
     }
 
     return tx.productUnit.update({
-        where: { id: params.unitId },
+        where: { id: params.unitId, tenantId: params.tenantId },
         data: buildConversionFactorField(params.newConversionFactor),
     });
 }
