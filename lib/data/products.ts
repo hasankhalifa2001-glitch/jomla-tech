@@ -119,6 +119,43 @@
  * same posture it already has toward `.conversionFactor` via
  * units.ts's `buildConversionFactorField()`/`isReservedBaseUnitFactor()`.
  *
+ * [FIX 5 — tx parameter widened to TxOrClient for read-only and
+ * single-field-write helpers] Every function below previously typed its
+ * `tx` parameter strictly as `Prisma.TransactionClient`. In practice,
+ * many callers invoke these functions with the plain tenant-scoped
+ * client returned by `getTenantDb()` directly — NOT wrapped in
+ * `db.$transaction(...)` — because a standalone read (e.g. a GET
+ * handler's product listing) or a single top-level write with no
+ * sibling writes to stay atomic with (e.g. the DELETE handler's
+ * `setProductActive(db, tenantId, id, false)`) needs no transaction at
+ * all. `getTenantDb()`'s return type (a Prisma Client Extension type)
+ * does not structurally satisfy `Prisma.TransactionClient` (different
+ * internal generic branding), so every such call site failed to
+ * compile: "Argument of type 'DynamicClientExtensionThis<...>' is not
+ * assignable to parameter of type 'TransactionClient'."
+ *
+ * Fixed by widening the affected functions' `tx` parameter to
+ * `TxOrClient` (exported from lib/inventory/base-unit.ts, where
+ * requireBaseUnit()/requireBaseUnits() already used this exact pattern
+ * successfully) — a union covering `Prisma.TransactionClient`,
+ * `PrismaClient`, and `getTenantDb()`'s return type. `TxOrClient`
+ * includes `Prisma.TransactionClient`, so every existing call site that
+ * DOES pass a real transaction client (e.g. everything inside this
+ * file's own `db.$transaction(async (tx) => {...})` blocks in the
+ * routes) keeps working unchanged.
+ *
+ * `createProductWithBaseUnit()` is the ONE exception below — it is left
+ * pinned to `Prisma.TransactionClient` deliberately. It performs three
+ * related top-level writes (Product.create → ProductUnit.create →
+ * commitBaseUnitLink()) that must commit atomically, and
+ * commitBaseUnitLink() (lib/inventory/base-unit.ts) itself requires a
+ * real `Prisma.TransactionClient` — widening this function's parameter
+ * would silently remove the compile-time guarantee that it can only ever
+ * be invoked via `db.$transaction(async (tx) => ...)`, exactly the
+ * failure mode T1's nested-write/atomicity rules exist to prevent. See
+ * lib/inventory/base-unit.ts's file-header FIX 3 note for the same
+ * reasoning applied to resetProductUnits()/updateNonBaseUnitConversionFactor().
+ *
  * [NOTE — this file never SHAPES conversionFactor-bearing output itself]
  * Any conversionFactor-bearing payload this file returns is always built
  * by calling into lib/inventory/units.ts's toDisplayUnits()/
@@ -137,6 +174,7 @@ import {
     commitBaseUnitLink,
     toSafeProductWithUnits,
     type DisplayUnitWithBaseFlag,
+    type TxOrClient,
 } from "@/lib/inventory/base-unit";
 import {
     buildConversionFactorField,
@@ -160,7 +198,7 @@ export type { DisplayUnitWithBaseFlag };
 // excluded from every input type this file exports, not just the ones
 // that "obviously" needed it.
 // ----------------------------------------------------------------------------
-export type SafeProductCreate = Omit<Prisma.ProductCreateInput, "baseUnit" | "units">;
+export type SafeProductCreate = Omit<Prisma.ProductCreateInput, "baseUnit" | "units" | "tenant">;
 export type SafeProductUpdate = Omit<Prisma.ProductUpdateInput, "baseUnitId" | "baseUnit">;
 export type SafeProductUnitCreate = Omit<
     Prisma.ProductUnitCreateInput,
@@ -179,9 +217,13 @@ export type SafeProductUnitUpdate = Omit<
 // presence of the field in a full-row read result. See the file header
 // note above for what a CALLER of these must do if it needs
 // conversionFactor-bearing output in a specific shape.
+//
+// [FIX 5] `tx` widened to TxOrClient — these are pure reads, always safe
+// to call with either a real transaction client or the plain tenant-
+// scoped client directly.
 // ----------------------------------------------------------------------------
 export function findProductById(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string
 ): Promise<Product | null> {
@@ -189,14 +231,14 @@ export function findProductById(
 }
 
 export function listActiveProducts(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string
 ): Promise<Product[]> {
     return tx.product.findMany({ where: { tenantId, isActive: true } });
 }
 
 export function findProductUnitById(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     unitId: string
 ): Promise<ProductUnit | null> {
@@ -204,7 +246,7 @@ export function findProductUnitById(
 }
 
 export function listActiveUnitsForProduct(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string
 ): Promise<ProductUnit[]> {
@@ -232,7 +274,7 @@ export function listActiveUnitsForProduct(
  * or in a calling route.
  */
 export function listAllUnitsForProduct(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string
 ): Promise<ProductUnit[]> {
@@ -256,10 +298,19 @@ export function listAllUnitsForProduct(
 // tenantScopedRawQuery(), and the same posture
 // updateNonBaseUnitConversionFactor() in lib/inventory/base-unit.ts
 // already applies to its own write.
+//
+// [FIX 5] `tx` widened to TxOrClient for updateProduct/updateProductUnit/
+// setProductActive/createAdditionalUnit — each performs exactly one
+// top-level Prisma write with no sibling write it must stay atomic with
+// at this layer (any atomicity these need with OTHER models' writes —
+// e.g. the PATCH route's resetProductUnits() call — is the caller's
+// responsibility, achieved by opening its own db.$transaction(...) and
+// passing that `tx` in). createProductWithBaseUnit() is the deliberate
+// exception — see the file-header FIX 5 note.
 // ----------------------------------------------------------------------------
 
 async function assertProductBelongsToTenant(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string
 ): Promise<void> {
@@ -275,7 +326,7 @@ async function assertProductBelongsToTenant(
 }
 
 async function assertProductUnitBelongsToTenant(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     unitId: string
 ): Promise<void> {
@@ -291,7 +342,7 @@ async function assertProductUnitBelongsToTenant(
 }
 
 export async function updateProduct(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string,
     data: SafeProductUpdate
@@ -303,7 +354,7 @@ export async function updateProduct(
 }
 
 export async function updateProductUnit(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     unitId: string,
     data: SafeProductUnitUpdate
@@ -320,7 +371,7 @@ export async function updateProductUnit(
  * the same call.
  */
 export async function setProductActive(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string,
     isActive: boolean
@@ -353,7 +404,7 @@ export async function setProductActive(
  *   below.
  */
 export async function createAdditionalUnit(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string,
     conversionFactor: string,
@@ -396,6 +447,16 @@ export async function createAdditionalUnit(
  * tenant-ownership pre-check is needed here (unlike createAdditionalUnit)
  * since this function always creates its OWN product in the same call —
  * there is no pre-existing productId to cross-wire against.
+ *
+ * [FIX 5] Deliberately still pinned to `Prisma.TransactionClient`, NOT
+ * widened to TxOrClient — see the file-header FIX 5 note. This function
+ * calls commitBaseUnitLink() (lib/inventory/base-unit.ts), which itself
+ * requires a real `Prisma.TransactionClient`; widening this parameter
+ * would let a caller invoke this multi-write function with a plain
+ * client outside any transaction, silently breaking the atomicity
+ * guarantee (a crash between the Product.create and the ProductUnit.create
+ * would then leave an orphaned Product row). Every caller must open its
+ * own `db.$transaction(async (tx) => ...)` and pass that `tx` in.
  */
 export async function createProductWithBaseUnit(
     tx: Prisma.TransactionClient,
@@ -430,6 +491,9 @@ export async function createProductWithBaseUnit(
 // None of these name `conversionFactor` as a literal key (no `orderBy` by
 // it either — CONVERSION_FACTOR_RULES stays fully active in this file),
 // and none leak a `.product` relation to a caller outside this file.
+//
+// [FIX 5] `tx` widened to TxOrClient throughout this section too — every
+// one of these is a pure read.
 // ----------------------------------------------------------------------------
 
 /**
@@ -452,7 +516,7 @@ export async function createProductWithBaseUnit(
  * off that flag, never off conversionFactor === "1" or the raw FK.
  */
 export async function findProductWithUnits(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string
 ): Promise<(Omit<Product, "baseUnitId"> & { units: DisplayUnitWithBaseFlag[] }) | null> {
@@ -471,7 +535,7 @@ export async function findProductWithUnits(
  * "is this barcode already used by a DIFFERENT product's unit?"
  */
 export function findProductUnitByBarcodeExcludingProduct(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     barcode: string,
     excludeProductId: string
@@ -493,7 +557,7 @@ export function findProductUnitByBarcodeExcludingProduct(
  * transaction via base-unit.ts's assertBaseUnitMutable().
  */
 export function countProductBatches(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     productId: string
 ): Promise<number> {
@@ -548,12 +612,18 @@ export interface ProductWithInventoryDetails extends Omit<Product, "baseUnitId">
  * precomputed `isBaseUnit` flag instead — same reasoning as
  * findProductWithUnits() above.
  *
+ * [FIX 5] `tx` widened to TxOrClient — this is the function whose call
+ * site (`listProductsWithInventoryDetails(db, tenantId, whereClause)` in
+ * the GET handler, called directly on the plain tenant-scoped client,
+ * with no surrounding transaction) originally surfaced this whole class
+ * of type error.
+ *
  * Ordered by batch createdAt (never by conversionFactor — that field
  * name stays banned in this file; sort by it only happens inside
  * lib/inventory/units.ts, if ever needed).
  */
 export async function listProductsWithInventoryDetails(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     whereClause: Omit<Prisma.ProductWhereInput, "tenantId">
 ): Promise<ProductWithInventoryDetails[]> {
@@ -612,7 +682,7 @@ export interface ProductUnitBarcodeMatch {
  * why a caller must never receive that key directly.
  */
 export async function findProductUnitByBarcode(
-    tx: Prisma.TransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     barcode: string
 ): Promise<ProductUnitBarcodeMatch | null> {

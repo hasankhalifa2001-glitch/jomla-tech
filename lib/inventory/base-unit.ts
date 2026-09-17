@@ -70,6 +70,37 @@
  * (its own writes additionally scope by tenantId in the update's own
  * `where`, not just via the earlier ownership check), rather than leaning
  * solely on the earlier ownership check plus the Client Extension.
+ *
+ * [FIX 3 — TxOrClient exported] Previously module-private. Read-only and
+ * single-field-write helpers in lib/data/products.ts
+ * (listProductsWithInventoryDetails, findProductWithUnits, updateProduct,
+ * updateProductUnit, setProductActive, etc.) are frequently called with
+ * the plain tenant-scoped client returned by getTenantDb() directly — NOT
+ * wrapped in db.$transaction(...) — since a single read or a single
+ * top-level write needs no transaction (e.g. a GET handler, or the
+ * DELETE handler's setProductActive(db, tenantId, id, false) call).
+ * Those functions were typed to accept only `Prisma.TransactionClient`,
+ * which does not structurally match the Client Extension type
+ * getTenantDb() returns (different internal generic branding) — this
+ * produced a real TypeScript compile error at every such call site:
+ * "Argument of type 'DynamicClientExtensionThis<...>' is not assignable
+ * to parameter of type 'TransactionClient'."
+ *
+ * Exporting this union type lets products.ts widen exactly those
+ * functions' `tx` parameter to accept either shape — the same pattern
+ * requireBaseUnit()/requireBaseUnits() below already used successfully.
+ *
+ * IMPORTANT — NOT every function should be widened this way. Any
+ * function that performs MULTIPLE related writes requiring atomicity
+ * (createProductWithBaseUnit in products.ts; resetProductUnits and
+ * updateNonBaseUnitConversionFactor here in this file — anything that
+ * calls commitBaseUnitLink() or otherwise depends on genuinely running
+ * inside one real $transaction) must stay pinned to
+ * `Prisma.TransactionClient` deliberately, so a caller is compile-time
+ * forced to invoke it via db.$transaction(async (tx) => ...). Widening
+ * those would silently remove the atomicity guarantee T1's Unit
+ * Conversion Architecture depends on. See products.ts's header for which
+ * of its functions were and weren't widened, and why.
  */
 
 import type { Prisma, PrismaClient, Product, ProductUnit } from "@prisma/client";
@@ -126,7 +157,19 @@ export class PendingB2BReferenceError extends Error {
     }
 }
 
-type TxOrClient = Prisma.TransactionClient | PrismaClient | ReturnType<typeof getTenantDb>;
+/**
+ * [FIX 3 — exported] See the file-header FIX 3 note for the full
+ * rationale. Used by lib/data/products.ts to widen its read-only and
+ * single-field-write helpers so they can be called with either a real
+ * `Prisma.TransactionClient` (inside a db.$transaction(...) block) or
+ * the plain tenant-scoped client returned by getTenantDb() (for a
+ * standalone read or single top-level write that needs no transaction).
+ *
+ * Functions requiring multi-write atomicity (createProductWithBaseUnit,
+ * resetProductUnits, updateNonBaseUnitConversionFactor) deliberately do
+ * NOT use this type — they stay pinned to `Prisma.TransactionClient`.
+ */
+export type TxOrClient = Prisma.TransactionClient | PrismaClient | ReturnType<typeof getTenantDb>;
 
 /**
  * Resolves and returns a product's base ProductUnit, guaranteed non-null.
@@ -240,10 +283,15 @@ export function toSafeProductWithUnits<
  * Once any batch exists, every conversionFactor on the product (base or
  * otherwise) is permanently locked.
  *
+ * Deliberately still pinned to `Prisma.TransactionClient` — always
+ * called from within resetProductUnits() / updateNonBaseUnitConversionFactor(),
+ * both of which must themselves run inside a real $transaction. See the
+ * file-header FIX 3 note.
+ *
  * @throws {Error} if the product already has at least one ProductBatch.
  */
 export async function assertBaseUnitMutable(
-    tx: TxOrClient,
+    tx: Prisma.TransactionClient,
     tenantId: string,
     productId: string
 ): Promise<void> {
@@ -304,6 +352,10 @@ export async function assertNoPendingB2BReferences(
  * it exists so a future caller (or a copy-paste mistake) fails loud
  * immediately instead of silently corrupting the product's
  * unit-conversion integrity.
+ *
+ * Deliberately still pinned to `Prisma.TransactionClient` — see the
+ * file-header FIX 3 note: this is a link-write that must always happen
+ * inside the same $transaction as the ProductUnit.create() it follows.
  */
 export async function commitBaseUnitLink(
     tx: Prisma.TransactionClient,
@@ -341,6 +393,12 @@ export async function commitBaseUnitLink(
  * hard-delete version was a real bug (a Restrict FK violation waiting to
  * happen for any product with ANY historical B2B order, not just a
  * pending one).
+ *
+ * Deliberately still pinned to `Prisma.TransactionClient` (not widened
+ * to TxOrClient) — this function performs multiple related writes
+ * (deactivate units, create new base unit, commitBaseUnitLink, write
+ * BaseUnitChangeLog) that must all commit atomically. See the
+ * file-header FIX 3 note.
  *
  * ADMIN-only at the route level (T2b's Role Capability Matrix) — this
  * function itself enforces two preconditions before writing anything:
@@ -457,6 +515,11 @@ export async function resetProductUnits(
  * design — see the file header.
  *
  * No BaseUnitChangeLog entry — this never changes Product.baseUnitId.
+ *
+ * Deliberately still pinned to `Prisma.TransactionClient` — the read
+ * (assertBaseUnitMutable's re-check) and the write must commit
+ * atomically against the same transaction the caller opened. See the
+ * file-header FIX 3 note.
  *
  * The final write below is scoped by BOTH `id` and `tenantId` — see the
  * file-header FIX 2 note.
