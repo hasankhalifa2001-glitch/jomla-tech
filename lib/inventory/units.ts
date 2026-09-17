@@ -166,6 +166,13 @@ export interface DisplayUnit {
     id: string;
     unitName: string;
     conversionFactor: Numeric;
+    isActive: boolean;
+    pricingCurrency: "SYP" | "USD";
+    priceWholesale: Numeric;
+    priceRetail: Numeric | null;
+    barcode: string | null;
+    barcodeSource: "GS1" | "INTERNAL" | null;
+    imageUrl: string | null;
 }
 
 export interface UnitBreakdownEntry {
@@ -260,6 +267,13 @@ export function toDisplayUnits(units: ProductUnit[]): DisplayUnit[] {
         id: u.id,
         unitName: u.unitName,
         conversionFactor: u.conversionFactor.toString(),
+        isActive: u.isActive,
+        pricingCurrency: u.pricingCurrency,
+        priceWholesale: u.priceWholesale,
+        priceRetail: u.priceRetail,
+        barcode: u.barcode,
+        barcodeSource: u.barcodeSource,
+        imageUrl: u.imageUrl,
     }));
 }
 

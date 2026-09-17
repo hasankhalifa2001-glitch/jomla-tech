@@ -311,7 +311,7 @@ const eslintConfig = defineConfig([
     // "is this unit the base unit?" flag they need is computed inside
     // lib/data/products.ts's findProductWithUnits() and handed to them
     // pre-shaped, never derived here from a raw relation.
-    files: ["app/api/products/route.ts", "app/api/products/[id]/route.ts"],
+    files: ["app/api/inventory/products/route.ts", "app/api/inventory/products/[id]/route.ts"],
     rules: {
       "no-restricted-syntax": [
         "error",

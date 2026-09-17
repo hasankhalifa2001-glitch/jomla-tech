@@ -12,9 +12,29 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { validatePackagingUnits, type PackagingUnit } from "@/lib/inventory/packaging-unit-validation";
-// [v4.0] Sole gateway for reading Product.baseUnitId.
-import { requireBaseUnit, MissingBaseUnitError } from "@/lib/inventory/base-unit";
+// [FIX] validatePackagingUnits/PackagingUnit now live in units.ts — the
+// standalone lib/inventory/packaging-unit-validation.ts file was deleted
+// when its logic was merged into units.ts (see that file's header, FIX
+// #3). This route was still importing from the deleted path.
+import { validatePackagingUnits, type PackagingUnit } from "@/lib/inventory/units";
+import {
+  requireBaseUnit,
+  MissingBaseUnitError,
+  resetProductUnits,
+  updateNonBaseUnitConversionFactor,
+  PendingB2BReferenceError,
+} from "@/lib/inventory/base-unit";
+// [FIX] Sole gateway for tx.product.* / tx.productUnit.* outside
+// base-unit.ts — see lib/data/products.ts's header.
+import {
+  findProductWithUnits,
+  findProductUnitByBarcodeExcludingProduct,
+  updateProduct,
+  updateProductUnit,
+  createAdditionalUnit,
+  countProductBatches,
+  setProductActive,
+} from "@/lib/data/products";
 import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
 import { z } from "zod";
@@ -67,10 +87,10 @@ const updateProductSchema = z.object({
   isActive: z.boolean().optional(),
   isPublic: z.boolean().optional(),
   units: z.array(unitSchema).min(1, "يجب أن يحتوي المنتج على وحدة قياس واحدة على الأقل").optional(),
-  // [v4.0] Required whenever this PATCH would actually change WHICH unit
-  // is the base unit (only possible when the product has zero batches —
-  // see the immutability check below). Backs the BaseUnitChangeLog audit
-  // row — a base-unit correction is never a silent field edit.
+  // Required whenever this PATCH would actually change WHICH unit is the
+  // base unit (only reachable when the product has zero batches AND zero
+  // pending B2B references — both re-checked INSIDE the transaction, see
+  // below). Backs the BaseUnitChangeLog audit row.
   baseUnitChangeReason: z.string().optional(),
 });
 
@@ -80,10 +100,6 @@ interface PublishabilityCandidateUnit {
   priceRetail: string | number | Prisma.Decimal | null | undefined;
 }
 
-// [v4.0] The full merged shape used both for the effective-units
-// validation below and for the publishing-gate candidate check, so both
-// checks see the SAME resulting state — not just whatever subset of units
-// happened to be included in this particular PATCH payload.
 interface EffectiveUnit {
   id?: string;
   unitName: string;
@@ -108,19 +124,41 @@ export async function GET(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    const product = await db.product.findFirst({
-      where: { id },
-      include: {
-        units: { orderBy: { conversionFactor: "asc" } },
-        batches: { orderBy: { createdAt: "desc" } },
-      },
-    });
+    // [FIX] Routed through lib/data/products.ts.
+    const product = await findProductWithUnits(db, tenantId, id);
 
     if (!product) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    return NextResponse.json({ success: true, product });
+    // [v4.0] Surfaced for the UI so the edit screen can lock the base
+    // unit's conversionFactor field — resolved via the sole sanctioned
+    // gateway, never by reading product.baseUnitId directly.
+    let baseUnitId: string;
+    try {
+      const baseUnit = await requireBaseUnit(db, tenantId, id);
+      baseUnitId = baseUnit.id;
+    } catch (e) {
+      if (e instanceof MissingBaseUnitError) {
+        return NextResponse.json(
+          {
+            error: "MISSING_BASE_UNIT",
+            message: "هذا المنتج بدون وحدة أساسية محددة (بيانات قديمة تحتاج تصحيح) — الرجاء التواصل مع الدعم الفني.",
+          },
+          { status: 409 }
+        );
+      }
+      throw e;
+    }
+
+    return NextResponse.json({
+      success: true,
+      product: {
+        ...product,
+        baseUnitId,
+        units: product.units.map((u) => ({ ...u, isBaseUnit: u.id === baseUnitId })),
+      },
+    });
   } catch (error) {
     console.error("GET product error:", error);
     return NextResponse.json({ error: "SERVER_ERROR", message: "حدث خطأ أثناء جلب المنتج." }, { status: 500 });
@@ -144,26 +182,16 @@ export async function PATCH(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    const existingProduct = await db.product.findFirst({
-      where: { id },
-      include: { units: true },
-    });
-
+    const existingProduct = await findProductWithUnits(db, tenantId, id);
     if (!existingProduct) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    // [v4.0] Resolve the CURRENT base unit through the sole sanctioned
-    // gateway — never by reading existingProduct.baseUnitId directly
-    // (blocked by this project's ESLint rule) and never by re-deriving it
-    // via conversionFactor === 1.
     let currentBaseUnit;
     try {
       currentBaseUnit = await requireBaseUnit(db, tenantId, id);
     } catch (e) {
       if (e instanceof MissingBaseUnitError) {
-        // Pre-v4.0 legacy row that still needs a one-time baseUnitId
-        // backfill migration — fail loud rather than guess.
         return NextResponse.json(
           {
             error: "MISSING_BASE_UNIT",
@@ -174,8 +202,6 @@ export async function PATCH(
       }
       throw e;
     }
-
-    const batchCount = await db.productBatch.count({ where: { productId: id, tenantId } });
 
     const body = await req.json();
     const parsed = updateProductSchema.safeParse(body);
@@ -189,17 +215,16 @@ export async function PATCH(
         { status: 400 }
       );
     }
-
     const data = parsed.data;
 
-    // [v4.0] Build the EFFECTIVE resulting unit list — existing units not
+    // Build the EFFECTIVE resulting unit list — existing units not
     // mentioned in data.units stay as they are; units with a matching
-    // `id` are replaced by their submitted values; units with no `id` are
-    // additions. Every check below runs against this merged list, not
-    // just the submitted subset — otherwise a partial update that simply
-    // omits the current base unit from data.units could silently evade
-    // the "exactly one conversionFactor === 1" / base-unit-immutability
-    // rules.
+    // `id` are replaced by their submitted values; units with no `id`
+    // are additions. Every validation check below runs against this
+    // merged list, not just the submitted subset — otherwise a partial
+    // update that simply omits the current base unit from data.units
+    // could silently evade the "exactly one conversionFactor === 1" /
+    // base-unit-immutability rules.
     const effectiveUnits: EffectiveUnit[] = existingProduct.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
@@ -217,9 +242,6 @@ export async function PATCH(
           if (idx >= 0) {
             effectiveUnits[idx] = { ...effectiveUnits[idx], ...submitted };
           } else {
-            // A submitted id that doesn't belong to this product — let
-            // the per-unit write loop below surface that naturally
-            // (Prisma's update on a non-existent id fails).
             effectiveUnits.push(submitted);
           }
         } else {
@@ -228,8 +250,8 @@ export async function PATCH(
       }
     }
 
-    let baseUnitWouldChange = false;
-    let effectiveBaseUnitId = currentBaseUnit.id;
+    let wantsBaseUnitChange = false;
+    let newBaseUnitSubmission: z.infer<typeof unitSchema> | null = null;
 
     if (data.units) {
       const packagingCheck = validatePackagingUnits(effectiveUnits as PackagingUnit[]);
@@ -240,76 +262,131 @@ export async function PATCH(
         );
       }
 
-      // [v4.0] Base-unit immutability (T1's Unit Conversion Architecture).
-      // validatePackagingUnits above already guarantees exactly one unit
-      // in effectiveUnits has conversionFactor === 1.
       const effectiveBaseUnit = effectiveUnits.find((u) =>
         new Decimal(u.conversionFactor).equals(1)
       )!;
-      effectiveBaseUnitId = effectiveBaseUnit.id ?? "__NEW_UNIT__"; // real id resolved after creation inside the transaction
-      baseUnitWouldChange =
-        !effectiveBaseUnit.id || effectiveBaseUnit.id !== currentBaseUnit.id;
+      wantsBaseUnitChange = !effectiveBaseUnit.id || effectiveBaseUnit.id !== currentBaseUnit.id;
 
-      if (baseUnitWouldChange && batchCount > 0) {
-        return NextResponse.json(
-          {
-            error: "BASE_UNIT_LOCKED",
-            message: "لا يمكن تغيير الوحدة الأساسية أو معامل تحويلها لمنتج لديه دفعات مخزون مسجلة.",
-          },
-          { status: 400 }
-        );
-      }
-
-      if (baseUnitWouldChange && batchCount === 0 && !data.baseUnitChangeReason?.trim()) {
-        return NextResponse.json(
-          {
-            error: "BASE_UNIT_CHANGE_REASON_REQUIRED",
-            message: "يجب إدخال سبب لتغيير الوحدة الأساسية.",
-          },
-          { status: 400 }
-        );
-      }
-
-      const names = new Set<string>();
-      const barcodesInRequest = new Set<string>();
-      for (const u of data.units) {
-        const lowerName = u.unitName.trim().toLowerCase();
-        if (names.has(lowerName)) {
+      if (wantsBaseUnitChange) {
+        // [FIX] This is now an EARLY, INFORMATIONAL check only — it gives
+        // a fast, friendly error for the common case, but it is NOT the
+        // security boundary. The authoritative re-check happens INSIDE
+        // the transaction below via resetProductUnits(), which calls
+        // assertBaseUnitMutable() + assertNoPendingB2BReferences()
+        // itself, closing the exact window between this read and that
+        // write where a concurrent CSV import / POS sync / B2B approval
+        // could otherwise create the product's first batch (or a pending
+        // B2B order) after this check passes but before the transaction
+        // commits.
+        const earlyBatchCount = await countProductBatches(db, tenantId, id);
+        if (earlyBatchCount > 0) {
           return NextResponse.json(
-            { error: "DUPLICATE_UNIT_NAME", message: `اسم الوحدة "${u.unitName}" مكرر لهذا المنتج` },
+            {
+              error: "BASE_UNIT_LOCKED",
+              message: "لا يمكن تغيير الوحدة الأساسية أو معامل تحويلها لمنتج لديه دفعات مخزون مسجلة.",
+            },
             { status: 400 }
           );
         }
-        names.add(lowerName);
 
-        if (u.barcode && u.barcode.trim()) {
-          const barcodeTrim = u.barcode.trim();
+        if (!data.baseUnitChangeReason?.trim()) {
+          return NextResponse.json(
+            {
+              error: "BASE_UNIT_CHANGE_REASON_REQUIRED",
+              message: "يجب إدخال سبب لتغيير الوحدة الأساسية.",
+            },
+            { status: 400 }
+          );
+        }
 
-          if (barcodesInRequest.has(barcodeTrim)) {
+        // A base-unit change is a dedicated, standalone correction flow
+        // (see resetProductUnits()'s "wipe and restart" design) — it does
+        // not attempt to also apply arbitrary sibling-unit edits from the
+        // same payload. If other unit edits are genuinely needed, submit
+        // them in a separate PATCH after the base-unit correction.
+        newBaseUnitSubmission = data.units.find(
+          (u) => new Decimal(u.conversionFactor).equals(1)
+        )!;
+      } else {
+        // Ordinary path (no base-unit change): validate name/barcode
+        // uniqueness for the submitted units.
+        const names = new Set<string>();
+        const barcodesInRequest = new Set<string>();
+        for (const u of data.units) {
+          const lowerName = u.unitName.trim().toLowerCase();
+          if (names.has(lowerName)) {
             return NextResponse.json(
-              { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مكرر لأكثر من وحدة ضمن نفس الطلب.` },
+              { error: "DUPLICATE_UNIT_NAME", message: `اسم الوحدة "${u.unitName}" مكرر لهذا المنتج` },
               { status: 400 }
             );
           }
-          barcodesInRequest.add(barcodeTrim);
+          names.add(lowerName);
 
-          const duplicate = await db.productUnit.findFirst({
-            where: { barcode: barcodeTrim, product: { tenantId }, NOT: { productId: id } },
-          });
-          if (duplicate) {
-            return NextResponse.json(
-              { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مستخدم مسبقاً في منتج آخر لديك.` },
-              { status: 400 }
-            );
+          if (u.barcode && u.barcode.trim()) {
+            const barcodeTrim = u.barcode.trim();
+
+            if (barcodesInRequest.has(barcodeTrim)) {
+              return NextResponse.json(
+                { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مكرر لأكثر من وحدة ضمن نفس الطلب.` },
+                { status: 400 }
+              );
+            }
+            barcodesInRequest.add(barcodeTrim);
+
+            const duplicate = await findProductUnitByBarcodeExcludingProduct(db, tenantId, barcodeTrim, id);
+            if (duplicate) {
+              return NextResponse.json(
+                { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مستخدم مسبقاً في منتج آخر لديك.` },
+                { status: 400 }
+              );
+            }
+
+            // A non-base unit whose conversionFactor is CHANGING (not
+            // just re-submitted unchanged) needs the same early,
+            // informational batch-count preview as a base-unit change —
+            // the authoritative gate is still inside the transaction
+            // (updateNonBaseUnitConversionFactor's own
+            // assertBaseUnitMutable call).
+          }
+        }
+
+        for (const u of data.units) {
+          if (!u.id) continue; // new non-base unit — no prior factor to compare against
+          const existing = effectiveUnits.find((e) => e.id === u.id);
+          const priorFactorRow = existingProduct.units.find((eu) => eu.id === u.id);
+          if (
+            priorFactorRow &&
+            !new Decimal(u.conversionFactor).equals(priorFactorRow.conversionFactor.toString())
+          ) {
+            const earlyBatchCount = await countProductBatches(db, tenantId, id);
+            if (earlyBatchCount > 0) {
+              return NextResponse.json(
+                {
+                  error: "CONVERSION_FACTOR_LOCKED",
+                  message: `لا يمكن تعديل معامل تحويل الوحدة "${existing?.unitName}" لمنتج لديه دفعات مخزون مسجلة.`,
+                },
+                { status: 400 }
+              );
+            }
           }
         }
       }
     }
 
     const nextIsActive = data.isActive !== undefined ? data.isActive : existingProduct.isActive;
-    const nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
+    let nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
 
-    if (data.isPublic === true) {
+    // [FIX] A base-unit reset always forces the product private — the
+    // freshly created base unit has no priceRetail/imageUrl, so a
+    // product left `isPublic: true` across a reset would silently keep
+    // failing (or worse, keep passing on stale cached data) T3a's
+    // publishing gate. This is enforced regardless of what the request
+    // body says for isPublic.
+    if (wantsBaseUnitChange) {
+      nextIsPublic = false;
+    }
+
+    if (data.isPublic === true && !wantsBaseUnitChange) {
       if (!nextIsActive) {
         return NextResponse.json(
           { error: "PRODUCT_INACTIVE", message: "لا يمكن نشر منتج موقوف في المتجر." },
@@ -317,11 +394,6 @@ export async function PATCH(
         );
       }
 
-      // [v4.0] Now built from effectiveUnits (the full merged state), not
-      // just data.units OR existingProduct.units — a partial update that
-      // e.g. only edits one unit's price no longer loses visibility into
-      // every OTHER unit's isActive/imageUrl/priceRetail for this gate
-      // check.
       const candidateUnits: PublishabilityCandidateUnit[] = effectiveUnits.map((u) => ({
         isActive: u.isActive !== false,
         imageUrl: u.imageUrl,
@@ -338,87 +410,129 @@ export async function PATCH(
     }
 
     const updatedProduct = await db.$transaction(async (tx) => {
-      const product = await tx.product.update({
-        where: { id },
-        data: {
+      if (wantsBaseUnitChange && newBaseUnitSubmission) {
+        // [FIX] resetProductUnits() itself calls assertBaseUnitMutable()
+        // AND assertNoPendingB2BReferences() as its first two actions,
+        // inside THIS transaction — this is the actual, race-free gate.
+        await resetProductUnits(tx, {
+          tenantId,
+          productId: id,
+          newBaseUnit: {
+            unitName: newBaseUnitSubmission.unitName,
+            pricingCurrency: newBaseUnitSubmission.pricingCurrency,
+            priceWholesale: newBaseUnitSubmission.priceWholesale,
+            priceRetail: newBaseUnitSubmission.priceRetail ?? null,
+            imageUrl: newBaseUnitSubmission.imageUrl ?? null,
+          },
+          changedByUserId: session.user.id,
+          reason: data.baseUnitChangeReason!.trim(),
+        });
+
+        // [FIX] updateProduct's current signature is
+        // (tx, tenantId, productId, data) — the tenantId argument was
+        // missing here, which is a compile error against the current
+        // lib/data/products.ts (and, if it somehow ran, would have
+        // relied entirely on the Client Extension for tenant scoping
+        // instead of the belt-and-suspenders check that function now
+        // performs itself).
+        await updateProduct(tx, tenantId, id, {
+          name: data.name,
+          category: data.category !== undefined ? data.category : undefined,
+          isActive: nextIsActive,
+          isPublic: false, // forced — see the note above
+        });
+      } else {
+        // [FIX] Same missing-tenantId issue as above.
+        await updateProduct(tx, tenantId, id, {
           name: data.name,
           category: data.category !== undefined ? data.category : undefined,
           isActive: nextIsActive,
           isPublic: nextIsPublic,
-        },
-      });
+        });
 
-      // [v4.0] Tracks which unit ends up with conversionFactor === 1 as
-      // we actually write each row — starts at the current base unit (no
-      // change) and is overwritten only if a unit written below turns out
-      // to carry factor 1.
-      let resolvedBaseUnitId = currentBaseUnit.id;
+        if (data.units) {
+          for (const u of data.units) {
+            const isNonBaseFactorChange =
+              !!u.id &&
+              (() => {
+                const priorRow = existingProduct.units.find((eu) => eu.id === u.id);
+                return !!priorRow && !new Decimal(u.conversionFactor).equals(priorRow.conversionFactor.toString());
+              })();
 
-      if (data.units) {
-        for (const u of data.units) {
-          let writtenUnitId: string;
-
-          if (u.id) {
-            const updated = await tx.productUnit.update({
-              where: { id: u.id },
-              data: {
-                unitName: u.unitName,
-                conversionFactor: u.conversionFactor,
-                pricingCurrency: u.pricingCurrency,
-                priceWholesale: u.priceWholesale,
-                priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
-                barcode: u.barcode ? u.barcode.trim() : null,
-                barcodeSource: u.barcode ? u.barcodeSource : null,
-                imageUrl: u.imageUrl || null,
-                isActive: u.isActive !== undefined ? u.isActive : true,
-              },
-            });
-            writtenUnitId = updated.id;
-          } else {
-            const created = await tx.productUnit.create({
-              data: {
-                tenantId,
-                productId: id,
-                unitName: u.unitName,
-                conversionFactor: u.conversionFactor,
-                pricingCurrency: u.pricingCurrency,
-                priceWholesale: u.priceWholesale,
-                priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
-                barcode: u.barcode ? u.barcode.trim() : null,
-                barcodeSource: u.barcode ? u.barcodeSource : null,
-                imageUrl: u.imageUrl || null,
-                isActive: u.isActive !== undefined ? u.isActive : true,
-              },
-            });
-            writtenUnitId = created.id;
-          }
-
-          if (new Decimal(u.conversionFactor).equals(1)) {
-            resolvedBaseUnitId = writtenUnitId;
-          }
-
-          if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
-            const barcodeTrim = u.barcode.trim();
-            const existingCatalog = await tx.productCatalogEntry.findUnique({
-              where: { barcode: barcodeTrim },
-            });
-            if (!existingCatalog) {
-              try {
-                await tx.productCatalogEntry.create({
-                  data: {
-                    barcode: barcodeTrim,
-                    name: data.name || product.name,
-                    category: data.category !== undefined ? data.category : product.category,
-                    imageUrl: u.imageUrl || null,
-                    addedByTenantId: tenantId,
-                  },
+            if (u.id) {
+              if (isNonBaseFactorChange) {
+                // [FIX] conversionFactor changes on an existing unit go
+                // through the one explicitly-guarded path — it re-checks
+                // zero-batch INSIDE this same transaction, and refuses
+                // to touch the current base unit.
+                await updateNonBaseUnitConversionFactor(tx, {
+                  tenantId,
+                  productId: id,
+                  unitId: u.id,
+                  newConversionFactor: u.conversionFactor,
                 });
-              } catch (catalogError) {
-                const isBenignRace =
-                  catalogError instanceof Prisma.PrismaClientKnownRequestError &&
-                  catalogError.code === "P2002";
-                if (!isBenignRace) {
-                  throw catalogError;
+              }
+              // [FIX] updateProductUnit's current signature is
+              // (tx, tenantId, unitId, data) — tenantId was missing.
+              await updateProductUnit(tx, tenantId, u.id, {
+                unitName: u.unitName,
+                pricingCurrency: u.pricingCurrency,
+                priceWholesale: u.priceWholesale,
+                priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
+                barcode: u.barcode ? u.barcode.trim() : null,
+                barcodeSource: u.barcode ? u.barcodeSource : null,
+                imageUrl: u.imageUrl || null,
+                isActive: u.isActive !== undefined ? u.isActive : true,
+              });
+            } else {
+              // [FIX] createAdditionalUnit's current signature is
+              // (tx, tenantId, productId, conversionFactor, data), with
+              // `conversionFactor` passed as its own explicit argument
+              // (never embedded in `data`) and `tenant`/`product`
+              // connects handled internally by the function itself —
+              // never supplied by the caller. The previous call here
+              // used a stale 2-argument shape
+              // (tx, { tenant, product, conversionFactor, ... }), which
+              // both fails to compile against the current
+              // lib/data/products.ts and — had it somehow run — would
+              // have written the literal `conversionFactor` key from
+              // route code, exactly the pattern the model/field-level
+              // restriction on this codebase exists to prevent.
+              await createAdditionalUnit(tx, tenantId, id, u.conversionFactor, {
+                unitName: u.unitName,
+                pricingCurrency: u.pricingCurrency,
+                priceWholesale: u.priceWholesale,
+                priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
+                barcode: u.barcode ? u.barcode.trim() : null,
+                barcodeSource: u.barcode ? u.barcodeSource : null,
+                imageUrl: u.imageUrl || null,
+                isActive: u.isActive !== undefined ? u.isActive : true,
+              });
+            }
+
+            if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
+              const barcodeTrim = u.barcode.trim();
+              const existingCatalog = await tx.productCatalogEntry.findUnique({
+                where: { barcode: barcodeTrim },
+              });
+              if (!existingCatalog) {
+                try {
+                  await tx.productCatalogEntry.create({
+                    data: {
+                      barcode: barcodeTrim,
+                      name: data.name || existingProduct.name,
+                      category: data.category !== undefined ? data.category : existingProduct.category,
+                      imageUrl: u.imageUrl || null,
+                      addedByTenantId: tenantId,
+                    },
+                  });
+                } catch (catalogError) {
+                  const isBenignRace =
+                    catalogError instanceof Prisma.PrismaClientKnownRequestError &&
+                    catalogError.code === "P2002";
+                  if (!isBenignRace) {
+                    throw catalogError;
+                  }
                 }
               }
             }
@@ -426,43 +540,15 @@ export async function PATCH(
         }
       }
 
-      // [v4.0] If the base unit actually changed (only reachable when
-      // batchCount === 0 — already blocked above otherwise), log it via
-      // BaseUnitChangeLog and update Product.baseUnitId — both as their
-      // own top-level calls in this same transaction (T1's nested-write
-      // rule). A base-unit correction is never a silent field edit.
-      if (resolvedBaseUnitId !== currentBaseUnit.id) {
-        await tx.baseUnitChangeLog.create({
-          data: {
-            tenantId,
-            productId: id,
-            oldBaseUnitId: currentBaseUnit.id,
-            newBaseUnitId: resolvedBaseUnitId,
-            // NOTE: assumes `session.user.id` is populated on the JWT
-            // session per T2a — please confirm this field name matches
-            // your actual auth callback (role/tenantId/isPlatformAdmin
-            // were the three explicitly documented; user id wasn't
-            // called out by name).
-            changedByUserId: session.user.id,
-            reason: data.baseUnitChangeReason!.trim(),
-          },
-        });
-        await tx.product.update({
-          where: { id },
-          data: { baseUnitId: resolvedBaseUnitId },
-        });
-      }
-
-      return tx.product.findFirst({
-        where: { id },
-        include: { units: { orderBy: { conversionFactor: "asc" } } },
-      });
+      return findProductWithUnits(tx, tenantId, id);
     });
 
     return NextResponse.json({
       success: true,
       product: updatedProduct,
-      message: "تم تحديث بيانات المنتج والوحدات بنجاح.",
+      message: wantsBaseUnitChange
+        ? "تم تصحيح الوحدة الأساسية للمنتج بنجاح. تم إلغاء نشر المنتج تلقائياً — يرجى مراجعة بيانات النشر (السعر والصورة) قبل إعادة نشره."
+        : "تم تحديث بيانات المنتج والوحدات بنجاح.",
     });
   } catch (error) {
     if (error instanceof SubscriptionLockedError) {
@@ -470,6 +556,37 @@ export async function PATCH(
     }
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse();
+    }
+    // [FIX] The two race-condition guards that now run INSIDE the
+    // transaction (assertBaseUnitMutable via resetProductUnits, and the
+    // new assertNoPendingB2BReferences) throw plain Error /
+    // PendingB2BReferenceError rather than returning a response
+    // themselves — map them here so a race lost at the last moment still
+    // produces a clear Arabic message instead of a raw 500.
+    if (error instanceof PendingB2BReferenceError) {
+      return NextResponse.json(
+        {
+          error: "PENDING_B2B_ORDERS_EXIST",
+          message: "لا يمكن تصحيح الوحدة الأساسية حالياً — يوجد طلب/طلبات بيع بالجملة (B2B) قيد المراجعة على وحدات هذا المنتج. يرجى الموافقة على الطلبات أو رفضها أولاً.",
+        },
+        { status: 409 }
+      );
+    }
+    if (
+      error instanceof Error &&
+      error.message.includes("already has") &&
+      error.message.includes("batch(es)")
+    ) {
+      // Thrown by assertBaseUnitMutable() when the transaction's own
+      // re-check catches a batch that was created concurrently, after
+      // the early informational check above already passed.
+      return NextResponse.json(
+        {
+          error: "BASE_UNIT_LOCKED",
+          message: "تعذر إتمام التصحيح: تم تسجيل دفعة مخزون على هذا المنتج للتو من عملية أخرى. لا يمكن تغيير الوحدة الأساسية أو معامل تحويلها بعد الآن.",
+        },
+        { status: 409 }
+      );
     }
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       return NextResponse.json(
@@ -499,16 +616,18 @@ export async function DELETE(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    const existingProduct = await db.product.findFirst({ where: { id } });
-
+    // [FIX] Routed through lib/data/products.ts.
+    const existingProduct = await findProductWithUnits(db, tenantId, id);
     if (!existingProduct) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    await db.product.update({
-      where: { id },
-      data: { isActive: false },
-    });
+    // [FIX] setProductActive's current signature is
+    // (tx, tenantId, productId, isActive) — tenantId was missing here.
+    // Pure visibility toggle — the ONLY field this touches, never
+    // bundled with an isPublic change (see lib/data/products.ts's header
+    // on why that's a dedicated helper).
+    await setProductActive(db, tenantId, id, false);
 
     return NextResponse.json({ success: true, message: "تم تعطيل المنتج بنجاح." });
   } catch (error) {

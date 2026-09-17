@@ -12,20 +12,29 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { validatePackagingUnits } from "@/lib/inventory/packaging-unit-validation";
-// [v4.0] The sole gateway for reading Product.baseUnitId — see
-// lib/inventory/base-unit.ts. requireBaseUnits() is the batch variant,
-// used here for the product list so we don't issue one lookup per
-// product. FAIL-LOUD BY DESIGN: see the comment at its call site below.
+// [FIX] validatePackagingUnits now lives in units.ts (merged in — see
+// that file's header FIX #3), not the deleted packaging-unit-validation.ts.
+import { validatePackagingUnits } from "@/lib/inventory/units";
+// [v4.0] Sole gateway for reading Product.baseUnitId.
 import { requireBaseUnits } from "@/lib/inventory/base-unit";
-// [v4.0] The sole gateway for any conversionFactor arithmetic. Used here
-// only in POST, to convert an initial batch's entered quantity (possibly
-// in a non-base sale unit) into the base unit before it is ever written
-// to ProductBatch.quantity.
+// [v4.0] Sole gateway for any conversionFactor arithmetic.
 import { toBaseUnit } from "@/lib/inventory/units";
+// [FIX] Sole gateway for tx.product.* / tx.productUnit.* — see that
+// file's header and eslint.config.mjs's model-level rule. Neither this
+// route nor any other route outside lib/data/products.ts (or
+// lib/inventory/base-unit.ts) may call db.product.*/db.productUnit.*
+// directly anymore.
+import {
+  createProductWithBaseUnit,
+  createAdditionalUnit,
+  listProductsWithInventoryDetails,
+  findProductUnitByBarcode,
+} from "@/lib/data/products";
 import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
 import { z } from "zod";
+
+type DecimalInstance = InstanceType<typeof Decimal>;
 
 const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
 
@@ -49,8 +58,7 @@ const unitSchema = z
     // for it (T3a §0). The backend's guarantee that exactly ONE submitted
     // unit has conversionFactor === 1 (and that THAT unit becomes
     // Product.baseUnitId) is enforced below via validatePackagingUnits +
-    // the base-unit designation step in the transaction, not by this
-    // per-field schema rule.
+    // createProductWithBaseUnit(), not by this per-field schema rule.
     conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
     priceWholesale: positiveDecimalString("سعر الجملة يجب أن يكون أكبر من صفر"),
@@ -82,10 +90,10 @@ const createProductSchema = z.object({
   units: z.array(unitSchema).min(1, "يجب تقديم وحدة قياس واحدة على الأقل"),
   initialBatch: z
     .object({
-      // [v4.0] This is now "which unit did the admin enter the quantity
-      // in?" — a display/entry convenience only. It is NEVER written
-      // directly as ProductBatch.unitId anymore (see the transaction
-      // below) — that field is always resolved to the base unit.
+      // [v4.0] "which unit did the admin enter the quantity in?" — a
+      // display/entry convenience only. NEVER written directly as
+      // ProductBatch.unitId (that field is always resolved to the base
+      // unit inside the transaction below).
       unitIndex: z.number().default(0),
       batchNumber: z.string().min(1, "رقم الدفعة مطلوب"),
       quantity: nonNegativeDecimalString("الكمية يجب أن تكون صفراً أو أكثر"),
@@ -94,61 +102,6 @@ const createProductSchema = z.object({
     .optional()
     .nullable(),
 });
-
-type ProductUnitRow = {
-  id: string;
-  unitName: string;
-  conversionFactor: Prisma.Decimal | number | string;
-  pricingCurrency: string;
-  priceWholesale: Prisma.Decimal | number;
-  priceRetail: Prisma.Decimal | number | null;
-  barcode: string | null;
-  barcodeSource: string | null;
-  imageUrl: string | null;
-  isActive: boolean;
-};
-
-type ProductAdjustmentRow = {
-  id: string;
-  quantityDelta: Prisma.Decimal | number;
-  reason: string;
-  createdAt: Date;
-  adjustedByUser?: {
-    id: string;
-    name: string | null;
-    email: string | null;
-  } | null;
-};
-
-type ProductBatchRow = {
-  id: string;
-  batchNumber: string;
-  quantity: Prisma.Decimal | number;
-  unitId: string;
-  expiryDate: Date | null;
-  unit: { unitName: string; conversionFactor: Prisma.Decimal | number } | null;
-  adjustments?: ProductAdjustmentRow[];
-  _count?: {
-    invoiceItems: number;
-    adjustments: number;
-  };
-};
-
-type ProductRow = {
-  id: string;
-  name: string;
-  category: string | null;
-  isPublic: boolean;
-  isActive: boolean;
-  createdAt: Date;
-  units: ProductUnitRow[];
-  batches: ProductBatchRow[];
-  // NOTE: baseUnitId IS present on the raw Prisma result (Product's own
-  // scalar field), but per the ESLint rule this file must never read it
-  // directly — see the requireBaseUnits() call below. It's intentionally
-  // left off this type so a future edit can't casually reach for
-  // `product.baseUnitId` here.
-};
 
 export async function GET(req: Request) {
   try {
@@ -164,7 +117,7 @@ export async function GET(req: Request) {
     const filter = searchParams.get("filter") || "all";
     const status = searchParams.get("status");
 
-    const whereClause: Prisma.ProductWhereInput = {};
+    const whereClause: Omit<Prisma.ProductWhereInput, "tenantId"> = {};
     if (status === "active") {
       whereClause.isActive = true;
     } else if (status === "inactive" || filter === "inactive_products") {
@@ -174,27 +127,9 @@ export async function GET(req: Request) {
     // `status` param no longer defaults to "active"; left as-is pending a
     // product decision.
 
-    const products = (await db.product.findMany({
-      where: whereClause,
-      include: {
-        units: true,
-        batches: {
-          include: {
-            unit: true,
-            adjustments: {
-              include: {
-                adjustedByUser: {
-                  select: { id: true, name: true, email: true },
-                },
-              },
-              orderBy: { createdAt: "desc" },
-            },
-            _count: { select: { invoiceItems: true, adjustments: true } },
-          },
-        },
-      },
-      orderBy: { createdAt: "desc" },
-    })) as unknown as ProductRow[];
+    // [FIX] Routed through lib/data/products.ts instead of
+    // db.product.findMany directly.
+    const products = await listProductsWithInventoryDetails(db, tenantId, whereClause);
 
     // [v4.0] Batch-resolve every listed product's base unit through the
     // sole sanctioned gateway. THIS CALL IS FAIL-LOUD: it throws
@@ -215,28 +150,22 @@ export async function GET(req: Request) {
     const now = new Date();
 
     const processedProducts = products.map((product) => {
-      // [v4.0] Product.baseUnitId is the authoritative source now — never
-      // re-derived by scanning units for conversionFactor === 1.
-      const baseUnit = baseUnitsByProduct.get(product.id)!; // guaranteed present — requireBaseUnits already threw otherwise
+      const baseUnit = baseUnitsByProduct.get(product.id)!; // guaranteed present
 
-      let totalBaseStock = 0;
+      // [FIX] Summed in Decimal end-to-end — no native-number accumulation
+      // and therefore no epsilon-rounding patch needed. ProductBatch.quantity
+      // is already always base-unit under v4.0, so this is a pure sum, but
+      // "pure sum" done via repeated JS `+=` on many rows can still drift on
+      // ordinary floating-point summation noise; Decimal removes that too.
+      let totalBaseStock = new Decimal(0);
       let hasExpiringSoonBatch = false;
       let hasNegativeStockBatch = false;
 
       const processedBatches = product.batches.map((batch) => {
-        const batchQty = Number(batch.quantity);
-        // [v4.0 — REMOVED conversionFactor arithmetic] Previously:
-        // `totalBaseStock += batchQty * batchUnitFactor`, converting via
-        // the batch's own unit's factor. That's no longer needed OR
-        // permitted here: ProductBatch.quantity is now ALWAYS already
-        // expressed in the base unit (batch.unitId is always the base
-        // unit going forward), so summing batch quantities directly IS
-        // the total base-unit stock — no conversion, no
-        // conversionFactor arithmetic outside lib/inventory/units.ts
-        // (blocked by this project's ESLint rule).
-        totalBaseStock += batchQty;
+        const batchQty = new Decimal(batch.quantity.toString());
+        totalBaseStock = totalBaseStock.plus(batchQty);
 
-        if (batchQty < 0) {
+        if (batchQty.isNegative()) {
           hasNegativeStockBatch = true;
         }
 
@@ -268,7 +197,7 @@ export async function GET(req: Request) {
           expiryDate: batch.expiryDate,
           daysToExpiry,
           expiryStatus,
-          isNegative: batchQty < 0,
+          isNegative: batchQty.isNegative(),
           adjustments: (batch.adjustments || []).map((adj) => ({
             id: adj.id,
             quantityDelta: adj.quantityDelta.toString(),
@@ -284,34 +213,22 @@ export async function GET(req: Request) {
         };
       });
 
-      // [v4.0] No more epsilon-rounding hack needed: the previous
-      // near-integer noise (e.g. 93.9992 instead of 94) came specifically
-      // from converting through a fractional conversionFactor, which no
-      // longer happens here (see the removed multiplication above). A
-      // light rounding guard is kept only as defensive protection against
-      // ordinary floating-point summation noise across many JS-number
-      // additions — not against unit-conversion remainder.
-      const totalStockInBase =
-        Math.abs(totalBaseStock - Math.round(totalBaseStock)) < 0.0001
-          ? Math.round(totalBaseStock)
-          : totalBaseStock;
-
-      const isOutOfStock = totalStockInBase <= 0;
+      const totalStockInBase = totalBaseStock.toString();
+      const isOutOfStock = totalBaseStock.lessThanOrEqualTo(0);
 
       // [FLAGGED — open question, not resolved here] Under v3.9, a
       // deactivated NON-base unit could still carry its own batches
       // (ProductBatch.unitId could be any unit), so this flag made sense.
-      // Under v4.0, ProductBatch.unitId is always the base unit — so for
-      // any NEW batch, this condition can only ever be true if the BASE
-      // unit itself is deactivated (a scenario T3a §4's original spec
-      // text doesn't explicitly address for v4.0). Left functionally
-      // unchanged pending a product decision on whether deactivating the
-      // base unit should even be allowed, and if so what this badge
-      // should say in that case.
+      // Under v4.0, ProductBatch.unitId is always the base unit — so this
+      // condition can only ever be true if the BASE unit itself is
+      // deactivated, a scenario T3a §4's original spec text doesn't
+      // explicitly address for v4.0. Left functionally unchanged pending
+      // a product decision on whether deactivating the base unit should
+      // even be allowed.
       const hasDiscontinuedUnitStock = product.units.some(
         (u) =>
           !u.isActive &&
-          product.batches.some((b) => b.unitId === u.id && Number(b.quantity) > 0)
+          product.batches.some((b) => b.unitId === u.id && new Decimal(b.quantity.toString()).greaterThan(0))
       );
 
       return {
@@ -321,9 +238,6 @@ export async function GET(req: Request) {
         isPublic: product.isPublic,
         isActive: product.isActive,
         createdAt: product.createdAt,
-        // [v4.0] Surfaced for the UI (base-unit badge, locking the base
-        // unit's factor field in edit screens) — resolved via the trusted
-        // baseUnit above, never via product.baseUnitId directly.
         baseUnitId: baseUnit.id,
         units: product.units.map((u) => ({
           id: u.id,
@@ -336,9 +250,6 @@ export async function GET(req: Request) {
           barcodeSource: u.barcodeSource,
           imageUrl: u.imageUrl,
           isActive: u.isActive !== false,
-          // [v4.0] Lets the edit UI lock this specific unit's
-          // conversionFactor field to "1" / non-editable once the product
-          // has any batch, per T1's Immutability rule.
           isBaseUnit: u.id === baseUnit.id,
         })),
         batches: processedBatches,
@@ -449,57 +360,82 @@ export async function POST(req: Request) {
     }
 
     for (const barcode of incomingBarcodes) {
-      const existingBarcode = await db.productUnit.findUnique({
-        where: { tenantId_barcode: { tenantId, barcode } },
-        include: { product: { select: { name: true } } },
-      });
+      // [FIX] Routed through lib/data/products.ts.
+      const existingBarcode = await findProductUnitByBarcode(db, tenantId, barcode);
       if (existingBarcode) {
         const statusText = existingBarcode.isActive ? "نشطة" : "متوقفة";
         return NextResponse.json(
           {
             error: "DUPLICATE_BARCODE",
-            message: `الباركود (${barcode}) مستخدم مسبقاً في وحدة (${existingBarcode.unitName}) للمنتج (${existingBarcode.product.name}) وهي بحالة [${statusText}].`,
+            message: `الباركود (${barcode}) مستخدم مسبقاً في وحدة (${existingBarcode.unitName}) للمنتج (${existingBarcode.productName}) وهي بحالة [${statusText}].`,
           },
           { status: 400 }
         );
       }
     }
 
+    // [v4.0] validatePackagingUnits above already guarantees exactly one
+    // submitted unit has conversionFactor === 1 — that one becomes the
+    // base unit via createProductWithBaseUnit(); every other submitted
+    // unit is created afterward via createAdditionalUnit().
+    const baseUnitIndex = units.findIndex((u) => new Decimal(u.conversionFactor).equals(1));
+    // Structurally unreachable — validatePackagingUnits already rejected
+    // the request otherwise — but fail loud rather than silently proceed
+    // with -1 as an array index.
+    if (baseUnitIndex === -1) {
+      return NextResponse.json(
+        { error: "INVALID_PACKAGING_UNITS", message: "لم يتم العثور على الوحدة الأساسية (معامل تحويل = 1)." },
+        { status: 400 }
+      );
+    }
+
     const createdProduct = await db.$transaction(async (tx) => {
-      // [v4.0] Write 1 of 3 in the product-creation transaction (see T1's
-      // Unit Conversion Architecture, "Product creation atomicity").
-      const product = await tx.product.create({
-        data: {
-          tenantId,
-          name,
-          category: category || null,
-          isPublic: !!isPublic,
-        },
-      });
+      const baseUnitInput = units[baseUnitIndex];
+      const { product, baseUnit } = await createProductWithBaseUnit(
+        tx,
+        tenantId,
+        { name, category: category || null, isPublic: !!isPublic },
+        {
+          unitName: baseUnitInput.unitName,
+          pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
+          priceWholesale: baseUnitInput.priceWholesale,
+          priceRetail: baseUnitInput.priceRetail ?? null,
+          barcode: baseUnitInput.barcode || null,
+          barcodeSource: baseUnitInput.barcodeSource || null,
+          imageUrl: baseUnitInput.imageUrl || null,
+          isActive: baseUnitInput.isActive ?? true,
+        }
+      );
 
-      const unitIds: string[] = [];
-      const createdUnits: ProductUnitRow[] = [];
-      for (const u of units) {
-        // [v4.0] Write 2 of 3 (for each unit; exactly one of these will
-        // have conversionFactor === 1, per validatePackagingUnits above).
-        const createdUnit = await tx.productUnit.create({
-          data: {
-            tenantId,
-            productId: product.id,
-            unitName: u.unitName,
-            conversionFactor: u.conversionFactor,
-            pricingCurrency: u.pricingCurrency || "SYP",
-            priceWholesale: u.priceWholesale,
-            priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
-            barcode: u.barcode || null,
-            barcodeSource: u.barcodeSource || null,
-            imageUrl: u.imageUrl || null,
-            isActive: u.isActive ?? true,
-          },
+      // createdUnits, in the SAME ORDER as the submitted `units` array, so
+      // initialBatch.unitIndex still lines up. Filled in below.
+      const createdUnits: { id: string; conversionFactor: string }[] = new Array(units.length);
+      createdUnits[baseUnitIndex] = { id: baseUnit.id, conversionFactor: "1" };
+
+      // [FIX] createAdditionalUnit() now takes tenantId/productId/
+      // conversionFactor as explicit, separate arguments — never embedded
+      // in `data` — matching lib/data/products.ts's current signature.
+      for (let i = 0; i < units.length; i++) {
+        if (i === baseUnitIndex) continue;
+        const u = units[i];
+        const createdUnit = await createAdditionalUnit(tx, tenantId, product.id, u.conversionFactor, {
+          unitName: u.unitName,
+          pricingCurrency: u.pricingCurrency || "SYP",
+          priceWholesale: u.priceWholesale,
+          priceRetail: u.priceRetail ?? null,
+          barcode: u.barcode || null,
+          barcodeSource: u.barcodeSource || null,
+          imageUrl: u.imageUrl || null,
+          isActive: u.isActive ?? true,
         });
-        unitIds.push(createdUnit.id);
-        createdUnits.push(createdUnit as unknown as ProductUnitRow);
+        createdUnits[i] = { id: createdUnit.id, conversionFactor: u.conversionFactor };
+      }
 
+      // GS1 shared-catalog entries — ProductCatalogEntry is not a
+      // restricted model (only Product/ProductUnit are), so this stays a
+      // direct tx call, same as before.
+      for (let i = 0; i < units.length; i++) {
+        const u = units[i];
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
           const barcodeTrim = u.barcode.trim();
           try {
@@ -523,44 +459,23 @@ export async function POST(req: Request) {
         }
       }
 
-      // [v4.0] Identify the base unit: validatePackagingUnits already
-      // guaranteed exactly one submitted unit has conversionFactor === 1
-      // before this transaction ever started.
-      const baseUnitRow = createdUnits.find((u) =>
-        new Decimal(u.conversionFactor).equals(1)
-      );
-      if (!baseUnitRow) {
-        // Structurally unreachable — validatePackagingUnits already
-        // rejected the request otherwise. Never proceed with a null
-        // baseUnitId if this somehow happens.
-        throw new Error("لم يتم العثور على الوحدة الأساسية (معامل تحويل = 1) بعد الإنشاء.");
-      }
-
-      // [v4.0] Write 3 of 3 — designate the base unit. A required
-      // top-level call (T1's nested-write rule), never nested inside the
-      // product.create() call above.
-      await tx.product.update({
-        where: { id: product.id },
-        data: { baseUnitId: baseUnitRow.id },
-      });
-
       if (initialBatch) {
         // [v4.0] ProductBatch.unitId is ALWAYS the base unit — never the
-        // unit the admin picked via `initialBatch.unitIndex` (that's an
-        // ENTRY convenience only: the admin may still type "10 packs").
-        // The entered quantity is converted to the base unit via
+        // unit the admin picked via `initialBatch.unitIndex` (an ENTRY
+        // convenience only). The entered quantity is converted via
         // toBaseUnit(), using the ENTERED unit's own conversionFactor —
-        // never the base unit's (which is always 1 and would apply no
-        // conversion at all) — exactly once, here, before it ever reaches
-        // ProductBatch.quantity.
-        const enteredUnit = createdUnits[initialBatch.unitIndex] ?? createdUnits[0];
-        const baseQuantity = toBaseUnit(initialBatch.quantity, enteredUnit.conversionFactor);
+        // trusted here because it comes from this same create request,
+        // not a later, separately-submitted payload (contrast with
+        // T4c/T5, which must re-fetch the factor from the DB instead of
+        // trusting a client payload).
+        const enteredUnit = createdUnits[initialBatch.unitIndex] ?? createdUnits[baseUnitIndex];
+        const baseQuantity: DecimalInstance = toBaseUnit(initialBatch.quantity, enteredUnit.conversionFactor);
 
         await tx.productBatch.create({
           data: {
             tenantId,
             productId: product.id,
-            unitId: baseUnitRow.id,
+            unitId: baseUnit.id,
             batchNumber: initialBatch.batchNumber,
             quantity: baseQuantity.toString(),
             expiryDate: initialBatch.expiryDate ? new Date(initialBatch.expiryDate) : null,
@@ -568,16 +483,44 @@ export async function POST(req: Request) {
         });
       }
 
-      return { ...product, units: createdUnits, baseUnitId: baseUnitRow.id };
+      // [FIX] Flattened to top-level fields (productId/productName/...)
+      // rather than nesting the raw Prisma row under a "product" key —
+      // `.product` is exactly the property access the model-level ESLint
+      // rule blocks outside lib/data/products.ts, so a route-local object
+      // must never carry that key either.
+      return {
+        productId: product.id,
+        productName: product.name,
+        productCategory: product.category,
+        productIsPublic: product.isPublic,
+        productIsActive: product.isActive,
+        productCreatedAt: product.createdAt,
+        baseUnitId: baseUnit.id,
+        createdUnits,
+        unitInputs: units,
+      };
     });
 
     const responseProduct = {
-      ...createdProduct,
-      units: createdProduct.units.map((u) => ({
-        ...u,
+      id: createdProduct.productId,
+      name: createdProduct.productName,
+      category: createdProduct.productCategory,
+      isPublic: createdProduct.productIsPublic,
+      isActive: createdProduct.productIsActive,
+      createdAt: createdProduct.productCreatedAt,
+      baseUnitId: createdProduct.baseUnitId,
+      units: createdProduct.createdUnits.map((u, i) => ({
+        id: u.id,
+        unitName: createdProduct.unitInputs[i].unitName,
         conversionFactor: Number(u.conversionFactor),
-        priceWholesale: Number(u.priceWholesale),
-        priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? Number(u.priceRetail) : null,
+        pricingCurrency: createdProduct.unitInputs[i].pricingCurrency || "SYP",
+        priceWholesale: Number(createdProduct.unitInputs[i].priceWholesale),
+        priceRetail:
+          createdProduct.unitInputs[i].priceRetail !== null &&
+            createdProduct.unitInputs[i].priceRetail !== undefined
+            ? Number(createdProduct.unitInputs[i].priceRetail)
+            : null,
+        isBaseUnit: u.id === createdProduct.baseUnitId,
       })),
     };
 

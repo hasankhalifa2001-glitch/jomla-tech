@@ -566,6 +566,33 @@ export function countProductBatches(
     });
 }
 
+/**
+ * [FIX 6 — real bug: `adjustments: unknown[]` broke every consumer]
+ * `listProductsWithInventoryDetails()`'s query fetches each batch's
+ * adjustments via `adjustments: { include: { adjustedByUser: true },
+ * orderBy: { createdAt: "desc" } }` — i.e. full StockAdjustment rows,
+ * each carrying its full `adjustedByUser` User relation. The previous
+ * `adjustments: unknown[]` on InventoryBatchView below didn't reflect
+ * that shape at all, so any caller (e.g. the GET route's
+ * `batch.adjustments.map((adj) => ({ id: adj.id, quantityDelta:
+ * adj.quantityDelta.toString(), ..., adjustedByUserName:
+ * adj.adjustedByUser?.name || adj.adjustedByUser?.email || "مستخدم" }))`)
+ * hit "'adj' is of type 'unknown'" on every property access — `unknown`
+ * has no accessible members without a type guard/assertion first. Fixed
+ * by giving `adjustments` its real element type below, matching exactly
+ * the fields the query actually includes and callers actually read.
+ */
+export interface InventoryBatchAdjustmentView {
+    id: string;
+    quantityDelta: Prisma.Decimal;
+    reason: string;
+    createdAt: Date;
+    // StockAdjustment.adjustedByUser is a required (Restrict) relation at
+    // the schema level, so this is never null on a row that was
+    // successfully fetched — kept non-optional to match that guarantee.
+    adjustedByUser: { name: string | null; email: string };
+}
+
 export interface InventoryBatchView {
     id: string;
     tenantId: string;
@@ -576,7 +603,7 @@ export interface InventoryBatchView {
     quantity: Prisma.Decimal;
     expiryDate: Date | null;
     createdAt: Date;
-    adjustments: unknown[];
+    adjustments: InventoryBatchAdjustmentView[];
     _count: { invoiceItems: number; adjustments: number };
 }
 
