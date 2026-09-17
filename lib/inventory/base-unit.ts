@@ -2,74 +2,52 @@
  * lib/inventory/base-unit.ts
  *
  * THE ONLY FILE IN THE ENTIRE CODEBASE PERMITTED TO READ *OR WRITE*
- * `Product.baseUnitId` / `Product.baseUnit` DIRECTLY OFF A PRISMA MODEL.
+ * `Product.baseUnitId` / `Product.baseUnit` DIRECTLY OFF A PRISMA MODEL,
+ * AND ONE OF THE TWO FILES (the other being lib/data/products.ts itself)
+ * PERMITTED TO CALL `tx.product.*` / `tx.productUnit.*` DIRECTLY — see
+ * lib/data/products.ts's header for the model-level rationale, and
+ * eslint.config.mjs's per-file override block for this file.
  *
- * Every other call site — POS checkout, the sync engine (T4c), B2B order
- * approval (T5), CSV import (T3d), stock reconciliation (T3c), the seed
- * script, and the product-administration routes (T3a) — MUST go through
- * the functions below (via lib/data/products.ts for the writes, or
- * directly for the reads). Direct access to `.baseUnitId` / `.baseUnit`
- * anywhere else is blocked structurally: `lib/data/products.ts` is the
- * only other file allowed to import `tx.product` / `tx.productUnit` at
- * all (see eslint-rules/no-direct-model-access.js — same enforcement
- * mechanism as the project's existing `$queryRaw` and nested-write
- * rules; CI fails the build on violation), and its own `Safe*` update
- * types (Omit<..., "baseUnitId" | "baseUnit">) make it a *compile-time*
- * error for that file to leak the field into any generic write helper it
- * exports. This file is the single place where the raw field is ever
- * named in a `select`/`data`/`include` object anywhere in the codebase.
- *
- * WHY THIS FILE EXISTS (see UNIT-ARCHITECTURE.md / MASTER-SPEC v4.0):
- * `Product.baseUnitId` is `String? @unique` at the schema level because
- * Prisma has no way to express "non-null after row creation." That is a
- * TYPE-LEVEL HONESTY about what the database can enforce, not a license
- * for application code to treat the field as usually-present and skip the
- * check. In practice, baseUnitId becomes non-null the instant a Product's
- * creation transaction commits (Product.create + base ProductUnit.create +
- * commitBaseUnitLink(), all inside one $transaction — see
- * createProductWithBaseUnit() in lib/data/products.ts) and never changes
- * after that, except through the explicitly-logged correctBaseUnit() path
- * below for a zero-batch product. A null baseUnitId observed anywhere
- * outside the create-transaction window is a genuine data-integrity bug,
- * not a normal case — so this module fails LOUD (throws) rather than
- * silently returning undefined, defaulting to some arbitrary unit, or
- * letting a caller's TypeScript `!` assertion paper over the gap.
+ * This file never names `.conversionFactor` as a literal object key or
+ * MemberExpression property either — see lib/inventory/units.ts's header
+ * for why that field name is now fully centralized there instead of just
+ * having its arithmetic uses blocked. Wherever this file needs to WRITE
+ * a conversionFactor value, it spreads units.ts's
+ * buildConversionFactorField() — it never reads or re-validates the
+ * field's value itself; "1" is trusted structurally from the single
+ * creation path (see createProductWithBaseUnit()/resetProductUnits()).
  *
  * ============================================================================
- * [FIX — TypeScript build error] `requireBaseUnit()` / `requireBaseUnits()` /
- * `assertBaseUnitMutable()` are called from both real transaction contexts
- * (`tx: Prisma.TransactionClient`, e.g. inside T4c's sync commit or T5's
- * B2B approval) AND from `previewFifoAllocation`'s plain, unlocked read
- * path, which uses `getTenantDb(tenantId)` (lib/db/tenant-scope.ts) — a
- * Prisma Client Extension (`client.$extends(...)`) rather than a raw
- * `PrismaClient`. That extended client's TypeScript type is
- * `DynamicClientExtensionThis<...>`, which is NOT structurally assignable
- * to `PrismaClient` (it's missing internal members like `$on` that a bare
- * `PrismaClient` type declares) — even though it exposes the exact same
- * model delegates (`.product.findUniqueOrThrow(...)`, etc.) at runtime.
- * The previous `TxOrClient = Prisma.TransactionClient | PrismaClient`
- * union didn't account for this third shape, so passing `getTenantDb()`'s
- * result here failed to compile (TS2345 / "Property '$on' is missing").
+ * [FIX — real bug closed] `resetProductUnits()` previously called
+ * `tx.productUnit.deleteMany(...)` to wipe a zero-batch product's units
+ * before creating a fresh base unit. This was WRONG: `ProductUnit` is
+ * never a hard-delete candidate anywhere else in this system (T1's
+ * Tenant Lifecycle & Deletion Policy establishes this explicitly, for
+ * exactly this Cascade/Restrict collision reason), and
+ * `B2BOrderRequestItem.unit` is `onDelete: Restrict` — a relation that
+ * does not distinguish PENDING_REVIEW from APPROVED/REJECTED order
+ * status. ANY B2BOrderRequestItem row ever created against one of this
+ * product's units — regardless of how long ago its order was approved or
+ * rejected — would make `deleteMany` fail with a raw Prisma FK-violation
+ * error (P2003), not the clean `PendingB2BReferenceError` this file
+ * previously implied was the only failure mode.
  *
- * FIX: widened the union to also include `ReturnType<typeof getTenantDb>`
- * (imported type-only, so there is no runtime coupling or import-cycle
- * risk — lib/db/tenant-scope.ts does not import from this file). No
- * runtime behavior changes; this is a type-only fix.
- *
- * `commitBaseUnitLink()` and `correctBaseUnit()` below are DELIBERATELY
- * NOT typed against `TxOrClient` — both are write paths that only ever
- * make sense inside a real, mutable transaction (product creation, or an
- * explicit admin correction), never against `getTenantDb()`'s read-only
- * preview client. They take `Prisma.TransactionClient` directly, which
- * also means a caller on the preview/read path gets a compile error if it
- * ever mistakenly tries to call either — the same "wrong shape doesn't
- * compile" guarantee T3b's commitFifoAllocation already relies on.
+ * FIX: `resetProductUnits()` now SOFT-deletes — `isActive: false` on
+ * every existing unit — exactly like every other unit-retirement path in
+ * this codebase (T3a's ProductUnit.isActive flag). No row is ever
+ * removed, so the Restrict FK never enters into it at all, for orders in
+ * ANY status. `assertNoPendingB2BReferences()` is kept as a narrower,
+ * business-level guard (see its own updated doc below) rather than the
+ * load-bearing FK-safety check it was mistakenly relied on for before.
  * ============================================================================
  */
 
 import type { Prisma, PrismaClient, ProductUnit } from "@prisma/client";
 import type { getTenantDb } from "@/lib/db/tenant-scope";
-import { assertIsValidBaseUnitFactor } from "@/lib/inventory/units";
+import {
+    buildConversionFactorField,
+    BASE_UNIT_CONVERSION_FACTOR,
+} from "@/lib/inventory/units";
 
 export class MissingBaseUnitError extends Error {
     constructor(productId: string) {
@@ -77,44 +55,55 @@ export class MissingBaseUnitError extends Error {
             `Product ${productId} has no baseUnitId (or its baseUnit relation ` +
             `could not be resolved). This should be structurally impossible ` +
             `outside the create-transaction window — treat this as a data ` +
-            `integrity bug (e.g. an incomplete/legacy product row, or a ` +
-            `crashed creation transaction that somehow left a partial row), ` +
-            `never as a null case to silently route around. Do not catch ` +
-            `this error and fall back to a default/first unit — surface it, ` +
-            `fix the underlying product row, or block the operation.`
+            `integrity bug, never as a null case to silently route around. ` +
+            `Do not catch this error and fall back to a default/first unit — ` +
+            `surface it, fix the underlying product row, or block the ` +
+            `operation.`
         );
         this.name = "MissingBaseUnitError";
     }
 }
 
-// [FIX] widened to also accept getTenantDb()'s extended-client shape —
-// see the file-header FIX note above. Read-only functions accept this
-// wider union; write functions (commitBaseUnitLink, correctBaseUnit)
-// deliberately do not — see the note above.
+/**
+ * Thrown by resetProductUnits() when the product has at least one
+ * still-pending (PENDING_REVIEW) B2BOrderRequestItem referencing one of
+ * its units.
+ *
+ * [FIX — rationale corrected] This is now a BUSINESS-level guard, not an
+ * FK-safety one: since resetProductUnits() no longer deletes any row
+ * (see the file-header FIX note above), nothing here prevents a
+ * database-level error. The reason to still block the reset is UX/data
+ * coherence — a retailer's order is awaiting an admin's approve/reject
+ * decision against a specific set of units; silently deactivating those
+ * units out from under a pending decision would leave the approving
+ * admin looking at stale unit info. APPROVED/REJECTED orders are exempt:
+ * their items are either already immortalized on a real Invoice (via
+ * separate InvoiceItem rows) or carry no ongoing significance.
+ */
+export class PendingB2BReferenceError extends Error {
+    constructor(productId: string, pendingOrderCount: number) {
+        super(
+            `Product ${productId} has ${pendingOrderCount} pending ` +
+            `(PENDING_REVIEW) B2BOrderRequestItem row(s) referencing one of ` +
+            `its units. A base-unit reset cannot proceed while a retailer ` +
+            `order is still awaiting approval against these units — resolve ` +
+            `(approve or reject) every pending order for this product first.`
+        );
+        this.name = "PendingB2BReferenceError";
+    }
+}
+
 type TxOrClient = Prisma.TransactionClient | PrismaClient | ReturnType<typeof getTenantDb>;
 
 /**
  * Resolves and returns a product's base ProductUnit, guaranteed non-null.
  *
- * This is the ONLY sanctioned way to answer "what is this product's base
- * unit?" anywhere in the codebase. Every write path that needs to know
- * which ProductUnit a ProductBatch.unitId must reference, and every
- * conversion that needs a base-unit conversionFactor reference point,
- * calls this function — never reads `.baseUnitId` off a product object
- * it already has in scope, since that object may be stale or may have
- * been fetched without the `baseUnit` relation included.
+ * IMPORTANT: returns the BASE unit itself (conversionFactor always 1).
+ * NEVER a source of the conversion factor for a sold/ordered unit — that
+ * factor always comes from lib/inventory/units.ts's
+ * getUnitConversionFactor(), called with the sold/ordered unit's own id.
  *
- * IMPORTANT: this function returns the BASE unit itself (whose
- * conversionFactor is always 1). It is NEVER a source of the conversion
- * factor for a unit that was actually sold/ordered (e.g. an InvoiceItem
- * or B2BOrderRequestItem's unit, which may be a "pack" or "carton"). That
- * factor must always be fetched separately, directly off the sold/ordered
- * unit's own row — see units.ts's file header and T4c/T5 in MASTER-SPEC
- * v4.0 (corrected) for the write paths this distinction protects.
- *
- * @throws {MissingBaseUnitError} if the product has no baseUnitId, or the
- *   baseUnitId points at a ProductUnit row that no longer resolves (both
- *   should be structurally impossible — see the file-level doc above).
+ * @throws {MissingBaseUnitError}
  */
 export async function requireBaseUnit(
     tx: TxOrClient,
@@ -134,15 +123,10 @@ export async function requireBaseUnit(
 }
 
 /**
- * Batch variant of requireBaseUnit(), for call sites resolving base units
- * for multiple products at once (e.g. a POS checkout with several distinct
- * products in the cart, or a CSV import batch). Still goes through one
- * query per product's underlying guarantee — no shortcut that skips the
- * per-product null check.
+ * Batch variant of requireBaseUnit() for multiple products at once.
  *
- * @throws {MissingBaseUnitError} on the first product found missing a
- *   valid base unit — fails the whole batch loud rather than silently
- *   skipping the offending product.
+ * @throws {MissingBaseUnitError} on the first product missing a valid
+ *   base unit.
  */
 export async function requireBaseUnits(
     tx: TxOrClient,
@@ -162,11 +146,6 @@ export async function requireBaseUnits(
         result.set(product.id, product.baseUnit);
     }
 
-    // Defensive: findMany silently omits ids that don't exist at all (e.g.
-    // a deleted/mistyped productId) rather than throwing — surface that
-    // distinctly from "found but missing a base unit," since it's a
-    // different bug class (referential integrity, not unit-conversion
-    // integrity).
     const foundIds = new Set(result.keys());
     const missingIds = productIds.filter((id) => !foundIds.has(id));
     if (missingIds.length > 0) {
@@ -180,12 +159,10 @@ export async function requireBaseUnits(
 }
 
 /**
- * Asserts that a product is eligible to have its base unit (or its base
- * unit's conversionFactor) changed — i.e. it has zero ProductBatch rows.
- * Per T1's Unit Conversion Architecture, once any batch exists, the base
- * unit choice and its conversionFactor (always 1) are permanently locked.
- * Call this before allowing any admin-facing "fix the base unit" action;
- * do NOT re-implement this check inline at each call site.
+ * Asserts a product is eligible to have its base unit, or any of its
+ * units' conversionFactor, changed — i.e. it has zero ProductBatch rows.
+ * Once any batch exists, every conversionFactor on the product (base or
+ * otherwise) is permanently locked.
  *
  * @throws {Error} if the product already has at least one ProductBatch.
  */
@@ -200,98 +177,258 @@ export async function assertBaseUnitMutable(
 
     if (batchCount > 0) {
         throw new Error(
-            `Product ${productId} already has ${batchCount} batch(es) — its ` +
-            `base unit and that unit's conversionFactor can never be changed ` +
-            `once any ProductBatch exists (see T1's Unit Conversion ` +
-            `Architecture, Immutability rule). If this is a genuine data-entry ` +
-            `correction, it must go through correctBaseUnit() below on a ` +
-            `zero-batch product, never a silent field edit.`
+            `Product ${productId} already has ${batchCount} batch(es) — no ` +
+            `unit's conversionFactor (base or otherwise) can be changed once ` +
+            `any ProductBatch exists (see T1's Unit Conversion Architecture, ` +
+            `Immutability rule).`
         );
     }
 }
 
 /**
- * The ONLY sanctioned write of Product.baseUnitId anywhere in the
- * codebase, for the ordinary "brand-new product" path. Called exclusively
- * from lib/data/products.ts's createProductWithBaseUnit(), as the third
- * of three top-level calls inside one $transaction (Product.create →
- * base ProductUnit.create → commitBaseUnitLink) — per T1's nested-write
- * rule, this function issues its own top-level `product.update` call and
- * must never be wrapped inside a nested write of either prior step.
+ * Asserts a product has no still-pending B2BOrderRequestItem rows
+ * referencing any of its current units. See PendingB2BReferenceError's
+ * doc above for the corrected (business-level, not FK-safety) rationale
+ * for why this check still exists even though resetProductUnits() no
+ * longer deletes anything.
  *
- * Deliberately takes a plain `Prisma.TransactionClient` (not the wider
- * TxOrClient union) — this is a write path and only ever makes sense
- * inside a real transaction, never against a read-only preview client.
+ * @throws {PendingB2BReferenceError} if any PENDING_REVIEW
+ *   B2BOrderRequestItem references a unit belonging to this product.
  */
-export function commitBaseUnitLink(
+export async function assertNoPendingB2BReferences(
     tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string
+): Promise<void> {
+    const pendingCount = await tx.b2BOrderRequestItem.count({
+        where: {
+            tenantId,
+            productId,
+            orderRequest: { status: "PENDING_REVIEW" },
+        },
+    });
+
+    if (pendingCount > 0) {
+        throw new PendingB2BReferenceError(productId, pendingCount);
+    }
+}
+
+/**
+ * The ONLY sanctioned write of Product.baseUnitId for the ordinary
+ * "brand-new product" path. Called exclusively from lib/data/products.ts's
+ * createProductWithBaseUnit() and from resetProductUnits() below, as the
+ * final top-level call inside their respective $transactions.
+ *
+ * Verifies baseUnitId actually belongs to productId before writing the
+ * FK — Product.baseUnitId is a bare `@unique` FK to ProductUnit.id, not a
+ * composite (productId, unitId) constraint, so nothing at the schema
+ * level otherwise stops a caller from cross-wiring products. Both of
+ * this function's current callers always pass a unit they just created
+ * on the exact same productId, so this can never actually throw today —
+ * it exists so a future caller (or a copy-paste mistake) fails loud
+ * immediately instead of silently corrupting the product's
+ * unit-conversion integrity.
+ */
+export async function commitBaseUnitLink(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
     productId: string,
     baseUnitId: string
 ): Promise<{ id: string; baseUnitId: string | null }> {
+    const unit = await tx.productUnit.findUniqueOrThrow({
+        where: { id: baseUnitId, tenantId },
+        select: { productId: true },
+    });
+    if (unit.productId !== productId) {
+        throw new Error(
+            `commitBaseUnitLink: baseUnitId ${baseUnitId} belongs to a ` +
+            `different product (${unit.productId}) than ${productId}.`
+        );
+    }
+
     return tx.product.update({
-        where: { id: productId },
+        where: { id: productId, tenantId },
         data: { baseUnitId },
         select: { id: true, baseUnitId: true },
     });
 }
 
 /**
- * The rare, explicitly-logged correction of a product's base unit — the
- * ONLY other path (besides createProductWithBaseUnit's initial link)
- * ever allowed to change Product.baseUnitId, and only for a product with
- * zero ProductBatch rows (see assertBaseUnitMutable above). Writes
- * exactly one BaseUnitChangeLog row in the same transaction as the field
- * update — never a silent field edit, per T1's Unit Conversion
- * Architecture, Immutability rule.
+ * Replaces a product's designated base unit with a fresh one, for the
+ * rare correction case: a zero-batch product whose base unit was chosen
+ * wrong at creation.
  *
- * ADMIN-only at the route level (see T2b's Role Capability Matrix) — this
- * function itself does not check role, only the batch-count precondition.
+ * [FIX] No longer wipes anything. Every existing ProductUnit for the
+ * product is SOFT-deleted (`isActive: false`) — the same retirement
+ * mechanism T3a already uses for an ordinary unit deactivation — never a
+ * hard `deleteMany`. See the file-header FIX note for why the previous
+ * hard-delete version was a real bug (a Restrict FK violation waiting to
+ * happen for any product with ANY historical B2B order, not just a
+ * pending one).
+ *
+ * ADMIN-only at the route level (T2b's Role Capability Matrix) — this
+ * function itself enforces two preconditions before writing anything:
+ *   1. Zero ProductBatch rows (assertBaseUnitMutable).
+ *   2. Zero PENDING_REVIEW B2BOrderRequestItem rows referencing any
+ *      current unit (assertNoPendingB2BReferences) — a business-level
+ *      guard now, not an FK-safety one; see that function's doc.
+ *
+ * Writes, in one $transaction (per T1's nested-write rule):
+ *   1. Deactivates every existing ProductUnit for this product
+ *      (isActive: false) — a plain field update, not a delete.
+ *   2. Creates the new base ProductUnit (conversionFactor forced to "1"
+ *      via units.ts's buildConversionFactorField() — this file never
+ *      writes that field name itself).
+ *   3. Links it via commitBaseUnitLink().
+ *   4. Writes one BaseUnitChangeLog row — never a silent reset.
+ *
+ * Callers whose product may currently be published (isPublic: true) MUST
+ * separately force isPublic to false in the SAME transaction — a freshly
+ * created base unit has no priceRetail/imageUrl, so the product would
+ * otherwise be left publicly listed while failing T3a's own publishing
+ * gate. This function has no opinion on publishing state — that stays a
+ * caller responsibility (see app/api/products/[id]/route.ts's PATCH
+ * handler).
  *
  * @throws {Error} via assertBaseUnitMutable if the product already has
  *   at least one ProductBatch.
+ * @throws {PendingB2BReferenceError} via assertNoPendingB2BReferences if
+ *   any PENDING_REVIEW B2B order still references a current unit.
  * @throws {MissingBaseUnitError} via requireBaseUnit if the product's
- *   *current* base unit cannot be resolved (should be structurally
- *   impossible — surfaced rather than silently skipped).
+ *   *current* base unit cannot be resolved (structurally unexpected).
  */
-export async function correctBaseUnit(
+export async function resetProductUnits(
     tx: Prisma.TransactionClient,
     params: {
         tenantId: string;
         productId: string;
-        newBaseUnitId: string;
+        newBaseUnit: {
+            unitName: string;
+            pricingCurrency: "SYP" | "USD";
+            priceWholesale: string;
+            priceRetail?: string | null;
+            imageUrl?: string | null;
+        };
         changedByUserId: string;
         reason: string;
     }
-): Promise<void> {
+): Promise<ProductUnit> {
     await assertBaseUnitMutable(tx, params.tenantId, params.productId);
+    await assertNoPendingB2BReferences(tx, params.tenantId, params.productId);
 
-    const currentBaseUnit = await requireBaseUnit(tx, params.tenantId, params.productId);
+    const oldBaseUnit = await requireBaseUnit(tx, params.tenantId, params.productId);
 
-    const newUnit = await tx.productUnit.findUniqueOrThrow({
-        where: { id: params.newBaseUnitId, tenantId: params.tenantId },
+    // [FIX] Soft-delete only — no FK to worry about, since nothing is
+    // actually removed. Deliberately does not touch barcode/barcodeSource
+    // on these rows; they simply become invisible to every active-unit
+    // picker per T3a's existing isActive filtering.
+    await tx.productUnit.updateMany({
+        where: { productId: params.productId, tenantId: params.tenantId },
+        data: { isActive: false },
     });
 
-    // The newly-designated base unit must itself carry conversionFactor
-    // 1 — same rule as the original base unit at product creation. If it
-    // doesn't yet (e.g. it was created as an ordinary non-base unit
-    // before this correction), that is a separate data-entry problem this
-    // function does not silently paper over.
-    assertIsValidBaseUnitFactor(newUnit.conversionFactor);
-
-    // Two top-level calls, same $transaction — per T1's nested-write rule.
-    await tx.product.update({
-        where: { id: params.productId },
-        data: { baseUnitId: params.newBaseUnitId },
+    const newBaseUnit = await tx.productUnit.create({
+        data: {
+            tenantId: params.tenantId,
+            productId: params.productId,
+            unitName: params.newBaseUnit.unitName,
+            ...buildConversionFactorField(BASE_UNIT_CONVERSION_FACTOR),
+            pricingCurrency: params.newBaseUnit.pricingCurrency,
+            priceWholesale: params.newBaseUnit.priceWholesale,
+            priceRetail: params.newBaseUnit.priceRetail ?? null,
+            imageUrl: params.newBaseUnit.imageUrl ?? null,
+            isActive: true,
+        },
     });
+
+    await commitBaseUnitLink(tx, params.tenantId, params.productId, newBaseUnit.id);
 
     await tx.baseUnitChangeLog.create({
         data: {
             tenantId: params.tenantId,
             productId: params.productId,
-            oldBaseUnitId: currentBaseUnit.id,
-            newBaseUnitId: params.newBaseUnitId,
+            oldBaseUnitId: oldBaseUnit.id,
+            newBaseUnitId: newBaseUnit.id,
             changedByUserId: params.changedByUserId,
             reason: params.reason,
         },
+    });
+
+    return newBaseUnit;
+}
+
+/**
+ * Corrects a data-entry mistake on a NON-base unit's conversionFactor —
+ * for a product with zero ProductBatch rows only. Deliberately separate
+ * from lib/data/products.ts's updateProductUnit(), whose
+ * SafeProductUnitUpdate type permanently excludes conversionFactor for
+ * every unit — this function is the single, explicitly-guarded exception
+ * for the zero-batch case, reusing assertBaseUnitMutable's precondition.
+ *
+ * Does NOT need assertNoPendingB2BReferences: this function never
+ * deletes or deactivates the unit — a pending B2BOrderRequestItem
+ * referencing it is unaffected by a plain field edit.
+ *
+ * Refuses to touch the product's CURRENT base unit — that unit's factor
+ * must stay exactly 1 for as long as it IS the base unit; changing which
+ * unit is the base goes through resetProductUnits() instead. This
+ * function identifies the base unit purely by id (requireBaseUnit()) and
+ * never re-reads its conversionFactor to double-check — that field is
+ * structurally guaranteed to be "1" from the moment it was created (see
+ * lib/data/products.ts's createProductWithBaseUnit() and this file's own
+ * resetProductUnits(), the only two places that ever set it), and this
+ * file does not name `.conversionFactor` anywhere in its own source, by
+ * design — see the file header.
+ *
+ * No BaseUnitChangeLog entry — this never changes Product.baseUnitId.
+ *
+ * @throws {Error} via assertBaseUnitMutable if the product already has
+ *   at least one ProductBatch.
+ * @throws {Error} if unitId does not belong to productId, is the
+ *   product's current base unit, or the new factor equals 1.
+ */
+export async function updateNonBaseUnitConversionFactor(
+    tx: Prisma.TransactionClient,
+    params: {
+        tenantId: string;
+        productId: string;
+        unitId: string;
+        newConversionFactor: string;
+    }
+): Promise<ProductUnit> {
+    await assertBaseUnitMutable(tx, params.tenantId, params.productId);
+
+    const baseUnit = await requireBaseUnit(tx, params.tenantId, params.productId);
+
+    if (params.unitId === baseUnit.id) {
+        throw new Error(
+            `updateNonBaseUnitConversionFactor: unit ${params.unitId} is this ` +
+            `product's current base unit — its factor must stay 1. Use ` +
+            `resetProductUnits() to change which unit is the base unit.`
+        );
+    }
+
+    const unit = await tx.productUnit.findUniqueOrThrow({
+        where: { id: params.unitId, tenantId: params.tenantId },
+    });
+    if (unit.productId !== params.productId) {
+        throw new Error(
+            `updateNonBaseUnitConversionFactor: unit ${params.unitId} belongs ` +
+            `to a different product (${unit.productId}) than ${params.productId}.`
+        );
+    }
+
+    if (Number(params.newConversionFactor) === 1) {
+        throw new Error(
+            `updateNonBaseUnitConversionFactor: a conversionFactor of exactly ` +
+            `1 is reserved for the base unit — this would create a duplicate ` +
+            `factor-1 unit. Use resetProductUnits() if this unit should ` +
+            `actually become the base unit.`
+        );
+    }
+
+    return tx.productUnit.update({
+        where: { id: params.unitId },
+        data: buildConversionFactorField(params.newConversionFactor),
     });
 }
