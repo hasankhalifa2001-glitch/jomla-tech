@@ -12,18 +12,13 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-// [FIX] validatePackagingUnits now lives in units.ts (merged in — see
-// that file's header FIX #3), not the deleted packaging-unit-validation.ts.
 import { validatePackagingUnits } from "@/lib/inventory/units";
 // [v4.0] Sole gateway for reading Product.baseUnitId.
 import { requireBaseUnits } from "@/lib/inventory/base-unit";
 // [v4.0] Sole gateway for any conversionFactor arithmetic.
 import { toBaseUnit } from "@/lib/inventory/units";
 // [FIX] Sole gateway for tx.product.* / tx.productUnit.* — see that
-// file's header and eslint.config.mjs's model-level rule. Neither this
-// route nor any other route outside lib/data/products.ts (or
-// lib/inventory/base-unit.ts) may call db.product.*/db.productUnit.*
-// directly anymore.
+// file's header and eslint.config.mjs's model-level rule.
 import {
   createProductWithBaseUnit,
   createAdditionalUnit,
@@ -53,12 +48,6 @@ const nonNegativeDecimalString = (message: string) =>
 const unitSchema = z
   .object({
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-    // [v4.0] Still validated generically here (any positive value) — the
-    // UI is what locks the FIRST unit's factor to "1" and hides the field
-    // for it (T3a §0). The backend's guarantee that exactly ONE submitted
-    // unit has conversionFactor === 1 (and that THAT unit becomes
-    // Product.baseUnitId) is enforced below via validatePackagingUnits +
-    // createProductWithBaseUnit(), not by this per-field schema rule.
     conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
     pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
     priceWholesale: positiveDecimalString("سعر الجملة يجب أن يكون أكبر من صفر"),
@@ -90,7 +79,7 @@ const createProductSchema = z.object({
   units: z.array(unitSchema).min(1, "يجب تقديم وحدة قياس واحدة على الأقل"),
   initialBatch: z
     .object({
-      // [v4.0] "which unit did the admin enter the quantity in?" — a
+      // "which unit did the admin enter the quantity in?" — a
       // display/entry convenience only. NEVER written directly as
       // ProductBatch.unitId (that field is always resolved to the base
       // unit inside the transaction below).
@@ -127,20 +116,12 @@ export async function GET(req: Request) {
     // `status` param no longer defaults to "active"; left as-is pending a
     // product decision.
 
-    // [FIX] Routed through lib/data/products.ts instead of
-    // db.product.findMany directly.
     const products = await listProductsWithInventoryDetails(db, tenantId, whereClause);
 
     // [v4.0] Batch-resolve every listed product's base unit through the
-    // sole sanctioned gateway. THIS CALL IS FAIL-LOUD: it throws
-    // MissingBaseUnitError the moment it hits any product whose
-    // baseUnitId doesn't resolve. If this route starts 500ing right after
-    // deploying v4.0, that almost certainly means there are pre-v4.0
-    // product rows still needing a one-time baseUnitId backfill — that is
-    // the intended signal, not a bug to route around by silently falling
-    // back to the old "guess by conversionFactor === 1" heuristic. Do
-    // NOT wrap this in a try/catch that swallows MissingBaseUnitError and
-    // substitutes a guess.
+    // sole sanctioned gateway. FAIL-LOUD: throws MissingBaseUnitError the
+    // moment it hits any product whose baseUnitId doesn't resolve. Do
+    // NOT wrap this in a try/catch that swallows it.
     const baseUnitsByProduct = await requireBaseUnits(
       db,
       tenantId,
@@ -152,11 +133,6 @@ export async function GET(req: Request) {
     const processedProducts = products.map((product) => {
       const baseUnit = baseUnitsByProduct.get(product.id)!; // guaranteed present
 
-      // [FIX] Summed in Decimal end-to-end — no native-number accumulation
-      // and therefore no epsilon-rounding patch needed. ProductBatch.quantity
-      // is already always base-unit under v4.0, so this is a pure sum, but
-      // "pure sum" done via repeated JS `+=` on many rows can still drift on
-      // ordinary floating-point summation noise; Decimal removes that too.
       let totalBaseStock = new Decimal(0);
       let hasExpiringSoonBatch = false;
       let hasNegativeStockBatch = false;
@@ -216,15 +192,12 @@ export async function GET(req: Request) {
       const totalStockInBase = totalBaseStock.toString();
       const isOutOfStock = totalBaseStock.lessThanOrEqualTo(0);
 
-      // [FLAGGED — open question, not resolved here] Under v3.9, a
-      // deactivated NON-base unit could still carry its own batches
-      // (ProductBatch.unitId could be any unit), so this flag made sense.
-      // Under v4.0, ProductBatch.unitId is always the base unit — so this
-      // condition can only ever be true if the BASE unit itself is
-      // deactivated, a scenario T3a §4's original spec text doesn't
-      // explicitly address for v4.0. Left functionally unchanged pending
-      // a product decision on whether deactivating the base unit should
-      // even be allowed.
+      // [FLAGGED — open question, not resolved here] Under v4.0,
+      // ProductBatch.unitId is always the base unit, so this condition
+      // can only ever be true if the BASE unit itself is deactivated — a
+      // scenario T3a §4's spec text doesn't explicitly address for v4.0.
+      // Left functionally unchanged pending a product decision on
+      // whether deactivating the base unit should even be allowed.
       const hasDiscontinuedUnitStock = product.units.some(
         (u) =>
           !u.isActive &&
@@ -239,18 +212,25 @@ export async function GET(req: Request) {
         isActive: product.isActive,
         createdAt: product.createdAt,
         baseUnitId: baseUnit.id,
+        // [FIX] All decimal-precision fields now consistently returned as
+        // strings — previously conversionFactor/priceWholesale/priceRetail
+        // used a mix of Number()/toString() across GET and POST, which is
+        // both internally inconsistent and risks precision loss on large
+        // SYP figures (native JS number is float64-limited; this schema
+        // allows up to 14 integer digits). Never Number() on a monetary or
+        // conversion-factor field anywhere in this codebase.
         units: product.units.map((u) => ({
           id: u.id,
           unitName: u.unitName,
-          conversionFactor: Number(u.conversionFactor),
+          conversionFactor: u.conversionFactor,
           pricingCurrency: u.pricingCurrency || "SYP",
-          priceWholesale: u.priceWholesale.toString(),
-          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? u.priceRetail.toString() : null,
+          priceWholesale: u.priceWholesale,
+          priceRetail: u.priceRetail,
           barcode: u.barcode,
           barcodeSource: u.barcodeSource,
           imageUrl: u.imageUrl,
           isActive: u.isActive !== false,
-          isBaseUnit: u.isBaseUnit,
+          isBaseUnit: u.id === baseUnit.id,
         })),
         batches: processedBatches,
         totalStockInBase,
@@ -360,7 +340,6 @@ export async function POST(req: Request) {
     }
 
     for (const barcode of incomingBarcodes) {
-      // [FIX] Routed through lib/data/products.ts.
       const existingBarcode = await findProductUnitByBarcode(db, tenantId, barcode);
       if (existingBarcode) {
         const statusText = existingBarcode.isActive ? "نشطة" : "متوقفة";
@@ -379,9 +358,6 @@ export async function POST(req: Request) {
     // base unit via createProductWithBaseUnit(); every other submitted
     // unit is created afterward via createAdditionalUnit().
     const baseUnitIndex = units.findIndex((u) => new Decimal(u.conversionFactor).equals(1));
-    // Structurally unreachable — validatePackagingUnits already rejected
-    // the request otherwise — but fail loud rather than silently proceed
-    // with -1 as an array index.
     if (baseUnitIndex === -1) {
       return NextResponse.json(
         { error: "INVALID_PACKAGING_UNITS", message: "لم يتم العثور على الوحدة الأساسية (معامل تحويل = 1)." },
@@ -389,35 +365,58 @@ export async function POST(req: Request) {
       );
     }
 
-    const createdProduct = await db.$transaction(async (tx) => {
-      const baseUnitInput = units[baseUnitIndex];
-      // [FIX] product/baseUnit → createdProduct/createdBaseUnit (الأسماء
-      // الجديدة من الدالة). خليتهم كمتغيرات محلية بأسماء مختصرة عشان الكود
-      // تحت ما يطول بلا داعي.
-      const { createdProduct: newProduct, createdBaseUnit: newBaseUnit } =
-        await createProductWithBaseUnit(
-          tx,
-          tenantId,
-          { name, category: category || null, isPublic: !!isPublic },
-          {
-            unitName: baseUnitInput.unitName,
-            pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
-            priceWholesale: baseUnitInput.priceWholesale,
-            priceRetail: baseUnitInput.priceRetail ?? null,
-            barcode: baseUnitInput.barcode || null,
-            barcodeSource: baseUnitInput.barcodeSource || null,
-            imageUrl: baseUnitInput.imageUrl || null,
-            isActive: baseUnitInput.isActive ?? true,
-          }
-        );
+    // [FIX] Validate initialBatch.unitIndex is in range BEFORE opening the
+    // transaction — previously `createdUnits[initialBatch.unitIndex] ??
+    // createdUnits[baseUnitIndex]` silently fell back to the base unit on
+    // an out-of-range index, meaning a genuine client bug (or a future
+    // frontend regression) would record the initial quantity against the
+    // WRONG unit's conversion factor with no error at all. Fail loud
+    // instead — consistent with this codebase's "never guess, always
+    // surface" posture (see MissingBaseUnitError's own doc).
+    if (initialBatch && (initialBatch.unitIndex < 0 || initialBatch.unitIndex >= units.length)) {
+      return NextResponse.json(
+        {
+          error: "INVALID_INITIAL_BATCH_UNIT",
+          message: `فهرس الوحدة المحدد للدفعة الأولية (${initialBatch.unitIndex}) غير موجود ضمن الوحدات المرسلة.`,
+        },
+        { status: 400 }
+      );
+    }
 
+    const createdProductResult = await db.$transaction(async (tx) => {
+      const baseUnitInput = units[baseUnitIndex];
+      // [FIX] Renamed to createdProduct/createdBaseUnit — matches
+      // createProductWithBaseUnit()'s new return field names, which also
+      // sidesteps a false-positive against eslint.config.mjs's
+      // PRODUCT_MODEL_RULES (that rule matches on destructured KEY NAME,
+      // not value origin — `product`/`baseUnit` as local names would
+      // have tripped it even though this is the sanctioned gateway's own
+      // trusted return value).
+      const { createdProduct, createdBaseUnit } = await createProductWithBaseUnit(
+        tx,
+        tenantId,
+        { name, category: category || null, isPublic: !!isPublic },
+        {
+          unitName: baseUnitInput.unitName,
+          pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
+          priceWholesale: baseUnitInput.priceWholesale,
+          priceRetail: baseUnitInput.priceRetail ?? null,
+          barcode: baseUnitInput.barcode || null,
+          barcodeSource: baseUnitInput.barcodeSource || null,
+          imageUrl: baseUnitInput.imageUrl || null,
+          isActive: baseUnitInput.isActive ?? true,
+        }
+      );
+
+      // createdUnits, in the SAME ORDER as the submitted `units` array, so
+      // initialBatch.unitIndex still lines up.
       const createdUnits: { id: string; conversionFactor: string }[] = new Array(units.length);
-      createdUnits[baseUnitIndex] = { id: newBaseUnit.id, conversionFactor: "1" };
+      createdUnits[baseUnitIndex] = { id: createdBaseUnit.id, conversionFactor: "1" };
 
       for (let i = 0; i < units.length; i++) {
         if (i === baseUnitIndex) continue;
         const u = units[i];
-        const createdUnit = await createAdditionalUnit(tx, tenantId, newProduct.id, u.conversionFactor, {
+        const createdUnit = await createAdditionalUnit(tx, tenantId, createdProduct.id, u.conversionFactor, {
           unitName: u.unitName,
           pricingCurrency: u.pricingCurrency || "SYP",
           priceWholesale: u.priceWholesale,
@@ -430,6 +429,8 @@ export async function POST(req: Request) {
         createdUnits[i] = { id: createdUnit.id, conversionFactor: u.conversionFactor };
       }
 
+      // GS1 shared-catalog entries — ProductCatalogEntry is not a
+      // tenant-scoped model, so this stays a direct tx call.
       for (let i = 0; i < units.length; i++) {
         const u = units[i];
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
@@ -448,26 +449,24 @@ export async function POST(req: Request) {
             const isBenignRace =
               catalogError instanceof Prisma.PrismaClientKnownRequestError &&
               catalogError.code === "P2002";
-            if (!isBenignRace) throw catalogError;
+            if (!isBenignRace) {
+              throw catalogError;
+            }
           }
         }
       }
 
       if (initialBatch) {
-        // [FIX — من الجولة اللي قبلها] رفض صريح بدل fallback صامت
-        if (initialBatch.unitIndex < 0 || initialBatch.unitIndex >= createdUnits.length) {
-          throw new Error(
-            `initialBatch.unitIndex (${initialBatch.unitIndex}) is out of range for ${createdUnits.length} submitted units.`
-          );
-        }
+        // Range already validated before the transaction opened, above —
+        // this is a plain, guaranteed-safe index at this point.
         const enteredUnit = createdUnits[initialBatch.unitIndex];
         const baseQuantity: DecimalInstance = toBaseUnit(initialBatch.quantity, enteredUnit.conversionFactor);
 
         await tx.productBatch.create({
           data: {
             tenantId,
-            productId: newProduct.id,
-            unitId: newBaseUnit.id,
+            productId: createdProduct.id,
+            unitId: createdBaseUnit.id,
             batchNumber: initialBatch.batchNumber,
             quantity: baseQuantity.toString(),
             expiryDate: initialBatch.expiryDate ? new Date(initialBatch.expiryDate) : null,
@@ -476,38 +475,41 @@ export async function POST(req: Request) {
       }
 
       return {
-        productId: newProduct.id,
-        productName: newProduct.name,
-        productCategory: newProduct.category,
-        productIsPublic: newProduct.isPublic,
-        productIsActive: newProduct.isActive,
-        productCreatedAt: newProduct.createdAt,
-        resolvedBaseUnitId: newBaseUnit.id,
+        productId: createdProduct.id,
+        productName: createdProduct.name,
+        productCategory: createdProduct.category,
+        productIsPublic: createdProduct.isPublic,
+        productIsActive: createdProduct.isActive,
+        productCreatedAt: createdProduct.createdAt,
+        resolvedBaseUnitId: createdBaseUnit.id,
         createdUnits,
         unitInputs: units,
       };
     });
 
+    // [FIX] All decimal-precision fields returned as strings, consistent
+    // with GET — previously mixed Number()/string across the two
+    // endpoints for the same fields.
     const responseProduct = {
-      id: createdProduct.productId,
-      name: createdProduct.productName,
-      category: createdProduct.productCategory,
-      isPublic: createdProduct.productIsPublic,
-      isActive: createdProduct.productIsActive,
-      createdAt: createdProduct.productCreatedAt,
-      baseUnitId: createdProduct.resolvedBaseUnitId,
-      units: createdProduct.createdUnits.map((u, i) => ({
+      id: createdProductResult.productId,
+      name: createdProductResult.productName,
+      category: createdProductResult.productCategory,
+      isPublic: createdProductResult.productIsPublic,
+      isActive: createdProductResult.productIsActive,
+      createdAt: createdProductResult.productCreatedAt,
+      baseUnitId: createdProductResult.resolvedBaseUnitId,
+      units: createdProductResult.createdUnits.map((u, i) => ({
         id: u.id,
-        unitName: createdProduct.unitInputs[i].unitName,
-        conversionFactor: Number(u.conversionFactor),
-        pricingCurrency: createdProduct.unitInputs[i].pricingCurrency || "SYP",
-        priceWholesale: Number(createdProduct.unitInputs[i].priceWholesale),
+        unitName: createdProductResult.unitInputs[i].unitName,
+        conversionFactor: u.conversionFactor,
+        pricingCurrency: createdProductResult.unitInputs[i].pricingCurrency || "SYP",
+        priceWholesale: createdProductResult.unitInputs[i].priceWholesale,
         priceRetail:
-          createdProduct.unitInputs[i].priceRetail !== null &&
-            createdProduct.unitInputs[i].priceRetail !== undefined
-            ? Number(createdProduct.unitInputs[i].priceRetail)
+          createdProductResult.unitInputs[i].priceRetail !== null &&
+            createdProductResult.unitInputs[i].priceRetail !== undefined
+            ? createdProductResult.unitInputs[i].priceRetail
             : null,
-        isBaseUnit: u.id === createdProduct.resolvedBaseUnitId,
+        isBaseUnit: u.id === createdProductResult.resolvedBaseUnitId,
       })),
     };
 

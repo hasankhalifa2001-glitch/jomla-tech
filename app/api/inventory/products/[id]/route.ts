@@ -12,10 +12,6 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-// [FIX] validatePackagingUnits/PackagingUnit now live in units.ts — the
-// standalone lib/inventory/packaging-unit-validation.ts file was deleted
-// when its logic was merged into units.ts (see that file's header, FIX
-// #3). This route was still importing from the deleted path.
 import { validatePackagingUnits, type PackagingUnit } from "@/lib/inventory/units";
 import {
   requireBaseUnit,
@@ -23,9 +19,10 @@ import {
   resetProductUnits,
   updateNonBaseUnitConversionFactor,
   PendingB2BReferenceError,
+  // [FIX] Dedicated error class replacing brittle string-matching on
+  // assertBaseUnitMutable()'s thrown message — see base-unit.ts's header.
+  BaseUnitLockedError,
 } from "@/lib/inventory/base-unit";
-// [FIX] Sole gateway for tx.product.* / tx.productUnit.* outside
-// base-unit.ts — see lib/data/products.ts's header.
 import {
   findProductWithUnits,
   findProductUnitByBarcodeExcludingProduct,
@@ -89,8 +86,7 @@ const updateProductSchema = z.object({
   units: z.array(unitSchema).min(1, "يجب أن يحتوي المنتج على وحدة قياس واحدة على الأقل").optional(),
   // Required whenever this PATCH would actually change WHICH unit is the
   // base unit (only reachable when the product has zero batches AND zero
-  // pending B2B references — both re-checked INSIDE the transaction, see
-  // below). Backs the BaseUnitChangeLog audit row.
+  // pending B2B references — both re-checked INSIDE the transaction).
   baseUnitChangeReason: z.string().optional(),
 });
 
@@ -124,7 +120,6 @@ export async function GET(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    // [FIX] Routed through lib/data/products.ts.
     const product = await findProductWithUnits(db, tenantId, id);
 
     if (!product) {
@@ -221,10 +216,7 @@ export async function PATCH(
     // mentioned in data.units stay as they are; units with a matching
     // `id` are replaced by their submitted values; units with no `id`
     // are additions. Every validation check below runs against this
-    // merged list, not just the submitted subset — otherwise a partial
-    // update that simply omits the current base unit from data.units
-    // could silently evade the "exactly one conversionFactor === 1" /
-    // base-unit-immutability rules.
+    // merged list, not just the submitted subset.
     const effectiveUnits: EffectiveUnit[] = existingProduct.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
@@ -268,16 +260,11 @@ export async function PATCH(
       wantsBaseUnitChange = !effectiveBaseUnit.id || effectiveBaseUnit.id !== currentBaseUnit.id;
 
       if (wantsBaseUnitChange) {
-        // [FIX] This is now an EARLY, INFORMATIONAL check only — it gives
-        // a fast, friendly error for the common case, but it is NOT the
-        // security boundary. The authoritative re-check happens INSIDE
-        // the transaction below via resetProductUnits(), which calls
-        // assertBaseUnitMutable() + assertNoPendingB2BReferences()
-        // itself, closing the exact window between this read and that
-        // write where a concurrent CSV import / POS sync / B2B approval
-        // could otherwise create the product's first batch (or a pending
-        // B2B order) after this check passes but before the transaction
-        // commits.
+        // Early, INFORMATIONAL check only — fast/friendly error for the
+        // common case, NOT the security boundary. The authoritative
+        // re-check happens INSIDE the transaction below via
+        // resetProductUnits(), closing the window a concurrent write
+        // could otherwise slip through.
         const earlyBatchCount = await countProductBatches(db, tenantId, id);
         if (earlyBatchCount > 0) {
           return NextResponse.json(
@@ -299,11 +286,11 @@ export async function PATCH(
           );
         }
 
-        // A base-unit change is a dedicated, standalone correction flow
-        // (see resetProductUnits()'s "wipe and restart" design) — it does
-        // not attempt to also apply arbitrary sibling-unit edits from the
-        // same payload. If other unit edits are genuinely needed, submit
-        // them in a separate PATCH after the base-unit correction.
+        // A base-unit change is a dedicated, standalone correction flow —
+        // it does not attempt to also apply arbitrary sibling-unit edits
+        // from the same payload. If other unit edits are genuinely
+        // needed, submit them in a separate PATCH after the base-unit
+        // correction.
         newBaseUnitSubmission = data.units.find(
           (u) => new Decimal(u.conversionFactor).equals(1)
         )!;
@@ -340,13 +327,6 @@ export async function PATCH(
                 { status: 400 }
               );
             }
-
-            // A non-base unit whose conversionFactor is CHANGING (not
-            // just re-submitted unchanged) needs the same early,
-            // informational batch-count preview as a base-unit change —
-            // the authoritative gate is still inside the transaction
-            // (updateNonBaseUnitConversionFactor's own
-            // assertBaseUnitMutable call).
           }
         }
 
@@ -376,12 +356,10 @@ export async function PATCH(
     const nextIsActive = data.isActive !== undefined ? data.isActive : existingProduct.isActive;
     let nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
 
-    // [FIX] A base-unit reset always forces the product private — the
-    // freshly created base unit has no priceRetail/imageUrl, so a
-    // product left `isPublic: true` across a reset would silently keep
-    // failing (or worse, keep passing on stale cached data) T3a's
-    // publishing gate. This is enforced regardless of what the request
-    // body says for isPublic.
+    // A base-unit reset always forces the product private — the freshly
+    // created base unit has no priceRetail/imageUrl, so a product left
+    // `isPublic: true` across a reset would silently keep failing (or
+    // worse, keep passing on stale cached data) T3a's publishing gate.
     if (wantsBaseUnitChange) {
       nextIsPublic = false;
     }
@@ -411,9 +389,9 @@ export async function PATCH(
 
     const updatedProduct = await db.$transaction(async (tx) => {
       if (wantsBaseUnitChange && newBaseUnitSubmission) {
-        // [FIX] resetProductUnits() itself calls assertBaseUnitMutable()
-        // AND assertNoPendingB2BReferences() as its first two actions,
-        // inside THIS transaction — this is the actual, race-free gate.
+        // resetProductUnits() itself calls assertBaseUnitMutable() AND
+        // assertNoPendingB2BReferences() as its first two actions, inside
+        // THIS transaction — this is the actual, race-free gate.
         await resetProductUnits(tx, {
           tenantId,
           productId: id,
@@ -428,13 +406,6 @@ export async function PATCH(
           reason: data.baseUnitChangeReason!.trim(),
         });
 
-        // [FIX] updateProduct's current signature is
-        // (tx, tenantId, productId, data) — the tenantId argument was
-        // missing here, which is a compile error against the current
-        // lib/data/products.ts (and, if it somehow ran, would have
-        // relied entirely on the Client Extension for tenant scoping
-        // instead of the belt-and-suspenders check that function now
-        // performs itself).
         await updateProduct(tx, tenantId, id, {
           name: data.name,
           category: data.category !== undefined ? data.category : undefined,
@@ -442,7 +413,6 @@ export async function PATCH(
           isPublic: false, // forced — see the note above
         });
       } else {
-        // [FIX] Same missing-tenantId issue as above.
         await updateProduct(tx, tenantId, id, {
           name: data.name,
           category: data.category !== undefined ? data.category : undefined,
@@ -461,10 +431,10 @@ export async function PATCH(
 
             if (u.id) {
               if (isNonBaseFactorChange) {
-                // [FIX] conversionFactor changes on an existing unit go
-                // through the one explicitly-guarded path — it re-checks
-                // zero-batch INSIDE this same transaction, and refuses
-                // to touch the current base unit.
+                // conversionFactor changes on an existing unit go through
+                // the one explicitly-guarded path — it re-checks
+                // zero-batch INSIDE this same transaction, and refuses to
+                // touch the current base unit.
                 await updateNonBaseUnitConversionFactor(tx, {
                   tenantId,
                   productId: id,
@@ -472,8 +442,6 @@ export async function PATCH(
                   newConversionFactor: u.conversionFactor,
                 });
               }
-              // [FIX] updateProductUnit's current signature is
-              // (tx, tenantId, unitId, data) — tenantId was missing.
               await updateProductUnit(tx, tenantId, u.id, {
                 unitName: u.unitName,
                 pricingCurrency: u.pricingCurrency,
@@ -485,19 +453,6 @@ export async function PATCH(
                 isActive: u.isActive !== undefined ? u.isActive : true,
               });
             } else {
-              // [FIX] createAdditionalUnit's current signature is
-              // (tx, tenantId, productId, conversionFactor, data), with
-              // `conversionFactor` passed as its own explicit argument
-              // (never embedded in `data`) and `tenant`/`product`
-              // connects handled internally by the function itself —
-              // never supplied by the caller. The previous call here
-              // used a stale 2-argument shape
-              // (tx, { tenant, product, conversionFactor, ... }), which
-              // both fails to compile against the current
-              // lib/data/products.ts and — had it somehow run — would
-              // have written the literal `conversionFactor` key from
-              // route code, exactly the pattern the model/field-level
-              // restriction on this codebase exists to prevent.
               await createAdditionalUnit(tx, tenantId, id, u.conversionFactor, {
                 unitName: u.unitName,
                 pricingCurrency: u.pricingCurrency,
@@ -557,12 +512,6 @@ export async function PATCH(
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse();
     }
-    // [FIX] The two race-condition guards that now run INSIDE the
-    // transaction (assertBaseUnitMutable via resetProductUnits, and the
-    // new assertNoPendingB2BReferences) throw plain Error /
-    // PendingB2BReferenceError rather than returning a response
-    // themselves — map them here so a race lost at the last moment still
-    // produces a clear Arabic message instead of a raw 500.
     if (error instanceof PendingB2BReferenceError) {
       return NextResponse.json(
         {
@@ -572,14 +521,16 @@ export async function PATCH(
         { status: 409 }
       );
     }
-    if (
-      error instanceof Error &&
-      error.message.includes("already has") &&
-      error.message.includes("batch(es)")
-    ) {
-      // Thrown by assertBaseUnitMutable() when the transaction's own
-      // re-check catches a batch that was created concurrently, after
-      // the early informational check above already passed.
+    // [FIX] Was brittle string-matching on error.message.includes(...) —
+    // replaced with instanceof against the dedicated BaseUnitLockedError
+    // class (see base-unit.ts's header FIX note). Catches the race where
+    // assertBaseUnitMutable()'s re-check inside the transaction finds a
+    // batch that was created concurrently, after the early informational
+    // check above already passed — for BOTH the base-unit-reset path
+    // (resetProductUnits) and the non-base conversionFactor-edit path
+    // (updateNonBaseUnitConversionFactor), since both throw this same
+    // error class.
+    if (error instanceof BaseUnitLockedError) {
       return NextResponse.json(
         {
           error: "BASE_UNIT_LOCKED",
@@ -616,17 +567,13 @@ export async function DELETE(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    // [FIX] Routed through lib/data/products.ts.
     const existingProduct = await findProductWithUnits(db, tenantId, id);
     if (!existingProduct) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    // [FIX] setProductActive's current signature is
-    // (tx, tenantId, productId, isActive) — tenantId was missing here.
-    // Pure visibility toggle — the ONLY field this touches, never
-    // bundled with an isPublic change (see lib/data/products.ts's header
-    // on why that's a dedicated helper).
+    // Pure visibility toggle — the ONLY field this touches, never bundled
+    // with an isPublic change.
     await setProductActive(db, tenantId, id, false);
 
     return NextResponse.json({ success: true, message: "تم تعطيل المنتج بنجاح." });
