@@ -140,6 +140,44 @@ export type PaymentMethod =
 //      `null` USD figure the same way the UI already must for a live
 //      cart line with no cached rate (T1: "omitted entirely, not shown as
 //      an error").
+//
+// [FIX — review pass 7] Two gaps closed:
+//   1. CachedProductUnit.conversionFactor was a native JS `number`, the
+//      only decimal-precision field on CachedProductUnit/CachedProductBatch
+//      NOT routed through serializeMoney() — every sibling field
+//      (priceWholesale, priceRetail, and CachedProductBatch.quantity,
+//      itself fixed in an earlier pass for exactly this reason) is a
+//      decimal.js-serialized string. This directly undermines v4.0's own
+//      unit-conversion architecture: Product.baseUnitId/ProductUnit.
+//      conversionFactor exist specifically because native-number
+//      arithmetic on conversionFactor caused the "21.9984 pieces" drift
+//      bug server-side — caching it here as a raw `number` reintroduces
+//      that exact risk for any client-side offline conversion computed
+//      from this cache before sync (e.g. converting a POS sale-unit
+//      quantity into the base unit while offline). Fixed: now `string`,
+//      serialized via serializeMoney() in createCachedProductRecord(),
+//      matching every other decimal field in this factory. No Dexie
+//      version bump needed — conversionFactor is nested inside the
+//      non-indexed `units[]` array, not a key in any .stores() index (see
+//      the review-pass-6 note above for the same reasoning applied to the
+//      USD-nullability change).
+//   2. createOfflineVoidRecord's totalSYP-matches-items recomputation was
+//      previously skipped whenever `data.originalTotalSYP` was provided
+//      (`if (data.originalTotalSYP === undefined) { ...check... }`) — but
+//      voiding a real, previously-synced or locally-pending invoice
+//      (i.e. the ordinary, dominant use of this factory) is exactly the
+//      case where a caller WOULD pass originalTotalSYP. That left this
+//      factory's single most important defense-in-depth check disabled
+//      for its single most common call pattern: nothing verified that the
+//      (negated) items array supplied actually corresponds to
+//      originalTotalSYP, only that originalTotalSYP itself got negated
+//      correctly. A caller bug picking the wrong/incomplete item list
+//      alongside a correct originalTotalSYP would sail through
+//      undetected. Fixed: the recomputation now runs unconditionally,
+//      exactly mirroring createOfflineInvoiceRecord's own unconditional
+//      check above — a void's negated items must always sum to its own
+//      (negated) totalSYP, regardless of which path totalSYP itself was
+//      derived through.
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -237,7 +275,20 @@ export interface CachedTenantSettings {
 export interface CachedProductUnit {
   id: string;
   unitName: string;
-  conversionFactor: number;
+  /**
+   * [FIX — review pass 7] Decimal-serialized string, never a native JS
+   * number — was previously `number`, the sole decimal-precision outlier
+   * on this interface. See the file-header FIX note for why this
+   * directly undermines v4.0's unit-conversion architecture (the whole
+   * point of Product.baseUnitId/ProductUnit.conversionFactor is to
+   * eliminate native-number arithmetic on this exact value). Any
+   * client-side conversion of a sale-unit quantity into the product's
+   * base unit — while offline, before this record ever reaches the
+   * server — must go through the same decimal.js discipline as every
+   * other quantity/price figure in this file, which requires the source
+   * value to already be a decimal-safe string, not a float.
+   */
+  conversionFactor: string;
   priceWholesale: string;
   priceRetail?: string;
   pricingCurrency?: "USD" | "SYP";
@@ -364,13 +415,15 @@ export class OfflineDatabase extends Dexie {
     //
     // [NOTE — review pass 6] This does NOT apply to review pass 6's
     // OfflineInvoice/OfflineInvoiceItem USD-field nullability change
-    // above — those fields are not part of any index key in the
-    // stores({...}) call above (only offlineId/tenantId/customerId/
-    // offlineCustomerId/status/createdAt are indexed on offlineInvoices),
-    // so Dexie's physical schema is completely unaffected. Only a change
-    // to an INDEXED key ever requires a version bump; a plain value
-    // field's TypeScript type (or even its presence/absence on a given
-    // record) is something Dexie has never enforced.
+    // above, or to review pass 7's CachedProductUnit.conversionFactor
+    // type change — none of those fields are part of any index key in
+    // the stores({...}) call above (only offlineId/tenantId/customerId/
+    // offlineCustomerId/status/createdAt are indexed on offlineInvoices,
+    // and only id/tenantId/isActive on cachedProducts), so Dexie's
+    // physical schema is completely unaffected. Only a change to an
+    // INDEXED key ever requires a version bump; a plain value field's
+    // TypeScript type (or even its presence/absence on a given record) is
+    // something Dexie has never enforced.
   }
 }
 
@@ -746,20 +799,26 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  // [FIX] Same total-matches-line-items check as createOfflineInvoiceRecord,
-  // applied to the void's own (negated) totalSYP — only meaningful when
-  // totalSYP wasn't itself derived from originalTotalSYP above, since in
-  // that branch totalSYP is a straight negation, not a fresh sum.
-  if (data.originalTotalSYP === undefined) {
-    const computedTotal = sumMoney(
-      serializedItems.map((item) => multiplyMoney(item.quantity, item.unitPriceSYP))
+  // [FIX — review pass 7] Previously wrapped in
+  // `if (data.originalTotalSYP === undefined) { ... }`, which skipped
+  // this check for exactly the DOMINANT real-world call pattern (voiding
+  // an actual invoice, where a caller naturally has and passes
+  // originalTotalSYP). That left the negated items array completely
+  // unverified against originalTotalSYP in the common case — a caller
+  // bug supplying the wrong/incomplete item list alongside a correct
+  // originalTotalSYP would previously pass silently. Now runs
+  // unconditionally, exactly mirroring createOfflineInvoiceRecord's own
+  // unconditional check: a void's negated items must always sum to its
+  // own (negated) totalSYP, regardless of which path totalSYP was
+  // derived through.
+  const computedTotal = sumMoney(
+    serializedItems.map((item) => multiplyMoney(item.quantity, item.unitPriceSYP))
+  );
+  if (compareMoney(computedTotal, totalSYP) !== 0) {
+    throw new Error(
+      `totalSYP (${totalSYP}) must equal the sum of item.quantity × item.unitPriceSYP ` +
+      `(${computedTotal}).`
     );
-    if (compareMoney(computedTotal, totalSYP) !== 0) {
-      throw new Error(
-        `totalSYP (${totalSYP}) must equal the sum of item.quantity × item.unitPriceSYP ` +
-        `(${computedTotal}).`
-      );
-    }
   }
 
   if (compareMoney(subtractMoney(totalSYP, paidSYP), debtSYP) !== 0) {
@@ -917,7 +976,14 @@ export function createCachedProductRecord(data: {
   units: Array<{
     id: string;
     unitName: string;
-    conversionFactor: number;
+    /**
+     * [FIX — review pass 7] Now MoneyInput (string | number | Decimal),
+     * routed through serializeMoney() below like every other
+     * decimal-precision field — was previously a bare `number` passed
+     * through untouched. See CachedProductUnit.conversionFactor's doc
+     * comment above and the file-header FIX note for the full reasoning.
+     */
+    conversionFactor: MoneyInput;
     priceWholesale: MoneyInput;
     priceRetail?: MoneyInput;
     pricingCurrency?: "USD" | "SYP";
@@ -951,7 +1017,10 @@ export function createCachedProductRecord(data: {
     units: data.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
-      conversionFactor: u.conversionFactor,
+      // [FIX — review pass 7] Now routed through serializeMoney(), same
+      // as every other decimal field on this record — was previously
+      // passed through as a raw, unserialized `number`.
+      conversionFactor: serializeMoney(u.conversionFactor),
       priceWholesale: serializeMoney(u.priceWholesale),
       priceRetail: u.priceRetail !== undefined ? serializeMoney(u.priceRetail) : undefined,
       pricingCurrency: u.pricingCurrency,

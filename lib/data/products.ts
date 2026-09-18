@@ -12,56 +12,42 @@
  * [FIX — tx types] Every function below now takes `TenantTransactionClient`
  * or `TxOrClient` imported from lib/inventory/base-unit.ts (itself
  * re-exporting them from lib/db/tenant-scope.ts, the single source of
- * truth) instead of `Prisma.TransactionClient`. getTenantDb()'s
- * `.$transaction()` returns an EXTENDED client's tx, which is not
- * structurally identical to `Prisma.TransactionClient` — see
- * tenant-scope.ts's header for the full explanation. `createProductWithBaseUnit()`
- * stays pinned to `TenantTransactionClient` (not widened to `TxOrClient`)
- * since it performs multiple related writes that must commit atomically.
+ * truth) instead of `Prisma.TransactionClient`. `createProductWithBaseUnit()`
+ * stays pinned to `TenantTransactionClient` since it performs multiple
+ * related writes that must commit atomically.
  *
- * [FIX — createProductWithBaseUnit() return field names] Previously
- * returned `{ product, baseUnit }`. Destructuring that at a call site
- * (`const { product, baseUnit } = await createProductWithBaseUnit(...)`)
- * is a false positive against eslint.config.mjs's PRODUCT_MODEL_RULES —
- * that rule inspects the destructured KEY NAME, not the value's origin,
- * so it can't tell "a raw Prisma relation" apart from "this function's
- * own trusted return value." Renamed to `{ createdProduct, createdBaseUnit }`
- * so ordinary destructuring of this specific, sanctioned return value no
- * longer trips the lint rule that exists to catch something else
- * entirely.
+ * [FIX — createProductWithBaseUnit() return field names] Renamed to
+ * `{ createdProduct, createdBaseUnit }` (was `{ product, baseUnit }`) so
+ * ordinary destructuring of this sanctioned return value no longer trips
+ * eslint.config.mjs's PRODUCT_MODEL_RULES ObjectPattern selector, which
+ * matches on the destructured KEY NAME alone.
  *
  * [FIX — adjustedByUser leaked full User row, including passwordHash]
- * `listProductsWithInventoryDetails()`'s batch-adjustments query used
- * `adjustedByUser: true` (an unfiltered include of the full User model) —
- * unlike the `unit` relation right next to it in the same query, which
- * was correctly `select`-narrowed. The declared return type
- * (`InventoryBatchAdjustmentView.adjustedByUser: { name; email }`) implied
- * a narrow shape, but the query itself fetched everything, and the
- * function's own `as unknown as InventoryBatchView[]` cast at the return
- * statement suppressed any compile-time check that would have caught the
- * mismatch. Any route returning this data straight into a JSON response
- * (an ordinary thing for an inventory-listing endpoint to do) would have
- * leaked every stock-adjuster's passwordHash. Fixed: `adjustedByUser` is
- * now `select`-narrowed to `{ name, email }`, matching the declared type
- * for real.
+ * listProductsWithInventoryDetails()'s batch-adjustments query now
+ * `select`-narrows adjustedByUser to { name, email } — previously an
+ * unfiltered `adjustedByUser: true` fetched (and could leak) every
+ * stock-adjuster's passwordHash.
  *
  * [FIX — findProductUnitByBarcodeExcludingProduct() over-fetched]
- * Previously returned the full raw `ProductUnit` row (conversionFactor
- * included) to the [id] route's PATCH handler — a route whose per-file
- * ESLint override lifts the conversionFactor ban specifically on the
- * documented assumption that it can never hold a raw fetched
- * ProductUnit relation. This function was silently violating that
- * assumption. Fixed: narrowed to a dedicated `ProductUnitBarcodeCollision`
- * shape carrying only what the caller's error message actually needs
- * (id, unitName, productId) — conversionFactor never leaves this file
- * through this path.
+ * Narrowed to a dedicated ProductUnitBarcodeCollision shape (id,
+ * unitName, productId only) — previously returned the full raw
+ * ProductUnit row (conversionFactor included) to a route whose ESLint
+ * override assumes it can never hold that field.
  *
- * [Everything below this point (Safe* types, tenant-ownership
- * double-checks on every write, the baseUnitId/conversionFactor
- * stripping via toSafeProductWithUnits()/toDisplayUnits(), the
- * TxOrClient widening for pure reads and single-field writes) is
- * unchanged from the previously reviewed revision — see inline comments
- * for the reasoning behind each.]
+ * [FIX — createAdditionalUnit() now writes tenantId explicitly] See the
+ * inline comment at that function below: this function's `tx` parameter
+ * is the wide `TxOrClient`, which includes the RAW, unextended
+ * `Prisma.TransactionClient` (per tenant-scope.ts's own TxOrClient
+ * union). A `create` operation has no `where` to scope against — the
+ * ONLY way tenantId ends up on the row is either the Client Extension's
+ * auto-injection (which requires a real getTenantDb()-derived client) or
+ * writing it explicitly. Previously this function relied solely on
+ * auto-injection while accepting a client type that doesn't guarantee
+ * that injection happens — a real gap, inconsistent with this file's own
+ * belt-and-suspenders posture on every UPDATE below (each of which scopes
+ * tenantId via its own `where`, not the extension alone). Fixed by
+ * writing `tenantId` explicitly in the `data` object, closing the gap
+ * regardless of which client shape is actually passed in.
  */
 
 import type { Prisma, Product, ProductUnit } from "@prisma/client";
@@ -122,9 +108,7 @@ export function listActiveProducts(
  * to call from lib/inventory/base-unit.ts and other internal, sanctioned
  * callers that are themselves exempt from the conversionFactor ban.
  * Do NOT call this from a route file whose ESLint override assumes it
- * can never hold a raw ProductUnit relation — use a narrowed accessor
- * (e.g. findProductUnitByBarcodeExcludingProduct below) from a route
- * instead, or add a similarly narrowed one if a new need arises.
+ * can never hold a raw ProductUnit relation.
  */
 export function findProductUnitById(
     tx: TxOrClient,
@@ -259,10 +243,25 @@ export async function createAdditionalUnit(
             "this is genuinely the product's first/base unit."
         );
     }
+
+    // [FIX — belt-and-suspenders, matching this file's own posture on
+    // every UPDATE above] Unlike an update (which scopes tenantId via its
+    // own `where`), a create has no existing row to scope against — the
+    // ONLY way tenantId ends up correct here is either the Client
+    // Extension's auto-injection (which requires a real
+    // getTenantDb()-derived client) or writing it explicitly. Since this
+    // function's `tx` parameter is the wide `TxOrClient` — which includes
+    // the RAW, unextended `Prisma.TransactionClient` per tenant-scope.ts's
+    // own union — relying on auto-injection alone would silently produce
+    // a tenantId-less row if ever called with that raw variant. Writing
+    // it explicitly closes that gap regardless of which client shape is
+    // passed, exactly the same defensive stance
+    // updateProduct()/updateProductUnit()/setProductActive() already take.
     return tx.productUnit.create({
         data: {
             ...data,
             ...buildConversionFactorField(conversionFactor),
+            tenantId: tenantId,
             productId: productId,
         } as Prisma.ProductUnitUncheckedCreateInput,
     });
@@ -279,13 +278,17 @@ export async function createAdditionalUnit(
  * This is the ONLY sanctioned way to create a new Product in the entire
  * codebase.
  *
- * [FIX] Return fields renamed `createdProduct`/`createdBaseUnit` (was
- * `product`/`baseUnit`) — see the file-header FIX note. Deliberately
- * still pinned to `TenantTransactionClient`, not widened to `TxOrClient`
- * — this function calls commitBaseUnitLink(), which itself requires a
- * real transaction client; widening would let a caller invoke this
- * multi-write function outside any transaction, silently breaking the
- * atomicity guarantee.
+ * Deliberately pinned to `TenantTransactionClient`, not widened to
+ * `TxOrClient` — this function calls commitBaseUnitLink(), which itself
+ * requires a real transaction client; widening would let a caller invoke
+ * this multi-write function outside any transaction, silently breaking
+ * the atomicity guarantee. Because `tx` is guaranteed to be a real
+ * getTenantDb()-derived transaction client here (never the raw,
+ * unextended Prisma.TransactionClient — see tenant-scope.ts's own
+ * TenantTransactionClient definition), relying on the Client Extension's
+ * auto-injection of `tenantId` on the two `create` calls below is safe —
+ * unlike createAdditionalUnit() above, which had to write it explicitly
+ * because ITS `tx` type permits the raw client variant.
  */
 export async function createProductWithBaseUnit(
     tx: TenantTransactionClient,
@@ -338,12 +341,11 @@ export async function findProductWithUnits(
 }
 
 /**
- * [NEW SHAPE] Cross-product barcode collision check for the [id] route's
- * PATCH — "is this barcode already used by a DIFFERENT product's unit?"
+ * Cross-product barcode collision check for the [id] route's PATCH —
+ * "is this barcode already used by a DIFFERENT product's unit?"
  *
- * [FIX] Narrowed to a select excluding conversionFactor (id/unitName/
- * productId only — the only fields the caller's error message actually
- * uses). See the file-header FIX note.
+ * Narrowed to a select excluding conversionFactor (id/unitName/productId
+ * only — the only fields the caller's error message actually uses).
  */
 export interface ProductUnitBarcodeCollision {
     id: string;
@@ -389,9 +391,6 @@ export interface InventoryBatchAdjustmentView {
     quantityDelta: Prisma.Decimal;
     reason: string;
     createdAt: Date;
-    // StockAdjustment.adjustedByUser is a required (Restrict) relation at
-    // the schema level, so this is never null on a row that was
-    // successfully fetched.
     adjustedByUser: { name: string | null; email: string };
 }
 
@@ -419,17 +418,11 @@ export interface ProductWithInventoryDetails extends Omit<Product, "baseUnitId">
  * with its units and batches (each batch carrying its unit, its
  * adjustment history, and invoiceItems/adjustments counts).
  *
- * [FIX — passwordHash leak closed] `adjustedByUser` is now `select`-
- * narrowed to `{ name, email }`, matching the declared
- * InventoryBatchAdjustmentView type for real. Previously fetched the
- * full User row (including passwordHash) via an unfiltered
- * `adjustedByUser: true` — see the file-header FIX note.
- *
- * `batch.unit` stays `select`-narrowed to exclude conversionFactor
- * entirely (a batch's unit is always the product's base unit under
- * v4.0, so conversionFactor is structurally always "1" here and was
- * never needed). `Product.units` is reshaped via toSafeProductWithUnits()
- * before this function returns.
+ * `adjustedByUser` is `select`-narrowed to `{ name, email }` — see the
+ * file-header FIX note (previously leaked passwordHash via an unfiltered
+ * `adjustedByUser: true`). `batch.unit` stays `select`-narrowed to
+ * exclude conversionFactor entirely. `Product.units` is reshaped via
+ * toSafeProductWithUnits() before this function returns.
  */
 export async function listProductsWithInventoryDetails(
     tx: TxOrClient,
@@ -453,9 +446,6 @@ export async function listProductsWithInventoryDetails(
                     },
                     adjustments: {
                         include: {
-                            // [FIX] Was `adjustedByUser: true` (full User
-                            // row, including passwordHash). Narrowed to
-                            // match InventoryBatchAdjustmentView for real.
                             adjustedByUser: {
                                 select: { name: true, email: true },
                             },
@@ -519,8 +509,8 @@ export interface ProductNameCategoryUnits {
 }
 
 /**
- * [NEW — CSV import] Every product for a tenant with its units reshaped
- * via toDisplayUnits() — used by validateAndPreviewCsv() to seed the
+ * [CSV import] Every product for a tenant with its units reshaped via
+ * toDisplayUnits() — used by validateAndPreviewCsv() to seed the
  * packaging-consistency check without ever naming conversionFactor
  * itself in csv-parser.ts.
  */
@@ -547,9 +537,9 @@ export interface UnitWithProductName extends DisplayUnit {
 }
 
 /**
- * [NEW — CSV import] Every ProductUnit for a tenant with its parent
- * product's name — used by validateAndPreviewCsv() to build the barcode
- * lookup map without a raw `.product` relation leaving this file.
+ * [CSV import] Every ProductUnit for a tenant with its parent product's
+ * name — used by validateAndPreviewCsv() to build the barcode lookup map
+ * without a raw `.product` relation leaving this file.
  */
 export async function listAllUnitsForTenantWithProductName(
     tx: TxOrClient,
@@ -568,9 +558,9 @@ export async function listAllUnitsForTenantWithProductName(
 }
 
 /**
- * [NEW — CSV import] Case-insensitive (name, category) product match,
- * with all its units — used by commitCsvImport() to decide whether a
- * "new product" CSV row is genuinely new or should attach an additional
+ * [CSV import] Case-insensitive (name, category) product match, with all
+ * its units — used by commitCsvImport() to decide whether a "new
+ * product" CSV row is genuinely new or should attach an additional
  * packaging unit to an already-existing product.
  */
 export async function findProductByNameCategory(

@@ -276,6 +276,21 @@ const eslintConfig = defineConfig([
     },
   },
   {
+    // Offline engine reads pre-fetched unit/product records from local cache,
+    // not direct Prisma relations.
+    files: ["lib/offline/**"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        QUERY_RAW_RULE,
+        NESTED_WRITE_RULE,
+        ...BASE_UNIT_ID_RULES,
+        ...PRODUCT_MODEL_RULES,
+        // CONVERSION_FACTOR_RULES explicitly omitted for offline cache processing
+      ],
+    },
+  },
+  {
     // seed.ts legitimately creates Product/ProductUnit rows directly
     // (documented in T1's Developer Tooling section) — exempted from the
     // model-level rule. baseUnitId and conversionFactor stay fully
