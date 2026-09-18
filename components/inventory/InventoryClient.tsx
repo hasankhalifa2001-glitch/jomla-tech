@@ -162,11 +162,7 @@ export function InventoryClient() {
         throw new Error(data.message || "فشل تعديل حالة تفعيل المنتج.");
       }
       toast.success(data.message);
-      setProducts((prev) =>
-        prev.map((p) =>
-          p.id === productId ? { ...p, isActive: data.isActive, isPublic: data.isPublic } : p
-        )
-      );
+      await fetchProducts(); // ✅ بدل الـ optimistic patch
     } catch (err: any) {
       toast.error(err.message || "حدث خطأ أثناء تعديل حالة المنتج.");
     } finally {
@@ -185,16 +181,7 @@ export function InventoryClient() {
         throw new Error(data.message || "فشل تعديل حالة الوحدة.");
       }
       toast.success(data.message);
-      setProducts((prev) =>
-        prev.map((p) => {
-          if (p.id !== productId) return p;
-          return {
-            ...p,
-            isPublic: data.productIsPublic !== undefined ? data.productIsPublic : p.isPublic,
-            units: p.units.map((u) => (u.id === unitId ? { ...u, isActive: data.unit.isActive } : u)),
-          };
-        })
-      );
+      await fetchProducts(); // ✅ بدل الـ optimistic patch
     } catch (err: any) {
       toast.error(err.message || "حدث خطأ أثناء تعديل حالة الوحدة.");
     } finally {

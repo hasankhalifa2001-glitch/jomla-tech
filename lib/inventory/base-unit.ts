@@ -29,6 +29,15 @@
  * `MissingBaseUnitError`/`PendingB2BReferenceError` already use — callers
  * now do `error instanceof BaseUnitLockedError`, immune to message wording.
  *
+ * [FIX — UnitNotBelongingToProductError wired up] This class was
+ * previously defined at the bottom of the file but never actually thrown
+ * — `commitBaseUnitLink()` and `updateNonBaseUnitConversionFactor()` both
+ * still raised a plain `Error` for the exact "this unit belongs to a
+ * different product" situation the class exists to describe, leaving
+ * callers with the same brittle string-matching problem
+ * `BaseUnitLockedError` was introduced to solve elsewhere in this file.
+ * Both call sites now throw `UnitNotBelongingToProductError` instead.
+ *
  * [FIX — resetProductUnits() clears barcode/barcodeSource on soft-delete]
  * `ProductUnit` carries `@@unique([tenantId, barcode])` — a DB-level
  * constraint that does NOT distinguish active from inactive rows.
@@ -83,10 +92,10 @@ export class MissingBaseUnitError extends Error {
 }
 
 /**
- * [NEW] Thrown by assertBaseUnitMutable() when a product already has at
- * least one ProductBatch — dedicated class replacing the previous plain
- * Error, so callers detect this via `instanceof` instead of matching on
- * message text. See the file-header FIX note.
+ * Thrown by assertBaseUnitMutable() when a product already has at least
+ * one ProductBatch — dedicated class replacing the previous plain Error,
+ * so callers detect this via `instanceof` instead of matching on message
+ * text. See the file-header FIX note.
  */
 export class BaseUnitLockedError extends Error {
     constructor(productId: string, batchCount: number) {
@@ -119,6 +128,22 @@ export class PendingB2BReferenceError extends Error {
             `(approve or reject) every pending order for this product first.`
         );
         this.name = "PendingB2BReferenceError";
+    }
+}
+
+/**
+ * [FIX — now actually thrown] Raised whenever a unitId is confirmed to
+ * belong to a DIFFERENT product than the one a caller expected —
+ * commitBaseUnitLink()'s cross-wiring guard and
+ * updateNonBaseUnitConversionFactor()'s ownership check both throw this
+ * instead of a plain Error, so a caller can catch it via `instanceof`
+ * rather than matching on message text. Previously defined but unused;
+ * see the file-header FIX note.
+ */
+export class UnitNotBelongingToProductError extends Error {
+    constructor(unitId: string, productId: string) {
+        super(`ProductUnit ${unitId} does not belong to product ${productId}.`);
+        this.name = "UnitNotBelongingToProductError";
     }
 }
 
@@ -269,6 +294,9 @@ export async function assertNoPendingB2BReferences(
  * Verifies baseUnitId actually belongs to productId before writing the
  * FK — nothing at the schema level otherwise stops a caller from
  * cross-wiring products.
+ *
+ * @throws {UnitNotBelongingToProductError} if baseUnitId belongs to a
+ *   different product than productId.
  */
 export async function commitBaseUnitLink(
     tx: TenantTransactionClient,
@@ -281,10 +309,7 @@ export async function commitBaseUnitLink(
         select: { productId: true },
     });
     if (unit.productId !== productId) {
-        throw new Error(
-            `commitBaseUnitLink: baseUnitId ${baseUnitId} belongs to a ` +
-            `different product (${unit.productId}) than ${productId}.`
-        );
+        throw new UnitNotBelongingToProductError(baseUnitId, productId);
     }
 
     return tx.product.update({
@@ -409,8 +434,10 @@ export async function resetProductUnits(
  *
  * @throws {BaseUnitLockedError} via assertBaseUnitMutable if the product
  *   already has at least one ProductBatch.
- * @throws {Error} if unitId does not belong to productId, is the
- *   product's current base unit, or the new factor equals 1.
+ * @throws {Error} if unitId is the product's current base unit, or the
+ *   new factor equals 1.
+ * @throws {UnitNotBelongingToProductError} if unitId belongs to a
+ *   different product.
  */
 export async function updateNonBaseUnitConversionFactor(
     tx: TenantTransactionClient,
@@ -437,10 +464,7 @@ export async function updateNonBaseUnitConversionFactor(
         where: { id: params.unitId, tenantId: params.tenantId },
     });
     if (unit.productId !== params.productId) {
-        throw new Error(
-            `updateNonBaseUnitConversionFactor: unit ${params.unitId} belongs ` +
-            `to a different product (${unit.productId}) than ${params.productId}.`
-        );
+        throw new UnitNotBelongingToProductError(params.unitId, params.productId);
     }
 
     if (isReservedBaseUnitFactor(params.newConversionFactor)) {
@@ -456,11 +480,4 @@ export async function updateNonBaseUnitConversionFactor(
         where: { id: params.unitId, tenantId: params.tenantId },
         data: buildConversionFactorField(params.newConversionFactor),
     });
-}
-
-export class UnitNotBelongingToProductError extends Error {
-    constructor(unitId: string, productId: string) {
-        super(`ProductUnit ${unitId} does not belong to product ${productId}.`);
-        this.name = "UnitNotBelongingToProductError";
-    }
 }

@@ -339,6 +339,12 @@ export function validatePackagingUnits(units: PackagingUnit[]): {
 
         if (factor.equals(1)) {
             baseUnitCount += 1;
+            if (baseUnitCount > 1) {
+                return {
+                    valid: false,
+                    error: "لا يمكن تحديد أكثر من وحدة أساسية واحدة بمعامل تحويل يساوي 1.",
+                };
+            }
         }
 
         const factorKey = factor.toFixed();

@@ -13,7 +13,13 @@ import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { validatePackagingUnits } from "@/lib/inventory/packaging-unit-validation";
+// [FIX] lib/inventory/packaging-unit-validation.ts was deleted when
+// validatePackagingUnits() was merged into lib/inventory/units.ts (see
+// that file's header FIX #3 note) — every former importer, including
+// this component, now imports it from there instead. The old path no
+// longer resolves to anything and previously broke the build/dev server
+// on this file ("Module not found").
+import { validatePackagingUnits } from "@/lib/inventory/units";
 
 // [FIX] products/route.ts's POST now requires conversionFactor/
 // priceWholesale/priceRetail/initialBatch.quantity as validated DECIMAL
@@ -179,6 +185,26 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   };
 
   const handleRemoveUnit = (index: number) => {
+    // [FIX — real bug] Unit 0 is always the product's base unit (T3a §0:
+    // the first unit entered at creation automatically becomes
+    // Product.baseUnitId, with conversionFactor locked to 1). Previously
+    // only `units.length <= 1` was guarded against — nothing stopped
+    // removing index 0 specifically when 2+ units existed. Doing so left
+    // the array's NEW index 0 (the old index 1) displayed as "الوحدة
+    // الأساسية" with its conversionFactor field forced to show "1" and
+    // disabled (`idx === 0` in the JSX below) — while the underlying state
+    // for that unit still held its real, original factor (e.g. 6). The
+    // user could never fix this (the field is disabled), and
+    // validatePackagingUnits() would then fail with "يجب تحديد وحدة
+    // أساسية واحدة بمعامل تحويل يساوي 1" even though the screen showed a
+    // "1". This guard makes index-0 removal impossible regardless of
+    // caller, as defense in depth alongside hiding the delete button for
+    // idx === 0 in the JSX below.
+    if (index === 0) {
+      toast.error("لا يمكن حذف الوحدة الأساسية — هي المرجع الذي تُحسب عليه كل الوحدات الأخرى.");
+      return;
+    }
+
     if (units.length <= 1) {
       toast.error("يجب الإبقاء على وحدة قياس واحدة على الأقل.");
       return;
@@ -190,9 +216,20 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       setBatchUnitIndex(0);
     }
 
-    if (barcodeGate.unitIndex === index) {
-      setBarcodeGate({ unitIndex: null, barcode: "" });
-    }
+    // [FIX — real bug] Previously only cleared the gate when
+    // `barcodeGate.unitIndex === index` (an exact match). If the gate was
+    // open for a LATER unit (e.g. unitIndex: 2) and an EARLIER unit was
+    // removed (index: 1), every index after the removed one shifts down
+    // by one in the new array — but the gate's stored unitIndex was left
+    // unchanged, pointing at the wrong unit (or, if it was the last one,
+    // out of bounds). Fixed to shift the index down when it's past the
+    // removed position, and only clear it on an exact match.
+    setBarcodeGate((prev) => {
+      if (prev.unitIndex === null) return prev;
+      if (prev.unitIndex === index) return { unitIndex: null, barcode: "" };
+      if (prev.unitIndex > index) return { ...prev, unitIndex: prev.unitIndex - 1 };
+      return prev;
+    });
   };
 
   const handleUnitChange = (index: number, field: keyof UnitForm, value: any) => {
@@ -209,6 +246,14 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       updated[unitIndex] = { ...updated[unitIndex], barcode: "", barcodeSource: "" };
       setUnits(updated);
       setCatalogInfo(null);
+      // [FIX] Also close the classification gate if it was open for this
+      // exact unit — previously only the unit's own barcode/barcodeSource
+      // fields were cleared, but a still-open BarcodeSourceModal (opened
+      // for the barcode value that just got erased) could be left
+      // pointing at a barcode that no longer exists on this unit.
+      if (barcodeGate.unitIndex === unitIndex) {
+        setBarcodeGate({ unitIndex: null, barcode: "" });
+      }
       return;
     }
 
@@ -764,7 +809,13 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                           <span className="font-bold text-xs text-zinc-700 dark:text-zinc-300">
                             {idx === 0 ? "الوحدة الأساسية (Base Unit)" : `وحدة تجميعية #${idx + 1}`}
                           </span>
-                          {units.length > 1 && (
+                          {/* [FIX — real bug] Was `units.length > 1` only,
+                              which let the base unit (idx 0) be deleted
+                              whenever a second unit existed. The base unit
+                              can never be removed (T3a §0) — see
+                              handleRemoveUnit()'s matching guard above,
+                              kept as defense in depth. */}
+                          {idx !== 0 && units.length > 1 && (
                             <Button
                               type="button"
                               variant="ghost"
@@ -797,7 +848,26 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                               min="0.0001"
                               disabled={idx === 0}
                               value={idx === 0 ? 1 : unit.conversionFactor}
-                              onChange={(e) => handleUnitChange(idx, "conversionFactor", parseFloat(e.target.value) || 1)}
+                              onChange={(e) => {
+                                // [FIX — real bug] Was
+                                // `parseFloat(e.target.value) || 1`. Since
+                                // `0` is falsy in JS, the very first
+                                // keystroke of any fractional value under 1
+                                // (e.g. typing "0" on the way to "0.25")
+                                // was immediately snapped back to "1",
+                                // making it practically impossible to type
+                                // a fractional conversionFactor — even
+                                // though fractional factors are explicitly
+                                // allowed (a wholesaler selling a quarter-
+                                // or half-carton). Fixed to only fall back
+                                // when the parsed value isn't a real
+                                // number at all (e.g. an empty string);
+                                // validatePackagingUnits() below already
+                                // rejects a submitted value <= 0, so no
+                                // separate floor is needed here.
+                                const parsed = parseFloat(e.target.value);
+                                handleUnitChange(idx, "conversionFactor", Number.isFinite(parsed) ? parsed : 0);
+                              }}
                               className={`${FIELD_H} mt-1`}
                               required
                             />

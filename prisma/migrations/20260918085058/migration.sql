@@ -66,6 +66,7 @@ CREATE TABLE "Product" (
     "category" TEXT,
     "isPublic" BOOLEAN NOT NULL DEFAULT false,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "baseUnitId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -86,6 +87,8 @@ CREATE TABLE "ProductUnit" (
     "imageUrl" TEXT,
     "barcode" TEXT,
     "barcodeSource" "BarcodeSource",
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "ProductUnit_pkey" PRIMARY KEY ("id")
 );
@@ -311,6 +314,20 @@ CREATE TABLE "BatchDeletionLog" (
     CONSTRAINT "BatchDeletionLog_pkey" PRIMARY KEY ("id")
 );
 
+-- CreateTable
+CREATE TABLE "BaseUnitChangeLog" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "productId" TEXT NOT NULL,
+    "oldBaseUnitId" TEXT NOT NULL,
+    "newBaseUnitId" TEXT NOT NULL,
+    "changedByUserId" TEXT NOT NULL,
+    "reason" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "BaseUnitChangeLog_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "Tenant_slug_key" ON "Tenant"("slug");
 
@@ -322,6 +339,9 @@ CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
 -- CreateIndex
 CREATE INDEX "User_tenantId_idx" ON "User"("tenantId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Product_baseUnitId_key" ON "Product"("baseUnitId");
 
 -- CreateIndex
 CREATE INDEX "Product_tenantId_idx" ON "Product"("tenantId");
@@ -482,6 +502,12 @@ CREATE INDEX "BatchDeletionLog_tenantId_idx" ON "BatchDeletionLog"("tenantId");
 -- CreateIndex
 CREATE INDEX "BatchDeletionLog_batchId_idx" ON "BatchDeletionLog"("batchId");
 
+-- CreateIndex
+CREATE INDEX "BaseUnitChangeLog_tenantId_idx" ON "BaseUnitChangeLog"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "BaseUnitChangeLog_productId_idx" ON "BaseUnitChangeLog"("productId");
+
 -- AddForeignKey
 ALTER TABLE "Tenant" ADD CONSTRAINT "Tenant_systemCustomerId_fkey" FOREIGN KEY ("systemCustomerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
@@ -490,6 +516,9 @@ ALTER TABLE "User" ADD CONSTRAINT "User_tenantId_fkey" FOREIGN KEY ("tenantId") 
 
 -- AddForeignKey
 ALTER TABLE "Product" ADD CONSTRAINT "Product_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Product" ADD CONSTRAINT "Product_baseUnitId_fkey" FOREIGN KEY ("baseUnitId") REFERENCES "ProductUnit"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "ProductUnit" ADD CONSTRAINT "ProductUnit_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -601,3 +630,18 @@ ALTER TABLE "BatchDeletionLog" ADD CONSTRAINT "BatchDeletionLog_tenantId_fkey" F
 
 -- AddForeignKey
 ALTER TABLE "BatchDeletionLog" ADD CONSTRAINT "BatchDeletionLog_deletedByUserId_fkey" FOREIGN KEY ("deletedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_oldBaseUnitId_fkey" FOREIGN KEY ("oldBaseUnitId") REFERENCES "ProductUnit"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_newBaseUnitId_fkey" FOREIGN KEY ("newBaseUnitId") REFERENCES "ProductUnit"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_changedByUserId_fkey" FOREIGN KEY ("changedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

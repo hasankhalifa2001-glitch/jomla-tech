@@ -319,6 +319,7 @@ const eslintConfig = defineConfig([
       "app/api/inventory/products/route.ts",
       "app/api/inventory/products/\\[id\\]/route.ts",
       "lib/inventory/csv-parser.ts",
+      "components/inventory/AddProductModal.tsx"
     ],
     rules: {
       "no-restricted-syntax": [
