@@ -117,7 +117,8 @@
  */
 
 import Decimal from "decimal.js";
-import type { Prisma, ProductUnit } from "@prisma/client";
+import type { ProductUnit } from "@prisma/client";
+import type { TenantTransactionClient } from "@/lib/db/tenant-scope";
 
 type DecimalInstance = InstanceType<typeof Decimal>;
 type Numeric = string | number | DecimalInstance;
@@ -240,7 +241,7 @@ export function breakdownForDisplay(
  * @throws if no ProductUnit with this id exists for this tenant.
  */
 export async function getUnitConversionFactor(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient,
     tenantId: string,
     unitId: string
 ): Promise<DecimalInstance> {

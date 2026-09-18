@@ -11,6 +11,13 @@ import {
   ForbiddenRoleError,
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
+// [FIX] Sole gateway for tenant-scoped product reads — the previous GET
+// handler pulled `product: { select: {...} } }` directly inside a
+// ProductBatch include, which is exactly the Property-key access
+// PRODUCT_MODEL_RULES bans (a Property named "product" nested under
+// "include"), plus a separate MemberExpression violation on
+// `batch.product.name`. Routed through findProductById() instead.
+import { findProductById } from "@/lib/data/products";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
@@ -50,18 +57,6 @@ const updateBatchSchema = z.object({
     }),
 });
 
-// [FIX] Moved above every handler that references it. The previous version
-// declared this at the very bottom of the file, after the DELETE handler
-// that uses it — in a module with `const`, that binding isn't initialized
-// until its own declaration line runs at module-evaluation time, so any
-// code path that could execute before the module finished loading would
-// have thrown a ReferenceError (temporal dead zone). In practice Next.js
-// fully evaluates the route module before serving any request, so this
-// specific case likely never triggered at runtime — but the DELETE
-// function body was also byte-for-byte pasted inside PATCH's body in the
-// submitted file, which is the real breakage; consolidating the schema up
-// here removes any ambiguity either way and matches every other schema's
-// placement in this file.
 const deleteBatchSchema = z.object({
   reason: z.string().min(3, "يرجى تحديد سبب حذف الدفعة (3 أحرف على الأقل)."),
 });
@@ -85,12 +80,16 @@ export async function GET(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
+    // [FIX] `product` relation removed from this include entirely — see
+    // the import note above. `unit` stays, but NARROWED to exclude
+    // conversionFactor (same pattern lib/data/products.ts's FIX 3
+    // already established for batch.unit) — this route only ever needs
+    // unitName here, never the raw conversionFactor.
     const batch = await db.productBatch.findFirst({
       where: { id, tenantId },
       include: {
-        unit: true,
-        product: {
-          select: { id: true, name: true, category: true },
+        unit: {
+          select: { id: true, unitName: true, isActive: true },
         },
         adjustments: {
           include: {
@@ -113,6 +112,11 @@ export async function GET(
       );
     }
 
+    // [FIX] Product name/category fetched via the sanctioned gateway
+    // instead of a nested `product: { select: {...} } }` relation on the
+    // batch query above.
+    const product = await findProductById(db, tenantId, batch.productId);
+
     const now = new Date();
     let daysToExpiry: number | null = null;
     let expiryStatus: "RED" | "YELLOW" | "NORMAL" = "NORMAL";
@@ -132,7 +136,7 @@ export async function GET(
       batch: {
         id: batch.id,
         productId: batch.productId,
-        productName: batch.product.name,
+        productName: product?.name ?? "",
         unitId: batch.unitId,
         unitName: batch.unit.unitName,
         batchNumber: batch.batchNumber,
@@ -228,20 +232,33 @@ export async function PATCH(
       updateData.expiryDate = expiryDate ? new Date(expiryDate) : null;
     }
 
-    // [FIX] The submitted file's `update()` call was left open — its
-    // closing `});` was replaced by the entire DELETE function body being
-    // pasted inline as if it were another property of the `data`/options
-    // object, which does not even parse as valid TypeScript. Restored to
-    // a normal, fully-closed call.
+    // [FIX] No `include: { unit: true }` here anymore — this handler
+    // never needed a unit relation at all; it was only ever there so
+    // the previous response could spread `...updatedBatch` including
+    // `.unit`. That spread leaked a raw ProductUnit row — real
+    // conversionFactor Decimal included — straight to the client. This
+    // route has no per-file exemption for conversionFactor (unlike
+    // products/route.ts / products/[id]/route.ts), so carrying that
+    // value downstream at all, even unnamed via a spread, defeats the
+    // whole point of the restriction. Fixed by dropping the include
+    // entirely and building the response by hand from only the scalar
+    // ProductBatch fields actually needed.
     const updatedBatch = await db.productBatch.update({
       where: { id, tenantId },
       data: updateData,
-      include: { unit: true },
     });
 
     return NextResponse.json({
       success: true,
-      batch: { ...updatedBatch, quantity: Number(updatedBatch.quantity) },
+      batch: {
+        id: updatedBatch.id,
+        productId: updatedBatch.productId,
+        unitId: updatedBatch.unitId,
+        batchNumber: updatedBatch.batchNumber,
+        quantity: Number(updatedBatch.quantity),
+        expiryDate: updatedBatch.expiryDate,
+        createdAt: updatedBatch.createdAt,
+      },
       message: "تم تحديث بيانات الدفعة بنجاح.",
     });
   } catch (error) {
@@ -297,14 +314,6 @@ export async function DELETE(
 
     const { reason } = validation.data;
 
-    // Every rejection path below THROWS a BatchOperationError instead of
-    // returning a NextResponse — required so Prisma's interactive
-    // transaction aborts and rolls back automatically on any of these
-    // paths, and so the BatchDeletionLog write + productBatch.delete()
-    // stay atomic with the checks that gate them (closing the TOCTOU
-    // window between the count checks and the delete itself). The catch
-    // block below the transaction is the only place a NextResponse is
-    // ever constructed for these cases.
     await db.$transaction(async (tx) => {
       const batch = await tx.productBatch.findFirst({
         where: { id, tenantId },
@@ -373,11 +382,6 @@ export async function DELETE(
     if (error instanceof SubscriptionLockedError) {
       return subscriptionLockedResponse(error);
     }
-    // Last-line defense: even though the count checks above should catch
-    // every ordinary case, a genuine race (another transaction inserting
-    // an InvoiceItem/StockAdjustment between our count and our delete)
-    // would surface here as a Postgres foreign-key violation via Prisma's
-    // typed error class — never as a raw/opaque error shown to the user.
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
       return NextResponse.json(
         {

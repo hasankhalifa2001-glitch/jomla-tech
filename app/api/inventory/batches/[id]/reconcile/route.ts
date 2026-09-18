@@ -25,6 +25,18 @@ const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
 // the union/transform gave no real protection, only the appearance of it.
 // `quantityDelta` now accepts a string only; the frontend is required to
 // serialize the delta as a decimal string itself.
+//
+// [v4.0 NOTE] Per T1's Unit Conversion Architecture / T3c's edit:
+// quantityDelta here is always in the batch's BASE unit, exactly like
+// ProductBatch.quantity itself. If the reconciliation UI lets an admin
+// enter the correction in a non-base unit (e.g. "one pack short"), that
+// conversion (via toBaseUnit(), using the entered unit's own
+// conversionFactor) must happen on the client BEFORE this value reaches
+// this route — this endpoint receives and stores the value as-is, with
+// no unit context of its own to convert against. No change made here;
+// flagged for confirmation that the frontend reconciliation screen
+// actually performs this conversion before submitting, since this route
+// has no way to verify it server-side.
 const reconcileBatchSchema = z.object({
   quantityDelta: z
     .string()
@@ -77,9 +89,13 @@ export async function POST(
     const { quantityDelta, reason } = validation.data;
 
     const result = await db.$transaction(async (tx) => {
+      // [FIX] `include: { unit: true }` removed — this read is only ever
+      // used for the existence check and `batch.id` below; nothing here
+      // ever touched `.unit`. Dropping the include avoids pulling a raw
+      // ProductUnit row (real conversionFactor Decimal) into scope for
+      // no reason.
       const batch = await tx.productBatch.findFirst({
         where: { id, tenantId },
-        include: { unit: true },
       });
 
       if (!batch) {
@@ -107,15 +123,18 @@ export async function POST(
       });
 
       // 2. Atomic increment update to ProductBatch.quantity
+      // [FIX] `include: { unit: true }` removed — this route has no
+      // per-file exemption for conversionFactor (unlike
+      // products/route.ts / products/[id]/route.ts), so carrying a raw
+      // ProductUnit row downstream at all — even unnamed, via a later
+      // spread — defeats the point of the restriction. This route only
+      // ever needs scalar ProductBatch fields for its response.
       const updatedBatch = await tx.productBatch.update({
         where: { id: batch.id, tenantId },
         data: {
           quantity: {
             increment: quantityDelta,
           },
-        },
-        include: {
-          unit: true,
         },
       });
 
@@ -128,9 +147,18 @@ export async function POST(
     return NextResponse.json({
       success: true,
       message: "تم تسجيل التسوية المخزنية وتحديث كمية الدفعة بنجاح.",
+      // [FIX] Built by hand from scalar ProductBatch fields only — no
+      // `...result.batch` spread, which previously leaked
+      // `result.batch.unit.conversionFactor` (a real Decimal) straight
+      // into the JSON response.
       batch: {
-        ...result.batch,
+        id: result.batch.id,
+        productId: result.batch.productId,
+        unitId: result.batch.unitId,
+        batchNumber: result.batch.batchNumber,
         quantity: Number(result.batch.quantity),
+        expiryDate: result.batch.expiryDate,
+        createdAt: result.batch.createdAt,
       },
       adjustment: {
         id: result.adjustment.id,

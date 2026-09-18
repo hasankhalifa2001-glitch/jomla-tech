@@ -103,8 +103,14 @@
  * of its functions were and weren't widened, and why.
  */
 
-import type { Prisma, PrismaClient, Product, ProductUnit } from "@prisma/client";
-import type { getTenantDb } from "@/lib/db/tenant-scope";
+import type { Product, ProductUnit } from "@prisma/client";
+import type { TxOrClient, TenantTransactionClient } from "@/lib/db/tenant-scope";
+// [FIX] TxOrClient/TenantTransactionClient كانت معرّفة هون محلياً
+// (Prisma.TransactionClient | PrismaClient | ReturnType<typeof getTenantDb>)
+// — دايماً كان تعريف خاطئ لأنه ما بيغطي نوع الـ tx داخل transaction على
+// extended client. صار الاستيراد من المصدر الصحيح.
+export type { TxOrClient, TenantTransactionClient };
+
 import {
     buildConversionFactorField,
     BASE_UNIT_CONVERSION_FACTOR,
@@ -169,7 +175,7 @@ export class PendingB2BReferenceError extends Error {
  * resetProductUnits, updateNonBaseUnitConversionFactor) deliberately do
  * NOT use this type — they stay pinned to `Prisma.TransactionClient`.
  */
-export type TxOrClient = Prisma.TransactionClient | PrismaClient | ReturnType<typeof getTenantDb>;
+// export type TxOrClient = TenantTransactionClient | TenantDb | ReturnType<typeof getTenantDb>;
 
 /**
  * Resolves and returns a product's base ProductUnit, guaranteed non-null.
@@ -291,7 +297,7 @@ export function toSafeProductWithUnits<
  * @throws {Error} if the product already has at least one ProductBatch.
  */
 export async function assertBaseUnitMutable(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient,
     tenantId: string,
     productId: string
 ): Promise<void> {
@@ -320,7 +326,7 @@ export async function assertBaseUnitMutable(
  *   B2BOrderRequestItem references a unit belonging to this product.
  */
 export async function assertNoPendingB2BReferences(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient,
     tenantId: string,
     productId: string
 ): Promise<void> {
@@ -358,7 +364,7 @@ export async function assertNoPendingB2BReferences(
  * inside the same $transaction as the ProductUnit.create() it follows.
  */
 export async function commitBaseUnitLink(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient,
     tenantId: string,
     productId: string,
     baseUnitId: string
@@ -432,7 +438,7 @@ export async function commitBaseUnitLink(
  *   *current* base unit cannot be resolved (structurally unexpected).
  */
 export async function resetProductUnits(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient,
     params: {
         tenantId: string;
         productId: string;
@@ -452,13 +458,20 @@ export async function resetProductUnits(
 
     const oldBaseUnit = await requireBaseUnit(tx, params.tenantId, params.productId);
 
-    // [FIX] Soft-delete only — no FK to worry about, since nothing is
-    // actually removed. Deliberately does not touch barcode/barcodeSource
-    // on these rows; they simply become invisible to every active-unit
-    // picker per T3a's existing isActive filtering.
+    // [FIX 9] Soft-delete AND clear `barcode` (setting it to null) on
+    // every deactivated unit. `ProductUnit` carries `@@unique([tenantId,
+    // barcode])` — a DB-level constraint that does NOT distinguish
+    // active from inactive rows. Leaving the old barcode value in place
+    // on a deactivated row would make it permanently unavailable to any
+    // future unit on this product (including a corrected base unit that
+    // legitimately reuses the same physical barcode), failing with a
+    // raw P2002 the caller has no clean way to explain to the merchant.
+    // barcodeSource is cleared alongside it for consistency — a barcode
+    // reattached later goes through T3a's confirmation modal fresh, per
+    // that flow's existing rule for any changed barcode.
     await tx.productUnit.updateMany({
         where: { productId: params.productId, tenantId: params.tenantId },
-        data: { isActive: false },
+        data: { isActive: false, barcode: null, barcodeSource: null },
     });
 
     const newBaseUnit = await tx.productUnit.create({
@@ -530,7 +543,7 @@ export async function resetProductUnits(
  *   product's current base unit, or the new factor equals 1.
  */
 export async function updateNonBaseUnitConversionFactor(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient,
     params: {
         tenantId: string;
         productId: string;

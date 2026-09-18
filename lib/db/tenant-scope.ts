@@ -108,6 +108,7 @@ export const TENANT_SCOPED_MODELS = new Set([
   // [FIX] v3.9 additions (T3c) — see the file-header note above.
   "StockAdjustment",
   "BatchDeletionLog",
+  "BaseUnitChangeLog",
 ]);
 
 // Operations that read/target existing rows and must be scoped via `where`.
@@ -176,18 +177,13 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
   return client.$extends({
     query: {
       $allModels: {
-        // `args` is typed by Prisma as a union of every operation's args
-        // shape across every model — TypeScript has no way to narrow that
-        // union to "the variant that has `where`" just because we checked
-        // `operation === "findMany"` at runtime. Treated as `any` inside
-        // this callback specifically; shape safety comes from the
-        // `operation` string checks below, not the static type.
         async $allOperations({ model, operation, args, query }: {
           model?: string;
           operation: string;
           args: any;
           query: (args: any) => Promise<any>;
         }) {
+          args = args ?? {};
           if (model && TENANT_SCOPED_MODELS.has(model)) {
             if (WHERE_SCOPED_READ_OPS.has(operation)) {
               args.where = { ...(args?.where || {}), tenantId };
@@ -236,6 +232,16 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
   });
 }
 
+// [NEW] النوع الحقيقي لـ tx جوا tenantDb.$transaction(async (tx) => ...)
+// — مختلف بنيوياً عن Prisma.TransactionClient الخام لأنه getTenantDb()
+// بترجع extended client عبر $extends(). أي دالة بتحتاج atomicity حقيقية
+// (لازم تُستدعى جوا $transaction) لازم تتثبّت على هالنوع.
+export type TenantDb = ReturnType<typeof getTenantDb>;
+export type TenantTransactionClient =
+  Parameters<Parameters<TenantDb["$transaction"]>[0]>[0];
+
+// للقراءة/الكتابة الفردية يلي ما بتحتاج transaction إجباري
+export type TxOrClient = TenantTransactionClient | TenantDb;
 // The raw client is deliberately NOT re-exported from this file under any
 // name. lib/db.ts is the file that intentionally re-exports rawPrisma as
 // `prisma` for a specific, documented allowlist of call sites — see that

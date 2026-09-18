@@ -11,6 +11,25 @@ import {
   ForbiddenRoleError,
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
+// [FIX] Sole gateway for tx.product.* — this route previously called
+// db.product.findFirst() / db.product.update() directly, which is
+// exactly the model-level access eslint.config.mjs's PRODUCT_MODEL_RULES
+// bans. This file is not in the per-file override list that lifts that
+// ban — routed through lib/data/products.ts instead.
+//
+// setProductActive() is used for the write rather than the general
+// updateProduct() — it's the dedicated, single-field helper
+// (lib/data/products.ts's own header explains why: "deliberately
+// separate from updateProduct() so a caller can never accidentally
+// bundle an isActive toggle with an isPublic change in the same call").
+// That's precisely the guarantee this route's own comment below is
+// relying on (isPublic must stay untouched) — using the dedicated
+// helper makes that guarantee structural instead of just "this call
+// happens to omit isPublic from its data object."
+import {
+  findProductById,
+  setProductActive,
+} from "@/lib/data/products";
 
 export async function PATCH(
   req: Request,
@@ -33,9 +52,13 @@ export async function PATCH(
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
 
-    const product = await db.product.findFirst({
-      where: { id },
-    });
+    // [FIX] Tenant-scoped read via the sanctioned gateway — the previous
+    // db.product.findFirst({ where: { id } }) never filtered by
+    // tenantId explicitly, relying solely on the Prisma Client
+    // Extension. This route only needs isActive here, so
+    // findProductById() (a plain, full-row read) is sufficient — no need
+    // for findProductWithUnits()'s heavier units payload.
+    const product = await findProductById(db, tenantId, id);
 
     if (!product) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
@@ -51,12 +74,13 @@ export async function PATCH(
     // already hides the product. A reactivated product's isPublic value
     // must return to whatever it was before deactivation, automatically,
     // with zero manual re-publishing required from the admin.
-    const updated = await db.product.update({
-      where: { id },
-      data: {
-        isActive: nextIsActive,
-      },
-    });
+    //
+    // [FIX] setProductActive(db, tenantId, id, isActive) touches ONLY the
+    // isActive field by construction — see the import note above. The
+    // write's own `where` is additionally scoped by tenantId inside that
+    // helper (belt-and-suspenders), not relied on via the Client
+    // Extension alone.
+    const updated = await setProductActive(db, tenantId, id, nextIsActive);
 
     return NextResponse.json({
       success: true,

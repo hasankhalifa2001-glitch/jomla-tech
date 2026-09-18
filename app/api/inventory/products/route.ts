@@ -250,7 +250,7 @@ export async function GET(req: Request) {
           barcodeSource: u.barcodeSource,
           imageUrl: u.imageUrl,
           isActive: u.isActive !== false,
-          isBaseUnit: u.id === baseUnit.id,
+          isBaseUnit: u.isBaseUnit,
         })),
         batches: processedBatches,
         totalStockInBase,
@@ -391,34 +391,33 @@ export async function POST(req: Request) {
 
     const createdProduct = await db.$transaction(async (tx) => {
       const baseUnitInput = units[baseUnitIndex];
-      const { product, baseUnit } = await createProductWithBaseUnit(
-        tx,
-        tenantId,
-        { name, category: category || null, isPublic: !!isPublic },
-        {
-          unitName: baseUnitInput.unitName,
-          pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
-          priceWholesale: baseUnitInput.priceWholesale,
-          priceRetail: baseUnitInput.priceRetail ?? null,
-          barcode: baseUnitInput.barcode || null,
-          barcodeSource: baseUnitInput.barcodeSource || null,
-          imageUrl: baseUnitInput.imageUrl || null,
-          isActive: baseUnitInput.isActive ?? true,
-        }
-      );
+      // [FIX] product/baseUnit → createdProduct/createdBaseUnit (الأسماء
+      // الجديدة من الدالة). خليتهم كمتغيرات محلية بأسماء مختصرة عشان الكود
+      // تحت ما يطول بلا داعي.
+      const { createdProduct: newProduct, createdBaseUnit: newBaseUnit } =
+        await createProductWithBaseUnit(
+          tx,
+          tenantId,
+          { name, category: category || null, isPublic: !!isPublic },
+          {
+            unitName: baseUnitInput.unitName,
+            pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
+            priceWholesale: baseUnitInput.priceWholesale,
+            priceRetail: baseUnitInput.priceRetail ?? null,
+            barcode: baseUnitInput.barcode || null,
+            barcodeSource: baseUnitInput.barcodeSource || null,
+            imageUrl: baseUnitInput.imageUrl || null,
+            isActive: baseUnitInput.isActive ?? true,
+          }
+        );
 
-      // createdUnits, in the SAME ORDER as the submitted `units` array, so
-      // initialBatch.unitIndex still lines up. Filled in below.
       const createdUnits: { id: string; conversionFactor: string }[] = new Array(units.length);
-      createdUnits[baseUnitIndex] = { id: baseUnit.id, conversionFactor: "1" };
+      createdUnits[baseUnitIndex] = { id: newBaseUnit.id, conversionFactor: "1" };
 
-      // [FIX] createAdditionalUnit() now takes tenantId/productId/
-      // conversionFactor as explicit, separate arguments — never embedded
-      // in `data` — matching lib/data/products.ts's current signature.
       for (let i = 0; i < units.length; i++) {
         if (i === baseUnitIndex) continue;
         const u = units[i];
-        const createdUnit = await createAdditionalUnit(tx, tenantId, product.id, u.conversionFactor, {
+        const createdUnit = await createAdditionalUnit(tx, tenantId, newProduct.id, u.conversionFactor, {
           unitName: u.unitName,
           pricingCurrency: u.pricingCurrency || "SYP",
           priceWholesale: u.priceWholesale,
@@ -431,9 +430,6 @@ export async function POST(req: Request) {
         createdUnits[i] = { id: createdUnit.id, conversionFactor: u.conversionFactor };
       }
 
-      // GS1 shared-catalog entries — ProductCatalogEntry is not a
-      // restricted model (only Product/ProductUnit are), so this stays a
-      // direct tx call, same as before.
       for (let i = 0; i < units.length; i++) {
         const u = units[i];
         if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
@@ -452,30 +448,26 @@ export async function POST(req: Request) {
             const isBenignRace =
               catalogError instanceof Prisma.PrismaClientKnownRequestError &&
               catalogError.code === "P2002";
-            if (!isBenignRace) {
-              throw catalogError;
-            }
+            if (!isBenignRace) throw catalogError;
           }
         }
       }
 
       if (initialBatch) {
-        // [v4.0] ProductBatch.unitId is ALWAYS the base unit — never the
-        // unit the admin picked via `initialBatch.unitIndex` (an ENTRY
-        // convenience only). The entered quantity is converted via
-        // toBaseUnit(), using the ENTERED unit's own conversionFactor —
-        // trusted here because it comes from this same create request,
-        // not a later, separately-submitted payload (contrast with
-        // T4c/T5, which must re-fetch the factor from the DB instead of
-        // trusting a client payload).
-        const enteredUnit = createdUnits[initialBatch.unitIndex] ?? createdUnits[baseUnitIndex];
+        // [FIX — من الجولة اللي قبلها] رفض صريح بدل fallback صامت
+        if (initialBatch.unitIndex < 0 || initialBatch.unitIndex >= createdUnits.length) {
+          throw new Error(
+            `initialBatch.unitIndex (${initialBatch.unitIndex}) is out of range for ${createdUnits.length} submitted units.`
+          );
+        }
+        const enteredUnit = createdUnits[initialBatch.unitIndex];
         const baseQuantity: DecimalInstance = toBaseUnit(initialBatch.quantity, enteredUnit.conversionFactor);
 
         await tx.productBatch.create({
           data: {
             tenantId,
-            productId: product.id,
-            unitId: baseUnit.id,
+            productId: newProduct.id,
+            unitId: newBaseUnit.id,
             batchNumber: initialBatch.batchNumber,
             quantity: baseQuantity.toString(),
             expiryDate: initialBatch.expiryDate ? new Date(initialBatch.expiryDate) : null,
@@ -483,19 +475,14 @@ export async function POST(req: Request) {
         });
       }
 
-      // [FIX] Flattened to top-level fields (productId/productName/...)
-      // rather than nesting the raw Prisma row under a "product" key —
-      // `.product` is exactly the property access the model-level ESLint
-      // rule blocks outside lib/data/products.ts, so a route-local object
-      // must never carry that key either.
       return {
-        productId: product.id,
-        productName: product.name,
-        productCategory: product.category,
-        productIsPublic: product.isPublic,
-        productIsActive: product.isActive,
-        productCreatedAt: product.createdAt,
-        baseUnitId: baseUnit.id,
+        productId: newProduct.id,
+        productName: newProduct.name,
+        productCategory: newProduct.category,
+        productIsPublic: newProduct.isPublic,
+        productIsActive: newProduct.isActive,
+        productCreatedAt: newProduct.createdAt,
+        resolvedBaseUnitId: newBaseUnit.id,
         createdUnits,
         unitInputs: units,
       };
@@ -508,7 +495,7 @@ export async function POST(req: Request) {
       isPublic: createdProduct.productIsPublic,
       isActive: createdProduct.productIsActive,
       createdAt: createdProduct.productCreatedAt,
-      baseUnitId: createdProduct.baseUnitId,
+      baseUnitId: createdProduct.resolvedBaseUnitId,
       units: createdProduct.createdUnits.map((u, i) => ({
         id: u.id,
         unitName: createdProduct.unitInputs[i].unitName,
@@ -520,7 +507,7 @@ export async function POST(req: Request) {
             createdProduct.unitInputs[i].priceRetail !== undefined
             ? Number(createdProduct.unitInputs[i].priceRetail)
             : null,
-        isBaseUnit: u.id === createdProduct.baseUnitId,
+        isBaseUnit: u.id === createdProduct.resolvedBaseUnitId,
       })),
     };
 

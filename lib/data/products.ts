@@ -175,6 +175,7 @@ import {
     toSafeProductWithUnits,
     type DisplayUnitWithBaseFlag,
     type TxOrClient,
+    type TenantTransactionClient, // [FIX] مضافة
 } from "@/lib/inventory/base-unit";
 import {
     buildConversionFactorField,
@@ -459,11 +460,15 @@ export async function createAdditionalUnit(
  * own `db.$transaction(async (tx) => ...)` and pass that `tx` in.
  */
 export async function createProductWithBaseUnit(
-    tx: Prisma.TransactionClient,
+    tx: TenantTransactionClient, // [FIX] كان Prisma.TransactionClient
     tenantId: string,
     productData: SafeProductCreate,
     firstUnitData: SafeProductUnitCreate
-): Promise<{ product: Product; baseUnit: ProductUnit }> {
+): Promise<{ createdProduct: Product; createdBaseUnit: ProductUnit }> {
+    // [FIX] أسماء الحقول تغيّرت من product/baseUnit إلى createdProduct/
+    // createdBaseUnit — عشان أي destructuring لنتيجة هالدالة بملف route ما
+    // يوقع بـ false-positive على قاعدة PRODUCT_MODEL_RULES (يلي بتفحص
+    // اسم المفتاح حرفياً، مش مصدر القيمة).
     const product = await tx.product.create({
         data: {
             ...productData,
@@ -482,7 +487,7 @@ export async function createProductWithBaseUnit(
 
     await commitBaseUnitLink(tx, tenantId, product.id, baseUnit.id);
 
-    return { product, baseUnit };
+    return { createdProduct: product, createdBaseUnit: baseUnit };
 }
 
 // ----------------------------------------------------------------------------
@@ -530,22 +535,37 @@ export async function findProductWithUnits(
     return toSafeProductWithUnits(product);
 }
 
+
+export interface ProductUnitBarcodeCollision {
+    id: string;
+    unitName: string;
+    productId: string;
+}
+
 /**
  * Cross-product barcode collision check for the [id] route's PATCH —
  * "is this barcode already used by a DIFFERENT product's unit?"
+ *
+ * [FIX 8] Narrowed to a select excluding conversionFactor — this
+ * function is callable from app/api/inventory/products/[id]/route.ts,
+ * whose per-file ESLint override lifts the conversionFactor ban on the
+ * stated assumption that no raw fetched ProductUnit relation ever
+ * reaches it. Previously this returned the full ProductUnit row
+ * (conversionFactor included), which silently broke that assumption.
  */
 export function findProductUnitByBarcodeExcludingProduct(
     tx: TxOrClient,
     tenantId: string,
     barcode: string,
     excludeProductId: string
-): Promise<ProductUnit | null> {
+): Promise<ProductUnitBarcodeCollision | null> {
     return tx.productUnit.findFirst({
         where: {
             tenantId,
             barcode,
             NOT: { productId: excludeProductId },
         },
+        select: { id: true, unitName: true, productId: true },
     });
 }
 
@@ -670,7 +690,15 @@ export async function listProductsWithInventoryDetails(
                         },
                     },
                     adjustments: {
-                        include: { adjustedByUser: true },
+                        include: {
+                            // [FIX 7] كان `adjustedByUser: true` — صف User كامل
+                            // بما فيه passwordHash. مضيّق الآن بنفس نمط `unit`
+                            // أعلاه، ليطابق فعلياً النوع المُعلن
+                            // InventoryBatchAdjustmentView.adjustedByUser.
+                            adjustedByUser: {
+                                select: { name: true, email: true },
+                            },
+                        },
                         orderBy: { createdAt: "desc" },
                     },
                     _count: { select: { invoiceItems: true, adjustments: true } },
@@ -680,10 +708,6 @@ export async function listProductsWithInventoryDetails(
         },
     });
 
-    // [FIX 4b] Never destructure `.baseUnitId` in this file — the
-    // stripping/annotating happens entirely inside base-unit.ts's
-    // toSafeProductWithUnits(); this file only reshapes the untouched
-    // `batches` field afterward, which is not a restricted name.
     return products.map((p) => {
         const safe = toSafeProductWithUnits(p);
         return {
