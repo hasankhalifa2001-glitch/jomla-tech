@@ -9,82 +9,39 @@
  * Any raw SQL query must use `tenantScopedRawQuery()` below, which strictly
  * requires `tenantId` at the type level.
  *
- * [FIX] `tenantScopedRawQuery` no longer appends `AND "tenantId" = $1` blindly
- * to the end of whatever SQL it's given. The one sanctioned call site in this
- * system (T4c's batch lock) has the shape:
- *   SELECT ... WHERE id = ANY($1) ORDER BY id ASC FOR UPDATE
- * Appending `AND "tenantId" = $1` after `ORDER BY ... FOR UPDATE` is not
- * syntactically valid SQL — the previous version of this function could
- * never actually be used for the query it was written for. It now takes a
- * builder callback that receives a pre-built `Prisma.Sql` tenant condition
- * fragment, so the caller places it correctly inside their own WHERE clause
- * instead of it being force-appended at the end.
- *
  * 2. NESTED WRITES BANNED ON TENANT-SCOPED MODELS:
- * Prisma Client Extensions intercept top-level model operations (e.g., `prisma.invoice.create(...)`)
- * but do NOT intercept nested writes buried inside another model's `data` payload
- * (e.g., `prisma.invoice.create({ data: { items: { create: [...] } } })`).
+ * Prisma Client Extensions intercept top-level model operations but do NOT
+ * intercept nested writes buried inside another model's `data` payload.
  * Nested writes bypass extension tenantId injection entirely.
  *
- * RULE:
- * NO nested create/update/upsert/set/disconnect targeting a tenant-scoped model,
- * anywhere in the codebase. Every write to a tenant-scoped model must be its own
- * top-level `prisma.model.<method>(...)` call, executed inside the same `$transaction`
- * as related writes it must stay atomic with.
+ * RULE: NO nested create/update/upsert/set/disconnect targeting a
+ * tenant-scoped model, anywhere in the codebase. Every write to a
+ * tenant-scoped model must be its own top-level `prisma.model.<method>(...)`
+ * call, executed inside the same `$transaction` as related writes it must
+ * stay atomic with. Enforced by ESLint via `no-restricted-syntax`.
  *
- * Enforced by ESLint via `no-restricted-syntax`. CI fails the build on violation.
- *
- * 3. THE RAW CLIENT IS NEVER RE-EXPORTED FROM THIS FILE:
- * `rawPrisma` (imported below from lib/db/client.ts) is used internally to build
- * the extended client and nowhere else. This file must never re-export it under
- * any name (including `prisma`) — doing so hands out an unscoped client to any
- * caller and defeats every guarantee below.
- *
- * lib/db.ts is the public entry point for getTenantDb()/tenantScopedRawQuery(),
- * and it ALSO re-exports `rawPrisma` under the name `prisma`, deliberately, for
- * the small, documented allowlist of call sites that must run before any
- * tenant/session context exists (registration, seed.ts, isPlatformAdmin-gated
- * super-admin routes, the T4c/fifo-preview shared-helper category, and the
- * narrow storefront tenant-by-slug lookup — see lib/db.ts's own header
- * comment for the full, current allowlist). That export is intentional, not
- * a leak — the actual safety boundary is the `no-restricted-imports` ESLint
- * rule (see eslint.config.mjs) restricting who is allowed to import the
- * `prisma` name from lib/db.ts to that specific allowlist, plus required
- * inline `eslint-disable-next-line` justification comments at any one-off
- * exemption site that isn't a whole-file exemption (see eslint.config.mjs's
- * notes on the storefront category specifically).
+ * 3. THE RAW CLIENT IS NEVER RE-EXPORTED FROM THIS FILE.
+ * lib/db.ts is the public entry point that re-exports `rawPrisma` as
+ * `prisma` for a small, documented allowlist of call sites.
  *
  * 4. TENANT_SCOPED_MODELS MUST STAY IN SYNC WITH schema.prisma:
- * [FIX] Every model in schema.prisma that carries a denormalized tenantId
- * column and a `Tenant` relation is tenant-scoped and MUST appear in the set
- * below. This previously omitted the three models added in schema.prisma
- * v3.7 — B2BOrderRequest, B2BOrderRequestItem, and CustomerMergeLog — which
- * silently meant getTenantDb() never injected tenantId into any query
- * against them: a call site that forgot to filter by tenantId manually on
- * one of these three models would have executed completely unscoped, with
- * no error, no warning, nothing. This directly violated T1's own acceptance
- * criterion: "Every tenant-scoped Prisma model — including B2BOrderRequest,
- * B2BOrderRequestItem, and CustomerMergeLog — is covered by the tenant-scope
- * extension; a query missing tenant context throws rather than executing
- * unscoped." All three are now included below.
+ * Every model in schema.prisma that carries a denormalized tenantId column
+ * and a `Tenant` relation is tenant-scoped and MUST appear in the set below.
  *
- * [FIX — this revision] The exact same silent gap existed for the two
- * models schema.prisma's v3.9 revision added for T3c — StockAdjustment and
- * BatchDeletionLog. Both carry a denormalized tenantId and a Tenant
- * relation just like every other model in this set, and T1's Tenant
- * Isolation acceptance criteria explicitly name them as carrying "no
- * special exemption from anything." Before this fix, a call site writing
- * `prisma.stockAdjustment.create(...)` or `prisma.batchDeletionLog.create(...)`
- * through getTenantDb() would NOT have had tenantId auto-injected — the
- * write would only be tenant-safe if every call site remembered to pass
- * tenantId manually, which is precisely the failure mode this whole
- * extension exists to eliminate. Both are now included below.
+ * History of this exact gap recurring (do not let it happen a fourth time —
+ * see the CI recommendation at the bottom of this file):
+ *   - v3.7 omitted B2BOrderRequest, B2BOrderRequestItem, CustomerMergeLog.
+ *   - v3.9 omitted StockAdjustment, BatchDeletionLog.
+ *   - v4.0 omitted BaseUnitChangeLog — [FIX, this revision] now included.
+ * Each omission meant getTenantDb() never injected tenantId into queries
+ * against that model: a call site that forgot to filter by tenantId
+ * manually would have executed completely unscoped, with no error, no
+ * warning, nothing.
  *
  * Deliberately NOT in this set (correct, not an oversight):
  *   - Tenant itself — it IS the scope, not scoped by it.
  *   - VerifiedRetailer, ProductCatalogEntry, ProductCatalogEntryReport —
- *     platform-wide models with no tenantId column at all (see their
- *     model-level notes in schema.prisma for why).
+ *     platform-wide models with no tenantId column at all.
  * ============================================================================
  */
 
@@ -101,13 +58,13 @@ export const TENANT_SCOPED_MODELS = new Set([
   "InvoiceItem",
   "CustomerPayment",
   "Subscription",
-  // v3.7 additions — see the file-header note above.
   "B2BOrderRequest",
   "B2BOrderRequestItem",
   "CustomerMergeLog",
-  // [FIX] v3.9 additions (T3c) — see the file-header note above.
   "StockAdjustment",
   "BatchDeletionLog",
+  // [FIX] v4.0 addition — see the file-header history note above. Same
+  // shape (tenantId + Tenant relation) as StockAdjustment/BatchDeletionLog.
   "BaseUnitChangeLog",
 ]);
 
@@ -138,15 +95,7 @@ const WHERE_SCOPED_WRITE_OPS = new Set([
  *
  * Takes a `buildQuery` callback instead of a flat `sql` fragment. The
  * caller receives a ready-made `tenantCondition` fragment (`"tenantId" = $1`)
- * and is responsible for placing it correctly inside their own WHERE clause
- * — this function can't safely guess where in an arbitrary query a bolted-on
- * `AND` belongs (before ORDER BY / FOR UPDATE, inside a subquery, etc.), and
- * guessing wrong produces invalid SQL rather than an isolation gap, which is
- * at least fail-loud — but "always fails" is still wrong. This shape is
- * fail-loud AND correct: the type signature forces every call site to
- * consciously place the condition, and tenantId itself is still required at
- * the type level, so a call site that forgets to use the fragment at all
- * simply won't compile against a query with no matching placeholder logic.
+ * and is responsible for placing it correctly inside their own WHERE clause.
  *
  * Column name is `"tenantId"` (double-quoted, camelCase) — this schema has
  * no @map/@@map, so Postgres's actual column name is camelCase and folds to
@@ -183,25 +132,23 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
           args: any;
           query: (args: any) => Promise<any>;
         }) {
+          // [FIX] `args` can be undefined for a call with no arguments at
+          // all (e.g. db.product.findMany()) — the `args.where = ...`
+          // writes below would previously throw
+          // "Cannot set properties of undefined" in that case.
           args = args ?? {};
+
           if (model && TENANT_SCOPED_MODELS.has(model)) {
             if (WHERE_SCOPED_READ_OPS.has(operation)) {
               args.where = { ...(args?.where || {}), tenantId };
             } else if (operation === "create") {
               args.data = { ...(args?.data || {}), tenantId };
             } else if (operation === "createMany") {
-              // Prisma's createMany always takes an array for `data` — no
-              // single-object branch exists in the real input type, so
-              // only that shape is handled here.
               args.data = (args.data as Record<string, unknown>[]).map((item) => ({
                 ...item,
                 tenantId,
               }));
             } else if (operation === "upsert") {
-              // `where` so the lookup can't match another tenant's row,
-              // `create` so a genuinely new row lands on the right tenant,
-              // and any caller-supplied tenantId is stripped out of
-              // `update` so an existing row can never be reassigned.
               args.where = { ...(args?.where || {}), tenantId };
               args.create = { ...(args?.create || {}), tenantId };
               if (args.update && typeof args.update === "object" && "tenantId" in args.update) {
@@ -210,10 +157,6 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
               }
             } else if (WHERE_SCOPED_WRITE_OPS.has(operation)) {
               args.where = { ...(args?.where || {}), tenantId };
-              // Strip any caller-supplied tenantId from the update payload
-              // itself — `where` scoping prevents targeting another
-              // tenant's row to begin with, but this closes the same class
-              // of gap defensively for update/updateMany's `data` payload.
               if (
                 (operation === "update" || operation === "updateMany") &&
                 args.data &&
@@ -232,17 +175,54 @@ export function getTenantDb(tenantId: string, client: PrismaClient = rawPrisma) 
   });
 }
 
-// [NEW] النوع الحقيقي لـ tx جوا tenantDb.$transaction(async (tx) => ...)
-// — مختلف بنيوياً عن Prisma.TransactionClient الخام لأنه getTenantDb()
-// بترجع extended client عبر $extends(). أي دالة بتحتاج atomicity حقيقية
-// (لازم تُستدعى جوا $transaction) لازم تتثبّت على هالنوع.
+// ============================================================================
+// [NEW] Shared transaction/client types, exported from the single place
+// that actually knows getTenantDb()'s real return type.
+//
+// WHY THIS LIVES HERE, NOT IN lib/inventory/base-unit.ts (where it used to
+// be defined): getTenantDb() returns an EXTENDED client (via $extends()
+// above). Calling `.$transaction(async (tx) => ...)` on an extended client
+// returns a `tx` whose type is NOT structurally identical to
+// `Prisma.TransactionClient` — the extended client's model methods use a
+// different (Exact<...> vs SelectSubset<...>) generic signature. Any
+// function previously typed to accept `Prisma.TransactionClient` fails to
+// compile against the real `tx` this codebase actually produces, since
+// every $transaction() call in this system goes through getTenantDb(),
+// never a raw, unextended PrismaClient.
+//
+// `TenantTransactionClient` is derived directly from getTenantDb's own
+// `$transaction` signature instead of being guessed/hand-written, so it
+// can never drift out of sync with the real extended-client type.
+// ============================================================================
+
 export type TenantDb = ReturnType<typeof getTenantDb>;
+
+/**
+ * The real type of `tx` inside `tenantDb.$transaction(async (tx) => ...)`.
+ * Use this — never `Prisma.TransactionClient` — for any function that must
+ * be invoked inside a real transaction (multi-write atomicity).
+ */
 export type TenantTransactionClient =
   Parameters<Parameters<TenantDb["$transaction"]>[0]>[0];
 
-// للقراءة/الكتابة الفردية يلي ما بتحتاج transaction إجباري
+/**
+ * For read-only or single-top-level-write helpers that may be called
+ * either with a real transaction client OR the plain tenant-scoped client
+ * returned by getTenantDb() directly (no transaction needed).
+ */
 export type TxOrClient = TenantTransactionClient | TenantDb;
+
 // The raw client is deliberately NOT re-exported from this file under any
 // name. lib/db.ts is the file that intentionally re-exports rawPrisma as
 // `prisma` for a specific, documented allowlist of call sites — see that
 // file's header comment.
+
+// ============================================================================
+// [RECOMMENDATION — not yet enforced] This exact "a new tenant-scoped model
+// shipped in schema.prisma but was never added to TENANT_SCOPED_MODELS" gap
+// has now recurred three times (v3.7, v3.9, v4.0). Consider adding a CI
+// check (not a runtime one) that parses schema.prisma for every model with
+// a `tenantId` field + `Tenant` relation and asserts TENANT_SCOPED_MODELS
+// contains exactly that set — so the next new model fails the build
+// automatically instead of depending on someone remembering this file.
+// ============================================================================
