@@ -22,6 +22,7 @@ import {
   // [FIX] Dedicated error class replacing brittle string-matching on
   // assertBaseUnitMutable()'s thrown message — see base-unit.ts's header.
   BaseUnitLockedError,
+  UnitNotBelongingToProductError,
 } from "@/lib/inventory/base-unit";
 import {
   findProductWithUnits,
@@ -126,32 +127,37 @@ export async function GET(
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج غير موجود." }, { status: 404 });
     }
 
-    // [v4.0] Surfaced for the UI so the edit screen can lock the base
-    // unit's conversionFactor field — resolved via the sole sanctioned
-    // gateway, never by reading product.baseUnitId directly.
-    let baseUnitId: string;
-    try {
-      const baseUnit = await requireBaseUnit(db, tenantId, id);
-      baseUnitId = baseUnit.id;
-    } catch (e) {
-      if (e instanceof MissingBaseUnitError) {
-        return NextResponse.json(
-          {
-            error: "MISSING_BASE_UNIT",
-            message: "هذا المنتج بدون وحدة أساسية محددة (بيانات قديمة تحتاج تصحيح) — الرجاء التواصل مع الدعم الفني.",
-          },
-          { status: 409 }
-        );
-      }
-      throw e;
+    // [v4.0] `isBaseUnit` is already precomputed per-unit by
+    // findProductWithUnits() (via base-unit.ts's toSafeProductWithUnits()),
+    // which is itself the sanctioned gateway for resolving
+    // Product.baseUnitId — this file never reads that field directly.
+    // No separate requireBaseUnit() round-trip is needed here anymore;
+    // that DB call is now redundant with data findProductWithUnits()
+    // already fetched in the same request.
+    const baseUnit = product.units.find((u) => u.isBaseUnit);
+
+    if (!baseUnit) {
+      // Structurally the same situation MissingBaseUnitError signals —
+      // toSafeProductWithUnits() found no unit whose id matches
+      // Product.baseUnitId (a data-integrity bug, never expected in
+      // normal operation). Surfaced the same way requireBaseUnit()
+      // would have, without needing to import/throw that class here.
+      return NextResponse.json(
+        {
+          error: "MISSING_BASE_UNIT",
+          message: "هذا المنتج بدون وحدة أساسية محددة (بيانات قديمة تحتاج تصحيح) — الرجاء التواصل مع الدعم الفني.",
+        },
+        { status: 409 }
+      );
     }
 
     return NextResponse.json({
       success: true,
       product: {
         ...product,
-        baseUnitId,
-        units: product.units.map((u) => ({ ...u, isBaseUnit: u.id === baseUnitId })),
+        baseUnitId: baseUnit.id,
+        // product.units already carries isBaseUnit on every entry — no
+        // extra .map() needed to re-annotate it.
       },
     });
   } catch (error) {
@@ -421,6 +427,11 @@ export async function PATCH(
         });
 
         if (data.units) {
+          for (const u of data.units) {
+            if (u.id && !existingProduct.units.some((eu) => eu.id === u.id)) {
+              throw new UnitNotBelongingToProductError(u.id, id);
+            }
+          }
           for (const u of data.units) {
             const isNonBaseFactorChange =
               !!u.id &&

@@ -457,3 +457,10 @@ export async function updateNonBaseUnitConversionFactor(
         data: buildConversionFactorField(params.newConversionFactor),
     });
 }
+
+export class UnitNotBelongingToProductError extends Error {
+    constructor(unitId: string, productId: string) {
+        super(`ProductUnit ${unitId} does not belong to product ${productId}.`);
+        this.name = "UnitNotBelongingToProductError";
+    }
+}

@@ -76,7 +76,7 @@ import {
     buildConversionFactorField,
     isReservedBaseUnitFactor,
     BASE_UNIT_CONVERSION_FACTOR,
-    DisplayUnit,
+    type DisplayUnit,
     toDisplayUnits,
 } from "@/lib/inventory/units";
 

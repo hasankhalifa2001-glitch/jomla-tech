@@ -118,20 +118,31 @@ export async function GET(req: Request) {
 
     const products = await listProductsWithInventoryDetails(db, tenantId, whereClause);
 
-    // [v4.0] Batch-resolve every listed product's base unit through the
-    // sole sanctioned gateway. FAIL-LOUD: throws MissingBaseUnitError the
-    // moment it hits any product whose baseUnitId doesn't resolve. Do
-    // NOT wrap this in a try/catch that swallows it.
-    const baseUnitsByProduct = await requireBaseUnits(
-      db,
-      tenantId,
-      products.map((p) => p.id)
-    );
-
+    // [v4.0, simplified] `isBaseUnit` is already precomputed per-unit by
+    // listProductsWithInventoryDetails() (via base-unit.ts's
+    // toSafeProductWithUnits()) — the sole sanctioned gateway for
+    // resolving Product.baseUnitId. The previous batch requireBaseUnits()
+    // call re-fetched from the DB a second time for data already present
+    // in `products`. Dropped entirely; the base unit for each product is
+    // now found in its own `units` array below.
+    //
+    // FAIL-LOUD PRESERVED: if any product's units carry no isBaseUnit:
+    // true entry, that's the same data-integrity situation
+    // MissingBaseUnitError signaled before — thrown explicitly here so
+    // this stays a loud, surfaced bug rather than a silent
+    // undefined/fallback. Do NOT catch this and substitute a guess.
     const now = new Date();
 
     const processedProducts = products.map((product) => {
-      const baseUnit = baseUnitsByProduct.get(product.id)!; // guaranteed present
+      const baseUnit = product.units.find((u) => u.isBaseUnit);
+      if (!baseUnit) {
+        throw new Error(
+          `Product ${product.id} has no unit flagged isBaseUnit — data ` +
+          `integrity bug (see T1's Unit Conversion Architecture). This ` +
+          `should be structurally impossible outside the create-transaction ` +
+          `window; do not silently route around it.`
+        );
+      }
 
       let totalBaseStock = new Decimal(0);
       let hasExpiringSoonBatch = false;
@@ -212,26 +223,10 @@ export async function GET(req: Request) {
         isActive: product.isActive,
         createdAt: product.createdAt,
         baseUnitId: baseUnit.id,
-        // [FIX] All decimal-precision fields now consistently returned as
-        // strings — previously conversionFactor/priceWholesale/priceRetail
-        // used a mix of Number()/toString() across GET and POST, which is
-        // both internally inconsistent and risks precision loss on large
-        // SYP figures (native JS number is float64-limited; this schema
-        // allows up to 14 integer digits). Never Number() on a monetary or
-        // conversion-factor field anywhere in this codebase.
-        units: product.units.map((u) => ({
-          id: u.id,
-          unitName: u.unitName,
-          conversionFactor: u.conversionFactor,
-          pricingCurrency: u.pricingCurrency || "SYP",
-          priceWholesale: u.priceWholesale,
-          priceRetail: u.priceRetail,
-          barcode: u.barcode,
-          barcodeSource: u.barcodeSource,
-          imageUrl: u.imageUrl,
-          isActive: u.isActive !== false,
-          isBaseUnit: u.id === baseUnit.id,
-        })),
+        // `product.units` already carries `isBaseUnit` and every other
+        // display field on each entry (DisplayUnitWithBaseFlag) — no
+        // re-derivation needed, just pass it through as-is.
+        units: product.units,
         batches: processedBatches,
         totalStockInBase,
         baseUnitName: baseUnit.unitName,
