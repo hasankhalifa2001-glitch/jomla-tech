@@ -3,115 +3,75 @@ import nextVitals from "eslint-config-next/core-web-vitals";
 import nextTs from "eslint-config-next/typescript";
 
 // ============================================================================
-// [FIX — supersedes the previous "arithmetic-only" conversionFactor rule]
+// [see prior header comments for BASE_UNIT_ID_RULES / CONVERSION_FACTOR_RULES
+// / PRODUCT_MODEL_RULES history — unchanged below]
 //
-// The earlier revision of this config only blocked MULTIPLYING/DIVIDING
-// by `.conversionFactor` outside lib/inventory/units.ts. Two real gaps
-// followed from that (see lib/inventory/units.ts's own header for the
-// full narrative):
-//   1. The relation name leading to the field varies by model —
-//      `InvoiceItem.unit`, `ProductBatch.unit`, `B2BOrderRequestItem.unit`
-//      — never `.productUnit`. The model-level `product`/`productUnit`
-//      rule below never even sees `item.unit.conversionFactor`, since
-//      that's a different top-level model (InvoiceItem) with an
-//      unrelated relation field name. Chasing every possible relation
-//      name by regex is a losing game.
-//   2. The arithmetic-only rule only matched a raw `*`/`/` operator —
-//      never decimal.js method calls (`qty.times(unit.conversionFactor)`),
-//      which is the ONLY sanctioned way to do this arithmetic anywhere
-//      else in this codebase (native `*`/`/` on money/quantity figures is
-//      banned project-wide). The rule could never fire on the exact
-//      pattern the rest of the architecture requires everyone to use.
+// [FIX — CRITICAL, new] BACKEND_ONLY_FILES scoping.
 //
-// FIX: stop trying to block specific *usages* of conversionFactor and
-// instead block the field NAME itself, full stop, anywhere it appears
-// syntactically outside lib/inventory/units.ts — the same treatment
-// `baseUnitId` already gets. This is relation-name-agnostic (it fires on
-// `select: { unit: { select: { conversionFactor: true } } }` exactly as
-// readily as on `productUnit.conversionFactor}`), and it makes the
-// arithmetic concern moot: nothing outside units.ts can hold a reference
-// to the value at all, so there is nothing left to multiply, divide, or
-// call `.times()` on.
+// BASE_UNIT_ID_RULES, CONVERSION_FACTOR_RULES, and PRODUCT_MODEL_RULES were
+// previously applied GLOBALLY (every file in the project) with specific
+// backend files opting OUT of specific bans via per-file overrides. That
+// architecture assumed only backend/Prisma-adjacent files would ever
+// syntactically contain a `product`/`productUnit`/`conversionFactor`/
+// `baseUnitId` identifier — a false assumption. These are also completely
+// ordinary field/prop names on plain, already-serialized DTOs that flow
+// through the frontend (e.g. a React component destructuring
+// `{ product }: { product: ProductItem }`, or reading `unit.conversionFactor`
+// off a JSON API response) — the rules are pure AST pattern-matching with no
+// type information, so they cannot tell "a Prisma relation was just
+// destructured" apart from "a component prop happens to be named the same
+// thing." Every such frontend file was flagged as a false positive.
 //
-// The same reasoning applies to the model-level `product`/`productUnit`
-// rule below: the previous version only covered `MemberExpression` and
-// `ObjectPattern` destructuring, missing a bare `Property` key inside an
-// ordinary object literal — e.g. `include: { product: { select: {...} } } }`
-// — which is exactly the same AST-node-type gap the `baseUnitId` rule was
-// designed around from the start. A bare `Property[key.name=...]`
-// selector is added below to close that too.
+// FIX: invert the scoping. These three rule groups are no longer part of
+// the untargeted global rule at all — they are added ONLY to a
+// BACKEND_ONLY_FILES-scoped config block below. Frontend code (anything
+// under app/(dashboard)/**, app/(store)/**'s page/component files, and
+// components/**) is never subject to them, because it structurally cannot
+// reach a raw Prisma relation in the first place — it only ever sees
+// pre-shaped API response DTOs. The untargeted global rule now carries only
+// QUERY_RAW_RULE and NESTED_WRITE_RULE, which stay project-wide since a
+// stray `$queryRaw` or a `data: { create: ... }` shape appearing in
+// frontend code would be a red flag regardless (there is no legitimate
+// frontend reason to write either pattern).
 //
-// [FIX #2 — Property selectors scoped to ObjectPattern/data/select/
-// include/where only] An earlier revision made the bare `Property`
-// selectors below match ANY object literal, including ordinary
-// ObjectExpression construction/return statements like
-// `return { product, baseUnit };` (lib/data/products.ts's
-// createProductWithBaseUnit()) — a false positive, since that's a local
-// variable name, not a Prisma query key or a destructured read. Fixed by
-// splitting each Property-based rule into two: one scoped to
-// `data`/`select`/`include`/`where` keys (the real Prisma-query-shape
-// gap), and one scoped to `ObjectPattern` only (the real destructuring-
-// read gap: `const { baseUnitId } = product;`). Neither matches a plain
-// `{ product, baseUnit }` ObjectExpression.
-//
-// [FIX #3 — closes the isBaseUnitOf reverse-relation loophole] The
-// baseUnitId/baseUnit ban previously only matched the literal names
-// `baseUnitId`/`baseUnit`. But `ProductUnit.isBaseUnitOf` is the reverse
-// side of the exact same relation — a caller can determine "is this unit
-// the product's base unit?" via `unit.isBaseUnitOf` (a non-null Product
-// back-reference when true) without ever naming `.baseUnitId`/`.baseUnit`
-// at all, completely bypassing the guard this rule exists to provide.
-// Fixed: `isBaseUnitOf` is now included in every selector's name
-// alternation below, identically to `baseUnitId`/`baseUnit`. Any code
-// that needs to know whether a unit is the base unit must call
-// requireBaseUnit() and compare ids, or use a helper that does so —
-// never read this reverse relation directly outside
-// lib/inventory/base-unit.ts.
+// Per-file overrides for base-unit.ts / units.ts / products.ts / route
+// files / seed.ts / tenant-scope.ts below are UNCHANGED in spirit — they
+// still lift exactly the specific ban(s) each sanctioned backend file
+// legitimately needs, layered on top of the BACKEND_ONLY_FILES block.
 // ============================================================================
+
+const BACKEND_ONLY_FILES = ["app/api/**", "lib/**", "seed.ts"];
 
 const BASE_UNIT_ID_RULES = [
   {
-    selector:
-      "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector: "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Direct access to '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' (as a select/data/include/where key) is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits()/commitBaseUnitLink() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    // Destructuring READS only (ObjectPattern) — never matches an
-    // ordinary object-literal construction/return like `{ product, baseUnit }`,
-    // which is an ObjectExpression, not an ObjectPattern.
-    selector:
-      "ObjectPattern > Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector: "ObjectPattern > Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Destructuring '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' off a fetched result is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    selector:
-      "MemberExpression[property.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector: "MemberExpression[property.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Direct access to '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    selector:
-      "MemberExpression[computed=true] > Literal[value=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector: "MemberExpression[computed=true] > Literal[value=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Direct access to '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits() instead — see T1's Unit Conversion Architecture.",
   },
 ];
 
-// [FIX — new] Full field-name-level ban, replacing the old arithmetic-only
-// rule. See the module header above for why.
 const CONVERSION_FACTOR_RULES = [
   {
-    selector:
-      "Property[key.name=/^(data|select|include|where)$/] Property[key.name='conversionFactor']",
+    selector: "Property[key.name=/^(data|select|include|where)$/] Property[key.name='conversionFactor']",
     message:
       "Direct access to '.conversionFactor' (as a select/data/include/where key) is forbidden outside lib/inventory/units.ts, regardless of which relation path leads to it (.unit, .productUnit, .baseUnit...). Use units.ts's getUnitConversionFactor() to read it, or buildConversionFactorField()/isReservedBaseUnitFactor() to write/check it — see T1's Unit Conversion Architecture and the rounding-error bug this exists to prevent.",
   },
   {
-    // Destructuring READS only (ObjectPattern) — never matches an
-    // ordinary object-literal construction/return, a Zod schema field
-    // name, or a route DTO field name.
     selector: "ObjectPattern > Property[key.name='conversionFactor']",
     message:
       "Destructuring '.conversionFactor' off a fetched result is forbidden outside lib/inventory/units.ts, regardless of which relation path leads to it. Use getUnitConversionFactor() instead — see T1's Unit Conversion Architecture.",
@@ -122,27 +82,19 @@ const CONVERSION_FACTOR_RULES = [
       "Direct access to '.conversionFactor' is forbidden outside lib/inventory/units.ts, regardless of which relation path leads to it. Use getUnitConversionFactor() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    selector:
-      "MemberExpression[computed=true] > Literal[value='conversionFactor']",
+    selector: "MemberExpression[computed=true] > Literal[value='conversionFactor']",
     message:
       "Direct access to '.conversionFactor' is forbidden outside lib/inventory/units.ts. Use getUnitConversionFactor() instead — see T1's Unit Conversion Architecture.",
   },
 ];
 
-// [FIX — new] Model-level rule for Product/ProductUnit, now including the
-// previously-missing bare Property selector (catches `include: { product:
-// {...} } }` / `select: { productUnit: {...} } }`, which the old
-// MemberExpression + ObjectPattern-only version missed entirely).
 const PRODUCT_MODEL_RULES = [
   {
-    selector:
-      "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(product|productUnit)$/]",
+    selector: "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(product|productUnit)$/]",
     message:
       "Naming 'product'/'productUnit' (as a select/data/include/where key) is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead — see that file's header for why this is model-level, not just field-level.",
   },
   {
-    // Destructuring READS only (ObjectPattern) — never matches an
-    // ordinary object-literal construction/return like `{ product, baseUnit }`.
     selector: "ObjectPattern > Property[key.name=/^(product|productUnit)$/]",
     message:
       "Destructuring '.product'/'.productUnit' off a fetched result is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead.",
@@ -153,16 +105,14 @@ const PRODUCT_MODEL_RULES = [
       "Direct access to '.product'/'.productUnit' (as a Prisma model call or a fetched relation) is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead.",
   },
   {
-    selector:
-      "MemberExpression[computed=true] > Literal[value=/^(product|productUnit)$/]",
+    selector: "MemberExpression[computed=true] > Literal[value=/^(product|productUnit)$/]",
     message:
       "Direct access to '.product'/'.productUnit' is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead.",
   },
 ];
 
 const QUERY_RAW_RULE = {
-  selector:
-    "MemberExpression[property.name=/^(\\$queryRaw|\\$queryRawUnsafe)$/]",
+  selector: "MemberExpression[property.name=/^(\\$queryRaw|\\$queryRawUnsafe)$/]",
   message:
     "Direct $queryRaw or $queryRawUnsafe calls are forbidden outside lib/db/tenant-scope.ts. Use tenantScopedRawQuery() instead for tenant isolation compliance.",
 };
@@ -177,18 +127,22 @@ const NESTED_WRITE_RULE = {
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
-  globalIgnores([".next/**", "out/**", "build/**", "next-env.d.ts"]),
+  globalIgnores([
+    ".next/**",
+    "out/**",
+    "build/**",
+    "next-env.d.ts",
+  ]),
   {
-    // Global default: every restriction active. Per-file overrides below
-    // lift exactly the ones each sanctioned file legitimately needs.
+    // [FIX] Untargeted global rule: ONLY the two rules that carry no
+    // meaningful frontend false-positive risk. BASE_UNIT_ID_RULES /
+    // CONVERSION_FACTOR_RULES / PRODUCT_MODEL_RULES moved to the
+    // BACKEND_ONLY_FILES-scoped block below — see the module header note.
     rules: {
       "no-restricted-syntax": [
         "error",
         QUERY_RAW_RULE,
         NESTED_WRITE_RULE,
-        ...BASE_UNIT_ID_RULES,
-        ...CONVERSION_FACTOR_RULES,
-        ...PRODUCT_MODEL_RULES,
       ],
       "no-restricted-imports": [
         "error",
@@ -210,17 +164,32 @@ const eslintConfig = defineConfig([
       ],
       "@typescript-eslint/no-unused-vars": [
         "warn",
-        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+        { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }
+      ],
+    },
+  },
+  {
+    // [FIX — new] BASE_UNIT_ID_RULES / CONVERSION_FACTOR_RULES /
+    // PRODUCT_MODEL_RULES now apply ONLY within files that can possibly
+    // touch Prisma at all. Every per-file override below (which LIFTS a
+    // specific ban for a specific sanctioned file) still applies on top
+    // of this, since ESLint flat config merges matching entries in array
+    // order and each override file glob is a subset of BACKEND_ONLY_FILES.
+    files: BACKEND_ONLY_FILES,
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        QUERY_RAW_RULE,
+        NESTED_WRITE_RULE,
+        ...BASE_UNIT_ID_RULES,
+        ...CONVERSION_FACTOR_RULES,
+        ...PRODUCT_MODEL_RULES,
       ],
     },
   },
   {
     // lib/db/tenant-scope.ts — the sanctioned $queryRaw wrapper. Lifts
-    // ONLY the queryRaw ban (by omitting it below); every other
-    // restriction stays fully active, including the (new, full) model-
-    // level and conversionFactor bans — this file's raw-query wrapper
-    // operates generically via Prisma.Sql fragments, never by naming
-    // 'product'/'productUnit'/'conversionFactor'/'baseUnitId' literally.
+    // ONLY the queryRaw ban; every other restriction stays fully active.
     files: ["lib/db/tenant-scope.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -235,11 +204,9 @@ const eslintConfig = defineConfig([
   {
     // [v4.0] The one sanctioned file permitted to read/write
     // Product.baseUnitId directly, AND one of the two files permitted to
-    // call tx.product.* / tx.productUnit.* (per lib/data/products.ts's
-    // header) — for that one field. It still does NOT name
-    // 'conversionFactor' anywhere in its own source (see this file's own
-    // header FIX note — writes go through units.ts's
-    // buildConversionFactorField()), so that ban stays fully active here.
+    // call tx.product.* / tx.productUnit.* — see lib/data/products.ts's
+    // header. Still does NOT name 'conversionFactor' anywhere in its own
+    // source, so that ban stays fully active here.
     files: ["lib/inventory/base-unit.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -247,22 +214,17 @@ const eslintConfig = defineConfig([
         QUERY_RAW_RULE,
         NESTED_WRITE_RULE,
         ...CONVERSION_FACTOR_RULES,
-        // baseUnitId/isBaseUnitOf ban lifted (this IS the sanctioned file
-        // for it). Model-level ban lifted (this IS one of the two
-        // sanctioned files for tx.product.*/tx.productUnit.* — see
-        // lib/data/products.ts's header).
+        // baseUnitId/isBaseUnitOf ban lifted (this IS the sanctioned file).
+        // Model-level ban lifted (this IS one of the two sanctioned files
+        // for tx.product.*/tx.productUnit.*).
       ],
     },
   },
   {
-    // [FIX] The one sanctioned file permitted to name 'conversionFactor'
-    // anywhere. It now ALSO legitimately calls tx.productUnit.* directly
-    // (getUnitConversionFactor()), so the model-level ban is lifted here
-    // too — it was NOT lifted in the previous revision of this config,
-    // which assumed (incorrectly, once getUnitConversionFactor() was
-    // added) that this file "does not touch tx.product/tx.productUnit at
-    // all." baseUnitId/isBaseUnitOf stays fully banned — this file has no
-    // legitimate reason to touch that relation.
+    // The one sanctioned file permitted to name 'conversionFactor'
+    // anywhere. Also legitimately calls tx.productUnit.* directly
+    // (getUnitConversionFactor()), so the model-level ban is lifted too.
+    // baseUnitId/isBaseUnitOf stays fully banned.
     files: ["lib/inventory/units.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -279,11 +241,9 @@ const eslintConfig = defineConfig([
   {
     // lib/data/products.ts — the allowlisted data-access gateway itself.
     // Model-level ban lifted (this IS the gateway). Every other
-    // restriction stays fully active, INCLUDING the full conversionFactor
-    // ban (not just arithmetic) — this file never names that field
-    // literally either; see its own header FIX note. baseUnitId/
-    // isBaseUnitOf also stays fully banned — this file only ever touches
-    // it indirectly, via base-unit.ts's commitBaseUnitLink().
+    // restriction stays fully active. baseUnitId/isBaseUnitOf also stays
+    // fully banned — this file only ever touches it indirectly, via
+    // base-unit.ts's commitBaseUnitLink()/toSafeProductWithUnits().
     files: ["lib/data/products.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -297,30 +257,13 @@ const eslintConfig = defineConfig([
     },
   },
   {
-    // [FIX — new] Route-layer DTO files that legitimately name
-    // 'conversionFactor' as a Zod schema field, a JSON response field, or
-    // pass it through as a plain argument to toBaseUnit()/
-    // createAdditionalUnit() — never read off a raw Prisma relation
-    // directly. The model-level PRODUCT_MODEL_RULES ban stays fully
-    // active here and is what actually closes that gap: these files
-    // cannot touch tx.product/tx.productUnit at all, so any
-    // conversionFactor value they hold necessarily came from validated
-    // client input or a sanctioned gateway return value (toBaseUnit(),
-    // createProductWithBaseUnit()/createAdditionalUnit()'s own factor
-    // argument) — never a raw fetched relation. Neither file performs a
-    // native `*`/`/` or decimal `.times()`/`.dividedBy()` operation on
-    // conversionFactor itself — all real conversion arithmetic is
-    // delegated to units.ts. baseUnitId/isBaseUnitOf stays fully banned —
-    // neither file has any legitimate reason to touch that relation; the
-    // "is this unit the base unit?" flag they need is computed inside
-    // lib/data/products.ts's findProductWithUnits() and handed to them
-    // pre-shaped, never derived here from a raw relation.
-    files: [
-      "app/api/inventory/products/route.ts",
-      "app/api/inventory/products/\\[id\\]/route.ts",
-      "lib/inventory/csv-parser.ts",
-      "components/inventory/AddProductModal.tsx"
-    ],
+    // Route-layer DTO files that legitimately name 'conversionFactor' as
+    // a Zod schema field, a JSON response field, or pass it through as a
+    // plain argument to toBaseUnit()/createAdditionalUnit() — never read
+    // off a raw Prisma relation directly. The model-level PRODUCT_MODEL_RULES
+    // ban stays fully active here and is what actually closes that gap.
+    // baseUnitId/isBaseUnitOf stays fully banned.
+    files: ["app/api/inventory/products/route.ts", "app/api/inventory/products/\\[id\\]/route.ts", "lib/inventory/csv-parser.ts"],
     rules: {
       "no-restricted-syntax": [
         "error",
@@ -328,31 +271,16 @@ const eslintConfig = defineConfig([
         NESTED_WRITE_RULE,
         ...BASE_UNIT_ID_RULES,
         ...PRODUCT_MODEL_RULES,
-        // conversionFactor ban lifted for these two route files — see
-        // the note above for why this is safe given the model-level ban
-        // (which stays fully active) is what actually enforces the
-        // "no raw fetched relation" guarantee.
+        // conversionFactor ban lifted for these two route files.
       ],
     },
   },
   {
-    // [FIX] seed.ts legitimately creates Product/ProductUnit rows
-    // directly (documented in T1's Developer Tooling section) — exempted
-    // from the model-level rule the same way it's already exempted from
-    // no-restricted-imports below. Recommendation (not yet enforced by
-    // this config): migrate seed.ts's product-creation helper to call
-    // lib/data/products.ts's createProductWithBaseUnit() directly instead
-    // of constructing its own Product/ProductUnit writes — if that
-    // migration happens, this file would no longer need ANY of these
-    // exemptions, since it would never name baseUnitId/conversionFactor/
-    // product/productUnit itself at all. Until then, baseUnitId and
-    // conversionFactor stay fully banned here (seed.ts has no legitimate
-    // reason to write either directly — even its own product-creation
-    // helper should call requireBaseUnit()/buildConversionFactorField()
-    // if it needs them). no-nested-write stays intentionally ACTIVE —
-    // createInvoiceAtomic()'s whole documented purpose is to DEMONSTRATE
-    // the nested-write ban correctly (T1's Developer Tooling section);
-    // lifting it here would defeat that.
+    // seed.ts legitimately creates Product/ProductUnit rows directly
+    // (documented in T1's Developer Tooling section) — exempted from the
+    // model-level rule. baseUnitId and conversionFactor stay fully
+    // banned here (seed.ts has no legitimate reason to write either
+    // directly). no-nested-write stays intentionally ACTIVE.
     files: ["seed.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -361,8 +289,7 @@ const eslintConfig = defineConfig([
         ...BASE_UNIT_ID_RULES,
         ...CONVERSION_FACTOR_RULES,
         // Model-level ban lifted (documented direct Product/ProductUnit
-        // creation in seed.ts). queryRaw ban lifted too (unchanged from
-        // the previous revision of this config).
+        // creation in seed.ts). queryRaw ban lifted too.
       ],
     },
   },

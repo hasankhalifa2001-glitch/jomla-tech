@@ -11,43 +11,31 @@ import {
   ForbiddenRoleError,
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
-// [FIX — v4.0 architecture was entirely missing from this route]
-// ProductBatch.unitId must ALWAYS be the product's base unit (see T1's
-// Unit Conversion Architecture) — never the unit an admin picks to enter
-// a quantity in. This route previously wrote the submitted `unitId`
-// straight onto ProductBatch.unitId and the raw `quantity` straight onto
-// ProductBatch.quantity, with zero conversion — exactly the pre-v4.0
-// design that produced the accumulated rounding bug ("21.9984 قطعة"
-// instead of "24 قطعة") v4.0 exists to eliminate. Fixed by treating the
-// submitted `unitId` as an ENTRY convenience only (same as
-// products/route.ts's initialBatch.unitIndex): resolve the product's
-// real base unit via requireBaseUnit(), convert the submitted quantity
-// via toBaseUnit() using the SUBMITTED unit's own conversionFactor
-// (fetched fresh server-side via getUnitConversionFactor() — never
-// trusted from any client-supplied factor, though here only the unitId
-// itself comes from the client), and write the batch against the base
-// unit with the converted quantity.
+// [v4.0] ProductBatch.unitId must ALWAYS be the product's base unit (see
+// T1's Unit Conversion Architecture) — never the unit an admin picks to
+// enter a quantity in. The submitted `unitId` is treated as an ENTRY
+// convenience only (same as products/route.ts's initialBatch.unitIndex):
+// resolve the product's real base unit via requireBaseUnit(), convert
+// the submitted quantity via toBaseUnit() using the SUBMITTED unit's own
+// conversionFactor (fetched fresh server-side via
+// getUnitConversionFactor()), and write the batch against the base unit
+// with the converted quantity.
 import { requireBaseUnit, MissingBaseUnitError } from "@/lib/inventory/base-unit";
 import { getUnitConversionFactor, toBaseUnit } from "@/lib/inventory/units";
-// [FIX] Sole gateway for tx.productUnit.* — this route previously called
-// db.productUnit.findFirst() directly, which is exactly the model-level
-// access eslint.config.mjs's PRODUCT_MODEL_RULES bans. This file is not
-// in the per-file override list that lifts that ban.
+// Sole gateway for tx.productUnit.* — never call db.productUnit.findFirst()
+// directly from a route file (PRODUCT_MODEL_RULES bans it here).
 import { findProductUnitById } from "@/lib/data/products";
 import { z } from "zod";
 
 const STRICT_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
-// [FIX] Quantity is a Prisma Decimal(18,4) column — same precision class as
+// Quantity is a Prisma Decimal(18,4) column — same precision class as
 // every monetary field in this schema. Accepting it as `z.number()` (a
-// native JS double) risks silent precision loss for large batch quantities
-// or fractional units (e.g. 99999999999.9999 cannot round-trip through an
-// IEEE-754 double without drift), which is exactly what this project's
-// decimal.js-everywhere rule (T1) exists to prevent. Prisma's Decimal
-// fields accept a numeric string directly and construct an exact
-// Prisma.Decimal from it with no float in between — so quantity is
-// received as a string and validated with a regex, never coerced to
-// `number` at any point in this handler.
+// native JS double) risks silent precision loss for large batch
+// quantities or fractional units, which is exactly what this project's
+// decimal.js-everywhere rule (T1) exists to prevent. Received as a
+// string and validated with a regex, never coerced to `number` anywhere
+// in this handler.
 const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
 
 const createBatchSchema = z.object({
@@ -57,7 +45,6 @@ const createBatchSchema = z.object({
   // above the imports.
   unitId: z.string().min(1, "معرف الوحدة مطلوب"),
   batchNumber: z.string().min(1, "رقم الدفعة مطلوب"),
-  // [FIX] was z.number().min(0) — see the note above the regex constant.
   quantity: z
     .string()
     .min(1, "الكمية مطلوبة")
@@ -109,11 +96,9 @@ export async function POST(req: Request) {
 
     const { productId, unitId, batchNumber, quantity, expiryDate } = validation.data;
 
-    // [FIX] Routed through lib/data/products.ts instead of
-    // db.productUnit.findFirst() directly — the "does this unit belong
-    // to this product & tenant?" check now uses that gateway's plain
-    // read, matched against productId manually here (no combined helper
-    // exists for this exact query shape yet).
+    // "does this unit belong to this product & tenant?" — matched
+    // against productId manually here (no combined helper exists for
+    // this exact query shape yet).
     const productUnit = await findProductUnitById(db, tenantId, unitId);
     if (!productUnit || productUnit.productId !== productId) {
       return NextResponse.json({ error: "NOT_FOUND", message: "المنتج أو الوحدة المحددة غير موجودة." }, { status: 404 });
@@ -123,16 +108,20 @@ export async function POST(req: Request) {
     // the base unit, converting the quantity, and writing the batch are
     // all part of the same logical operation, and getUnitConversionFactor()
     // requires a real transaction client (see units.ts's signature).
+    //
+    // [FIX] Previously wrapped requireBaseUnit() in its own try/catch
+    // that caught MissingBaseUnitError and re-threw a plain
+    // `new Error("MISSING_BASE_UNIT")`, then matched on
+    // `error.message === "MISSING_BASE_UNIT"` in the outer catch below.
+    // MissingBaseUnitError is already imported and thrown directly by
+    // requireBaseUnit() — there is no reason to translate it into a
+    // string-matched generic Error in between. Removed the inner
+    // try/catch entirely; MissingBaseUnitError now propagates unchanged
+    // and is caught via `instanceof` in the outer catch, exactly the
+    // same posture already applied to BaseUnitLockedError/
+    // UnitNotBelongingToProductError elsewhere in this codebase.
     const result = await db.$transaction(async (tx) => {
-      let baseUnit;
-      try {
-        baseUnit = await requireBaseUnit(tx, tenantId, productId);
-      } catch (e) {
-        if (e instanceof MissingBaseUnitError) {
-          throw new Error("MISSING_BASE_UNIT");
-        }
-        throw e;
-      }
+      const baseUnit = await requireBaseUnit(tx, tenantId, productId);
 
       const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, unitId);
       const baseQuantity = toBaseUnit(quantity, soldUnitFactor);
@@ -148,27 +137,16 @@ export async function POST(req: Request) {
         },
       });
 
-      // [FIX] renamed from `baseUnit` to `resolvedBaseUnit` in the returned
-      // object — the LOCAL VARIABLE `baseUnit` above stays as-is (it's a
-      // parameter/local binding, not a property-access AST node, so it never
-      // matched the lint rule in the first place). Only the OBJECT KEY this
-      // function returns needed renaming, since `result.baseUnit.unitName`
-      // below is a MemberExpression whose property name is checked purely
-      // by literal text — "baseUnit" matches BASE_UNIT_ID_RULES regardless
-      // of the fact that `result` is a plain local object, not a fetched
-      // Product/ProductUnit relation. Same false-positive class already
-      // fixed once for `product`/`baseUnit` -> `createdProduct`/
-      // `createdBaseUnit` in products/route.ts's POST handler.
+      // Renamed to `resolvedBaseUnit` in the returned object — the
+      // OBJECT KEY "baseUnit" would trip BASE_UNIT_ID_RULES's
+      // MemberExpression selector on `result.baseUnit.unitName` below
+      // (it checks the literal property name, not whether the value
+      // came from a real Product/ProductUnit relation).
       return { batch, resolvedBaseUnit: baseUnit, enteredUnitName: productUnit.unitName };
     });
 
-    // [FIX] No raw `unit` relation included on the create/response — the
-    // previous version's `include: { unit: true }` handed a full
-    // ProductUnit row (real conversionFactor Decimal) straight into this
-    // file's own response object, which this file has no standing
-    // exemption to hold. Built by hand instead, from values already
-    // resolved above (baseUnit's own fields, never a fresh relation
-    // fetch).
+    // No raw `unit` relation included on the create/response — built by
+    // hand instead, from values already resolved above.
     //
     // NOTE: Decimal -> Number below is fine here — purely a display-shape
     // transform on the JSON response, not a value written to the DB or
@@ -201,7 +179,9 @@ export async function POST(req: Request) {
     if (error instanceof SubscriptionLockedError) {
       return subscriptionLockedResponse(error);
     }
-    if (error instanceof Error && error.message === "MISSING_BASE_UNIT") {
+    // [FIX] instanceof check against the real error class — never a
+    // string-matched message.
+    if (error instanceof MissingBaseUnitError) {
       return NextResponse.json(
         {
           error: "MISSING_BASE_UNIT",

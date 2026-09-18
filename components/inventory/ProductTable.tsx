@@ -16,13 +16,19 @@ import {
   History,
 } from "lucide-react";
 import { useState } from "react";
+import Decimal from "decimal.js";
 import { ExpiryBadge } from "@/components/inventory/ExpiryBadge";
 import { NegativeStockBadge } from "@/components/inventory/NegativeStockBadge";
 import { formatMoney } from "@/lib/utils/money";
 
 export interface BatchAdjustmentItem {
   id: string;
-  quantityDelta: number;
+  // [FIX] `quantityDelta` is a Decimal(18,4)-backed field — the API
+  // (products/route.ts's GET) sends it as `adj.quantityDelta.toString()`,
+  // never a native number. Declaring it `number` here was a lie the
+  // compiler couldn't catch (JSON has no runtime type checking), and it
+  // masked a real bug below (see the [FIX] on the reduce() call).
+  quantityDelta: string;
   reason: string;
   adjustedByUserName: string;
   createdAt: string;
@@ -31,7 +37,9 @@ export interface BatchAdjustmentItem {
 export interface BatchItem {
   id: string;
   batchNumber: string;
-  quantity: number;
+  // [FIX] Same as quantityDelta above — the API sends
+  // `batch.quantity.toString()`, always a decimal string.
+  quantity: string;
   unitId: string;
   unitName: string;
   expiryDate: string | null;
@@ -50,12 +58,24 @@ export interface UnitItem {
   unitName: string;
   conversionFactor: number;
   pricingCurrency?: "SYP" | "USD";
-  priceWholesale: number;
-  priceRetail?: number | null;
+  // [FIX] priceWholesale/priceRetail are sent as decimal strings by the
+  // API (`u.priceWholesale.toString()`) — kept as number|string here
+  // since formatMoney() (lib/utils/money.ts) accepts either via its
+  // MoneyInput type, so no runtime break either way, but the type now
+  // reflects what's actually on the wire.
+  priceWholesale: number | string;
+  priceRetail?: number | string | null;
   barcode: string | null;
   barcodeSource?: "GS1" | "INTERNAL" | null;
   imageUrl?: string | null;
   isActive?: boolean;
+  // [NEW — v4.0] Precomputed by the backend (base-unit.ts's
+  // toSafeProductWithUnits(), threaded through products/route.ts's GET).
+  // This is the ONLY reliable way to know which unit is the product's
+  // base unit — never infer it from conversionFactor === 1 in this
+  // component; that inference logic is exactly what the v4.0 backend
+  // architecture centralizes into one sanctioned gateway instead.
+  isBaseUnit?: boolean;
 }
 
 export interface ProductItem {
@@ -67,7 +87,11 @@ export interface ProductItem {
   createdAt: string;
   units: UnitItem[];
   batches: BatchItem[];
-  totalStockInBase: number;
+  // [FIX] Sent as `totalBaseStock.toString()` by the API — a decimal
+  // string, not a native number (the schema allows up to 14 integer
+  // digits, beyond safe native-number precision for very large stock
+  // counts).
+  totalStockInBase: string;
   baseUnitName: string;
   hasExpiringSoonBatch: boolean;
   hasNegativeStockBatch?: boolean;
@@ -155,11 +179,31 @@ function UnitsList({
   return (
     <div className="space-y-1.5">
       {product.units.map((unit) => {
+        // [FIX — real bug] Previously `sum + b.quantity` with a native
+        // `+` on `b.quantity`, which the API sends as a decimal STRING
+        // (see BatchItem.quantity's [FIX] note above). `0 + "24"`
+        // performs STRING CONCATENATION in JS ("024"), not numeric
+        // addition, once any operand is a string — this silently
+        // produced a wrong "discontinued stock" figure for any unit
+        // with more than one matching batch. Fixed via decimal.js,
+        // consistent with this project's quantity-arithmetic convention
+        // (see lib/inventory/units.ts) — never native +/- on a
+        // Decimal(18,4)-backed field.
+        //
+        // [NOTE — matches backend's own v4.0 caveat] Under v4.0,
+        // ProductBatch.unitId is ALWAYS the product's base unit, so
+        // `b.unitId === unit.id` can only ever match for the base unit
+        // itself — a non-base deactivated unit will always compute 0
+        // here. This mirrors products/route.ts's own flagged, unresolved
+        // open question (T3a §4 under v4.0) rather than a bug introduced
+        // in this component; not changed here pending that product
+        // decision.
         const discontinuedStock = !unit.isActive
           ? product.batches
-            .filter((b) => b.unitId === unit.id && b.quantity > 0)
-            .reduce((sum, b) => sum + b.quantity, 0)
-          : 0;
+            .filter((b) => b.unitId === unit.id && new Decimal(b.quantity).greaterThan(0))
+            .reduce((sum, b) => sum.plus(new Decimal(b.quantity)), new Decimal(0))
+          : new Decimal(0);
+
         return (
           <div key={unit.id} className="flex flex-wrap items-center gap-2 text-xs">
             <span
@@ -168,17 +212,31 @@ function UnitsList({
             >
               {unit.unitName}
             </span>
+            {/* [NEW — v4.0] Marks the product's designated base unit —
+                the only unit ProductBatch.quantity is ever counted in,
+                whose conversionFactor is permanently locked to 1 once
+                any batch exists. Read purely from `unit.isBaseUnit`
+                (precomputed server-side) — never inferred here from
+                conversionFactor === 1. */}
+            {unit.isBaseUnit && (
+              <Badge
+                variant="outline"
+                className="border-emerald-300 bg-emerald-50 px-1 py-0 text-[9px] text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300"
+              >
+                أساسية
+              </Badge>
+            )}
             {unit.isActive === false && (
               <Badge variant="outline" className="border-red-200 bg-red-50 px-1 py-0 text-[9px] text-red-500">
                 معطلة
               </Badge>
             )}
-            {discontinuedStock > 0 && (
+            {discontinuedStock.greaterThan(0) && (
               <Badge
                 variant="outline"
                 className="border-amber-300 bg-amber-50 px-1 py-0 text-[9px] text-amber-700"
               >
-                مخزون على وحدة متوقفة ({discontinuedStock})
+                مخزون على وحدة متوقفة ({discontinuedStock.toString()})
               </Badge>
             )}
             <span className="text-[11px] text-zinc-400">(معامل {unit.conversionFactor})</span>
@@ -204,7 +262,19 @@ function UnitsList({
                 onClick={() => onToggleUnitActive(product.id, unit.id)}
                 disabled={togglingActiveId === unit.id}
                 className="mr-1 text-[10px] text-zinc-400 underline hover:text-zinc-700"
-                title={unit.isActive === false ? "تفعيل هذه الوحدة" : "تعطيل هذه الوحدة"}
+                // [NOTE] Deactivating the BASE unit is not blocked at the
+                // API layer today (an open, unresolved question flagged
+                // in products/route.ts's GET handler) — this tooltip is a
+                // UX-only warning, not an enforcement mechanism. It does
+                // not disable the button, since the backend itself
+                // hasn't decided this should be forbidden yet.
+                title={
+                  unit.isBaseUnit && unit.isActive !== false
+                    ? "تنبيه: هذه هي الوحدة الأساسية — تعطيلها يخفيها من كل الشاشات رغم أنها الوحدة التي تُحسب بها كل الدفعات."
+                    : unit.isActive === false
+                      ? "تفعيل هذه الوحدة"
+                      : "تعطيل هذه الوحدة"
+                }
               >
                 {unit.isActive === false ? "تفعيل" : "تعطيل"}
               </button>
@@ -372,6 +442,13 @@ function BatchCard({
 
   const adjustmentsCount = batch.adjustments?.length || 0;
 
+  // [FIX] batch.quantity is now correctly typed/treated as the decimal
+  // string the API actually sends — comparisons and display both go
+  // through Decimal, never a native `<`/`>` coercion, consistent with
+  // this project's quantity-arithmetic convention.
+  const batchQuantity = new Decimal(batch.quantity);
+  const isNegativeQty = batchQuantity.isNegative();
+
   return (
     <div className="rounded-lg border border-zinc-200 bg-white p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900 space-y-2.5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -390,7 +467,7 @@ function BatchCard({
           <div className="mt-0.5 text-zinc-500">
             الكمية الحالية:{" "}
             <span
-              className={`font-bold ${batch.quantity < 0
+              className={`font-bold ${isNegativeQty
                 ? "text-purple-700 dark:text-purple-400 font-mono"
                 : "text-zinc-800 dark:text-zinc-200"
                 }`}
@@ -407,8 +484,16 @@ function BatchCard({
             expiryDate={batch.expiryDate}
             status={batch.expiryStatus}
           />
-          {batch.quantity < 0 && (
-            <NegativeStockBadge quantity={batch.quantity} unitName={batch.unitName} />
+          {isNegativeQty && (
+            // [FIX] NegativeStockBadge's `quantity` prop — passed as a
+            // Number here purely for DISPLAY purposes (this badge only
+            // ever renders the sign/value visually, never feeds back
+            // into any calculation), same pattern already established
+            // elsewhere in this codebase ("converting Decimal -> Number
+            // below is fine here because this is purely a display-shape
+            // transform"). The authoritative value stays the Decimal
+            // string everywhere else in this component.
+            <NegativeStockBadge quantity={batchQuantity.toNumber()} unitName={batch.unitName} />
           )}
         </div>
       </div>
@@ -436,17 +521,6 @@ function BatchCard({
         </div>
 
         <div className="flex items-center gap-1">
-          {/* [FIX] Wrapped in `isAdmin` — stock reconciliation is
-              ADMIN-only per T2b's Role Capability Matrix ("stock
-              reconciliation (StockAdjustment): not permitted [CASHIER] /
-              permitted [ADMIN]"). This button previously rendered for
-              any session with an `onReconcileBatch` handler regardless of
-              role, unlike its sibling edit/delete buttons right next to
-              it, which were already correctly `isAdmin`-gated. The
-              server-side route still rejects a CASHIER's actual request
-              either way — this fix restores the same UX courtesy of
-              hiding an action the session can't perform, consistent with
-              every other ADMIN-only button on this card. */}
           {isAdmin && onReconcileBatch && (
             <Button
               size="sm"
@@ -499,34 +573,41 @@ function BatchCard({
             <span>تفاصيل سجل تسويات الدفعة:</span>
           </div>
           <div className="space-y-1 divide-y divide-purple-100/60 dark:divide-purple-900/40">
-            {batch.adjustments.map((adj) => (
-              <div
-                key={adj.id}
-                className="flex flex-wrap items-center justify-between gap-2 pt-1.5 first:pt-0"
-              >
-                <div>
-                  <span className="font-medium text-zinc-800 dark:text-zinc-200">
-                    {adj.reason}
-                  </span>
-                  <div className="text-[10px] text-zinc-400">
-                    بواسطة: {adj.adjustedByUserName} •{" "}
-                    {new Date(adj.createdAt).toLocaleString("ar-SY", {
-                      dateStyle: "short",
-                      timeStyle: "short",
-                    })}
+            {batch.adjustments.map((adj) => {
+              // [FIX] quantityDelta is a decimal string — sign/display
+              // computed via Decimal, never a native `>` coercion on
+              // what the type system now correctly declares as `string`.
+              const delta = new Decimal(adj.quantityDelta);
+              const isPositive = delta.greaterThan(0);
+              return (
+                <div
+                  key={adj.id}
+                  className="flex flex-wrap items-center justify-between gap-2 pt-1.5 first:pt-0"
+                >
+                  <div>
+                    <span className="font-medium text-zinc-800 dark:text-zinc-200">
+                      {adj.reason}
+                    </span>
+                    <div className="text-[10px] text-zinc-400">
+                      بواسطة: {adj.adjustedByUserName} •{" "}
+                      {new Date(adj.createdAt).toLocaleString("ar-SY", {
+                        dateStyle: "short",
+                        timeStyle: "short",
+                      })}
+                    </div>
+                  </div>
+                  <div
+                    className={`font-mono font-bold ${isPositive
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-red-600 dark:text-red-400"
+                      }`}
+                  >
+                    {isPositive ? `+${adj.quantityDelta}` : adj.quantityDelta}{" "}
+                    {batch.unitName}
                   </div>
                 </div>
-                <div
-                  className={`font-mono font-bold ${adj.quantityDelta > 0
-                    ? "text-emerald-600 dark:text-emerald-400"
-                    : "text-red-600 dark:text-red-400"
-                    }`}
-                >
-                  {adj.quantityDelta > 0 ? `+${adj.quantityDelta}` : adj.quantityDelta}{" "}
-                  {batch.unitName}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -586,10 +667,7 @@ export function ProductTable({
 
   return (
     <div className="space-y-4">
-      {/* Desktop / tablet: real table, from md up. A wide multi-column
-          table squeezed onto a phone either truncates unreadably or forces
-          sideways scrolling on top of the page's own scroll — neither is
-          usable, so phones get the card list below instead. */}
+      {/* Desktop / tablet: real table, from md up. */}
       <div className="hidden overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900 md:block">
         <div className="overflow-x-auto">
           <table className="w-full text-right text-xs">
@@ -663,9 +741,7 @@ export function ProductTable({
         </div>
       </div>
 
-      {/* Mobile: one card per product, below md. Same data and the same
-          shared sub-components as the table above — just stacked instead
-          of laid out in columns. */}
+      {/* Mobile: one card per product, below md. */}
       <div className="space-y-3 md:hidden">
         {products.map((product) => (
           <div

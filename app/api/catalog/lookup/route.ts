@@ -3,11 +3,23 @@ import { auth } from "@/auth";
 // [NOTE] ProductCatalogEntry is platform-wide, NOT tenant-scoped (see
 // schema.prisma: "id, barcode (unique), name, category, imageUrl,
 // addedByTenantId, createdAt, updatedAt" — no tenantId field at all).
-// Importing the raw `prisma` client here is therefore correct, not an
-// oversight: `getTenantDb(tenantId)`'s auto-injection has nothing to
-// inject into a model with no tenantId column. This is a deliberate
-// exception to the "always use getTenantDb" rule, scoped specifically to
-// this platform-wide model.
+// getTenantDb(tenantId)'s Prisma Client Extension auto-injects tenantId
+// into tenant-scoped models only (see TENANT_SCOPED_MODELS in
+// lib/db/tenant-scope.ts) — ProductCatalogEntry is deliberately excluded
+// from that set, so there is nothing for the extension to inject here.
+// This is a legitimate, narrow exception to the "always use getTenantDb"
+// rule, scoped specifically to platform-wide models with no tenantId
+// column — the same structural reasoning as VerifiedRetailer/
+// ProductCatalogEntryReport elsewhere in this codebase.
+//
+// [FIX] This exception was previously undocumented in both lib/db.ts's
+// header (whose six numbered categories don't cover it) and
+// eslint.config.mjs's no-restricted-imports exemption list — meaning
+// this import would fail lint despite being architecturally correct.
+// Only ONE line in this whole file needs the raw client, so per
+// lib/db.ts's own guidance for that case, this uses an inline
+// eslint-disable rather than a whole-file exemption.
+// eslint-disable-next-line no-restricted-imports
 import { prisma } from "@/lib/db";
 
 export async function GET(req: Request) {

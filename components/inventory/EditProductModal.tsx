@@ -35,24 +35,20 @@ import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal"
 import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
-import { validatePackagingUnits } from "@/lib/inventory/packaging-unit-validation";
+// [FIX] lib/inventory/packaging-unit-validation.ts was deleted when
+// validatePackagingUnits() was merged into lib/inventory/units.ts. This
+// file was still importing from the deleted path — same fix already
+// applied to AddProductModal.tsx.
+import { validatePackagingUnits } from "@/lib/inventory/units";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import type { ProductItem, UnitItem } from "@/components/inventory/ProductTable";
+import type { ProductItem } from "@/components/inventory/ProductTable";
 
-// [FIX] `[id]/route.ts`'s PATCH now validates conversionFactor/
-// priceWholesale/priceRetail as decimal STRINGS (regex-checked, max 4
-// decimal places), matching products/route.ts's POST — see that file's
-// DECIMAL_STRING_REGEX note. This modal's internal state stays `number`
-// (simplest for <input type="number"> controls), but every such value
+// [FIX] `[id]/route.ts`'s PATCH validates conversionFactor/priceWholesale/
+// priceRetail as decimal STRINGS (regex-checked, max 4 decimal places).
+// This modal's internal state stays `number`, but every such value
 // crossing into the PATCH payload must go through this helper rather than
-// a raw `String(...)` cast: `String(0.1 + 0.2)` can produce floating-point
-// noise ("0.30000000000000004") with more than 4 decimal digits, which
-// would fail the backend's regex outright. `toFixed(4)` both rounds to the
-// column's actual precision (Decimal(18,4)) and guarantees a plain,
-// non-exponential decimal string. Non-finite input is coerced to "0"
-// rather than emitting an invalid string like "NaN". Duplicated here
-// (rather than shared with AddProductModal.tsx's identical helper) per
-// the decision not to introduce a shared decimal-format module.
+// a raw `String(...)` cast — see AddProductModal.tsx's identical helper
+// for the full reasoning (floating-point noise, regex compliance).
 const toDecimalString = (value: number): string => {
   if (!Number.isFinite(value)) return "0";
   return value.toFixed(4);
@@ -127,18 +123,31 @@ export function EditProductModal({
       setIsPublic(product.isPublic ?? false);
       setIsActive(product.isActive ?? true);
 
+      // [FIX] Explicit numeric coercion. The API now consistently returns
+      // conversionFactor/priceWholesale/priceRetail as strings (see
+      // route.ts's GET/PATCH — unified to strings project-wide for
+      // Decimal-precision fields). Reading them into this modal's
+      // `number`-typed local state without converting relied on JS's
+      // implicit string coercion in arithmetic/comparisons to avoid
+      // breaking outright — it worked by accident, not by type
+      // correctness. `Number(...)` here makes the local state genuinely
+      // match its declared type regardless of whether the API happens to
+      // send a string or a number.
       const sortedUnits = [...(product.units || [])].sort(
-        (a, b) => a.conversionFactor - b.conversionFactor
+        (a, b) => Number(a.conversionFactor) - Number(b.conversionFactor)
       );
 
       setUnits(
         sortedUnits.map((u) => ({
           id: u.id,
           unitName: u.unitName || "",
-          conversionFactor: u.conversionFactor || 1,
+          conversionFactor: Number(u.conversionFactor) || 1,
           pricingCurrency: u.pricingCurrency || "SYP",
-          priceWholesale: u.priceWholesale || 0,
-          priceRetail: u.priceRetail !== null && u.priceRetail !== undefined ? u.priceRetail : "",
+          priceWholesale: Number(u.priceWholesale) || 0,
+          priceRetail:
+            u.priceRetail !== null && u.priceRetail !== undefined && u.priceRetail !== ""
+              ? Number(u.priceRetail)
+              : "",
           barcode: u.barcode || "",
           barcodeSource: (u.barcodeSource as BarcodeSourceChoice) || "",
           imageUrl: u.imageUrl || "",
@@ -160,6 +169,14 @@ export function EditProductModal({
         return next;
       });
       setCatalogInfo(null);
+      // [FIX] Close the classification gate if it was open for this exact
+      // unit — previously only the unit's own fields were cleared, but a
+      // still-open BarcodeSourceModal could be left pointing at a barcode
+      // that no longer exists on this unit. Same fix already applied to
+      // AddProductModal.tsx.
+      if (barcodeGate.unitIndex === unitIndex) {
+        setBarcodeGate({ unitIndex: null, barcode: "" });
+      }
       return;
     }
 
@@ -286,11 +303,37 @@ export function EditProductModal({
   };
 
   const handleRemoveUnit = (index: number) => {
+    // Unit 0 is always the product's base unit — its conversionFactor is
+    // forced/locked to 1 and can never be changed via this screen (a
+    // base-unit correction is a dedicated, separate flow on the backend —
+    // see resetProductUnits()). This modal never exposes it.
     if (index === 0) {
       toast.error("لا يمكن حذف الوحدة الأساسية.");
       return;
     }
+
+    // [FIX] Defensive guard mirroring AddProductModal.tsx — index 0 is
+    // already protected above so this can't currently be reached with
+    // units.length going to 0, but kept for the same defense-in-depth
+    // reasoning.
+    if (units.length <= 1) {
+      toast.error("يجب الإبقاء على وحدة قياس واحدة على الأقل.");
+      return;
+    }
+
     setUnits((prev) => prev.filter((_, i) => i !== index));
+
+    // [FIX] Same bug class fixed in AddProductModal.tsx: removing a unit
+    // shifts every later index down by one. Previously the open
+    // barcodeGate's stored unitIndex was left unchanged, so if the gate
+    // was open for a unit AFTER the removed one, it would end up pointing
+    // at the wrong unit (or out of bounds if it was the last one).
+    setBarcodeGate((prev) => {
+      if (prev.unitIndex === null) return prev;
+      if (prev.unitIndex === index) return { unitIndex: null, barcode: "" };
+      if (prev.unitIndex > index) return { ...prev, unitIndex: prev.unitIndex - 1 };
+      return prev;
+    });
   };
 
   const handleToggleUnitActive = (index: number) => {
@@ -330,19 +373,9 @@ export function EditProductModal({
       return;
     }
 
-    // [FIX — GAP CLOSED] AddProductModal.tsx already enforces this exact
-    // check (in both goNext's step-2 gate and handleSubmit) — priceWholesale
-    // is the ONLY figure ever used to bill a sale (POS or B2B alike, per
-    // T1), so a unit reaching submit with priceWholesale <= 0 must be
-    // rejected here too. This modal previously had NO such check: the
-    // backend's own validator (nonNegativeDecimalString, [id]/route.ts)
-    // accepts priceWholesale === 0, and validatePackagingUnits()
-    // deliberately does not check priceWholesale at all (see that file's
-    // own VALIDATION SCOPE NOTE — it is intentionally out of that
-    // function's scope, left to each call site). Without this check, an
-    // ADMIN editing an existing unit through this screen could save a
-    // priceWholesale of 0 with nothing anywhere rejecting it, producing a
-    // unit sellable at zero cost on the POS.
+    // priceWholesale is the ONLY figure ever used to bill a sale (POS or
+    // B2B alike) — a unit reaching submit with priceWholesale <= 0 must
+    // be rejected here, matching AddProductModal.tsx's identical check.
     if (units.some((u) => !u.unitName.trim() || u.conversionFactor <= 0 || u.priceWholesale <= 0)) {
       toast.error("يرجى التأكد من ملء جميع الوحدات بمعامل تحويل وسعر جملة أكبر من الصفر.");
       return;
@@ -391,10 +424,6 @@ export function EditProductModal({
         category: category.trim() || null,
         isPublic,
         isActive,
-        // [FIX] conversionFactor/priceWholesale/priceRetail now sent as
-        // decimal strings via toDecimalString — matches [id]/route.ts's
-        // PATCH schema. Was previously sending raw numbers
-        // (`u.conversionFactor`, `Number(u.priceWholesale) || 0`, etc.).
         units: units.map((u) => ({
           ...(u.id ? { id: u.id } : {}),
           unitName: u.unitName.trim(),
@@ -560,7 +589,8 @@ export function EditProductModal({
                     <span>محرك وحدات التعبئة والتغليف</span>
                   </h3>
                   <p className="text-[11px] text-zinc-500">
-                    حدد الوحدة الأساسية (معامل = 1) والوحدات الثانوية/الثلاثية مع أسعار الجملة والتجزئة.
+                    الوحدة الأساسية (معامل = 1) مقفلة هنا — تصحيحها يتم من شاشة مخصصة منفصلة. عدّل الوحدات
+                    الثانوية/الثلاثية وأسعارها بحرية.
                   </p>
                 </div>
                 <Button
@@ -634,9 +664,20 @@ export function EditProductModal({
                           <Input
                             value={unit.unitName}
                             onChange={(e) => {
-                              const next = [...units];
-                              next[index].unitName = e.target.value;
-                              setUnits(next);
+                              // [FIX] Was direct mutation (`next[index].unitName =
+                              // ...; setUnits(next)`) — `[...units]` only copies
+                              // the array shallowly, so `next[index]` was the
+                              // SAME object reference as `units[index]`, meaning
+                              // this line mutated the current state in place
+                              // before React had a chance to diff it. Fixed to
+                              // create a new object for the changed index, same
+                              // pattern AddProductModal.tsx already uses.
+                              const value = e.target.value;
+                              setUnits((prev) => {
+                                const next = [...prev];
+                                next[index] = { ...next[index], unitName: value };
+                                return next;
+                              });
                             }}
                             placeholder={isBase ? "مثال: قطعة" : "مثال: طرد"}
                             className="h-8 text-xs mt-1"
@@ -654,10 +695,28 @@ export function EditProductModal({
                             disabled={isBase}
                             value={unit.conversionFactor}
                             onChange={(e) => {
-                              const val = Math.max(0.0001, parseFloat(e.target.value) || 1);
-                              const next = [...units];
-                              next[index].conversionFactor = val;
-                              setUnits(next);
+                              // [FIX — real bug, same class as
+                              // AddProductModal.tsx] Was
+                              // `Math.max(0.0001, parseFloat(e.target.value) || 1)`
+                              // — `|| 1` snapped any falsy parse (including the
+                              // first "0" keystroke on the way to typing "0.25")
+                              // straight to 1, and Math.max clamped anything
+                              // below 0.0001 immediately while typing. Fractional
+                              // conversionFactor values are explicitly allowed
+                              // (a wholesaler selling a quarter- or half-carton)
+                              // — only fall back when the parse isn't a real
+                              // number at all; validatePackagingUnits() already
+                              // rejects <= 0 at submit time, so no separate
+                              // floor is needed here. Also fixed to build an
+                              // immutable next-object instead of mutating in
+                              // place.
+                              const parsed = parseFloat(e.target.value);
+                              const value = Number.isFinite(parsed) ? parsed : 0;
+                              setUnits((prev) => {
+                                const next = [...prev];
+                                next[index] = { ...next[index], conversionFactor: value };
+                                return next;
+                              });
                             }}
                             className="h-8 text-xs mt-1"
                           />
@@ -670,9 +729,12 @@ export function EditProductModal({
                           <select
                             value={unit.pricingCurrency}
                             onChange={(e) => {
-                              const next = [...units];
-                              next[index].pricingCurrency = e.target.value as "SYP" | "USD";
-                              setUnits(next);
+                              const value = e.target.value as "SYP" | "USD";
+                              setUnits((prev) => {
+                                const next = [...prev];
+                                next[index] = { ...next[index], pricingCurrency: value };
+                                return next;
+                              });
                             }}
                             className="h-8 w-full border border-zinc-200 dark:border-zinc-700 rounded-md px-2 text-xs bg-white dark:bg-zinc-900 mt-1"
                           >
@@ -690,9 +752,12 @@ export function EditProductModal({
                             min="0"
                             value={unit.priceWholesale}
                             onChange={(e) => {
-                              const next = [...units];
-                              next[index].priceWholesale = Number(e.target.value) || 0;
-                              setUnits(next);
+                              const value = Number(e.target.value) || 0;
+                              setUnits((prev) => {
+                                const next = [...prev];
+                                next[index] = { ...next[index], priceWholesale: value };
+                                return next;
+                              });
                             }}
                             className="h-8 text-xs mt-1"
                           />
@@ -707,9 +772,13 @@ export function EditProductModal({
                             min="0"
                             value={unit.priceRetail}
                             onChange={(e) => {
-                              const next = [...units];
-                              next[index].priceRetail = e.target.value === "" ? "" : Number(e.target.value);
-                              setUnits(next);
+                              const raw = e.target.value;
+                              const value = raw === "" ? "" : Number(raw);
+                              setUnits((prev) => {
+                                const next = [...prev];
+                                next[index] = { ...next[index], priceRetail: value };
+                                return next;
+                              });
                             }}
                             placeholder="اختياري"
                             className="h-8 text-xs mt-1"
@@ -726,9 +795,12 @@ export function EditProductModal({
                                 value={unit.barcode}
                                 onBlur={(e) => requestBarcodeClassification(index, e.target.value)}
                                 onChange={(e) => {
-                                  const next = [...units];
-                                  next[index].barcode = e.target.value;
-                                  setUnits(next);
+                                  const value = e.target.value;
+                                  setUnits((prev) => {
+                                    const next = [...prev];
+                                    next[index] = { ...next[index], barcode: value };
+                                    return next;
+                                  });
                                 }}
                                 placeholder="امسح أو اكتب الباركود..."
                                 className="h-8 text-xs pl-7"
@@ -792,9 +864,11 @@ export function EditProductModal({
                                 size="sm"
                                 variant="ghost"
                                 onClick={() => {
-                                  const next = [...units];
-                                  next[index].imageUrl = "";
-                                  setUnits(next);
+                                  setUnits((prev) => {
+                                    const next = [...prev];
+                                    next[index] = { ...next[index], imageUrl: "" };
+                                    return next;
+                                  });
                                 }}
                                 className="h-6 text-[10px] text-red-500 hover:bg-red-50"
                               >

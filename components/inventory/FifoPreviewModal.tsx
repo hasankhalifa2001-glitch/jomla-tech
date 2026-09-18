@@ -2,6 +2,7 @@
 "use client";
 
 import { useState } from "react";
+import Decimal from "decimal.js";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,25 +23,35 @@ export interface ProductItem {
   units: ProductUnitItem[];
 }
 
+// [FIX] lib/inventory/fifo.ts's allocateBatches() now serializes every
+// quantity-shaped field via decimal.js's .toFixed(4) — a Decimal-
+// normalized STRING, never a native JS number (see that file's own
+// file-header FIX note: "requestedQty is now a decimal STRING, never
+// `number`"). These two fields were previously typed `number`, which
+// silently mismatched the real API response shape.
 export interface FifoAllocationItem {
   batchId: string;
   batchNumber: string;
   expiryDate: string | null;
-  allocatedQty: number;
-  deductQtyInBatchUnit: number;
+  allocatedQty: string;
+  deductQtyInBatchUnit: string;
   batchUnitName: string;
 }
 
+// [FIX] Same as above — requestedQty/totalAllocatedQty/remainingQty are
+// all Decimal-serialized strings on the wire now, matching
+// lib/inventory/fifo.ts's AllocationPlan and
+// app/api/inventory/fifo-preview/route.ts's JSON response exactly.
 export interface FifoResolution {
   productId?: string;
   requestedUnitId?: string;
   requestedUnitName: string;
-  requestedQty: number;
-  totalAllocatedQty: number;
-  remainingQty: number;
+  requestedQty: string;
+  totalAllocatedQty: string;
+  remainingQty: string;
   isSufficient: boolean;
   fullyAllocated?: boolean;
-  shortfallQty?: number;
+  shortfallQty?: string;
   allocations: FifoAllocationItem[];
 }
 
@@ -75,6 +86,10 @@ export function FifoPreviewModal({
 }: FifoPreviewModalProps) {
   const [internalProductId, setInternalProductId] = useState<string>("");
   const [internalUnitId, setInternalUnitId] = useState<string>("");
+  // Kept as a native `number` for the <Input type="number"> control's own
+  // value binding — this is purely UI input state, never itself the value
+  // sent to the API (see handleRunPreview below, which converts it to a
+  // decimal string via decimal.js immediately before the request).
   const [internalRequestedQty, setInternalRequestedQty] = useState<number>(DEFAULT_REQUESTED_QTY);
   const [loading, setLoading] = useState<boolean>(false);
   const [resolution, setResolution] = useState<FifoResolution | null>(null);
@@ -137,7 +152,18 @@ export function FifoPreviewModal({
         body: JSON.stringify({
           productId: effectiveProductId,
           unitId: effectiveUnitId,
-          requestedQty: Number(effectiveRequestedQty),
+          // [FIX — critical] The backend's fifoPreviewSchema validates
+          // `requestedQty` with `z.string().regex(DECIMAL_STRING_REGEX, ...)`
+          // — a bare Zod string schema rejects any non-string value
+          // OUTRIGHT, before the regex is even checked. The previous
+          // `Number(effectiveRequestedQty)` sent a native JS number every
+          // single time, which meant this feature failed validation on
+          // every call, unconditionally. Serialized via decimal.js's own
+          // .toString() (never a raw template-literal String(...) on a
+          // value that might carry float artifacts) so the value the
+          // backend receives is exact and already in the API's expected
+          // decimal-string shape.
+          requestedQty: new Decimal(effectiveRequestedQty).toString(),
         }),
       });
 
@@ -154,8 +180,19 @@ export function FifoPreviewModal({
     }
   };
 
-  const isShortfall = resolution && (!resolution.isSufficient || resolution.fullyAllocated === false || resolution.remainingQty > 0);
-  const shortfallAmount = resolution?.shortfallQty ?? resolution?.remainingQty ?? 0;
+  // [FIX] resolution.remainingQty is now a Decimal-serialized STRING —
+  // `resolution.remainingQty > 0` previously relied on JS's implicit
+  // string-to-number coercion for the `>` operator, which happened to
+  // work but is exactly the kind of native-arithmetic reliance on a
+  // Decimal(18,4)-backed value this project's conventions forbid.
+  // Compared via decimal.js explicitly instead.
+  const remainingQtyDecimal = resolution ? new Decimal(resolution.remainingQty) : null;
+  const isShortfall =
+    resolution &&
+    (!resolution.isSufficient ||
+      resolution.fullyAllocated === false ||
+      (remainingQtyDecimal !== null && remainingQtyDecimal.greaterThan(0)));
+  const shortfallAmount = resolution?.shortfallQty ?? resolution?.remainingQty ?? "0";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

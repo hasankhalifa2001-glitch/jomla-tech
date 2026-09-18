@@ -9,6 +9,14 @@ import { Label } from "@/components/ui/label";
 import { Layers } from "lucide-react";
 import { toast } from "sonner";
 
+// [FIX] Same decimal-string validation the backend applies
+// (createBatchSchema's DECIMAL_STRING_REGEX in
+// app/api/inventory/batches/route.ts) — mirrored here so an invalid
+// quantity is caught with a clear Arabic message before the request is
+// even sent, rather than surfacing as a generic VALIDATION_ERROR from
+// the server after a round trip.
+const DECIMAL_STRING_REGEX = /^\d{1,14}(\.\d{1,4})?$/;
+
 interface ProductUnitItem {
   id: string;
   unitName: string;
@@ -47,7 +55,17 @@ export function AddBatchModal({ open, onOpenChange, products, preselectedProduct
   );
 
   const [batchNumber, setBatchNumber] = useState<string>("");
-  const [quantity, setQuantity] = useState<number>(0);
+  // [FIX] Quantity is now a plain decimal-STRING typed directly by the
+  // user — never a `number` state round-tripped through parseFloat().
+  // ProductBatch.quantity is a Decimal(18,4) column; parseFloat() +
+  // String() risks silent precision loss for large/fractional values
+  // (IEEE-754 double, then a re-stringification that can even produce
+  // scientific notation for very small/large numbers, which fails the
+  // backend's own DECIMAL_STRING_REGEX outright). Every other decimal-
+  // string field in this codebase (see AddProductModal's toDecimalString
+  // pattern) is handled this same way — a raw text input, validated
+  // client-side with the same regex the backend enforces, sent as-is.
+  const [quantity, setQuantity] = useState<string>("0");
   const [expiryDate, setExpiryDate] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(false);
 
@@ -84,7 +102,7 @@ export function AddBatchModal({ open, onOpenChange, products, preselectedProduct
     setPrevOpen(open);
     if (!open) {
       setBatchNumber("");
-      setQuantity(0);
+      setQuantity("0");
       setExpiryDate("");
     }
   }
@@ -101,6 +119,17 @@ export function AddBatchModal({ open, onOpenChange, products, preselectedProduct
       return;
     }
 
+    // [FIX] Client-side decimal-string validation, mirroring the
+    // backend's own DECIMAL_STRING_REGEX + `>= 0` rule exactly — catches
+    // a malformed/empty/negative quantity before the request is sent,
+    // with a clear Arabic message, instead of relying solely on the
+    // server's 400 response.
+    const trimmedQuantity = quantity.trim();
+    if (!trimmedQuantity || !DECIMAL_STRING_REGEX.test(trimmedQuantity)) {
+      toast.error("صيغة الكمية غير صالحة (مثال: 10 أو 10.5).");
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -108,7 +137,10 @@ export function AddBatchModal({ open, onOpenChange, products, preselectedProduct
         productId: selectedProductId,
         unitId: selectedUnitId,
         batchNumber: batchNumber.trim(),
-        quantity: String(quantity),
+        // [FIX] Sent exactly as typed — never round-tripped through
+        // parseFloat()/String(), so no precision is ever lost between
+        // what the user typed and what reaches the server.
+        quantity: trimmedQuantity,
         expiryDate: expiryDate || null,
       };
 
@@ -211,12 +243,20 @@ export function AddBatchModal({ open, onOpenChange, products, preselectedProduct
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
               <Label>الكمية المستلمة *</Label>
+              {/* [FIX] type="text" + inputMode="decimal" instead of
+                  type="number" — a native number input silently coerces
+                  through the browser's own float parsing (and step="any"
+                  still allows scientific-notation entry in some
+                  browsers), which is exactly the precision risk this fix
+                  removes. The value here is the raw string the user
+                  typed, validated against DECIMAL_STRING_REGEX above at
+                  submit time — never parsed through parseFloat(). */}
               <Input
-                type="number"
-                step="any"
-                min="0"
+                type="text"
+                inputMode="decimal"
+                placeholder="0"
                 value={quantity}
-                onChange={(e) => setQuantity(parseFloat(e.target.value) || 0)}
+                onChange={(e) => setQuantity(e.target.value)}
                 required
               />
             </div>

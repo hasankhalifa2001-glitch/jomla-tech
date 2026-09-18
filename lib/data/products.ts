@@ -263,9 +263,8 @@ export async function createAdditionalUnit(
         data: {
             ...data,
             ...buildConversionFactorField(conversionFactor),
-            tenant: { connect: { id: tenantId } },
-            product: { connect: { id: productId } },
-        } as Prisma.ProductUnitCreateInput,
+            productId: productId,
+        } as Prisma.ProductUnitUncheckedCreateInput,
     });
 }
 
@@ -297,17 +296,15 @@ export async function createProductWithBaseUnit(
     const product = await tx.product.create({
         data: {
             ...productData,
-            tenant: { connect: { id: tenantId } },
-        } as Prisma.ProductCreateInput,
+        } as Prisma.ProductUncheckedCreateInput,
     });
 
     const baseUnit = await tx.productUnit.create({
         data: {
             ...firstUnitData,
             ...buildConversionFactorField(BASE_UNIT_CONVERSION_FACTOR),
-            tenant: { connect: { id: tenantId } },
-            product: { connect: { id: product.id } },
-        } as Prisma.ProductUnitCreateInput,
+            productId: product.id,
+        } as Prisma.ProductUnitUncheckedCreateInput,
     });
 
     await commitBaseUnitLink(tx, tenantId, product.id, baseUnit.id);

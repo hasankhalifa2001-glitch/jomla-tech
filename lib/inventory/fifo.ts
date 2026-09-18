@@ -1,4 +1,3 @@
-import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
 import { getTenantDb } from "@/lib/db/tenant-scope";
 import type { TenantTransactionClient } from "@/lib/db/tenant-scope";
@@ -300,7 +299,7 @@ export async function previewFifoAllocation(
  * the same open transaction the caller locked rows in.
  */
 export async function commitFifoAllocation(
-  tx: Prisma.TransactionClient,
+  tx: TenantTransactionClient,
   params: CommitFifoParams
 ): Promise<AllocationPlan> {
   const { tenantId, productId, unitId, requestedQty } = params;
