@@ -209,8 +209,39 @@ export type TenantTransactionClient =
  * For read-only or single-top-level-write helpers that may be called
  * either with a real transaction client OR the plain tenant-scoped client
  * returned by getTenantDb() directly (no transaction needed).
+ *
+ * [FIX] Widened to also include the RAW, unextended `Prisma.TransactionClient`.
+ * A handful of functions in this codebase — most notably
+ * lib/inventory/base-unit.ts's requireBaseUnit()/requireBaseUnits() — never
+ * rely on the getTenantDb() Client Extension for their own tenant
+ * isolation; they filter by `tenantId` explicitly in every query's own
+ * `where` clause, the same manual-filtering discipline lib/db.ts's
+ * category-5 exception (commitFifoAllocation, app/api/sync/route.ts)
+ * documents. That makes these functions structurally safe to call with
+ * EITHER client shape — but requireBaseUnit() is called from BOTH sides:
+ * from ordinary tenant-scoped write helpers (lib/data/products.ts,
+ * running inside a getTenantDb()-derived transaction) AND from
+ * lib/inventory/fifo.ts's commitFifoAllocation(), which is deliberately
+ * pinned to the raw `Prisma.TransactionClient` (lib/db.ts's category-5
+ * exception) because it's shared across T4c's sync engine and T5's B2B
+ * approval transaction contexts. Without this widening, TypeScript
+ * correctly but unhelpfully rejected passing a raw `Prisma.TransactionClient`
+ * into a `TxOrClient` parameter — even though the underlying `tx.model.*`
+ * calls are runtime-identical in shape between the raw and extended
+ * client. Adding `Prisma.TransactionClient` to this union closes that
+ * compile error without loosening any actual isolation guarantee: a
+ * caller passing the raw client into a `TxOrClient` function is exactly
+ * as safe as calling it with the extended client, since none of these
+ * functions depend on the extension's auto-injection to begin with.
+ *
+ * Do NOT use this reasoning to widen a function that DOES rely on the
+ * extension's auto-injection (i.e. one that omits `tenantId` from its own
+ * `where`/`data` and trusts getTenantDb() to have added it) — those
+ * functions must stay pinned to `TenantTransactionClient | TenantDb` only,
+ * since a raw `Prisma.TransactionClient` would silently skip that
+ * injection and produce an unscoped query.
  */
-export type TxOrClient = TenantTransactionClient | TenantDb;
+export type TxOrClient = TenantTransactionClient | TenantDb | Prisma.TransactionClient;
 
 // The raw client is deliberately NOT re-exported from this file under any
 // name. lib/db.ts is the file that intentionally re-exports rawPrisma as

@@ -76,6 +76,8 @@ import {
     buildConversionFactorField,
     isReservedBaseUnitFactor,
     BASE_UNIT_CONVERSION_FACTOR,
+    DisplayUnit,
+    toDisplayUnits,
 } from "@/lib/inventory/units";
 
 export type { DisplayUnitWithBaseFlag };
@@ -510,4 +512,84 @@ export async function findProductUnitByBarcode(
         productId: unit.productId,
         productName: unit.product.name,
     };
+}
+
+export interface ProductNameCategoryUnits {
+    id: string;
+    name: string;
+    category: string | null;
+    units: DisplayUnit[];
+}
+
+/**
+ * [NEW — CSV import] Every product for a tenant with its units reshaped
+ * via toDisplayUnits() — used by validateAndPreviewCsv() to seed the
+ * packaging-consistency check without ever naming conversionFactor
+ * itself in csv-parser.ts.
+ */
+export async function listAllProductsWithUnitsForPackagingCheck(
+    tx: TxOrClient,
+    tenantId: string
+): Promise<ProductNameCategoryUnits[]> {
+    const products = await tx.product.findMany({
+        where: { tenantId },
+        include: { units: true },
+    });
+    return products.map((p) => ({
+        id: p.id,
+        name: p.name,
+        category: p.category,
+        units: toDisplayUnits(p.units),
+    }));
+}
+
+export interface UnitWithProductName extends DisplayUnit {
+    productId: string;
+    productName: string;
+    isActive: boolean;
+}
+
+/**
+ * [NEW — CSV import] Every ProductUnit for a tenant with its parent
+ * product's name — used by validateAndPreviewCsv() to build the barcode
+ * lookup map without a raw `.product` relation leaving this file.
+ */
+export async function listAllUnitsForTenantWithProductName(
+    tx: TxOrClient,
+    tenantId: string
+): Promise<UnitWithProductName[]> {
+    const units = await tx.productUnit.findMany({
+        where: { tenantId },
+        include: { product: { select: { name: true } } },
+    });
+    return units.map((u) => ({
+        ...toDisplayUnits([u])[0],
+        productId: u.productId,
+        productName: u.product.name,
+        isActive: u.isActive,
+    }));
+}
+
+/**
+ * [NEW — CSV import] Case-insensitive (name, category) product match,
+ * with all its units — used by commitCsvImport() to decide whether a
+ * "new product" CSV row is genuinely new or should attach an additional
+ * packaging unit to an already-existing product.
+ */
+export async function findProductByNameCategory(
+    tx: TxOrClient,
+    tenantId: string,
+    name: string,
+    category: string | null
+): Promise<(Omit<Product, "baseUnitId"> & { units: DisplayUnitWithBaseFlag[] }) | null> {
+    const product = await tx.product.findFirst({
+        where: {
+            tenantId,
+            name: { equals: name, mode: "insensitive" },
+            category: category ? { equals: category, mode: "insensitive" } : null,
+        },
+        include: { units: true },
+    });
+    if (!product) return null;
+    return toSafeProductWithUnits(product);
 }

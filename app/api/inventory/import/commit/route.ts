@@ -48,6 +48,43 @@ const nonNegativeDecimalSchema = z
     message: "يجب أن يكون رقماً غير سالب (صفر أو أكثر)",
   });
 
+// [FIX — v4.0 base-unit invariant] A "new product" CSV row's unit ALWAYS
+// becomes that product's base unit — see MASTER-SPEC v4.0's T3d §5.1
+// ("Importing a 'new product' row creates Product.baseUnitId equal to
+// that row's unit automatically, following the same mechanism as T3a's
+// Section 0") and T3a §0 ("this first unit automatically becomes the
+// product's physical base unit... conversionFactor: 1... the UI does
+// not expose an editable conversionFactor field for this first unit at
+// all"). A base unit's conversionFactor is ALWAYS exactly 1 — the same
+// invariant lib/inventory/units.ts's BASE_UNIT_CONVERSION_FACTOR /
+// isReservedBaseUnitFactor() / assertIsValidBaseUnitFactor() enforce
+// everywhere else a base unit is created.
+//
+// Previously, `newProductRowSchema.conversionFactor` was plain
+// `positiveDecimalSchema` — it accepted ANY positive value straight from
+// the CSV column (e.g. "24") and forwarded it verbatim to
+// commitCsvImport(). If csv-parser.ts uses that raw value when creating
+// the new product's base ProductUnit, this would silently corrupt the
+// exact base-unit invariant the whole v4.0 revision exists to protect —
+// reopening the historical "21.9984 قطعة" rounding bug, just via the CSV
+// path instead of the UI path. Fixed: the value is VALIDATED, not
+// silently overwritten. Blank/omitted defaults to "1" (a merchant who
+// leaves the column empty for a brand-new product gets the correct
+// behavior for free); any other explicit value is REJECTED with an
+// actionable message — silently coercing "24" to "1" would let a
+// merchant believe their pack size was recorded when it wasn't.
+const newProductConversionFactorSchema = z
+  .union([z.string(), z.number()])
+  .optional()
+  .transform((v) => (v === undefined || String(v).trim() === "" ? "1" : String(v).trim()))
+  .refine((v) => DECIMAL_STRING_REGEX.test(v) && Number(v) > 0, {
+    message: "معامل التحويل غير صالح.",
+  })
+  .refine((v) => Number(v) === 1, {
+    message:
+      "لا يمكن تحديد معامل تحويل مختلف عن 1 لمنتج جديد — أول وحدة تُدخل لمنتج جديد تصبح تلقائياً الوحدة الأساسية (معامل التحويل = 1 دائماً). لإضافة وحدة تعبئة أخرى (مثل طرد أو كرتونة) بمعامل تحويل مختلف، أضفها لاحقاً من شاشة تعديل المنتج بعد إنشائه.",
+  });
+
 // [FIX #2 — defensive] A frontend that omits an optional field by sending
 // an empty string ("") rather than truly dropping the key from the JSON
 // body is a common pattern (e.g. a controlled <input> bound to "" by
@@ -81,7 +118,10 @@ const newProductRowSchema = z
     name: z.string().min(1, "اسم المنتج مطلوب"),
     category: z.string().optional(),
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
-    conversionFactor: positiveDecimalSchema,
+    // [FIX] Was `positiveDecimalSchema` — see the dedicated schema above
+    // for why this must be locked to "1" for a brand-new product's base
+    // unit, not any arbitrary positive value.
+    conversionFactor: newProductConversionFactorSchema,
     priceWholesale: positiveDecimalSchema,
     priceRetail: nonNegativeDecimalSchema.optional(),
     pricingCurrency: z.enum(["SYP", "USD"]).optional(),

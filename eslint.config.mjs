@@ -71,7 +71,8 @@ import nextTs from "eslint-config-next/typescript";
 
 const BASE_UNIT_ID_RULES = [
   {
-    selector: "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector:
+      "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Direct access to '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' (as a select/data/include/where key) is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits()/commitBaseUnitLink() instead — see T1's Unit Conversion Architecture.",
   },
@@ -79,17 +80,20 @@ const BASE_UNIT_ID_RULES = [
     // Destructuring READS only (ObjectPattern) — never matches an
     // ordinary object-literal construction/return like `{ product, baseUnit }`,
     // which is an ObjectExpression, not an ObjectPattern.
-    selector: "ObjectPattern > Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector:
+      "ObjectPattern > Property[key.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Destructuring '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' off a fetched result is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    selector: "MemberExpression[property.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector:
+      "MemberExpression[property.name=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Direct access to '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    selector: "MemberExpression[computed=true] > Literal[value=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
+    selector:
+      "MemberExpression[computed=true] > Literal[value=/^(baseUnitId|baseUnit|isBaseUnitOf)$/]",
     message:
       "Direct access to '.baseUnitId'/'.baseUnit'/'.isBaseUnitOf' is forbidden outside lib/inventory/base-unit.ts. Use requireBaseUnit()/requireBaseUnits() instead — see T1's Unit Conversion Architecture.",
   },
@@ -99,7 +103,8 @@ const BASE_UNIT_ID_RULES = [
 // rule. See the module header above for why.
 const CONVERSION_FACTOR_RULES = [
   {
-    selector: "Property[key.name=/^(data|select|include|where)$/] Property[key.name='conversionFactor']",
+    selector:
+      "Property[key.name=/^(data|select|include|where)$/] Property[key.name='conversionFactor']",
     message:
       "Direct access to '.conversionFactor' (as a select/data/include/where key) is forbidden outside lib/inventory/units.ts, regardless of which relation path leads to it (.unit, .productUnit, .baseUnit...). Use units.ts's getUnitConversionFactor() to read it, or buildConversionFactorField()/isReservedBaseUnitFactor() to write/check it — see T1's Unit Conversion Architecture and the rounding-error bug this exists to prevent.",
   },
@@ -117,7 +122,8 @@ const CONVERSION_FACTOR_RULES = [
       "Direct access to '.conversionFactor' is forbidden outside lib/inventory/units.ts, regardless of which relation path leads to it. Use getUnitConversionFactor() instead — see T1's Unit Conversion Architecture.",
   },
   {
-    selector: "MemberExpression[computed=true] > Literal[value='conversionFactor']",
+    selector:
+      "MemberExpression[computed=true] > Literal[value='conversionFactor']",
     message:
       "Direct access to '.conversionFactor' is forbidden outside lib/inventory/units.ts. Use getUnitConversionFactor() instead — see T1's Unit Conversion Architecture.",
   },
@@ -129,7 +135,8 @@ const CONVERSION_FACTOR_RULES = [
 // MemberExpression + ObjectPattern-only version missed entirely).
 const PRODUCT_MODEL_RULES = [
   {
-    selector: "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(product|productUnit)$/]",
+    selector:
+      "Property[key.name=/^(data|select|include|where)$/] Property[key.name=/^(product|productUnit)$/]",
     message:
       "Naming 'product'/'productUnit' (as a select/data/include/where key) is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead — see that file's header for why this is model-level, not just field-level.",
   },
@@ -146,14 +153,16 @@ const PRODUCT_MODEL_RULES = [
       "Direct access to '.product'/'.productUnit' (as a Prisma model call or a fetched relation) is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead.",
   },
   {
-    selector: "MemberExpression[computed=true] > Literal[value=/^(product|productUnit)$/]",
+    selector:
+      "MemberExpression[computed=true] > Literal[value=/^(product|productUnit)$/]",
     message:
       "Direct access to '.product'/'.productUnit' is forbidden outside lib/data/products.ts. Import the matching helper from lib/data/products.ts instead.",
   },
 ];
 
 const QUERY_RAW_RULE = {
-  selector: "MemberExpression[property.name=/^(\\$queryRaw|\\$queryRawUnsafe)$/]",
+  selector:
+    "MemberExpression[property.name=/^(\\$queryRaw|\\$queryRawUnsafe)$/]",
   message:
     "Direct $queryRaw or $queryRawUnsafe calls are forbidden outside lib/db/tenant-scope.ts. Use tenantScopedRawQuery() instead for tenant isolation compliance.",
 };
@@ -168,12 +177,7 @@ const NESTED_WRITE_RULE = {
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
-  globalIgnores([
-    ".next/**",
-    "out/**",
-    "build/**",
-    "next-env.d.ts",
-  ]),
+  globalIgnores([".next/**", "out/**", "build/**", "next-env.d.ts"]),
   {
     // Global default: every restriction active. Per-file overrides below
     // lift exactly the ones each sanctioned file legitimately needs.
@@ -206,7 +210,7 @@ const eslintConfig = defineConfig([
       ],
       "@typescript-eslint/no-unused-vars": [
         "warn",
-        { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
       ],
     },
   },
@@ -311,7 +315,11 @@ const eslintConfig = defineConfig([
     // "is this unit the base unit?" flag they need is computed inside
     // lib/data/products.ts's findProductWithUnits() and handed to them
     // pre-shaped, never derived here from a raw relation.
-    files: ["app/api/inventory/products/route.ts", "app/api/inventory/products/\\[id\\]/route.ts",],
+    files: [
+      "app/api/inventory/products/route.ts",
+      "app/api/inventory/products/\\[id\\]/route.ts",
+      "lib/inventory/csv-parser.ts",
+    ],
     rules: {
       "no-restricted-syntax": [
         "error",

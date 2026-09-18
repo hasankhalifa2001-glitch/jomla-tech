@@ -1,8 +1,8 @@
 import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
 import { getTenantDb } from "@/lib/db/tenant-scope";
+import type { TenantTransactionClient } from "@/lib/db/tenant-scope";
 import { requireBaseUnit } from "@/lib/inventory/base-unit";
-
 /**
  * lib/inventory/fifo.ts (T3b)
  *
@@ -41,6 +41,25 @@ import { requireBaseUnit } from "@/lib/inventory/base-unit";
  * A mismatch throws immediately — that is a caller/integration bug (a
  * forgotten toBaseUnit() conversion upstream), never a case to silently
  * paper over.
+ *
+ * [FIX — requestedQty is now a decimal STRING, never `number`]
+ * `toBaseUnit()` (lib/inventory/units.ts) returns a Decimal instance;
+ * every caller (this project's fifo-preview route included) correctly
+ * serializes that via `.toString()` before handing it off, per T1's
+ * decimal.js-everywhere rule for anything quantity-shaped. The previous
+ * revision of this file typed `requestedQty` as a native `number` in
+ * every interface below — a real mismatch against every caller that
+ * follows the project's own convention, and one that would force a
+ * caller to round-trip through `Number(...)` just to satisfy the type,
+ * silently reopening the exact precision hole this whole base-unit
+ * architecture exists to close for large or fractional quantities.
+ * Fixed: `requestedQty` is now typed as `DecimalValue` (string | number |
+ * Decimal instance) everywhere in this file, the `<= 0` guard now
+ * compares via `new Decimal(requestedQty).lte(0)` instead of a native
+ * JS operator, and every requestedQty value that reaches an output field
+ * (`AllocationPlan.requestedQty`) is stored as a Decimal-normalized
+ * string, consistent with every other quantity-shaped field this file
+ * already produces (`totalAllocatedQty`, `remainingQty`, `allocatedQty`).
  * ============================================================================
  *
  * Sorting Rules (unchanged from the original design):
@@ -59,6 +78,9 @@ import { requireBaseUnit } from "@/lib/inventory/base-unit";
  * column's real 4-decimal precision limit exactly once, and never re-wrapped
  * in a native JS `Number(...)`.
  */
+
+type DecimalInstance = InstanceType<typeof Decimal>;
+type DecimalValue = number | string | DecimalInstance;
 
 export interface AllocationPlanItem {
   batchId: string;
@@ -85,7 +107,10 @@ export interface AllocationPlan {
   // NOTE above. Field name kept for backward compatibility.
   requestedUnitId: string;
   requestedUnitName: string;
-  requestedQty: number;
+  // [FIX] Decimal-normalized STRING now, matching totalAllocatedQty/
+  // remainingQty/allocatedQty — never a native JS number, regardless of
+  // whether the caller supplied requestedQty as a string or a number.
+  requestedQty: string;
   totalAllocatedQty: string; // In the base unit
   remainingQty: string; // Unallocated, in the base unit
   isSufficient: boolean;
@@ -102,20 +127,19 @@ export interface PreviewFifoParams {
   // is responsible for having already converted requestedQty into this
   // unit via toBaseUnit() before calling this function.
   unitId: string;
-  requestedQty: number;
+  // [FIX] Decimal string (or number/Decimal instance) — never coerced
+  // to a native number internally. See file-header FIX note.
+  requestedQty: DecimalValue;
 }
 
 export interface CommitFifoParams {
   tenantId: string;
   productId: string;
   unitId: string;
-  requestedQty: number;
+  requestedQty: DecimalValue;
 }
 
 export type FifoRequest = CommitFifoParams;
-
-type DecimalInstance = InstanceType<typeof Decimal>;
-type DecimalValue = number | string | DecimalInstance;
 
 interface BatchRecord {
   id: string;
@@ -137,7 +161,7 @@ interface BaseUnitRef {
 function allocateBatches(
   batches: BatchRecord[],
   baseUnit: BaseUnitRef,
-  requestedQty: number,
+  requestedQty: DecimalValue,
   productId: string
 ): AllocationPlan {
   const requestedQtyDecimal = new Decimal(requestedQty);
@@ -193,7 +217,9 @@ function allocateBatches(
     productId,
     requestedUnitId: baseUnit.id,
     requestedUnitName: baseUnit.unitName,
-    requestedQty,
+    // [FIX] Normalized to a Decimal-serialized string, never left as
+    // whatever raw type the caller passed in.
+    requestedQty: requestedQtyDecimal.toFixed(4),
     totalAllocatedQty: totalAllocated.toFixed(4),
     remainingQty: Decimal.max(0, remainingNeeded).toFixed(4),
     isSufficient,
@@ -223,14 +249,19 @@ function assertUnitIsBaseUnit(baseUnit: BaseUnitRef, suppliedUnitId: string, pro
  *
  * Goes through `getTenantDb(tenantId)`, the sanctioned tenant-scoped
  * client (lib/db/tenant-scope.ts) — tenantId injection is automatic and
- * structural, never a manually-repeated `where` clause.
+ * structural via the Prisma Client Extension, but the batch query below
+ * ALSO scopes explicitly by tenantId in its own `where` — the same
+ * double-layered posture every other query in this file
+ * (requireBaseUnit, commitFifoAllocation) already takes, and the same
+ * one T1's tenantScopedRawQuery() takes for raw queries. [FIX] Previously
+ * this query relied on the extension alone.
  */
 export async function previewFifoAllocation(
   params: PreviewFifoParams
 ): Promise<AllocationPlan> {
   const { tenantId, productId, unitId, requestedQty } = params;
 
-  if (requestedQty <= 0) {
+  if (new Decimal(requestedQty).lte(0)) {
     throw new Error("الكمية المطلوبة يجب أن تكون أكبر من الصفر.");
   }
 
@@ -244,7 +275,10 @@ export async function previewFifoAllocation(
   assertUnitIsBaseUnit(baseUnit, unitId, productId);
 
   const candidateBatches = (await db.productBatch.findMany({
-    where: { productId, quantity: { gt: 0 } },
+    // [FIX] tenantId added explicitly — belt-and-suspenders, matching
+    // every other query in this file, rather than relying solely on the
+    // Client Extension's automatic injection.
+    where: { tenantId, productId, quantity: { gt: 0 } },
     select: { id: true, batchNumber: true, quantity: true, expiryDate: true },
   })) as unknown as BatchRecord[];
 
@@ -271,7 +305,7 @@ export async function commitFifoAllocation(
 ): Promise<AllocationPlan> {
   const { tenantId, productId, unitId, requestedQty } = params;
 
-  if (requestedQty <= 0) {
+  if (new Decimal(requestedQty).lte(0)) {
     throw new Error("الكمية المطلوبة يجب أن تكون أكبر من الصفر.");
   }
 
