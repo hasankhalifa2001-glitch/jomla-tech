@@ -8,12 +8,12 @@ import {
   submitOfflineSale,
   seedSampleOfflineData,
   syncProductsFromServer,
-  getOfflineInvoicesList,
   calculateCartTotals,
   getSystemCashCustomer,
   isSystemCashCustomer,
   resolveCartLinePrices,
   cartNeedsExchangeRate,
+  useSyncWorker,
   type PosProductItem,
   type CachedProductUnit,
   type CartLineItem,
@@ -56,11 +56,23 @@ export function PosLayout() {
   const dailyExchangeRate = useExchangeRateStore((state) => state.dailyExchangeRate);
   const hydrateExchangeRate = useExchangeRateStore((state) => state.hydrateFromCache);
 
+  // [FIX] This hook was previously never mounted anywhere in the POS
+  // screen at all — sync-worker.ts's reactive auto-sync logic (fires a
+  // debounced sync attempt whenever a Dexie write moves pendingCount from
+  // 0 to a positive number) therefore never actually ran during a normal
+  // POS session; it only ever fired incidentally when some OTHER
+  // component holding this hook happened to mount/remount (e.g. a full
+  // page reload). `pendingCount` below is now the single, live source of
+  // truth for the "بانتظار المزامنة" badge — no more separately-tracked,
+  // stale local state that only updated on a handful of manual call
+  // sites (loadData, effect "1a", handleConfirmCheckout) and had no way
+  // to reflect a sync that succeeded elsewhere.
+  const { pendingCount: pendingInvoicesCount, triggerSync } = useSyncWorker(tenantId);
+
   // Data states
   const [products, setProducts] = useState<PosProductItem[]>([]);
   const [isLoadingProducts, setIsLoadingProducts] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
-  const [pendingInvoicesCount, setPendingInvoicesCount] = useState(0);
   const [isSyncingProducts, setIsSyncingProducts] = useState(false);
 
   // Cart & Customer states
@@ -91,22 +103,21 @@ export function PosLayout() {
   // source of truth for "is this response still the one we care about."
   const productsRequestIdRef = useRef(0);
 
-  // Full reload of everything (exchange rate + products + pending invoice
-  // count) — intentionally used ONLY after an action that can invalidate
-  // all of it at once (seeding demo data). Everyday product search and the
-  // exchange-rate/pending-count refresh are each handled by their own
-  // narrower effect below, so this is not on the render path.
+  // Full reload of products (exchange rate + product catalog) — intentionally
+  // used ONLY after an action that can invalidate all of it at once
+  // (seeding demo data). Everyday product search and the exchange-rate
+  // refresh are each handled by their own narrower effect below, so this
+  // is not on the render path.
+  //
+  // [FIX] No longer reads/sets pendingInvoicesCount — that value now comes
+  // live from useSyncWorker(tenantId) above, which reacts to Dexie writes
+  // on its own; there is nothing left here for this function to refresh.
   const loadData = useCallback(async () => {
     if (!isDbReady) return;
     try {
       await hydrateExchangeRate(tenantId);
-      const [prods, offlineInvoices] = await Promise.all([
-        getOfflineProducts(tenantId, searchQuery),
-        getOfflineInvoicesList(tenantId),
-      ]);
+      const prods = await getOfflineProducts(tenantId, searchQuery);
       setProducts(prods);
-      const pendingCount = offlineInvoices.filter((inv) => inv.status === "PENDING").length;
-      setPendingInvoicesCount(pendingCount);
     } catch (err) {
       console.error("Failed to load POS offline data:", err);
     } finally {
@@ -114,27 +125,29 @@ export function PosLayout() {
     }
   }, [isDbReady, hydrateExchangeRate, tenantId, searchQuery]);
 
-  // 1a. Exchange rate + pending-invoice count — loads once per tenant/DB
-  // readiness change. Deliberately does NOT depend on searchQuery: neither
-  // value has anything to do with what's typed in the product search box,
-  // so re-running this on every keystroke (as the old merged effect did)
-  // was pure wasted work, not a correctness requirement.
+  // 1a. Exchange rate — loads once per tenant/DB readiness change.
+  // Deliberately does NOT depend on searchQuery: it has nothing to do with
+  // what's typed in the product search box, so re-running this on every
+  // keystroke (as an old merged effect once did) was pure wasted work, not
+  // a correctness requirement.
+  //
+  // [FIX] Previously also fetched offlineInvoices here to compute
+  // pendingInvoicesCount manually. That entire branch is removed — the
+  // pending count is now sourced live from useSyncWorker(tenantId) above,
+  // which updates automatically on any Dexie write to
+  // offlineInvoices/offlinePayments/offlineCustomers, from any code path,
+  // including a sync pass completing on a totally different mounted
+  // component. Manually re-deriving the same count here would just be a
+  // second, out-of-sync source of truth for the exact bug this fix closes.
   useEffect(() => {
     if (!isDbReady) return;
     let isMounted = true;
 
-    hydrateExchangeRate(tenantId)
-      .then(() => getOfflineInvoicesList(tenantId))
-      .then((offlineInvoices) => {
-        if (!isMounted) return;
-        const pendingCount = offlineInvoices.filter((inv) => inv.status === "PENDING").length;
-        setPendingInvoicesCount(pendingCount);
-      })
-      .catch((err) => {
-        if (isMounted) {
-          console.error("Failed to load exchange rate / pending invoices:", err);
-        }
-      });
+    hydrateExchangeRate(tenantId).catch((err) => {
+      if (isMounted) {
+        console.error("Failed to load exchange rate:", err);
+      }
+    });
 
     return () => {
       isMounted = false;
@@ -453,29 +466,22 @@ export function PosLayout() {
   // createOfflineInvoiceRecord. This now takes paidAmountSYP/debtAmountSYP
   // from the payment step and forwards only the SYP fields.
   //
-  // NOTE: this requires payment-modal.tsx's own onConfirmCheckout callback
-  // to be updated to compute and pass `paidAmountSYP`/`debtAmountSYP`
-  // (leading its own payment UI with SYP, same as everywhere else) instead
-  // of the old USD amounts — that file wasn't included here, so it needs
-  // the matching change on its side for this to compile and work end to
-  // end.
-  //
-  // [FIX — real bug: product stock display never refreshed after a sale]
-  // This handler previously only re-fetched `getOfflineInvoicesList` after
-  // a successful checkout (to update `pendingInvoicesCount`) — it never
-  // re-read `products` from Dexie, unlike handleSyncProducts()/loadData()
-  // elsewhere in this file, which both correctly call
-  // `getOfflineProducts(tenantId, searchQuery)` + `setProducts(...)` after
-  // any action that can change what's in stock. That left the product
-  // catalog's displayed quantities frozen at whatever they were when this
-  // component last mounted or last searched — a completed sale's stock
-  // decrement was invisible until something else happened to re-run the
-  // product-loading effects from scratch (a full page reload, or
-  // navigating away from /pos and back, which unmounts and remounts this
-  // component). A cashier had no way to see accurate remaining stock
-  // in between. Fixed below: `products` is now refreshed in the same
-  // place `pendingInvoicesCount` already was, fetched together via
-  // Promise.all since neither read depends on the other's result.
+  // [FIX — real bug: pending badge and sync never reacted to a completed
+  // sale] This handler previously re-fetched getOfflineInvoicesList()
+  // manually at the end just to recompute pendingInvoicesCount by hand —
+  // a separate, disconnected source of truth from any actual sync attempt
+  // happening elsewhere in the app. Now that useSyncWorker(tenantId) is
+  // mounted at the top of this component, pendingInvoicesCount updates
+  // itself the instant saveOfflineInvoiceWithBalance() (inside
+  // submitOfflineSale) writes the new PENDING row to Dexie — there is
+  // nothing left to manually recompute here. What WAS still missing
+  // entirely is actually asking for a sync attempt: this component never
+  // called triggerSync() anywhere, so the very first sync after any sale
+  // only ever happened if some OTHER mounted component's useSyncWorker
+  // instance (or its own debounced reactive effect) happened to run. An
+  // explicit triggerSync() call right after a successful checkout gives
+  // the cashier fast, deterministic feedback instead of depending solely
+  // on the hook's own 2-second debounce.
   async function handleConfirmCheckout(paymentData: {
     paidAmountSYP: string;
     debtAmountSYP: string;
@@ -532,18 +538,21 @@ export function PosLayout() {
     setIsPaymentModalOpen(false);
     setIsSuccessModalOpen(true);
 
-    // [FIX — real bug] See the function-level FIX note above. A sale
-    // reduces the stock available to sell next, and the cashier needs to
-    // see that reflected in the product cards IMMEDIATELY — not after a
-    // manual page reload or navigating away and back. Fetched together
-    // with the pending-invoice-count refresh via Promise.all, since
-    // neither read depends on the other's result.
-    const [prods, offlineInvoices] = await Promise.all([
-      getOfflineProducts(tenantId, searchQuery),
-      getOfflineInvoicesList(tenantId),
-    ]);
+    // [FIX] Products still need a manual refresh here (stock display is
+    // not covered by any live query) — the pending-invoice COUNT no
+    // longer does, since useSyncWorker's pendingCount already updated
+    // itself reactively the instant the Dexie write above completed.
+    const prods = await getOfflineProducts(tenantId, searchQuery);
     setProducts(prods);
-    setPendingInvoicesCount(offlineInvoices.filter((inv) => inv.status === "PENDING").length);
+
+    // [FIX] Explicit, immediate sync attempt right after a successful
+    // checkout — see the function-level FIX note above for why this was
+    // the actual missing piece (this screen never called triggerSync()
+    // anywhere before). useSyncWorker's own reactive 0->positive
+    // detection + 2s debounce would eventually fire this on its own now
+    // that the hook is mounted here, but an explicit call gives faster,
+    // more deterministic feedback instead of waiting out the debounce.
+    void triggerSync();
 
     toast.success("تم حفظ الفاتورة محلياً بنجاح في قاعدة البيانات (Dexie)!");
   }

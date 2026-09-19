@@ -411,23 +411,40 @@ export async function getPendingRecordsCount(tenantId?: string): Promise<number>
  * React Hook for managing background sync worker lifecycle.
  * Automatically initiates sync within 5 seconds of network reconnection.
  */
+// أضف هاد الاستيراد فوق مع باقي الاستيرادات
+import { useLiveQuery } from "dexie-react-hooks";
+
+/**
+ * React Hook for managing background sync worker lifecycle.
+ *
+ * [FIX — critical] Previously, automatic sync only ever fired once per
+ * mount: a single `useEffect` ran `scheduleSync()` exactly once when the
+ * component first mounted (and again only on a genuine browser
+ * online/offline transition). Nothing in this hook ever noticed that a
+ * NEW PENDING record had been written to Dexie while the page was
+ * already open and already online — e.g. right after
+ * submitOfflineSale() completes a sale. The invoice sat PENDING
+ * indefinitely until the user manually reloaded the page (which
+ * remounted this hook and re-ran the one-time scheduleSync()).
+ *
+ * Fixed by making `pendingCount` itself REACTIVE via useLiveQuery
+ * (same pattern lib/offline/hooks.ts's useOfflineDbReady already uses)
+ * instead of a one-shot state variable populated by a plain fetch. Any
+ * write to offlineInvoices/offlinePayments/offlineCustomers — from
+ * anywhere in the app, at any time — now re-runs this query
+ * automatically and updates `pendingCount` live. A separate effect below
+ * watches for `pendingCount` transitioning from 0 to a positive number
+ * (a genuinely NEW pending item appearing) and, if online, schedules a
+ * sync the same debounced way the original online-reconnect path
+ * already did — no manual triggerSync() call needed anywhere else in
+ * the app.
+ */
 export function useSyncWorker(tenantId?: string) {
   const [isSyncing, setIsSyncing] = useState(false);
-  const [pendingCount, setPendingCount] = useState(0);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [lastSummary, setLastSummary] = useState<SyncSummary | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isSyncingRef = useRef(false);
-
-  const refreshPendingCount = useCallback(async () => {
-    if (!tenantId) return;
-    try {
-      const count = await getPendingRecordsCount(tenantId);
-      setPendingCount(count);
-    } catch {
-      // Ignore Dexie errors during unmount/initialization
-    }
-  }, [tenantId]);
 
   const triggerSync = useCallback(async () => {
     if (!tenantId || isSyncingRef.current) return;
@@ -437,54 +454,84 @@ export function useSyncWorker(tenantId?: string) {
       const summary = await syncPendingRecords(tenantId);
       setLastSummary(summary);
       setLastSyncTime(new Date());
-      await refreshPendingCount();
     } catch (err) {
       console.error("Background sync error:", err);
     } finally {
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [tenantId, refreshPendingCount]);
+  }, [tenantId]);
 
+  // [FIX] Reactive pending count — re-evaluates automatically on ANY
+  // write to these three tables, from any code path in the app (a new
+  // sale, a repayment, a walk-in customer, or this hook's own
+  // status-update writes after a sync pass completes). Replaces the
+  // previous one-shot getPendingRecordsCount() call + manual
+  // refreshPendingCount() plumbing entirely — there is nothing left to
+  // manually refresh; the live query IS the source of truth.
+  const pendingCount = useLiveQuery(
+    async () => {
+      if (!tenantId || !isOfflineDbSupported()) return 0;
+      return getPendingRecordsCount(tenantId);
+    },
+    [tenantId],
+    0
+  ) ?? 0;
+
+  const scheduleSync = useCallback(() => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      void triggerSync();
+    }, 2000);
+  }, [triggerSync]);
+
+  // [FIX] Fires a debounced sync attempt whenever pendingCount
+  // transitions from 0 to a positive number (a genuinely NEW pending
+  // item just appeared) — e.g. right after submitOfflineSale() writes
+  // its Dexie record. Also fires on the initial mount if there's already
+  // a nonzero pendingCount (e.g. a reload with leftover PENDING items),
+  // matching the original mount-time behavior. Does NOT fire on every
+  // pendingCount change — only on the 0 -> positive transition, so a
+  // sync pass's own status-update writes (which move items OUT of
+  // PENDING) never re-trigger themselves.
+  const prevPendingCountRef = useRef<number | null>(null);
   useEffect(() => {
     if (!tenantId) return;
-
-    let isMounted = true;
-    getPendingRecordsCount(tenantId)
-      .then((count) => {
-        if (isMounted) {
-          setPendingCount(count);
-        }
-      })
-      .catch(() => { });
-
-    const scheduleSync = () => {
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current);
-      }
-      // Within 5 seconds of reconnection (and of dashboard mount while online)
-      debounceTimerRef.current = setTimeout(() => {
-        void triggerSync();
-      }, 2000);
-    };
-
-    if (typeof window !== "undefined") {
-      window.addEventListener("online", scheduleSync);
-      if (navigator.onLine) {
-        scheduleSync();
-      }
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      prevPendingCountRef.current = pendingCount;
+      return;
     }
 
+    const prev = prevPendingCountRef.current;
+    const isNewPendingWork = prev === null ? pendingCount > 0 : prev === 0 && pendingCount > 0;
+
+    if (isNewPendingWork) {
+      scheduleSync();
+    }
+    prevPendingCountRef.current = pendingCount;
+  }, [tenantId, pendingCount, scheduleSync]);
+
+  // Reconnect handling — unchanged in spirit from the original: a real
+  // browser online transition still schedules a sync (covers PENDING
+  // items that piled up while genuinely offline, where the effect above
+  // deliberately skipped scheduling).
+  useEffect(() => {
+    if (!tenantId || typeof window === "undefined") return;
+
+    const handleOnline = () => {
+      if (pendingCount > 0) scheduleSync();
+    };
+    window.addEventListener("online", handleOnline);
+
     return () => {
-      isMounted = false;
-      if (typeof window !== "undefined") {
-        window.removeEventListener("online", scheduleSync);
-      }
+      window.removeEventListener("online", handleOnline);
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
       }
     };
-  }, [tenantId, triggerSync]);
+  }, [tenantId, pendingCount, scheduleSync]);
 
   return {
     isSyncing,
@@ -492,6 +539,9 @@ export function useSyncWorker(tenantId?: string) {
     lastSyncTime,
     lastSummary,
     triggerSync,
-    refreshPendingCount,
+    // [FIX] refreshPendingCount kept as a no-op-returning-current-value
+    // for backward compatibility with any existing caller — pendingCount
+    // is now always live and needs no manual refresh trigger.
+    refreshPendingCount: useCallback(async () => { }, []),
   };
 }
