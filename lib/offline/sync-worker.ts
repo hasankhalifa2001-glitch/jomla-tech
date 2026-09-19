@@ -31,9 +31,44 @@
  * Every authoritative SYP field is now included alongside its
  * informational USD counterpart, matching OfflineInvoice/
  * OfflineInvoiceItem's actual shape in db.ts exactly.
+ *
+ * [FIX — critical, this revision] syncPendingRecords() previously never
+ * refreshed cachedProducts/cachedCustomers after a successful sync pass
+ * at all — it only ever updated each offline record's own status field
+ * (SYNCED/FAILED) in Dexie. This produced a real, UNBOUNDED display bug,
+ * not a narrow timing edge case:
+ *
+ *   1. pos-service.ts's getOfflineProducts() correctly subtracts every
+ *      NOT-YET-SYNCED offlineInvoices item from the last-synced batch
+ *      total, so a stock count stays accurate WHILE a sale is pending.
+ *   2. The instant this file marks that same invoice SYNCED, it drops
+ *      out of that subtraction — correctly, since the server has now
+ *      committed the real deduction via commitFifoAllocation (T4c/T3b).
+ *   3. But nothing in THIS file ever called refreshProductCache() to
+ *      pull that real, now-lower server-side quantity back down into
+ *      cachedProducts.batches — so the displayed stock count would jump
+ *      back UP to its pre-sale value and STAY there indefinitely, until
+ *      some unrelated code path happened to trigger a refresh (e.g. the
+ *      user manually pressing a "sync products" button, or an app-load
+ *      refresh on a completely different screen). There was no bound on
+ *      how long this could persist — potentially the rest of the
+ *      cashier's shift.
+ *
+ * Fixed: syncPendingRecords() now calls refreshProductCache() whenever
+ * at least one invoice was actually synced this pass (the only source of
+ * stock-affecting writes), and refreshCustomerCache() whenever at least
+ * one invoice OR payment was synced (both can change a customer's
+ * server-side debt balance). Both are best-effort: a refresh failure
+ * (e.g. the network drops again immediately after the sync itself
+ * succeeded) is logged but does not flip the overall sync summary to
+ * failed — the sync itself genuinely succeeded; only the subsequent
+ * cache-refresh attempt didn't, and the next successful refresh (from
+ * any trigger) will still catch up correctly, so this is not silently
+ * losing data the way the original missing-refresh gap was.
  */
 
 import { getOfflineDb, isOfflineDbSupported } from "./db";
+import { refreshProductCache, refreshCustomerCache } from "./cache-refresh";
 import { useEffect, useState, useCallback, useRef } from "react";
 
 export interface SyncSummary {
@@ -290,6 +325,48 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       summary.failedCustomers === 0 &&
       summary.failedInvoices === 0 &&
       summary.failedPayments === 0;
+
+    // [FIX — critical, this revision] Refresh the caches that whatever
+    // just got synced actually invalidated — see the file-header FIX
+    // note for the full "stock silently reverts after a successful sync"
+    // bug this closes. Best-effort: a refresh failure here is logged but
+    // does NOT flip summary.success — the sync itself already committed
+    // successfully server-side; only the local cache didn't catch up
+    // this pass, and the next refresh from any trigger still corrects it.
+    //
+    // Product cache: only invoices affect ProductBatch.quantity server-
+    // side (via commitFifoAllocation) — a synced customer or a synced
+    // payment alone never does, so skip this refresh when no invoice
+    // synced, to avoid an unnecessary network round-trip.
+    if (summary.syncedInvoices > 0) {
+      try {
+        const productResult = await refreshProductCache(scopedTenantId);
+        if (!productResult.ok && productResult.reason !== "offline") {
+          console.error(
+            "syncPendingRecords: post-sync refreshProductCache failed:",
+            productResult.reason
+          );
+        }
+      } catch (err) {
+        console.error("syncPendingRecords: post-sync refreshProductCache threw:", err);
+      }
+    }
+
+    // Customer cache: either a synced invoice (debt) or a synced payment
+    // (repayment) can change a customer's server-side balance.
+    if (summary.syncedInvoices > 0 || summary.syncedPayments > 0) {
+      try {
+        const customerResult = await refreshCustomerCache(scopedTenantId);
+        if (!customerResult.ok && customerResult.reason !== "offline") {
+          console.error(
+            "syncPendingRecords: post-sync refreshCustomerCache failed:",
+            customerResult.reason
+          );
+        }
+      } catch (err) {
+        console.error("syncPendingRecords: post-sync refreshCustomerCache threw:", err);
+      }
+    }
 
     return summary;
   } catch (error) {

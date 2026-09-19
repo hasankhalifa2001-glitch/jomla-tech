@@ -134,6 +134,23 @@
  *      assume it's a mistake and normalize it away, or assume every
  *      product's batches always land on the base unit and copy that
  *      pattern elsewhere without the same justification.
+ *
+ * [FIX — review pass 10] getOfflineProducts()'s totalCachedStock
+ * previously reflected ONLY the last-synced server snapshot
+ * (cachedProducts.batches) — it never accounted for sales already
+ * recorded locally in offlineInvoices but not yet synced. Since
+ * ProductBatch.quantity is only ever decremented server-side at sync
+ * time (T4c's commitFifoAllocation), the displayed stock count never
+ * moved after an offline sale until the next successful sync — the SAME
+ * cashier could oversell the same physical stock repeatedly within one
+ * offline session with no warning. Fixed: getOfflineProducts() now
+ * subtracts, locally and immediately, the base-unit-converted sum of
+ * every item across every offlineInvoices row whose status is not
+ * SYNCED (PENDING or FAILED — see the function's own comment for why
+ * FAILED is deliberately included too) before reporting
+ * totalCachedStock. Void records' negated item quantities correctly add
+ * reversed stock back with no special-casing, since the same summation
+ * handles both signs uniformly.
  */
 
 import {
@@ -682,6 +699,60 @@ export async function getOfflineProducts(
   const db = getOfflineDb();
   const products = await db.cachedProducts.where("tenantId").equals(scopedTenantId).toArray();
 
+  // [FIX — review pass 10] totalCachedStock previously reflected ONLY the
+  // last-synced server snapshot (p.batches) — it never accounted for
+  // sales already recorded locally in offlineInvoices but not yet synced.
+  // Per T4c, ProductBatch.quantity is only ever decremented server-side
+  // at sync time (commitFifoAllocation); an offline sale never touches
+  // cachedProducts.batches directly. Without this, the displayed stock
+  // count never moved after an offline sale until the next successful
+  // sync — the SAME cashier could oversell the same physical stock
+  // repeatedly within one offline session with no warning at all.
+  //
+  // Fix: subtract, locally and immediately, the base-unit-converted sum
+  // of every item across every NOT-YET-SYNCED offlineInvoices row for
+  // this tenant — using the same per-unit conversionFactor lookup already
+  // used for batches. A void record's items carry NEGATIVE quantities
+  // (see createOfflineVoidRecord, db.ts), so summing them alongside
+  // ordinary sale items correctly ADDS the reversed stock back with no
+  // special-casing needed.
+  //
+  // PENDING and FAILED are BOTH included (i.e. every status !== SYNCED)
+  // — deliberately, not just PENDING: a FAILED sync still means the goods
+  // were physically handed over and a receipt was likely already
+  // printed. Reverting a FAILED sale's stock back into "available" before
+  // an admin has manually resolved it (T4e's Failed Sync Items view)
+  // would risk that exact same physical stock being sold a second time —
+  // the same "fail loud, never silently paper over" posture the rest of
+  // this codebase takes. A SYNCED invoice drops out of this calculation
+  // entirely and relies on the next refreshProductCache() to reflect its
+  // real server-side deduction in p.batches instead.
+  const pendingInvoices = await db.offlineInvoices
+    .where("tenantId")
+    .equals(scopedTenantId)
+    .filter((inv) => inv.status !== "SYNCED")
+    .toArray();
+
+  // unitId is a cuid, globally unique across the whole tenant's catalog
+  // (not just within one product) — safe to flatten into one map instead
+  // of a per-product lookup.
+  const globalUnitFactor = new Map<string, string | number>();
+  for (const p of products) {
+    for (const u of p.units) {
+      globalUnitFactor.set(u.id, u.conversionFactor || 1);
+    }
+  }
+
+  const pendingBaseQuantityByProduct = new Map<string, string>();
+  for (const inv of pendingInvoices) {
+    for (const item of inv.items) {
+      const factor = globalUnitFactor.get(item.unitId) ?? 1;
+      const baseQty = multiplyMoney(item.quantity, factor);
+      const existing = pendingBaseQuantityByProduct.get(item.productId) ?? "0";
+      pendingBaseQuantityByProduct.set(item.productId, sumMoney(["0", existing, baseQty]));
+    }
+  }
+
   const enriched: PosProductItem[] = products.map((p) => {
     // [FIX — critical] Each batch's `quantity` is recorded in ITS OWN
     // unit (via batch.unitId), not necessarily the product's base unit.
@@ -706,7 +777,17 @@ export async function getOfflineProducts(
       const factor = unit ? unit.conversionFactor || 1 : 1;
       return multiplyMoney(b.quantity || "0", factor);
     });
-    const totalStock = toDecimal(sumMoney(perBatchBaseQuantities)).toNumber();
+    const syncedBaseStock = sumMoney(["0", ...perBatchBaseQuantities]);
+
+    // [FIX — review pass 10] Subtract everything already sold locally but
+    // not yet confirmed synced — see the note above this function.
+    // Deliberately NOT clamped to zero: a negative result here is a real,
+    // meaningful signal (this device has locally recorded selling more
+    // than the last known synced stock), not an error to hide — the
+    // existing isOutOfStock / negative-stock handling downstream already
+    // treats <= 0 correctly.
+    const pendingBaseSold = pendingBaseQuantityByProduct.get(p.id) ?? "0";
+    const totalStock = toDecimal(subtractMoney(syncedBaseStock, pendingBaseSold)).toNumber();
 
     return {
       ...p,

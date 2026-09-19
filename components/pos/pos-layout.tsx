@@ -36,7 +36,6 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  Layers,
   Sparkles,
   RefreshCw,
   CloudOff,
@@ -292,13 +291,7 @@ export function PosLayout() {
 
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, [
-    cartItems.length,
-    dailyExchangeRate,
-    isCustomerModalOpen,
-    isPaymentModalOpen,
-    isSuccessModalOpen,
-  ]);
+  }, [cartItems, cartItems.length, dailyExchangeRate, isCustomerModalOpen, isPaymentModalOpen, isSuccessModalOpen]);
 
   // 3. Cart Management Operations
   //
@@ -466,6 +459,23 @@ export function PosLayout() {
   // of the old USD amounts — that file wasn't included here, so it needs
   // the matching change on its side for this to compile and work end to
   // end.
+  //
+  // [FIX — real bug: product stock display never refreshed after a sale]
+  // This handler previously only re-fetched `getOfflineInvoicesList` after
+  // a successful checkout (to update `pendingInvoicesCount`) — it never
+  // re-read `products` from Dexie, unlike handleSyncProducts()/loadData()
+  // elsewhere in this file, which both correctly call
+  // `getOfflineProducts(tenantId, searchQuery)` + `setProducts(...)` after
+  // any action that can change what's in stock. That left the product
+  // catalog's displayed quantities frozen at whatever they were when this
+  // component last mounted or last searched — a completed sale's stock
+  // decrement was invisible until something else happened to re-run the
+  // product-loading effects from scratch (a full page reload, or
+  // navigating away from /pos and back, which unmounts and remounts this
+  // component). A cashier had no way to see accurate remaining stock
+  // in between. Fixed below: `products` is now refreshed in the same
+  // place `pendingInvoicesCount` already was, fetched together via
+  // Promise.all since neither read depends on the other's result.
   async function handleConfirmCheckout(paymentData: {
     paidAmountSYP: string;
     debtAmountSYP: string;
@@ -522,8 +532,17 @@ export function PosLayout() {
     setIsPaymentModalOpen(false);
     setIsSuccessModalOpen(true);
 
-    // Refresh pending count
-    const offlineInvoices = await getOfflineInvoicesList(tenantId);
+    // [FIX — real bug] See the function-level FIX note above. A sale
+    // reduces the stock available to sell next, and the cashier needs to
+    // see that reflected in the product cards IMMEDIATELY — not after a
+    // manual page reload or navigating away and back. Fetched together
+    // with the pending-invoice-count refresh via Promise.all, since
+    // neither read depends on the other's result.
+    const [prods, offlineInvoices] = await Promise.all([
+      getOfflineProducts(tenantId, searchQuery),
+      getOfflineInvoicesList(tenantId),
+    ]);
+    setProducts(prods);
     setPendingInvoicesCount(offlineInvoices.filter((inv) => inv.status === "PENDING").length);
 
     toast.success("تم حفظ الفاتورة محلياً بنجاح في قاعدة البيانات (Dexie)!");
