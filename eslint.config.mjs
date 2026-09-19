@@ -285,7 +285,6 @@ const eslintConfig = defineConfig([
         QUERY_RAW_RULE,
         NESTED_WRITE_RULE,
         ...BASE_UNIT_ID_RULES,
-        ...PRODUCT_MODEL_RULES,
         // CONVERSION_FACTOR_RULES explicitly omitted for offline cache processing
       ],
     },

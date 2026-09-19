@@ -84,8 +84,9 @@ export class MoneyError extends Error {
  * still gets re-wrapped in `new Money(...)` when necessary elsewhere in
  * this file, so precision/rounding config is still correctly applied.
  */
+
 function isMoneyDecimalInstance(value: unknown): value is MoneyDecimal {
-  return Money.isDecimal(value);
+  return (Decimal as any).isDecimal(value);
 }
 
 /**

@@ -38,15 +38,18 @@ export type CacheRefreshResult =
 interface ServerProductUnit {
   id: string;
   unitName: string;
-  conversionFactor: number;
+  /**
+   * [FIX] Was previously typed `number`. ProductUnit.conversionFactor is
+   * a Decimal(18,4) column server-side (see schema.prisma) — same
+   * precision class as priceWholesale/priceRetail right below, and the
+   * exact field this whole codebase's Unit Conversion Architecture
+   * treats as precision-critical (see lib/inventory/units.ts). The
+   * server route (/api/inventory/products) now serializes this via
+   * toDisplayUnits(), which always returns a decimal string — never a
+   * native number — matching the actual contract this file must declare.
+   */
+  conversionFactor: string;
   pricingCurrency: "SYP" | "USD";
-  // Expected as a decimal string from the server (e.g. "1234567.8901"),
-  // never a native JS number — a Prisma Decimal converted via Number()
-  // on the server side risks precision loss on large values before it
-  // ever reaches this file. `string` here (not `number | string`) is a
-  // deliberate contract with /api/inventory/products: it must serialize
-  // every monetary field with .toString(), matching /api/customers'
-  // existing convention.
   priceWholesale: string;
   priceRetail: string | null;
   barcode: string | null;

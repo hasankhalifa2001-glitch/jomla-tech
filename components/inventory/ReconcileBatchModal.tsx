@@ -324,7 +324,7 @@ export function ReconcileBatchModal({
               <p className="text-[11px] text-zinc-500">
                 سيتم حساب الفرق تلقائياً وإرساله كتسوية مخزنية
                 {computedDeltaDecimal
-                  ? ` (${computedDeltaDecimal.isPositive() ? "+" : ""}${computedDeltaDecimal.toString()})`
+                  ? ` (${computedDeltaDecimal.greaterThan(0) ? "+" : ""}${computedDeltaDecimal.toString()})`
                   : ""}
                 .
               </p>
@@ -347,7 +347,7 @@ export function ReconcileBatchModal({
                   {projectedQuantityDecimal.toString()} {batch.unitName}
                 </span>
                 <span className="text-[10px] text-zinc-400">
-                  ({computedDeltaDecimal.isPositive() ? "+" : ""}
+                  ({computedDeltaDecimal.greaterThan(0) ? "+" : ""}
                   {computedDeltaDecimal.toString()})
                 </span>
               </div>

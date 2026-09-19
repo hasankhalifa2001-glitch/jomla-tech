@@ -1,6 +1,6 @@
 import Decimal from "decimal.js";
 import { getTenantDb } from "@/lib/db/tenant-scope";
-import type { TenantTransactionClient } from "@/lib/db/tenant-scope";
+import type { TenantTransactionClient, TxOrClient } from "@/lib/db/tenant-scope";
 import { requireBaseUnit } from "@/lib/inventory/base-unit";
 /**
  * lib/inventory/fifo.ts (T3b)
@@ -299,7 +299,7 @@ export async function previewFifoAllocation(
  * the same open transaction the caller locked rows in.
  */
 export async function commitFifoAllocation(
-  tx: TenantTransactionClient,
+  tx: TxOrClient,
   params: CommitFifoParams
 ): Promise<AllocationPlan> {
   const { tenantId, productId, unitId, requestedQty } = params;

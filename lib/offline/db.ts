@@ -21,163 +21,29 @@ export type PaymentMethod =
   | "OTHER";
 
 // ============================================================================
-// CURRENCY MODEL — mirrors schema.prisma's Invoice/CustomerPayment/
-// InvoiceItem models. SYP is the authoritative currency on every offline
-// financial record below. USD fields are purely a derived, informational
-// figure (computed via the record's own frozen exchangeRateUsed/
-// exchangeRate) — never validated against, never gates any action, and
-// never independently supplied by a caller. Every factory function below
-// computes the USD fields itself via convertCurrency from the SYP figure
-// it was actually given, so a caller-supplied USD number can never drift
-// from the SYP number it's supposed to mirror.
+// [FIX — review pass 8, this revision] Two real gaps closed:
 //
-// Both invoice-shaped factories also enforce, at construction time, two
-// authoritative invariants T1's acceptance criteria require at the
-// client-factory layer (not just the sync endpoint / not just a
-// higher-level service function):
-//   1. debtAmountSYP must equal totalSYP − paidAmountSYP.
-//   2. An invoice may reference the system-generated cash customer only
-//      when debtAmountSYP = 0 (T1: "An invoice may reference the
-//      system-generated customer only when debtAmountSYP = 0").
-// Both are what block a malformed invoice from ever being persisted
-// locally, at the earliest possible point — the factory itself, not a
-// caller several layers up that might forget to check.
+//   1. Neither createOfflineInvoiceRecord nor createOfflineVoidRecord ever
+//      checked the SIGN of paidAmountSYP — every other financial field in
+//      this file has an explicit, dedicated sign guard (debtAmountSYP >= 0
+//      on a plain sale, debtAmountSYP <= 0 on a void, amountSYP > 0 on a
+//      payment record), but paidAmountSYP had none. Without it, a caller
+//      could submit e.g. totalSYP=100, paidAmountSYP=-10,
+//      debtAmountSYP=110 — every EXISTING check in this file passes that
+//      combination (110 >= 0 is true; 100 − (−10) = 110 matches the
+//      supplied debtAmountSYP), yet it describes a nonsensical state: a
+//      100 SYP sale somehow generating 110 SYP of debt via a "negative
+//      payment." Fixed by adding an explicit, dedicated guard on
+//      paidAmountSYP in both factories — >= 0 on the plain sale, <= 0 on
+//      the void (mirroring its own negated-sign convention, exactly the
+//      same treatment already applied to debtAmountSYP on each factory).
+//      This also transitively guarantees debtAmountSYP can never exceed
+//      totalSYP on a plain sale (since debtSYP = totalSYP − paidSYP, and
+//      paidSYP >= 0 forces debtSYP <= totalSYP) without needing a
+//      separate explicit check for that.
 //
-// [FIX] createOfflineInvoiceRecord/createOfflineVoidRecord previously only
-// checked that debtAmountSYP was internally consistent with the caller-
-// supplied totalSYP/paidAmountSYP — nothing verified that totalSYP itself
-// actually equalled the sum of the cart's own line items. A caller could
-// pass an arbitrary totalSYP (e.g. a UI bug computing the wrong subtotal)
-// as long as it was self-consistent with paid/debt, and this factory would
-// accept it silently. Both factories now recompute the total from
-// quantity × unitPriceSYP across every item and reject a mismatch.
-//
-// [FIX — review pass 3] The system-customer/zero-debt rule above was
-// previously enforced ONLY in lib/offline/pos-service.ts's
-// submitOfflineSale() — a caller-side check, one layer above this file.
-// createOfflineInvoiceRecord itself had no way to even know whether the
-// customerId/offlineCustomerId it was given belonged to the system
-// customer, so a direct call to this factory (a future feature, a test,
-// T4d's void logic, anything that doesn't route through
-// submitOfflineSale) could construct an invoice violating this rule with
-// nothing here to stop it — the exact same "one enforcement layer instead
-// of two" gap already fixed for the totalSYP-matches-items check above.
-// Both factories now take an explicit `isSystemCustomer` flag and enforce
-// the rule directly, matching the defense-in-depth already applied to
-// every other financial invariant in this file.
-//
-// [FIX — review pass 4] createOfflineVoidRecord previously had no check
-// that the void's own (negated) debtAmountSYP was ever <= 0. Every other
-// financial invariant in this file is enforced directly at the factory
-// rather than trusted from the caller (see the two notes above) — this
-// closes the same class of gap for the void's debt sign. A void only
-// ever reverses debt that was already validated as >= 0 at the original
-// sale's creation (createOfflineInvoiceRecord's own debtSYP < 0 guard),
-// so a positive debtAmountSYP reaching this factory always indicates an
-// upstream bug (e.g. a caller passing an already-negated value through
-// originalDebtAmountSYP by mistake, double-negating it) — this factory no
-// longer trusts that upstream logic is correct and rejects it directly.
-//
-// [FIX — review pass 5] Two gaps closed:
-//   1. createOfflineVoidRecord's isSystemCustomer check previously read
-//      `compareMoney(debtSYP, 0) > 0` — but by that point in the function,
-//      the void-debt-sign guard immediately above it has already
-//      unconditionally rejected any positive debtSYP, regardless of
-//      isSystemCustomer. That made the isSystemCustomer branch dead code:
-//      it could never actually fire, despite its comment claiming to
-//      provide defense-in-depth. The one residual case actually worth
-//      catching — a NEGATIVE debtSYP paired with isSystemCustomer (the
-//      system customer must never carry debt OR credit, not just "no
-//      positive debt") — was not checked by anything. Changed to `!== 0`,
-//      which is both reachable and meaningful.
-//   2. createOfflinePaymentRecord's new invoiceId/offlineInvoiceId fields
-//      had no mutual-exclusivity check, unlike every other paired
-//      offline/synced identifier in this file (customerId/
-//      offlineCustomerId above). A payment record can legitimately
-//      reference neither (an independent repayment) or exactly one (a
-//      sale-time payment tied to either a not-yet-synced local invoice or
-//      an already-synced server one) — never both at once. Added the same
-//      guard pattern already used for customerId/offlineCustomerId.
-//
-// [ADDED — offline credit-sale gate] CachedCustomer.hasPriorInvoices and
-// createCachedCustomerRecord's matching parameter are new in this
-// revision — see CachedCustomer.hasPriorInvoices's own doc comment below
-// for the full reasoning. Consumed by lib/offline/pos-service.ts's
-// submitOfflineSale() to decide whether a customer may be extended
-// offline credit at all.
-//
-// [FIX — review pass 6, closes a real compile/runtime break] pos-service.ts's
-// submitOfflineSale() (T4b) computes `requiresExchangeRate =
-// cartNeedsExchangeRate(payload.items)` and, for a cart composed entirely
-// of SYP-priced units, calls this factory with `exchangeRateUsed:
-// undefined` and `requiresExchangeRate: false` — matching T4b's own
-// acceptance criterion: "checkout blocks only for a USD-priced item with
-// no cached rate, never for SYP-only carts." Neither factory below
-// previously accepted a `requiresExchangeRate` parameter at all, and both
-// UNCONDITIONALLY required `exchangeRateUsed` to serialize to a
-// strictly-positive value — so a SYP-only cart's `exchangeRateUsed:
-// undefined` hit `serializeMoney(undefined)` and threw immediately,
-// failing the exact scenario this whole conditional design exists to
-// support. Fixed by:
-//   1. Adding `requiresExchangeRate?: boolean` to both factories, default
-//      `true` when omitted — this preserves the OLD, stricter behavior
-//      for every existing caller that doesn't pass it explicitly (a rate
-//      is still mandatory unless a caller deliberately opts out).
-//   2. `exchangeRateUsed` is now `MoneyInput | null` (optional) on both
-//      factories. When absent/null AND requiresExchangeRate is false, no
-//      rate is required and every USD-derived field (totalUSD,
-//      paidAmountUSD, debtAmountUSD, each item's unitPriceUSD, and
-//      exchangeRateUsed itself) is stored as `null` — genuinely "no rate
-//      was available or needed," never a fabricated placeholder number.
-//   3. OfflineInvoice.exchangeRateUsed/totalUSD/paidAmountUSD/
-//      debtAmountUSD and OfflineInvoiceItem.unitPriceUSD are now
-//      `string | null` accordingly. This is a TypeScript-level shape
-//      change only — none of these fields are part of any Dexie index key
-//      (see the version(1).stores() indexes below), so this does NOT
-//      require a Dexie version() bump/.upgrade() migration; it only
-//      requires every consumer of these fields (T4c's sync engine, T4f's
-//      receipt rendering, any future ledger/report screen) to handle a
-//      `null` USD figure the same way the UI already must for a live
-//      cart line with no cached rate (T1: "omitted entirely, not shown as
-//      an error").
-//
-// [FIX — review pass 7] Two gaps closed:
-//   1. CachedProductUnit.conversionFactor was a native JS `number`, the
-//      only decimal-precision field on CachedProductUnit/CachedProductBatch
-//      NOT routed through serializeMoney() — every sibling field
-//      (priceWholesale, priceRetail, and CachedProductBatch.quantity,
-//      itself fixed in an earlier pass for exactly this reason) is a
-//      decimal.js-serialized string. This directly undermines v4.0's own
-//      unit-conversion architecture: Product.baseUnitId/ProductUnit.
-//      conversionFactor exist specifically because native-number
-//      arithmetic on conversionFactor caused the "21.9984 pieces" drift
-//      bug server-side — caching it here as a raw `number` reintroduces
-//      that exact risk for any client-side offline conversion computed
-//      from this cache before sync (e.g. converting a POS sale-unit
-//      quantity into the base unit while offline). Fixed: now `string`,
-//      serialized via serializeMoney() in createCachedProductRecord(),
-//      matching every other decimal field in this factory. No Dexie
-//      version bump needed — conversionFactor is nested inside the
-//      non-indexed `units[]` array, not a key in any .stores() index (see
-//      the review-pass-6 note above for the same reasoning applied to the
-//      USD-nullability change).
-//   2. createOfflineVoidRecord's totalSYP-matches-items recomputation was
-//      previously skipped whenever `data.originalTotalSYP` was provided
-//      (`if (data.originalTotalSYP === undefined) { ...check... }`) — but
-//      voiding a real, previously-synced or locally-pending invoice
-//      (i.e. the ordinary, dominant use of this factory) is exactly the
-//      case where a caller WOULD pass originalTotalSYP. That left this
-//      factory's single most important defense-in-depth check disabled
-//      for its single most common call pattern: nothing verified that the
-//      (negated) items array supplied actually corresponds to
-//      originalTotalSYP, only that originalTotalSYP itself got negated
-//      correctly. A caller bug picking the wrong/incomplete item list
-//      alongside a correct originalTotalSYP would sail through
-//      undetected. Fixed: the recomputation now runs unconditionally,
-//      exactly mirroring createOfflineInvoiceRecord's own unconditional
-//      check above — a void's negated items must always sum to its own
-//      (negated) totalSYP, regardless of which path totalSYP itself was
-//      derived through.
+// See all prior review-pass notes preserved below for the full history of
+// this file's defense-in-depth financial-invariant checks.
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -196,9 +62,8 @@ export interface OfflineInvoiceItem {
   unitPriceSYP: string;
   /**
    * Derived/informational — unitPriceSYP converted at exchangeRateUsed.
-   * [FIX — review pass 6] Now nullable: null whenever the parent
-   * invoice's exchangeRateUsed is null (a SYP-only sale that never needed
-   * a rate) — see the file-header FIX note above.
+   * Nullable: null whenever the parent invoice's exchangeRateUsed is null
+   * (a SYP-only sale that never needed a rate).
    */
   unitPriceUSD: string | null;
 }
@@ -212,18 +77,17 @@ export interface OfflineInvoice {
   items: OfflineInvoiceItem[];
   /** AUTHORITATIVE. */
   totalSYP: string;
-  /** Derived/informational. [FIX — review pass 6] Now nullable — see file-header note. */
+  /** Derived/informational. */
   totalUSD: string | null;
-  /** [FIX — review pass 6] Now nullable — null for a SYP-only sale that
-   * never needed a rate to resolve. See the file-header FIX note above. */
+  /** null for a SYP-only sale that never needed a rate to resolve. */
   exchangeRateUsed: string | null;
   /** AUTHORITATIVE. */
   paidAmountSYP: string;
-  /** Derived/informational. [FIX — review pass 6] Now nullable. */
+  /** Derived/informational. */
   paidAmountUSD: string | null;
   /** AUTHORITATIVE. */
   debtAmountSYP: string;
-  /** Derived/informational. [FIX — review pass 6] Now nullable. */
+  /** Derived/informational. */
   debtAmountUSD: string | null;
   paymentMethod?: PaymentMethod;
   voidsOfflineInvoiceId?: string;
@@ -276,17 +140,12 @@ export interface CachedProductUnit {
   id: string;
   unitName: string;
   /**
-   * [FIX — review pass 7] Decimal-serialized string, never a native JS
-   * number — was previously `number`, the sole decimal-precision outlier
-   * on this interface. See the file-header FIX note for why this
-   * directly undermines v4.0's unit-conversion architecture (the whole
-   * point of Product.baseUnitId/ProductUnit.conversionFactor is to
-   * eliminate native-number arithmetic on this exact value). Any
-   * client-side conversion of a sale-unit quantity into the product's
-   * base unit — while offline, before this record ever reaches the
-   * server — must go through the same decimal.js discipline as every
-   * other quantity/price figure in this file, which requires the source
-   * value to already be a decimal-safe string, not a float.
+   * Decimal-serialized string, never a native JS number — mirrors
+   * ProductUnit.conversionFactor's server-side precision. Any client-side
+   * conversion of a sale-unit quantity into the product's base unit —
+   * while offline, before this record ever reaches the server — must go
+   * through the same decimal.js discipline as every other quantity/price
+   * figure in this file.
    */
   conversionFactor: string;
   priceWholesale: string;
@@ -303,8 +162,19 @@ export interface CachedProductBatch {
   batchNumber: string;
   /**
    * Decimal-serialized string, never a native JS number — mirrors
-   * ProductBatch.quantity's Decimal(18,4) precision server-side. See the
-   * matching note on OfflineInvoiceItem.quantity above.
+   * ProductBatch.quantity's Decimal(18,4) precision server-side.
+   *
+   * [NOTE] Under v4.0, ProductBatch.unitId is always the product's
+   * current base unit for any batch created after the base-unit
+   * architecture was adopted — see schema.prisma's ProductBatch.unitId
+   * note. A batch may still reference a NON-base unit only as a legacy
+   * artifact of data created before v4.0 (unitId cannot be rewritten
+   * retroactively by a migration without a full manual audit — see
+   * UNIT-ARCHITECTURE.md §8). getOfflineProducts() below converts via
+   * each batch's own unit's conversionFactor specifically to stay correct
+   * for that legacy case; for any batch created under v4.0, that unit's
+   * conversionFactor is structurally always "1", making the conversion a
+   * no-op.
    */
   quantity: string;
   expiryDate?: string;
@@ -337,26 +207,12 @@ export interface CachedCustomer {
   cachedBalanceDebtUSD?: string;
   isSystemGenerated?: boolean;
   /**
-   * [ADDED — offline credit-sale gate] True when this customer has at
-   * least one Invoice on the server, of any status — i.e. an established,
-   * documented relationship with the merchant, not merely a row that
-   * exists in the customer table. Populated by /api/customers (which
-   * already fetches each customer's invoices to compute
-   * cachedBalanceDebtSYP, so this costs no extra query) and consumed by
+   * True when this customer has at least one Invoice on the server, of
+   * any status — an established, documented relationship with the
+   * merchant. Populated by /api/customers and consumed by
    * lib/offline/pos-service.ts's submitOfflineSale(): an offline credit
    * sale (debtAmountSYP > 0) is only permitted against a customer where
-   * this is true. See pos-service.ts's isEligibleForCredit() for the full
-   * commercial reasoning (credit is extended to known, documented
-   * customers — never to a customer this device cannot yet verify has
-   * ever transacted with the merchant at all, walk-in or otherwise).
-   *
-   * This is a monotonic fact once true (a customer's first invoice
-   * doesn't un-happen), so a stale cached copy can only ever be wrong in
-   * the safe direction: a genuinely-established customer whose very
-   * first invoice hasn't reached this device's cache yet would show
-   * false here and be temporarily blocked from an offline credit sale —
-   * an over-cautious false negative, never an under-cautious false
-   * positive that would incorrectly allow credit.
+   * this is true. See pos-service.ts's isEligibleForCredit().
    *
    * Optional/undefined only for backward compatibility with any
    * previously-cached row written before this field existed; treated as
@@ -402,28 +258,17 @@ export class OfflineDatabase extends Dexie {
       cachedSession: "userId, tenantId, cachedAt",
     });
 
-    // [NOTE — review pass 4] cachedSession currently lives inside
-    // version(1). This is only correct as long as no prior build has ever
-    // shipped to a real device with a version(1) schema that lacked this
-    // table. The moment this offline layer is deployed to even one real
-    // pilot device, ANY further table/field addition — including a future
-    // one, not just this one — must land as a NEW version(N).stores({...})
-    // block with a matching .upgrade() migration, never as an edit to an
-    // already-shipped version(N) block. Dexie will not retroactively
-    // create a table on a device that already opened this database at
-    // version 1 without it.
-    //
-    // [NOTE — review pass 6] This does NOT apply to review pass 6's
-    // OfflineInvoice/OfflineInvoiceItem USD-field nullability change
-    // above, or to review pass 7's CachedProductUnit.conversionFactor
-    // type change — none of those fields are part of any index key in
-    // the stores({...}) call above (only offlineId/tenantId/customerId/
-    // offlineCustomerId/status/createdAt are indexed on offlineInvoices,
-    // and only id/tenantId/isActive on cachedProducts), so Dexie's
-    // physical schema is completely unaffected. Only a change to an
-    // INDEXED key ever requires a version bump; a plain value field's
-    // TypeScript type (or even its presence/absence on a given record) is
-    // something Dexie has never enforced.
+    // Any future table/field addition must land as a NEW
+    // version(N).stores({...}) block with a matching .upgrade()
+    // migration, never as an edit to an already-shipped version(N) block
+    // — Dexie will not retroactively create a table/index on a device
+    // that already opened this database at an earlier version. This does
+    // NOT apply to a plain value field's TypeScript type or nullability
+    // (e.g. OfflineInvoice's USD fields, CachedProductUnit.conversionFactor's
+    // type) as long as that field is not part of any indexed key above —
+    // only offlineId/tenantId/customerId/offlineCustomerId/status/
+    // createdAt are indexed on offlineInvoices, and only id/tenantId/
+    // isActive on cachedProducts.
   }
 }
 
@@ -455,7 +300,26 @@ export async function resetOfflineDbForTests(): Promise<void> {
     const request = indexedDB.deleteDatabase("JomlaTechOffline");
     request.onsuccess = () => resolve();
     request.onerror = () => reject(request.error ?? new Error("Failed to delete offline DB"));
-    request.onblocked = () => resolve();
+    // [FIX — review pass 9] Reject, not resolve, on "blocked." This
+    // function's ENTIRE purpose is guaranteeing a genuinely clean slate
+    // before a test runs — a blocked delete means another open
+    // connection (e.g. a previous test's un-closed instance, or a
+    // leftover browser tab) prevented the database from actually being
+    // removed. Resolving anyway would let a subsequent test silently run
+    // against stale, un-reset state, and any failure it then produces
+    // would have no visible connection back to this function as the real
+    // cause. Failing loud here, with a message naming the actual reason,
+    // surfaces the problem at its source instead of as a mysterious
+    // downstream test failure.
+    request.onblocked = () =>
+      reject(
+        new Error(
+          "resetOfflineDbForTests: deleteDatabase was blocked by another " +
+          "open connection to 'JomlaTechOffline' — close every other tab/" +
+          "instance holding this database open before resetting, or call " +
+          "offlineDbInstance.close() on it first."
+        )
+      );
   });
 }
 
@@ -464,27 +328,7 @@ export function createOfflineInvoiceRecord(data: {
   offlineId?: string;
   customerId?: string;
   offlineCustomerId?: string;
-  /**
-   * [FIX — review pass 3] True when customerId/offlineCustomerId above
-   * refers to the tenant's system-generated "زبون نقدي" customer. The
-   * caller (lib/offline/pos-service.ts's submitOfflineSale, or any future
-   * caller) is responsible for resolving this — this factory has no way
-   * to look the customer up itself — but once told, it enforces T1's rule
-   * directly rather than trusting every caller to have already checked
-   * it upstream. Defaults to false (an ordinary real-customer invoice).
-   */
   isSystemCustomer?: boolean;
-  /**
-   * [ADDED — review pass 6] True when at least one line item was priced
-   * in USD, meaning a real, strictly-positive exchangeRateUsed is
-   * mandatory to resolve it. Defaults to `true` when omitted — this
-   * preserves the OLD, stricter behavior (a rate was always required) for
-   * every existing/future caller that doesn't explicitly pass `false`.
-   * pos-service.ts's submitOfflineSale() computes this via
-   * cartNeedsExchangeRate(payload.items) and passes it through explicitly
-   * — see the file-header FIX note above for the full scenario this
-   * unblocks (a SYP-only cart submitting with no cached rate).
-   */
   requiresExchangeRate?: boolean;
   items: Array<{
     productId: string;
@@ -493,14 +337,6 @@ export function createOfflineInvoiceRecord(data: {
     unitPriceSYP: MoneyInput;
   }>;
   totalSYP: MoneyInput;
-  /**
-   * [FIX — review pass 6] Now optional/nullable. Required to be a real,
-   * strictly-positive value ONLY when requiresExchangeRate is true (the
-   * default). When requiresExchangeRate is explicitly false and this is
-   * omitted/null, every USD-derived field on the resulting record
-   * (totalUSD, paidAmountUSD, debtAmountUSD, each item's unitPriceUSD,
-   * and this field itself) is stored as `null`.
-   */
   exchangeRateUsed?: MoneyInput | null;
   paidAmountSYP: MoneyInput;
   debtAmountSYP: MoneyInput;
@@ -524,8 +360,6 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("An offline invoice must have at least one line item.");
   }
 
-  // Serialize every item's quantity/price through the decimal.js boundary
-  // immediately — quantity is no longer trusted as a native JS number.
   const serializedItems = data.items.map((item) => ({
     productId: item.productId,
     unitId: item.unitId,
@@ -537,10 +371,6 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("Every line item on a sale must have a strictly positive quantity.");
   }
 
-  // [FIX — review pass 6] Conditional exchange-rate requirement — see
-  // this parameter's doc comment and the file-header FIX note above.
-  // requiresExchangeRate defaults to true (old, stricter behavior) unless
-  // a caller explicitly opts out for a cart that never needed a rate.
   const requiresExchangeRate = data.requiresExchangeRate ?? true;
 
   let rateUsed: string | null = null;
@@ -559,6 +389,19 @@ export function createOfflineInvoiceRecord(data: {
   }
 
   const paidSYP = serializeMoney(data.paidAmountSYP);
+
+  // [FIX — review pass 8] paidAmountSYP had no dedicated sign guard,
+  // unlike every other financial field in this file. Without this, e.g.
+  // totalSYP=100, paidAmountSYP=-10, debtAmountSYP=110 passed every
+  // existing check (110 >= 0; 100 − (−10) = 110) despite describing a
+  // nonsensical state — a 100 SYP sale generating 110 SYP of debt via a
+  // negative "payment." This also transitively guarantees debtAmountSYP
+  // can never exceed totalSYP on a plain sale, since debtSYP = totalSYP
+  // − paidSYP and paidSYP >= 0 forces debtSYP <= totalSYP.
+  if (compareMoney(paidSYP, 0) < 0) {
+    throw new Error("paidAmountSYP must not be negative.");
+  }
+
   if (compareMoney(paidSYP, 0) > 0 && !data.paymentMethod) {
     throw new Error("paymentMethod is required whenever paidAmountSYP > 0.");
   }
@@ -575,13 +418,6 @@ export function createOfflineInvoiceRecord(data: {
     );
   }
 
-  // [FIX] T1: "An invoice may reference the system-generated customer
-  // only when debtAmountSYP = 0." Previously only checked one layer up,
-  // in pos-service.ts's submitOfflineSale — see the file-header note.
-  // Enforced here directly so no caller of this factory can bypass it.
-  // (debtSYP is already guaranteed >= 0 by the guard immediately above,
-  // so `> 0` here is equivalent to `!== 0` for this factory — unlike the
-  // void factory below, where debtSYP's valid range is different.)
   if (data.isSystemCustomer && compareMoney(debtSYP, 0) > 0) {
     throw new Error(
       "An invoice cannot reference the system-generated cash customer while " +
@@ -591,8 +427,6 @@ export function createOfflineInvoiceRecord(data: {
 
   const totalSYP = serializeMoney(data.totalSYP);
 
-  // [FIX] totalSYP must actually equal the sum of quantity × unitPriceSYP
-  // across every line item — previously unchecked (see file-header note).
   const computedTotal = sumMoney(
     serializedItems.map((item) => multiplyMoney(item.quantity, item.unitPriceSYP))
   );
@@ -607,9 +441,6 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("debtAmountSYP must equal totalSYP − paidAmountSYP (SYP is authoritative).");
   }
 
-  // [FIX — review pass 6] Every USD-derived figure is now conditional on
-  // rateUsed actually being available — null (never a fabricated number)
-  // when this is a SYP-only sale that opted out via requiresExchangeRate.
   const totalUSD = rateUsed !== null ? convertCurrency(totalSYP, rateUsed, "SYP", "USD") : null;
   const paidAmountUSD =
     rateUsed !== null ? convertCurrency(paidSYP, rateUsed, "SYP", "USD") : null;
@@ -650,27 +481,7 @@ export function createOfflineVoidRecord(data: {
   voidReason: string;
   customerId?: string;
   offlineCustomerId?: string;
-  /**
-   * [FIX — review pass 3] Same flag/rationale as
-   * createOfflineInvoiceRecord above. In ordinary operation a void's
-   * debtAmountSYP is the negation of an original sale's debtAmountSYP
-   * (which was itself already validated as >= 0 at creation, and forced
-   * to exactly 0 whenever isSystemCustomer was true) — so this check
-   * should never actually trigger for a void produced through the normal
-   * flow. It's included anyway for the same defense-in-depth reason as
-   * the totalSYP-matches-items check below: this factory should not rely
-   * on every possible caller having already re-verified an invariant it
-   * can cheaply check itself.
-   */
   isSystemCustomer?: boolean;
-  /**
-   * [ADDED — review pass 6] Mirrors createOfflineInvoiceRecord's own
-   * parameter — a void of a SYP-only original sale never needed a rate
-   * either, and must be voidable without one. Defaults to `true` (old,
-   * stricter behavior) when omitted. A caller voiding an invoice should
-   * pass through whatever the ORIGINAL invoice's own requirement was
-   * (e.g. `originalInvoice.exchangeRateUsed !== null`).
-   */
   requiresExchangeRate?: boolean;
   items: Array<{
     productId: string;
@@ -680,11 +491,6 @@ export function createOfflineVoidRecord(data: {
   }>;
   originalTotalSYP?: MoneyInput;
   totalSYP?: MoneyInput;
-  /**
-   * [FIX — review pass 6] Now optional/nullable — see
-   * createOfflineInvoiceRecord's matching parameter doc comment above for
-   * the full reasoning.
-   */
   exchangeRateUsed?: MoneyInput | null;
   originalPaidAmountSYP?: MoneyInput;
   originalDebtAmountSYP?: MoneyInput;
@@ -730,9 +536,6 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  // [FIX — review pass 6] Same conditional exchange-rate logic as
-  // createOfflineInvoiceRecord — see that function's matching block for
-  // the full reasoning.
   const requiresExchangeRate = data.requiresExchangeRate ?? true;
 
   let rateUsed: string | null = null;
@@ -768,15 +571,22 @@ export function createOfflineVoidRecord(data: {
         ? serializeMoney(data.debtAmountSYP)
         : "0.0000";
 
-  // [FIX — review pass 4] A void only ever reverses debt — its own
-  // debtAmountSYP must never end up positive. The original sale this void
-  // reverses already had its debtAmountSYP validated as >= 0 at creation
-  // (createOfflineInvoiceRecord's own guard above), so after negation this
-  // value should always be <= 0. A positive value reaching this point
-  // means something upstream double-negated, or passed an already-negative
-  // originalDebtAmountSYP by mistake — reject it here directly rather than
-  // trusting the caller got the sign right, matching the defense-in-depth
-  // already applied to every other invariant in this file.
+  // [FIX — review pass 8] Mirrors the debtAmountSYP guard immediately
+  // below: paidAmountSYP on a void record must never end up positive — a
+  // void only ever reverses a previously-collected (non-negative)
+  // payment, never creates a new positive one. The same class of gap as
+  // createOfflineInvoiceRecord's own missing paidAmountSYP sign check
+  // above, just mirrored for the void's negated-sign convention. A
+  // positive value reaching this point means something upstream failed
+  // to negate correctly (or passed an already-negative
+  // originalPaidAmountSYP by mistake, double-negating it).
+  if (compareMoney(paidSYP, 0) > 0) {
+    throw new Error(
+      "paidAmountSYP on a void record must not be positive — a void only ever " +
+      "reverses a previously-collected payment, never creates one."
+    );
+  }
+
   if (compareMoney(debtSYP, 0) > 0) {
     throw new Error(
       "debtAmountSYP on a void record must not be positive — a void only ever " +
@@ -784,14 +594,6 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  // [FIX — review pass 5] Changed from `> 0` to `!== 0`. debtSYP is
-  // already guaranteed <= 0 by the guard immediately above, so a `> 0`
-  // condition here could never actually fire — it was dead code despite
-  // claiming to provide defense-in-depth. The one residual case actually
-  // worth catching is a NEGATIVE debtSYP paired with isSystemCustomer:
-  // the system-generated cash customer must never carry debt OR credit,
-  // not merely "no positive debt" — `!== 0` is both reachable and
-  // actually enforces that.
   if (data.isSystemCustomer && compareMoney(debtSYP, 0) !== 0) {
     throw new Error(
       "A void record cannot reference the system-generated cash customer while " +
@@ -799,18 +601,6 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  // [FIX — review pass 7] Previously wrapped in
-  // `if (data.originalTotalSYP === undefined) { ... }`, which skipped
-  // this check for exactly the DOMINANT real-world call pattern (voiding
-  // an actual invoice, where a caller naturally has and passes
-  // originalTotalSYP). That left the negated items array completely
-  // unverified against originalTotalSYP in the common case — a caller
-  // bug supplying the wrong/incomplete item list alongside a correct
-  // originalTotalSYP would previously pass silently. Now runs
-  // unconditionally, exactly mirroring createOfflineInvoiceRecord's own
-  // unconditional check: a void's negated items must always sum to its
-  // own (negated) totalSYP, regardless of which path totalSYP was
-  // derived through.
   const computedTotal = sumMoney(
     serializedItems.map((item) => multiplyMoney(item.quantity, item.unitPriceSYP))
   );
@@ -827,8 +617,6 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  // [FIX — review pass 6] Conditional on rateUsed, same as
-  // createOfflineInvoiceRecord above.
   const totalUSD = rateUsed !== null ? convertCurrency(totalSYP, rateUsed, "SYP", "USD") : null;
   const paidAmountUSD =
     rateUsed !== null ? convertCurrency(paidSYP, rateUsed, "SYP", "USD") : null;
@@ -891,22 +679,10 @@ export function createOfflinePaymentRecord(data: {
       "Offline payment must reference a customer via either customerId or offlineCustomerId."
     );
   }
-  // [FIX — review pass 5] Same mutual-exclusivity guard as
-  // customerId/offlineCustomerId above, now applied to invoiceId/
-  // offlineInvoiceId. A payment record legitimately references neither
-  // (an independent repayment) or exactly one (a sale-time payment tied
-  // to a not-yet-synced local invoice, or an already-synced server one)
-  // — never both at once.
   if (data.invoiceId && data.offlineInvoiceId) {
     throw new Error("Offline payment cannot have both invoiceId and offlineInvoiceId.");
   }
 
-  // [NOTE] A payment record's own exchangeRate is deliberately left
-  // REQUIRED and non-nullable, unlike the invoice/void factories above.
-  // A repayment is always collected and logged at a real, known moment in
-  // time — it is never assembled from a cart that might contain zero
-  // USD-priced lines — so there is no equivalent "this specific record
-  // never needed a rate" case to accommodate here.
   const rate = serializeMoney(data.exchangeRate);
   if (compareMoney(rate, 0) <= 0) {
     throw new Error("exchangeRate must be strictly greater than 0.");
@@ -976,13 +752,6 @@ export function createCachedProductRecord(data: {
   units: Array<{
     id: string;
     unitName: string;
-    /**
-     * [FIX — review pass 7] Now MoneyInput (string | number | Decimal),
-     * routed through serializeMoney() below like every other
-     * decimal-precision field — was previously a bare `number` passed
-     * through untouched. See CachedProductUnit.conversionFactor's doc
-     * comment above and the file-header FIX note for the full reasoning.
-     */
     conversionFactor: MoneyInput;
     priceWholesale: MoneyInput;
     priceRetail?: MoneyInput;
@@ -1009,17 +778,9 @@ export function createCachedProductRecord(data: {
     name: data.name,
     category: data.category,
     isActive: data.isActive !== false,
-    // pricingCurrency here is a merchant's own per-unit pricing choice —
-    // unrelated to which currency is authoritative for the ledger (SYP).
-    // Two units of the same product can sit in different currencies at
-    // the same time; POS-side code resolves each unit's own price into
-    // the ledger's SYP-primary figures at cart time.
     units: data.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
-      // [FIX — review pass 7] Now routed through serializeMoney(), same
-      // as every other decimal field on this record — was previously
-      // passed through as a raw, unserialized `number`.
       conversionFactor: serializeMoney(u.conversionFactor),
       priceWholesale: serializeMoney(u.priceWholesale),
       priceRetail: u.priceRetail !== undefined ? serializeMoney(u.priceRetail) : undefined,
@@ -1028,10 +789,6 @@ export function createCachedProductRecord(data: {
       barcodeSource: u.barcodeSource,
       isActive: u.isActive,
     })),
-    // [FIX] quantity is now routed through serializeMoney like every other
-    // decimal-precision field in this factory, instead of being passed
-    // through untouched as a raw, unvalidated `number` — see
-    // CachedProductBatch.quantity's doc comment above.
     batches: data.batches.map((b) => ({
       id: b.id,
       unitId: b.unitId,
@@ -1051,10 +808,6 @@ export function createCachedCustomerRecord(data: {
   cachedBalanceDebtSYP: MoneyInput;
   cachedBalanceDebtUSD?: MoneyInput;
   isSystemGenerated?: boolean;
-  /** [ADDED — offline credit-sale gate] See CachedCustomer.hasPriorInvoices's
-   * doc comment above. Defaults to false (no credit) rather than true if
-   * omitted — never assume prior usage that wasn't explicitly confirmed
-   * by the caller. */
   hasPriorInvoices?: boolean;
 }): CachedCustomer {
   if (!data.tenantId || !data.tenantId.trim()) {

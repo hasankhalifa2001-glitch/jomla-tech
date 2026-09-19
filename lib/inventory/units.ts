@@ -9,7 +9,7 @@
 
 import Decimal from "decimal.js";
 import type { ProductUnit } from "@prisma/client";
-import type { TenantTransactionClient } from "@/lib/db/tenant-scope";
+import type { TenantTransactionClient, TxOrClient } from "@/lib/db/tenant-scope";
 
 type DecimalInstance = InstanceType<typeof Decimal>;
 type Numeric = string | number | DecimalInstance;
@@ -74,7 +74,7 @@ export function breakdownForDisplay(
 }
 
 export async function getUnitConversionFactor(
-    tx: TenantTransactionClient,
+    tx: TxOrClient,
     tenantId: string,
     unitId: string
 ): Promise<DecimalInstance> {
@@ -82,7 +82,7 @@ export async function getUnitConversionFactor(
         where: { id: unitId, tenantId },
         select: { conversionFactor: true },
     });
-    return new Decimal(unit.conversionFactor);
+    return new Decimal(unit.conversionFactor.toString());
 }
 
 export function toDisplayUnits(units: ProductUnit[]): DisplayUnit[] {

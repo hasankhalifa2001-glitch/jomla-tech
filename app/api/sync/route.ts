@@ -12,18 +12,53 @@ import { auth } from "@/auth";
 // where/data clause below instead of relying on the extension. This route
 // IS on lib/db.ts's documented raw-client allowlist — see that file's
 // header comment.
+//
+// [FLAGGED — CRITICAL, UNRESOLVED] This rationale is now STALE relative to
+// the current lib/inventory/fifo.ts / lib/inventory/base-unit.ts /
+// lib/inventory/units.ts, which were migrated (in a later revision than
+// this file) to require `TenantTransactionClient` (derived from
+// getTenantDb()'s EXTENDED client) instead of plain `Prisma.TransactionClient`
+// — see fifo.ts's own current signature: `commitFifoAllocation(tx:
+// TenantTransactionClient, ...)`. This route still opens its transaction
+// via raw `prisma.$transaction(async (tx) => {...})`, which produces a
+// plain `Prisma.TransactionClient` — NOT `TenantTransactionClient`. Per
+// products.ts's own documented compile error ("DynamicClientExtensionThis
+// is not assignable to TransactionClient"), the extended type generally
+// does NOT structurally satisfy the raw type; the reverse direction (raw
+// satisfying extended) is equally unconfirmed without seeing
+// lib/db/tenant-scope.ts's actual `TenantTransactionClient` definition.
+// This file now calls requireBaseUnit()/getUnitConversionFactor()/
+// commitFifoAllocation() with this raw `tx` — if `TenantTransactionClient`
+// truly cannot be satisfied by a raw `Prisma.TransactionClient`, this will
+// not compile. Two possible fixes, neither applied here pending
+// confirmation: (a) switch this route to
+// `getTenantDb(tenantId).$transaction(...)`, which then requires
+// tenantScopedRawQuery()/lockBatchesById() below to also accept the
+// extended client type; or (b) widen requireBaseUnit()/
+// getUnitConversionFactor()/commitFifoAllocation() to accept `TxOrClient`
+// (a union covering both), as lib/data/products.ts's read-only functions
+// already do. Resolving this needs lib/db/tenant-scope.ts's current
+// content — flagging rather than guessing.
 // eslint-disable-next-line no-restricted-imports
 import { prisma } from "@/lib/db";
 import { tenantScopedRawQuery } from "@/lib/db/tenant-scope";
 import { commitFifoAllocation } from "@/lib/inventory/fifo";
 import { lockBatchesForFifoAllocations } from "@/lib/inventory/batch-locking";
+// [FIX — v4.0 base-unit conversion was entirely missing from this route]
+// See the large FIX block below, at both the sale-path and void-path
+// sections, for the full explanation. Sole gateways for base-unit
+// resolution and conversionFactor arithmetic — this file must never read
+// `.conversionFactor` off a `tx.productUnit.*` result directly (it
+// previously did, in the now-removed "leftover" fallback block — a real
+// ESLint violation this fix also closes).
+import { requireBaseUnit, MissingBaseUnitError } from "@/lib/inventory/base-unit";
+import { getUnitConversionFactor, toBaseUnit, fromBaseUnit } from "@/lib/inventory/units";
 import {
   compareMoney,
   convertCurrency,
   subtractMoney,
   serializeMoney,
   multiplyMoney,
-  divideMoney,
   sumMoney,
   MoneyError,
 } from "@/lib/utils/money";
@@ -83,22 +118,73 @@ export const dynamic = "force-dynamic";
  * payload outright with "expected number, received string". Changed to
  * `z.coerce.number()`, which parses the incoming decimal string into the
  * JS number every downstream FIFO/quantity calculation in this file
- * already expects (fifo.ts's commitFifoAllocation takes requestedQty as a
- * plain number by design — see that file) — no other logic in this route
- * needed to change as a result.
+ * already expects.
  *
  * [FIX — DOUBLE-ROUNDING PRECISION BUG] fifo.ts's commitFifoAllocation now
  * returns allocatedQty/deductQtyInBatchUnit (and remainingQty) as
- * decimal-serialized STRINGS, not rounded JS numbers — see that file's own
- * FIX note for the full reasoning. Every place below that previously did
- * native JS arithmetic on those fields (Number(...), *, /, Math.abs on a
- * FIFO-derived quantity) now goes through lib/utils/money.ts's decimal.js-
- * backed helpers instead, so a quantity requiring more precision than a
- * clean 4-decimal value (e.g. 2 pieces ÷ a 24-piece carton factor) is
- * rounded to the database column's real 4-decimal limit exactly ONCE, at
- * the point fifo.ts itself produces it — never re-touched by IEEE-754
- * float arithmetic on its way into ProductBatch.quantity's decrement or
- * InvoiceItem.quantity's write.
+ * decimal-serialized STRINGS, not rounded JS numbers. Every place below
+ * that does arithmetic on those fields goes through lib/utils/money.ts's
+ * decimal.js-backed helpers or lib/inventory/units.ts's toBaseUnit()/
+ * fromBaseUnit() instead of native JS `*`/`/`.
+ *
+ * [FIX — v4.0 BASE-UNIT CONVERSION WAS ENTIRELY MISSING — the critical fix
+ * in this revision] Neither the sale path nor the void path in the
+ * previous version of this file resolved or converted anything against
+ * the product's base unit. Concretely, three real bugs:
+ *
+ *   1. SALE PATH: `commitFifoAllocation()` was called with `unitId:
+ *      item.unitId` — the unit the CASHIER selected at the register (e.g.
+ *      "طرد") — and `requestedQty: item.quantity`, the raw quantity in
+ *      THAT unit, completely unconverted. But per T1's Unit Conversion
+ *      Architecture (and fifo.ts's own `assertUnitIsBaseUnit()` guard,
+ *      confirmed in this file's current signature), `commitFifoAllocation`
+ *      now REQUIRES `unitId` to be the product's actual base unit and
+ *      `requestedQty` to already be expressed in it — a mismatch throws
+ *      `Unit mismatch: ...` immediately. This meant EVERY sale of a
+ *      non-base-unit item (the ordinary case for most wholesale sales)
+ *      would fail sync outright.
+ *
+ *   2. SALE PATH — the "insufficient stock" leftover-conversion block
+ *      previously read `.conversionFactor` directly off two
+ *      `tx.productUnit.findFirst(...)` results — a real ESLint violation
+ *      (PRODUCT_MODEL_RULES / CONVERSION_FACTOR_RULES ban this file from
+ *      naming that field; this route has no per-file exemption for it,
+ *      unlike products/route.ts). It also manually re-derived a
+ *      conversion this file has no business performing itself.
+ *
+ *   3. VOID PATH: `batchAdjustments` restored `Math.abs(it.quantity)`
+ *      directly onto `ProductBatch.quantity` — but `it.quantity` is in
+ *      the SOLD unit (per InvoiceItem.quantity's own documented meaning:
+ *      "e.g. 3 meaning 3 طرد"), while `ProductBatch.quantity` is ALWAYS in
+ *      the base unit. Voiding a 3-طرد sale (= 72 قطعة at a factor of 24)
+ *      restored only 3 قطعة instead of 72 — silently corrupting stock on
+ *      every void of a non-base-unit sale.
+ *
+ * FIX, applied consistently to both paths, using the corrected T4c/T5
+ * pattern already established elsewhere in this codebase (batch-creation
+ * route, T5's B2B approval): two separate lookups, never conflated —
+ *   (a) requireBaseUnit(tx, tenantId, productId) — resolves the REAL base
+ *       unit, used only to know which unitId ProductBatch/FIFO is scoped
+ *       under. Never a source of a conversion factor (it's always 1).
+ *   (b) getUnitConversionFactor(tx, tenantId, unitId) — resolves the
+ *       SOLD/ORDERED unit's OWN factor, fetched fresh from the database
+ *       for the unitId actually on the item — never trusted from the
+ *       client payload, never taken from (a).
+ * `toBaseUnit()` converts a sold-unit quantity into base units before it
+ * ever reaches commitFifoAllocation or a ProductBatch decrement/increment.
+ * `fromBaseUnit()` converts each FIFO allocation (necessarily in base
+ * units, since fifo.ts only ever operates in base units — see that file's
+ * own CORRECTION NOTE) back into the SOLD unit for InvoiceItem.quantity,
+ * per schema.prisma's own InvoiceItem.unitId/quantity comments: "Quantity
+ * SOLD, expressed in unitId... NOT automatically the same number as how
+ * much was deducted from ProductBatch.quantity... batchQuantityDeducted =
+ * quantity × unitId.conversionFactor." A sale split across multiple
+ * batches therefore legitimately produces a FRACTIONAL sold-unit quantity
+ * on one or more of its InvoiceItem rows (e.g. 50 قطعة of a 72-قطعة, 3-طرد
+ * sale drawn from one batch becomes "50 ÷ 24 = 2.0833 طرد" on that row) —
+ * this is not a rounding bug, it is the schema's own documented design for
+ * a multi-batch split, and InvoiceItem.quantity's Decimal(18,4) column
+ * exists precisely to hold it exactly.
  */
 
 // ============================================================================
@@ -508,8 +594,10 @@ export async function POST(req: NextRequest) {
           }
 
           // Recomputes totalSYP independently from the line items
-          // (unitPriceSYP × quantity) and requires it to match what the
-          // client claims — AUTHORITATIVE.
+          // (unitPriceSYP × quantity, in the SOLD unit — totals were
+          // always computed on sold-unit quantities, unaffected by the
+          // base-unit conversion fix below) and requires it to match what
+          // the client claims — AUTHORITATIVE.
           const isVoidForTotalCheck = Boolean(inv.voidsOfflineInvoiceId);
           const computedItemsTotalSYP = sumMoney(
             inv.items.map((item) => multiplyMoney(Math.abs(item.quantity), item.unitPriceSYP))
@@ -550,6 +638,11 @@ export async function POST(req: NextRequest) {
 
             const targetCustomerId = originalInvoice.customerId;
 
+            // matchedItems.quantity stays in the ORIGINAL SOLD unit
+            // (voidItem.unitId) — mirrors InvoiceItem.quantity's own
+            // documented meaning ("quantity SOLD, expressed in unitId").
+            // No base-unit conversion happens here; it happens below,
+            // only for the ProductBatch restoration itself.
             const matchedItems = inv.items.map((voidItem) => {
               if (!voidItem.batchId) {
                 throw new Error(
@@ -598,10 +691,22 @@ export async function POST(req: NextRequest) {
               };
             });
 
-            const batchAdjustments = matchedItems.map((it) => ({
-              batchId: it.batchId,
-              qtyToRestore: Math.abs(it.quantity),
-            }));
+            // [FIX — v4.0 base-unit conversion, void path] Previously
+            // restored `Math.abs(it.quantity)` — the SOLD-unit quantity —
+            // directly onto ProductBatch.quantity, which is ALWAYS in the
+            // base unit. Voiding a 3-طرد sale (factor 24 -> 72 قطعة)
+            // restored only 3 instead of 72. Fixed: each restoration is
+            // now converted via toBaseUnit(), using the item's own SOLD
+            // unit's conversionFactor (fetched fresh via
+            // getUnitConversionFactor() — never assumed, never read
+            // directly off a Prisma relation in this file's own source).
+            const batchAdjustments = await Promise.all(
+              matchedItems.map(async (it) => {
+                const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, it.unitId);
+                const qtyToRestore = toBaseUnit(Math.abs(it.quantity), soldUnitFactor).toFixed(4);
+                return { batchId: it.batchId, qtyToRestore };
+              })
+            );
 
             await lockBatchesById(tx, tenantId, batchAdjustments.map((b) => b.batchId));
 
@@ -636,6 +741,8 @@ export async function POST(req: NextRequest) {
                   productId: item.productId,
                   unitId: item.unitId,
                   batchId: item.batchId,
+                  // Still the SOLD-unit quantity — InvoiceItem.quantity
+                  // never changes meaning, void or not.
                   quantity: item.quantity,
                   unitPriceSYP: item.unitPriceSYP,
                   unitPriceUSD: item.unitPriceUSD,
@@ -646,6 +753,9 @@ export async function POST(req: NextRequest) {
             for (const adj of batchAdjustments) {
               await tx.productBatch.update({
                 where: { id: adj.batchId, tenantId },
+                // [FIX] qtyToRestore is already base-unit, decimal-string
+                // — the exact figure that mirrors what was originally
+                // decremented at sale time.
                 data: { quantity: { increment: adj.qtyToRestore } },
               });
             }
@@ -672,20 +782,18 @@ export async function POST(req: NextRequest) {
             );
           }
 
-          // [FIX — precision] Both quantity fields are now decimal-
-          // serialized STRINGS, matching fifo.ts's own output type — see
-          // that file's FIX note. Never re-wrapped in Number(...)
-          // anywhere below; every arithmetic operation on them (the
-          // negative-stock conversion fallback) uses lib/utils/money.ts's
-          // decimal.js-backed helpers.
           interface ResolvedAllocation {
             productId: string;
-            unitId: string;
+            unitId: string; // Always the SOLD unit — see below.
             batchId: string;
             unitPriceSYP: string;
             unitPriceUSD: string;
-            allocatedQtyInRequestedUnit: string;
-            deductQtyInBatchUnit: string;
+            // InvoiceItem.quantity — in the SOLD unit, possibly
+            // fractional on a multi-batch split (see file-header FIX
+            // note on why this is the correct, documented design).
+            quantitySold: string;
+            // ProductBatch decrement — always base-unit.
+            deductQtyInBaseUnit: string;
           }
 
           const resolvedAllocations: ResolvedAllocation[] = [];
@@ -698,11 +806,34 @@ export async function POST(req: NextRequest) {
           );
 
           for (const item of inv.items) {
+            // [FIX — v4.0 base-unit conversion, sale path] Two separate
+            // lookups, never conflated — see file-header note above.
+            let baseUnit;
+            try {
+              baseUnit = await requireBaseUnit(tx, tenantId, item.productId);
+            } catch (e) {
+              if (e instanceof MissingBaseUnitError) {
+                throw new Error(
+                  `المنتج ${item.productId} بدون وحدة أساسية محددة (بيانات قديمة تحتاج ` +
+                  "تصحيح) — الرجاء التواصل مع الدعم الفني."
+                );
+              }
+              throw e;
+            }
+
+            // The SOLD unit's own factor — fetched fresh from the DB via
+            // item.unitId, never assumed to be 1, never taken from
+            // baseUnit above.
+            const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, item.unitId);
+            const baseQtyRequested = toBaseUnit(item.quantity, soldUnitFactor);
+
             const resolution = await commitFifoAllocation(tx, {
               tenantId,
               productId: item.productId,
-              unitId: item.unitId,
-              requestedQty: item.quantity,
+              // ProductBatch/FIFO always operates against the BASE unit —
+              // never the unit the cashier actually sold in.
+              unitId: baseUnit.id,
+              requestedQty: baseQtyRequested.toString(),
             });
 
             if (resolution.allocations.length === 0) {
@@ -720,47 +851,37 @@ export async function POST(req: NextRequest) {
             );
 
             for (const alloc of resolution.allocations) {
+              // [FIX] Each base-unit allocation is converted BACK into
+              // the sold unit for InvoiceItem.quantity — per
+              // schema.prisma's own InvoiceItem comment: quantity is
+              // always "what the customer actually bought," and a
+              // multi-batch split legitimately produces a fractional
+              // sold-unit figure on one or more rows. The actual
+              // ProductBatch decrement (deductQtyInBaseUnit) stays in
+              // base units, exactly as fifo.ts already computed it — no
+              // further conversion needed there.
+              const soldQtyForAlloc = fromBaseUnit(alloc.allocatedQty, soldUnitFactor);
               resolvedAllocations.push({
                 productId: item.productId,
                 unitId: item.unitId,
                 batchId: alloc.batchId,
                 unitPriceSYP: serializeMoney(item.unitPriceSYP),
                 unitPriceUSD: itemUnitPriceUSD,
-                // [FIX — precision] alloc.allocatedQty / .deductQtyInBatchUnit
-                // are already decimal-serialized strings from fifo.ts —
-                // passed through directly, never Number()-wrapped.
-                allocatedQtyInRequestedUnit: alloc.allocatedQty,
-                deductQtyInBatchUnit: alloc.deductQtyInBatchUnit,
+                quantitySold: soldQtyForAlloc.toFixed(4),
+                deductQtyInBaseUnit: alloc.allocatedQty,
               });
             }
 
-            // [FIX — precision] resolution.remainingQty is a string now —
-            // compared via compareMoney, never coerced to number first.
+            // Insufficient stock: the unallocated remainder is drawn
+            // against the LAST batch anyway, allowed to go negative (see
+            // T1's ProductBatch.quantity note: "can legitimately go
+            // negative — flagged for reconciliation"). remainingQty is
+            // already base-unit (fifo.ts's own output) — no further
+            // conversion needed for the ProductBatch side; only the
+            // InvoiceItem-facing sold-unit figure needs fromBaseUnit().
             if (!resolution.isSufficient && compareMoney(resolution.remainingQty, 0) > 0) {
               const last = resolution.allocations[resolution.allocations.length - 1];
-
-              const [requestedUnitRecord, batchUnitRecord] = await Promise.all([
-                tx.productUnit.findFirst({
-                  where: { id: item.unitId, productId: item.productId, tenantId },
-                  select: { conversionFactor: true },
-                }),
-                tx.productUnit.findFirst({
-                  where: { id: last.batchUnitId, tenantId },
-                  select: { conversionFactor: true },
-                }),
-              ]);
-
-              // [FIX — precision] Converts the leftover requested-unit
-              // quantity into the last batch's own unit using
-              // lib/utils/money.ts's decimal.js-backed multiplyMoney/
-              // divideMoney — the exact same conversion fifo.ts itself
-              // performs internally, kept in string/Decimal form the
-              // entire way instead of round-tripping through native JS
-              // `*`/`/` on floats.
-              const requestedFactor = requestedUnitRecord?.conversionFactor?.toString() ?? "1";
-              const batchFactor = batchUnitRecord?.conversionFactor?.toString() ?? "1";
-              const remainingInBaseUnits = multiplyMoney(resolution.remainingQty, requestedFactor);
-              const remainingDeductInBatchUnit = divideMoney(remainingInBaseUnits, batchFactor);
+              const remainingSoldQty = fromBaseUnit(resolution.remainingQty, soldUnitFactor);
 
               resolvedAllocations.push({
                 productId: item.productId,
@@ -768,8 +889,8 @@ export async function POST(req: NextRequest) {
                 batchId: last.batchId,
                 unitPriceSYP: serializeMoney(item.unitPriceSYP),
                 unitPriceUSD: itemUnitPriceUSD,
-                allocatedQtyInRequestedUnit: resolution.remainingQty,
-                deductQtyInBatchUnit: remainingDeductInBatchUnit,
+                quantitySold: remainingSoldQty.toFixed(4),
+                deductQtyInBaseUnit: resolution.remainingQty,
               });
             }
           }
@@ -803,10 +924,8 @@ export async function POST(req: NextRequest) {
                 productId: alloc.productId,
                 unitId: alloc.unitId,
                 batchId: alloc.batchId,
-                // [FIX — precision] Prisma's Decimal columns accept a
-                // decimal string directly — no native-number conversion
-                // needed or wanted here.
-                quantity: alloc.allocatedQtyInRequestedUnit,
+                // [FIX] Sold-unit quantity — never the base-unit figure.
+                quantity: alloc.quantitySold,
                 unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
               },
@@ -816,11 +935,9 @@ export async function POST(req: NextRequest) {
           for (const alloc of resolvedAllocations) {
             await tx.productBatch.update({
               where: { id: alloc.batchId, tenantId },
-              // [FIX — precision] `decrement` accepts a decimal string
-              // directly — this is the single point the fully-precise
-              // deduction value actually reaches the database, with no
-              // intervening float arithmetic.
-              data: { quantity: { decrement: alloc.deductQtyInBatchUnit } },
+              // [FIX] Base-unit quantity — the exact figure fifo.ts (or
+              // the remainder branch above) computed, never re-derived.
+              data: { quantity: { decrement: alloc.deductQtyInBaseUnit } },
             });
           }
 

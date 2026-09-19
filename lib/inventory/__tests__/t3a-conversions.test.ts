@@ -1,111 +1,117 @@
 import { describe, it, expect } from "vitest";
 import Decimal from "decimal.js";
 import {
-  convertUnitQuantity,
-  convertUnitCost,
-  calculateBatchDeductions,
+  toBaseUnit,
+  fromBaseUnit,
   validatePackagingUnits,
-} from "../packaging-unit-validation";
+  isReservedBaseUnitFactor,
+  assertIsValidBaseUnitFactor,
+} from "../units";
 
-// [FIX — TypeScript build error] Same root cause as documented atop
-// conversions.ts: decimal.js's own namespace-merged `Decimal` type does
-// not resolve under this project's Next.js 16 + Turbopack
-// "moduleResolution": "bundler" config — `import Decimal from "decimal.js"`
-// only carries the VALUE binding here, so using the bare `Decimal` class
-// name AS A TYPE fails with TS2749. `Decimal` still works fine as a VALUE
-// (e.g. inside the imported functions). Fixed by deriving a local
-// `DecimalInstance` type alias from `typeof Decimal`, which TypeScript can
-// always compute regardless of whether the value's own type name resolves.
+// [FIX — full rewrite] The previous version of this file tested
+// convertUnitQuantity/convertUnitCost/calculateBatchDeductions from the
+// now-deleted lib/inventory/packaging-unit-validation.ts — functions that
+// assumed a ProductBatch could be tracked in ANY packaging unit and
+// therefore needed a generic "convert between any two units" primitive.
+// That is exactly the pre-v4.0 design MASTER-SPEC v4.0 replaced (T1's
+// Rejected Approach #10): under v4.0, ProductBatch.unitId is ALWAYS the
+// product's base unit, so there is no longer a generic
+// unit-A-to-unit-B conversion anywhere in the codebase — only ONE
+// sanctioned direction each way:
+//   - toBaseUnit(quantityInSoldUnit, soldUnitConversionFactor) — sale/
+//     order/adjustment quantity -> base unit, the only thing ever passed
+//     to commitFifoAllocation() or written to ProductBatch.quantity /
+//     StockAdjustment.quantityDelta.
+//   - fromBaseUnit(quantityInBaseUnit, targetUnitConversionFactor) —
+//     DISPLAY ONLY, the reverse direction (e.g. breakdownForDisplay()'s
+//     "2 packs and 24 pieces" style output).
+// Both live in lib/inventory/units.ts now (this file's actual subject),
+// which also absorbed validatePackagingUnits() from the deleted
+// packaging-unit-validation.ts (see units.ts's own header, FIX #3).
+//
+// convertUnitCost() and calculateBatchDeductions() have no v4.0
+// equivalent at all — a batch's unit is always the base unit by
+// construction, so "cost per unit conversion" and "how much gets
+// deducted from the batch's own unit vs. the requested unit" are no
+// longer separate questions; toBaseUnit()'s single output IS the batch
+// deduction. Their test cases are not ported forward for that reason —
+// there is nothing left in the current codebase for them to test.
 type DecimalInstance = InstanceType<typeof Decimal>;
 
-// All conversion functions return Decimal instances, never native numbers
-// (per T1's decimal.js mandate) — compare via .toNumber() for readability
-// in these tests, or .equals() when checking against another Decimal.
 const num = (d: DecimalInstance) => d.toNumber();
 
-describe("T3a Packaging Unit Conversion Engine", () => {
-  describe("convertUnitQuantity", () => {
-    it("converts cartons to pieces correctly (factor 12 -> 1)", () => {
-      // 2 cartons of 12 = 24 pieces
-      expect(num(convertUnitQuantity(2, 12, 1))).toBe(24);
+describe("T1/T3a/T3b Unit Conversion Engine (v4.0)", () => {
+  describe("toBaseUnit", () => {
+    it("converts a sale/order quantity in a non-base unit into the base unit (factor 12)", () => {
+      // 2 cartons (factor 12) = 24 base units (pieces)
+      expect(num(toBaseUnit(2, 12))).toBe(24);
     });
 
-    it("converts pieces to cartons correctly (factor 1 -> 12)", () => {
-      // 24 pieces = 2 cartons
-      expect(num(convertUnitQuantity(24, 1, 12))).toBe(2);
+    it("returns the same quantity when the sold unit IS the base unit (factor 1)", () => {
+      expect(num(toBaseUnit(5, 1))).toBe(5);
     });
 
-    it("converts between non-base units correctly (factor 24 box -> factor 6 pack)", () => {
-      // 1 box of 24 pieces = 4 packs of 6 pieces
-      expect(num(convertUnitQuantity(1, 24, 6))).toBe(4);
+    it("handles a fractional conversion factor (e.g. selling half a carton)", () => {
+      // 1 half-carton (factor 0.5, relative to a single piece) = 0.5 base units
+      expect(num(toBaseUnit(1, 0.5))).toBe(0.5);
     });
 
     it("handles zero quantity gracefully", () => {
-      expect(num(convertUnitQuantity(0, 12, 1))).toBe(0);
+      expect(num(toBaseUnit(0, 12))).toBe(0);
     });
 
-    it("throws error for non-positive conversion factors", () => {
-      expect(() => convertUnitQuantity(10, 0, 1)).toThrow();
-      expect(() => convertUnitQuantity(10, 1, -5)).toThrow();
-    });
-  });
-
-  describe("convertUnitCost", () => {
-    it("calculates cost per piece given cost per carton", () => {
-      // 1 carton (12 pcs) costs $120 -> 1 piece costs $10
-      expect(num(convertUnitCost(120, 12, 1))).toBe(10);
-    });
-
-    it("calculates cost per box given cost per piece", () => {
-      // 1 piece costs $5 -> 1 box (24 pcs) costs $120
-      expect(num(convertUnitCost(5, 1, 24))).toBe(120);
-    });
-
-    it("calculates cost between packaging units", () => {
-      // 1 pack (6 pcs) costs $30 -> 1 box (24 pcs) costs $120
-      expect(num(convertUnitCost(30, 6, 24))).toBe(120);
-    });
-
-    it("throws error for invalid conversion factor", () => {
-      expect(() => convertUnitCost(50, -1, 10)).toThrow();
+    it("supports decimal-string inputs without precision loss", () => {
+      // A quantity/factor pair that would lose precision under native
+      // JS float math is preserved exactly via decimal.js.
+      expect(toBaseUnit("2.5", "3.3").toString()).toBe("8.25");
     });
   });
 
-  describe("calculateBatchDeductions", () => {
-    it("calculates deductions when batch unit matches requested unit", () => {
-      const res = calculateBatchDeductions(5, 1, 1);
-      expect(num(res.allocatedInRequestedUnit)).toBe(5);
-      expect(num(res.deductedInBatchUnit)).toBe(5);
-      expect(num(res.quantityInBaseUnit)).toBe(5);
+  describe("fromBaseUnit", () => {
+    it("converts a base-unit quantity into a display unit (factor 12)", () => {
+      // 24 base units (pieces) = 2 cartons of 12
+      expect(num(fromBaseUnit(24, 12))).toBe(2);
     });
 
-    it("calculates deductions when requested unit is larger than batch unit", () => {
-      // Selling 2 cartons (factor 12) from batch stocked in pieces (factor 1)
-      const res = calculateBatchDeductions(2, 12, 1);
-      expect(num(res.allocatedInRequestedUnit)).toBe(2);
-      expect(num(res.deductedInBatchUnit)).toBe(24);
-      expect(num(res.quantityInBaseUnit)).toBe(24);
+    it("returns the same quantity when the target unit IS the base unit (factor 1)", () => {
+      expect(num(fromBaseUnit(7, 1))).toBe(7);
     });
 
-    it("calculates deductions when requested unit is smaller than batch unit", () => {
-      // Selling 12 pieces (factor 1) from batch stocked in cartons (factor 12)
-      const res = calculateBatchDeductions(12, 1, 12);
-      expect(num(res.allocatedInRequestedUnit)).toBe(12);
-      expect(num(res.deductedInBatchUnit)).toBe(1);
-      expect(num(res.quantityInBaseUnit)).toBe(12);
+    it("is the exact inverse of toBaseUnit for the same factor", () => {
+      const factor = 24;
+      const original = new Decimal(3);
+      const roundTripped = fromBaseUnit(toBaseUnit(original, factor), factor);
+      expect(roundTripped.equals(original)).toBe(true);
+    });
+  });
+
+  describe("isReservedBaseUnitFactor / assertIsValidBaseUnitFactor", () => {
+    it("recognizes exactly 1 as the reserved base-unit factor", () => {
+      expect(isReservedBaseUnitFactor(1)).toBe(true);
+      expect(isReservedBaseUnitFactor("1")).toBe(true);
+      expect(isReservedBaseUnitFactor("1.0")).toBe(true);
     });
 
-    it("rejects zero or negative quantities", () => {
-      expect(() => calculateBatchDeductions(0, 1, 1)).toThrow();
-      expect(() => calculateBatchDeductions(-3, 1, 1)).toThrow();
+    it("rejects any factor other than exactly 1", () => {
+      expect(isReservedBaseUnitFactor(12)).toBe(false);
+      expect(isReservedBaseUnitFactor(0.5)).toBe(false);
+    });
+
+    it("assertIsValidBaseUnitFactor does not throw for exactly 1", () => {
+      expect(() => assertIsValidBaseUnitFactor(1)).not.toThrow();
+    });
+
+    it("assertIsValidBaseUnitFactor throws for anything other than 1", () => {
+      expect(() => assertIsValidBaseUnitFactor(12)).toThrow();
+      expect(() => assertIsValidBaseUnitFactor(0)).toThrow();
     });
   });
 
   describe("validatePackagingUnits", () => {
     // NOTE: validatePackagingUnits only returns { valid, error? } — it does
     // NOT return a `baseUnit` field. The confirmed rule set (see the
-    // VALIDATION SCOPE NOTE atop conversions.ts) is exactly five rules;
-    // these tests check only those five and do not assert on a `baseUnit`
+    // VALIDATION SCOPE NOTE atop units.ts) is exactly five rules; these
+    // tests check only those five and do not assert on a `baseUnit`
     // property that doesn't exist in the implementation.
 
     it("validates valid base + secondary + tertiary packaging setup", () => {
@@ -129,9 +135,9 @@ describe("T3a Packaging Unit Conversion Engine", () => {
       expect(result.error).toContain("يجب تحديد وحدة أساسية واحدة بمعامل تحويل يساوي 1");
     });
 
-    // NOTE ON IMPLEMENTATION BEHAVIOR: conversions.ts checks for a
-    // duplicate conversionFactor *inside* the same loop that counts base
-    // units, and the duplicate-factor check fires before the post-loop
+    // NOTE ON IMPLEMENTATION BEHAVIOR: units.ts checks for a duplicate
+    // conversionFactor *inside* the same loop that counts base units, and
+    // the duplicate-factor check fires before the post-loop
     // baseUnitCount > 1 check ever runs. Since two units can only both
     // have conversionFactor === 1 by definition sharing the same
     // normalized factorKey ("1"), the duplicate-factor branch always
@@ -207,12 +213,12 @@ describe("T3a Packaging Unit Conversion Engine", () => {
 });
 
 // NOT ported from the original test file: "fails on duplicate unit name".
-// The confirmed VALIDATION SCOPE NOTE in conversions.ts lists exactly five
+// The confirmed VALIDATION SCOPE NOTE in units.ts lists exactly five
 // rules and explicitly warns against adding further constraints "without
 // explicit confirmation." Duplicate-unit-name rejection is not one of the
 // five, and the current implementation only tracks duplicate conversion
 // factors, not duplicate names (two units named "قطعة" with different
 // factors currently pass validation). If a duplicate-name rule is actually
 // wanted, that needs to be confirmed as a real business decision first —
-// then conversions.ts's five-rule list, its scope note, and this test file
+// then units.ts's five-rule list, its scope note, and this test file
 // should all be updated together, not just the test.

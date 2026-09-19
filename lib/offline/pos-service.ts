@@ -105,6 +105,35 @@
  *      on a paidAmountSYP === 0 sale; this normalization makes that
  *      invariant hold here regardless of what the UI passed in.
  *
+ * [FIX — review pass 9, this revision] Two gaps closed:
+ *   1. CartLineItem.conversionFactor was typed `number` — the only
+ *      Decimal-precision field in this entire file (and one of the very
+ *      few anywhere in the codebase) not typed as a decimal-serialized
+ *      string. Every sibling field on this exact interface
+ *      (unitPriceSYP), every field on OfflineInvoiceItem (db.ts), and the
+ *      source this value is ultimately read from
+ *      (CachedProductUnit.conversionFactor, also db.ts) are all `string`.
+ *      A `number` field here would force whichever UI code populates
+ *      CartLineItem to either round-trip a precise decimal string through
+ *      `Number(...)` (reintroducing exactly the float-precision risk T1's
+ *      decimal.js-everywhere rule exists to close) or fail to compile
+ *      against CachedProductUnit's own string type. Fixed to `string`,
+ *      consistent with every other quantity/factor-shaped field in this
+ *      codebase.
+ *   2. seedSampleOfflineData()'s prod-1 sample data has one batch
+ *      (batch-1-2) recorded against a NON-base unit (unit-1-2, factor
+ *      10) while every other sample product's batches are recorded
+ *      against their base unit only. This is consistent with — and
+ *      appears to deliberately exercise — the "legacy pre-v4.0 batch"
+ *      conversion path documented on CachedProductBatch.quantity (db.ts)
+ *      and implemented in getOfflineProducts() below, but nothing marked
+ *      it as intentional. Left the data itself unchanged (rewriting it
+ *      would silently remove the only seed-data coverage of that
+ *      conversion path) and added an explicit comment at the call site so
+ *      a future reader — or a well-meaning "cleanup" — doesn't either
+ *      assume it's a mistake and normalize it away, or assume every
+ *      product's batches always land on the base unit and copy that
+ *      pattern elsewhere without the same justification.
  */
 
 import {
@@ -170,7 +199,15 @@ export interface CartLineItem {
   product: CachedProduct;
   unitId: string;
   unitName: string;
-  conversionFactor: number;
+  /**
+   * [FIX — review pass 9] Decimal-serialized string, never a native JS
+   * number — was previously typed `number`, the only Decimal-precision
+   * field on this interface (and one of very few anywhere in the
+   * codebase) that wasn't. Mirrors CachedProductUnit.conversionFactor's
+   * own string type (db.ts) — this value should be read straight from
+   * that field, never coerced through Number(...) on the way in.
+   */
+  conversionFactor: string;
   quantity: number;
   // [v3.6] AUTHORITATIVE.
   unitPriceSYP: string;
@@ -1102,6 +1139,19 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         ],
         batches: [
           { id: "batch-1-1", unitId: "unit-1-1", batchNumber: "B2026-01", quantity: 150, expiryDate: "2027-01-01" },
+          // [FIX — review pass 9] Deliberately recorded against a
+          // NON-base unit ("شوال 10 كغ", factor 10) — every other sample
+          // product's batches in this seed set are recorded against their
+          // base unit only. This is intentional demo coverage of the
+          // "legacy pre-v4.0 batch" path documented on
+          // CachedProductBatch.quantity (db.ts) and implemented in
+          // getOfflineProducts() above (converts via this unit's own
+          // conversionFactor before summing into totalCachedStock). Do
+          // NOT "normalize" this to unit-1-1 during a cleanup pass — doing
+          // so would silently remove the only seed-data exercise of that
+          // conversion path. If you need an additional product whose
+          // batches ALL land on the base unit (the ordinary v4.0 case),
+          // add a new one rather than changing this entry.
           { id: "batch-1-2", unitId: "unit-1-2", batchNumber: "B2026-02", quantity: 40, expiryDate: "2027-06-01" },
         ],
       }),
