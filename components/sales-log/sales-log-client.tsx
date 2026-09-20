@@ -49,6 +49,20 @@
  * no extra render, no one-frame flicker of stale "not loading" UI. While a
  * new request is in flight the previous rows stay on screen.
  *
+ * [FIX — do not wipe good data on a failed reload] Re-walking is a single
+ * request per "load more"/refresh, so a transient failure on ANY page of the
+ * walk (including a later page, after earlier pages in the SAME walk already
+ * succeeded server-side) used to blank the entire table via
+ * `setResult({ items: [], ... })` in the .catch handler — a user who had 75
+ * rows on screen from three successful pages could see the screen go empty
+ * because page four's request hiccuped. The .catch handler now folds the
+ * failure into the PREVIOUS successful result instead of discarding it:
+ * `rows`/`nextCursor` keep showing the last good data, `loading` still
+ * clears (the key still updates), and the toast alone communicates the
+ * failure. Only a first-ever load (no previous result yet) can show an
+ * empty state after an error, which is correct — there's nothing to
+ * preserve yet.
+ *
  * [v4.2 — customerName filter] A free-text, debounced partial match
  * against the invoice's linked Customer.name — see lib/data/invoices.ts
  * for the relational `contains`/`insensitive` filter this maps to
@@ -274,7 +288,25 @@ export function SalesLogClient() {
             })
             .catch((error: unknown) => {
                 if (cancelled) return;
-                setResult({ key: requestKey, items: [], nextCursor: null });
+                // [FIX] Fold the failure into the PREVIOUS successful
+                // result instead of discarding it. Re-walking means one
+                // fetch failure can occur after several earlier pages in
+                // the SAME walk already succeeded server-side — wiping
+                // `items` here used to blank a table that had, say, 75
+                // correctly-loaded rows on screen a moment ago, just
+                // because a later page's request hiccuped. Keeping the
+                // last good `items`/`nextCursor` (falling back to empty
+                // only when there truly is no previous result yet, i.e.
+                // the very first load) means a transient error degrades
+                // to "stale-but-visible data + an error toast" instead of
+                // "the screen goes empty". `key` still advances to the
+                // current requestKey so `loading` correctly clears either
+                // way — the user is never stuck on a spinner.
+                setResult((prev) => ({
+                    key: requestKey,
+                    items: prev?.items ?? [],
+                    nextCursor: prev?.nextCursor ?? null,
+                }));
                 toast.error(error instanceof Error ? error.message : "تعذّر جلب سجل الفواتير.");
             });
 
