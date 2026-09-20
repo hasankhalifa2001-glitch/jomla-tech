@@ -39,7 +39,6 @@ import { auth } from "@/auth";
 // (a union covering both), as lib/data/products.ts's read-only functions
 // already do. Resolving this needs lib/db/tenant-scope.ts's current
 // content — flagging rather than guessing.
-// eslint-disable-next-line no-restricted-imports
 import { prisma } from "@/lib/db";
 import { tenantScopedRawQuery } from "@/lib/db/tenant-scope";
 import { commitFifoAllocation } from "@/lib/inventory/fifo";
@@ -632,56 +631,99 @@ export async function POST(req: NextRequest) {
             if (alreadyVoided) {
               throw new Error("تم إلغاء هذه الفاتورة مسبقاً عبر مزامنة أخرى.");
             }
-            if (originalInvoice.items.length !== inv.items.length) {
-              throw new Error("عدد بنود الإلغاء لا يطابق عدد بنود الفاتورة الأصلية.");
+
+            // [FIX — offline void, batchId dependency removed] The device that
+            // creates an offline void has NO WAY to know which specific batchId
+            // an original sale item drew from — batch allocation only happens
+            // server-side, at sync time, via commitFifoAllocation. The old
+            // "items.length must match" + "match on batchId" logic therefore
+            // rejected EVERY offline void unconditionally, and additionally could
+            // never handle a sale that FIFO-split across more than one batch (one
+            // cart line → multiple InvoiceItem rows server-side).
+            //
+            // Fixed: match on (productId, unitId) instead — information the
+            // offline device DOES have, straight from its own cart. Every
+            // original InvoiceItem row sharing the same (productId, unitId) is
+            // grouped together; the void is validated against the GROUP's total
+            // quantity and price, not against any single row's batchId. The
+            // group's own batch breakdown (batchId + quantity per batch, exactly
+            // as FIFO originally split it) is then reused to distribute the
+            // restoration — the void device never needs to supply or know any
+            // batchId at all.
+            interface OriginalBatchPortion {
+              batchId: string;
+              quantity: string; // sold-unit quantity originally drawn from this batch
+              unitPriceSYP: string;
+            }
+            interface OriginalGroup {
+              batches: OriginalBatchPortion[];
+              totalQuantity: string; // sum of the above, sold-unit
             }
 
-            const targetCustomerId = originalInvoice.customerId;
+            const originalByProductUnit = new Map<string, OriginalGroup>();
+            for (const item of originalInvoice.items) {
+              const key = `${item.productId}::${item.unitId}`;
+              const group = originalByProductUnit.get(key) ?? { batches: [], totalQuantity: "0" };
+              group.batches.push({
+                batchId: item.batchId,
+                quantity: item.quantity.toString(),
+                unitPriceSYP: item.unitPriceSYP.toString(),
+              });
+              group.totalQuantity = sumMoney([group.totalQuantity, item.quantity.toString()]);
+              originalByProductUnit.set(key, group);
+            }
 
-            // matchedItems.quantity stays in the ORIGINAL SOLD unit
-            // (voidItem.unitId) — mirrors InvoiceItem.quantity's own
-            // documented meaning ("quantity SOLD, expressed in unitId").
-            // No base-unit conversion happens here; it happens below,
-            // only for the ProductBatch restoration itself.
-            const matchedItems = inv.items.map((voidItem) => {
-              if (!voidItem.batchId) {
-                throw new Error(
-                  `عنصر الإلغاء (${voidItem.productId}/${voidItem.unitId}) بلا batchId — ` +
-                  "يجب أن يرسل التطبيق batchId الأصلي مع كل عنصر إلغاء."
-                );
-              }
-              const originalItem = originalInvoice.items.find(
-                (oi) =>
-                  oi.batchId === voidItem.batchId &&
-                  oi.productId === voidItem.productId &&
-                  oi.unitId === voidItem.unitId
+            // Every (productId, unitId) group on the original invoice must be
+            // fully accounted for by the void payload — a void is always a
+            // complete reversal of the whole sale, never partial (a partial
+            // correction is a CustomerPayment, per T4d). This replaces the old
+            // items.length check, which compared raw row counts and broke the
+            // moment a sale had been FIFO-split.
+            if (originalByProductUnit.size !== inv.items.length) {
+              throw new Error(
+                "عدد عناصر الإلغاء لا يطابق عدد المنتجات/الوحدات المختلفة بالفاتورة الأصلية."
               );
-              if (!originalItem) {
+            }
+
+            const matchedGroups = inv.items.map((voidItem) => {
+              const key = `${voidItem.productId}::${voidItem.unitId}`;
+              const group = originalByProductUnit.get(key);
+              if (!group) {
                 throw new Error(
-                  `batchId المرسل لعنصر الإلغاء (${voidItem.batchId}) لا يطابق أي بند بالفاتورة الأصلية.`
+                  `المنتج/الوحدة (${voidItem.productId}/${voidItem.unitId}) لا يطابق أي بند بالفاتورة الأصلية.`
                 );
               }
+
+              // Price must match every batch portion in the group — in practice
+              // always the same price per (productId, unitId) on one invoice.
+              const priceMismatch = group.batches.some(
+                (b) =>
+                  compareMoney(serializeMoney(voidItem.unitPriceSYP), serializeMoney(b.unitPriceSYP)) !== 0
+              );
+              if (priceMismatch) {
+                throw new Error(
+                  `سعر عنصر الإلغاء (${voidItem.unitPriceSYP}) لا يطابق السعر الأصلي لـ ` +
+                  `${voidItem.productId}/${voidItem.unitId}.`
+                );
+              }
+
+              // Quantity must match the GROUP'S TOTAL, not any single row —
+              // this is what makes a multi-batch-split sale voidable at all.
               if (
-                compareMoney(
-                  serializeMoney(Math.abs(voidItem.quantity)),
-                  serializeMoney(originalItem.quantity.toString())
-                ) !== 0
+                compareMoney(serializeMoney(Math.abs(voidItem.quantity)), group.totalQuantity) !== 0
               ) {
                 throw new Error(
-                  `كمية عنصر الإلغاء (${Math.abs(voidItem.quantity)}) لا تطابق الكمية الأصلية ` +
-                  `(${originalItem.quantity.toString()}) — الإلغاء يجب أن يكون استرجاعاً كاملاً، ` +
-                  "أي تصحيح جزئي يُسجَّل كدفعة (CustomerPayment) بدلاً من إلغاء."
+                  `كمية عنصر الإلغاء (${Math.abs(voidItem.quantity)}) لا تطابق الكمية الإجمالية الأصلية ` +
+                  `(${group.totalQuantity}) لـ ${voidItem.productId}/${voidItem.unitId} — الإلغاء يجب ` +
+                  "أن يكون استرجاعاً كاملاً، أي تصحيح جزئي يُسجَّل كدفعة (CustomerPayment) بدلاً من إلغاء."
                 );
               }
+
               return {
                 productId: voidItem.productId,
                 unitId: voidItem.unitId,
-                batchId: voidItem.batchId,
-                quantity: voidItem.quantity,
+                group,
                 unitPriceSYP: serializeMoney(voidItem.unitPriceSYP),
-                // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS]
-                // Computed from unitPriceSYP + the resolved
-                // exchangeRateUsed — never trusted from the payload.
                 unitPriceUSD: convertCurrency(
                   serializeMoney(voidItem.unitPriceSYP),
                   exchangeRateUsed,
@@ -691,22 +733,41 @@ export async function POST(req: NextRequest) {
               };
             });
 
-            // [FIX — v4.0 base-unit conversion, void path] Previously
-            // restored `Math.abs(it.quantity)` — the SOLD-unit quantity —
-            // directly onto ProductBatch.quantity, which is ALWAYS in the
-            // base unit. Voiding a 3-طرد sale (factor 24 -> 72 قطعة)
-            // restored only 3 instead of 72. Fixed: each restoration is
-            // now converted via toBaseUnit(), using the item's own SOLD
-            // unit's conversionFactor (fetched fresh via
-            // getUnitConversionFactor() — never assumed, never read
-            // directly off a Prisma relation in this file's own source).
-            const batchAdjustments = await Promise.all(
-              matchedItems.map(async (it) => {
-                const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, it.unitId);
-                const qtyToRestore = toBaseUnit(Math.abs(it.quantity), soldUnitFactor).toFixed(4);
-                return { batchId: it.batchId, qtyToRestore };
-              })
-            );
+            const expectedVoidTotalSYP = subtractMoney("0", originalInvoice.totalSYP.toString());
+            const expectedVoidPaidSYP = subtractMoney("0", originalInvoice.paidAmountSYP.toString());
+            const expectedVoidDebtSYP = subtractMoney("0", originalInvoice.debtAmountSYP.toString());
+
+            if (compareMoney(totalSYP, expectedVoidTotalSYP) !== 0) {
+              throw new Error(
+                `إجمالي فاتورة الإلغاء (${totalSYP}) لا يساوي سالب إجمالي الفاتورة الأصلية (${expectedVoidTotalSYP}).`
+              );
+            }
+            if (compareMoney(paidSYP, expectedVoidPaidSYP) !== 0) {
+              throw new Error(
+                `المبلغ المدفوع بفاتورة الإلغاء (${paidSYP}) لا يساوي سالب المبلغ المدفوع بالفاتورة الأصلية (${expectedVoidPaidSYP}).`
+              );
+            }
+            if (compareMoney(debtSYP, expectedVoidDebtSYP) !== 0) {
+              throw new Error(
+                `قيمة الدين بفاتورة الإلغاء (${debtSYP}) لا تساوي سالب قيمة الدين بالفاتورة الأصلية (${expectedVoidDebtSYP}).`
+              );
+            }
+
+            const targetCustomerId = originalInvoice.customerId;
+
+            // [FIX — v4.0 base-unit conversion, void path, per-batch] Each batch
+            // portion in each group is restored individually, in the SAME split
+            // it was originally deducted in — never merged into one lump sum
+            // against a single arbitrary batch. This preserves FIFO history
+            // exactly: batch A gets back exactly what batch A gave up.
+            const batchAdjustments: Array<{ batchId: string; qtyToRestore: string }> = [];
+            for (const matched of matchedGroups) {
+              const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, matched.unitId);
+              for (const portion of matched.group.batches) {
+                const qtyToRestore = toBaseUnit(portion.quantity, soldUnitFactor).toFixed(4);
+                batchAdjustments.push({ batchId: portion.batchId, qtyToRestore });
+              }
+            }
 
             await lockBatchesById(tx, tenantId, batchAdjustments.map((b) => b.batchId));
 
@@ -722,7 +783,7 @@ export async function POST(req: NextRequest) {
                 paidAmountUSD: paidUSD,
                 debtAmountSYP: debtSYP,
                 debtAmountUSD: debtUSD,
-                isPaid: true,
+                isPaid: originalInvoice.isPaid,
                 status: InvoiceStatus.VOIDED,
                 offlineId: inv.offlineId,
                 syncedAt: new Date(),
@@ -733,29 +794,32 @@ export async function POST(req: NextRequest) {
               select: { id: true },
             });
 
-            for (const item of matchedItems) {
-              await tx.invoiceItem.create({
-                data: {
-                  tenantId,
-                  invoiceId: voidInvoice.id,
-                  productId: item.productId,
-                  unitId: item.unitId,
-                  batchId: item.batchId,
-                  // Still the SOLD-unit quantity — InvoiceItem.quantity
-                  // never changes meaning, void or not.
-                  quantity: item.quantity,
-                  unitPriceSYP: item.unitPriceSYP,
-                  unitPriceUSD: item.unitPriceUSD,
-                },
-              });
+            // [FIX] One InvoiceItem per ORIGINAL BATCH PORTION, not one per
+            // void-payload item — mirrors exactly how the original sale itself
+            // was recorded (one row per batch a FIFO-split sale drew from).
+            for (const matched of matchedGroups) {
+              for (const portion of matched.group.batches) {
+                await tx.invoiceItem.create({
+                  data: {
+                    tenantId,
+                    invoiceId: voidInvoice.id,
+                    productId: matched.productId,
+                    unitId: matched.unitId,
+                    batchId: portion.batchId,
+                    // Negated sold-unit quantity for THIS specific batch portion —
+                    // never the group total — so this void row mirrors the
+                    // original row it reverses exactly.
+                    quantity: subtractMoney("0", portion.quantity),
+                    unitPriceSYP: matched.unitPriceSYP,
+                    unitPriceUSD: matched.unitPriceUSD,
+                  },
+                });
+              }
             }
 
             for (const adj of batchAdjustments) {
               await tx.productBatch.update({
                 where: { id: adj.batchId, tenantId },
-                // [FIX] qtyToRestore is already base-unit, decimal-string
-                // — the exact figure that mirrors what was originally
-                // decremented at sale time.
                 data: { quantity: { increment: adj.qtyToRestore } },
               });
             }

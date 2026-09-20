@@ -102,7 +102,7 @@ const WHERE_SCOPED_WRITE_OPS = new Set([
  * lowercase (and fails to be found) unless quoted.
  */
 export async function tenantScopedRawQuery<T>(
-  tx: Prisma.TransactionClient,
+  tx: TxOrClient,
   tenantId: string,
   buildQuery: (tenantCondition: Prisma.Sql) => Prisma.Sql
 ): Promise<T> {
