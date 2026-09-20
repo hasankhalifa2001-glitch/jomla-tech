@@ -160,15 +160,24 @@ export async function POST(req: Request) {
       const voidInvoice = await tx.invoice.create({
         data: {
           tenantId,
+          // [FIX — pre-existing type error, runtime-identical] These six
+          // figures arrive as Prisma's own Decimal instances, and
+          // @types/decimal.js types the decimal.js constructor's parameter as
+          // `string | number | decimal.js.Decimal` — a structurally different
+          // class from Prisma's, so passing the instance straight in failed
+          // `next build`'s type-check (7 errors: these six + the item
+          // quantity below). `.toString()` preserves the exact value and is
+          // what every other call site in this codebase already does
+          // (e.g. lib/data/invoices.ts). No runtime behaviour change.
           userId: adminUserId,
           customerId: originalInvoice.customerId,
-          totalSYP: new Decimal(originalInvoice.totalSYP).negated().toString(),
-          totalUSD: new Decimal(originalInvoice.totalUSD).negated().toString(),
+          totalSYP: new Decimal(originalInvoice.totalSYP.toString()).negated().toString(),
+          totalUSD: new Decimal(originalInvoice.totalUSD.toString()).negated().toString(),
           exchangeRateUsed: originalInvoice.exchangeRateUsed,
-          paidAmountSYP: new Decimal(originalInvoice.paidAmountSYP).negated().toString(),
-          paidAmountUSD: new Decimal(originalInvoice.paidAmountUSD).negated().toString(),
-          debtAmountSYP: new Decimal(originalInvoice.debtAmountSYP).negated().toString(),
-          debtAmountUSD: new Decimal(originalInvoice.debtAmountUSD).negated().toString(),
+          paidAmountSYP: new Decimal(originalInvoice.paidAmountSYP.toString()).negated().toString(),
+          paidAmountUSD: new Decimal(originalInvoice.paidAmountUSD.toString()).negated().toString(),
+          debtAmountSYP: new Decimal(originalInvoice.debtAmountSYP.toString()).negated().toString(),
+          debtAmountUSD: new Decimal(originalInvoice.debtAmountUSD.toString()).negated().toString(),
           isPaid: originalInvoice.isPaid,
           status: "VOIDED",
           isSynced: true,
@@ -192,7 +201,7 @@ export async function POST(req: Request) {
             productId: item.productId,
             unitId: item.unitId,
             batchId: item.batchId,
-            quantity: new Decimal(item.quantity).negated().toString(),
+            quantity: new Decimal(item.quantity.toString()).negated().toString(),
             unitPriceSYP: item.unitPriceSYP,
             unitPriceUSD: item.unitPriceUSD,
           },

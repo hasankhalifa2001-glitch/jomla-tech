@@ -13,11 +13,15 @@ import { listInvoicesForTenant, type PaymentStatusBadge } from "@/lib/data/invoi
 /**
  * T4c2 — GET /api/invoices
  *
- * Distinct from the already-existing POST /api/invoices/void (T4d) — this
- * is a new, read-only, tenant-wide listing route. Read-only: does NOT call
- * assertTenantWritable(), since a PENDING/EXPIRED tenant is locked out of
- * WRITES (T2b's API-mutation layer), not reads — a merchant mid-renewal
- * should still be able to see what they already sold.
+ * [CORRECTED — stale cross-reference] This used to describe T4d's void
+ * endpoint as "POST /api/invoices/void". No such route exists (or ever
+ * did) — T4d's implementation is POST /api/ledger/voids (see
+ * app/api/ledger/voids/route.ts), which is also what T4c2's UI void
+ * button calls. This file is only the read-only listing route.
+ *
+ * Read-only: does NOT call assertTenantWritable(), since a PENDING/EXPIRED
+ * tenant is locked out of WRITES (T2b's API-mutation layer), not reads — a
+ * merchant mid-renewal should still be able to see what they already sold.
  *
  * [ROLE SCOPING — done BEFORE the Prisma query is built, never after]
  * Per T2b's Role Capability Matrix extension for T4c2:

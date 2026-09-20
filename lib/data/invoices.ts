@@ -1,4 +1,28 @@
-// lib/data/invoices.ts
+/**
+ * lib/data/invoices.ts
+ *
+ * T4c2 — Sales/Invoice History Log data-access layer. Mirrors
+ * lib/data/products.ts's own convention: pure tenant-scoped reads here,
+ * role/permission decisions stay in the route handlers that call this
+ * file (see app/api/invoices/route.ts and app/api/invoices/[id]/route.ts).
+ *
+ * No schema change. Reads exclusively through the caller-supplied
+ * tenant-scoped `db` (never a raw client) against the existing
+ * (tenantId, createdAt) composite index on Invoice — no new index
+ * required.
+ *
+ * NEVER reads .conversionFactor off any ProductUnit relation — this
+ * screen only ever needs a unit's display name, so `unit` is
+ * select-narrowed to { unitName } wherever an InvoiceItem's unit is
+ * joined. See lib/inventory/units.ts's header for why that field has
+ * exactly one sanctioned call site, which this file is not.
+ *
+ * Monetary comparisons (deriving the payment-status badge) go through
+ * lib/utils/money.ts's compareMoney() — never raw decimal.js or native
+ * number comparison — per that file's own scope note that every
+ * SYP/USD comparison in the codebase must go through it.
+ */
+
 import type { InvoiceStatus, Prisma } from "@prisma/client";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
 import { compareMoney } from "@/lib/utils/money";
@@ -15,7 +39,7 @@ export interface InvoiceLogFilters {
     from: Date;
     to: Date;
     status?: InvoiceStatus;
-    /** [NEW] Has no DB column — see the note above listInvoicesForTenant. */
+    /** Has no DB column — see the note above listInvoicesForTenant. */
     paymentStatus?: PaymentStatusBadge;
     userId?: string;
     cursor?: string;
@@ -142,14 +166,28 @@ export async function listInvoicesForTenant(
             break;
         }
 
-        cursor = batch[batch.length - 1].id;
-
+        // [FIX — real bug] Previously moved `cursor` to the batch's last
+        // row BEFORE scanning it, while the scan loop below could `break`
+        // partway through the batch once enough matches were collected.
+        // Any row after that early break — but still within this same,
+        // already-fetched batch — was silently skipped from `collected`
+        // AND never revisited, because `cursor` had already jumped past
+        // it. A matching invoice sitting later in a large batch than
+        // wherever the limit happened to be reached could vanish from
+        // every page with no error, no warning, nothing — the exact
+        // opposite of this function's own "never silently drop or
+        // duplicate rows" guarantee.
+        //
+        // Fixed: scan the ENTIRE fetched batch every round, with no early
+        // break, and only advance `cursor` to the batch's last row AFTER
+        // that full scan completes. `cursor` now only ever points past
+        // rows that have actually been examined.
         for (const row of batch) {
             if (derivePaymentStatus(row.totalSYP.toString(), row.paidAmountSYP.toString()) === filters.paymentStatus) {
                 collected.push(row);
             }
-            if (collected.length >= filters.limit + 1) break;
         }
+        cursor = batch[batch.length - 1].id;
 
         if (batch.length < batchSize) exhausted = true;
         if (collected.length >= filters.limit + 1 || exhausted) break;
@@ -175,7 +213,17 @@ export async function listInvoicesForTenant(
 }
 
 // ---------------------------------------------------------------------
-// findInvoiceDetail — unchanged from the version already reviewed/approved.
+// findInvoiceDetail
+//
+// [CHANGED — T4c2 cross-link completeness] Now also resolves
+// `originalInvoiceUserId`: the userId of the ORIGINAL invoice a void row
+// reverses (null on a non-void row). The earlier revision declared the field
+// on InvoiceDetail but never selected or populated it, which both failed the
+// type-check and left a real hole: a void row's own userId is always the
+// voiding ADMIN (T4d), so a CASHIER clicking the "أُلغيت بـ ..." cross-link on
+// their OWN sale would be rejected by GET /api/invoices/[id]'s ownership
+// check — making T4c2's "navigable from either side" guarantee false for
+// exactly the user most likely to need it.
 // ---------------------------------------------------------------------
 export interface InvoiceDetailItem {
     id: string;
@@ -204,6 +252,16 @@ export interface InvoiceDetail {
     voidsInvoiceId: string | null;
     voidedByInvoiceId: string | null;
     userId: string;
+    /**
+     * Populated only when this row IS a void (voidsInvoiceId is
+     * non-null): the userId of the ORIGINAL invoice being reversed —
+     * the cashier/admin who made the sale, not the admin who executed
+     * the void. A void row's own `userId` is always the voiding ADMIN
+     * (T4d), never the original seller — without this, the void is
+     * unreachable for the cashier whose own sale it reverses, breaking
+     * T4c2's "navigable from either side" cross-link guarantee.
+     */
+    originalInvoiceUserId: string | null;
     user: { id: string; name: string };
     customer: { id: string; name: string; phone: string | null };
     items: InvoiceDetailItem[];
@@ -220,7 +278,13 @@ export async function findInvoiceDetail(
             id: true, createdAt: true, status: true, totalSYP: true, totalUSD: true,
             exchangeRateUsed: true, paidAmountSYP: true, paidAmountUSD: true,
             debtAmountSYP: true, debtAmountUSD: true, voidReason: true, voidsInvoiceId: true,
+            // Only its userId is ever needed — see originalInvoiceUserId on
+            // InvoiceDetail for why this relation is resolved at all.
+            voidsInvoice: { select: { userId: true } },
             voidedBy: { select: { id: true } },
+            // [NEW] Only the userId of the invoice THIS row voids, if
+            // any — a single scalar field, resolved in the same query,
+            // no extra round-trip.
             userId: true,
             user: { select: { id: true, name: true } },
             customer: { select: { id: true, name: true, phone: true } },
@@ -250,6 +314,8 @@ export async function findInvoiceDetail(
         voidReason: invoice.voidReason,
         voidsInvoiceId: invoice.voidsInvoiceId,
         voidedByInvoiceId: invoice.voidedBy?.id ?? null,
+        // [NEW]
+        originalInvoiceUserId: invoice.voidsInvoice?.userId ?? null,
         userId: invoice.userId,
         user: invoice.user,
         customer: invoice.customer,

@@ -18,6 +18,7 @@ import {
     Package,
     BookOpen,
     Receipt,
+    ScrollText,
     Settings,
     Users,
     ChevronRight,
@@ -38,6 +39,13 @@ const navItems = [
     { href: "/dashboard", label: "الرئيسية", icon: LayoutDashboard, adminOnly: true },
     { href: "/pos", label: "نقطة البيع", icon: ShoppingCart },
     { href: "/inventory", label: "المخزون", icon: Package },
+    // [ADDED — T4c2] The sales/invoice history log. Deliberately NOT
+    // adminOnly: T2b's Role Capability Matrix grants BOTH roles full
+    // read-only access here, with a CASHIER's view scoped server-side to
+    // their own invoices (GET /api/invoices forces userId = session.user.id)
+    // and the "filter by staff member" control being ADMIN-only inside the
+    // screen itself.
+    { href: "/dashboard/sales-log", label: "سجل المبيعات", icon: ScrollText },
     { href: "/ledger", label: "دفتر الديون", icon: BookOpen },
     { href: "/orders", label: "الطلبات", icon: Receipt },
     { href: "/settings/staff", label: "طاقم العمل", icon: Users, adminOnly: true },
