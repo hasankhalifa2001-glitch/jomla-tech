@@ -15,7 +15,13 @@ export type AppAction =
   | "ledger:view_failed_sync"
   | "orders:view"
   | "orders:manage"
-  | "settings:manage";
+  | "settings:manage"
+  // [ADDED — T4c2] /dashboard/sales-log — an ADMIN filtering the invoice
+  // log by a staff member OTHER than themselves. Not needed for: an ADMIN
+  // viewing the unfiltered (all-staff) log, or any CASHIER request — a
+  // CASHIER is always scoped to their own invoices directly in
+  // app/api/invoices/route.ts, before this permission is ever checked.
+  | "sales_log:view_all_staff";
 
 /**
  * Single authoritative statement of CASHIER vs ADMIN access across every screen/action in the system.
@@ -84,6 +90,12 @@ export const ROLE_CAPABILITY_MATRIX: Record<AppAction, Record<UserRole, boolean>
   },
   // /dashboard/settings, /settings/billing, /settings/staff, daily exchange rate
   "settings:manage": {
+    ADMIN: true,
+    CASHIER: false,
+  },
+  // [ADDED — T4c2] /dashboard/sales-log — filtering the tenant-wide
+  // invoice log by a staff member other than yourself.
+  "sales_log:view_all_staff": {
     ADMIN: true,
     CASHIER: false,
   },

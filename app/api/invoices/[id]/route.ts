@@ -1,0 +1,64 @@
+import { NextResponse } from "next/server";
+import { auth } from "@/auth";
+import { getTenantDb } from "@/lib/db/tenant-scope";
+import { findInvoiceDetail } from "@/lib/data/invoices";
+
+/**
+ * T4c2 — GET /api/invoices/[id]
+ *
+ * Distinct from POST /api/invoices/void (T4d) — read-only detail view,
+ * listing every InvoiceItem on the invoice (product, unit, quantity,
+ * price). The single place in the system this level of per-line detail
+ * is shown outside T4f's printed/shared receipt.
+ *
+ * [SECURITY — deliberately re-checked here, not just at the list level]
+ * A CASHIER's list request (GET /api/invoices) is already scoped
+ * server-side to their own userId, but that scoping says nothing about
+ * a CASHIER opening an invoice id directly (typed/guessed/shared link) —
+ * this route re-derives and re-checks ownership independently, exactly
+ * the same defensive posture lib/data/products.ts's
+ * assertProductBelongsToTenant() takes for tenant scoping (never rely
+ * solely on an upstream filter having already excluded the row).
+ */
+
+export async function GET(
+    _req: Request,
+    { params }: { params: { id: string } }
+) {
+    const session = await auth();
+    if (!session?.user?.tenantId || !session.user.id) {
+        return NextResponse.json(
+            { error: "UNAUTHORIZED", message: "يرجى تسجيل الدخول أولاً." },
+            { status: 401 }
+        );
+    }
+
+    const tenantId = session.user.tenantId;
+    const db = getTenantDb(tenantId);
+
+    try {
+        const invoice = await findInvoiceDetail(db, tenantId, params.id);
+
+        if (!invoice) {
+            return NextResponse.json(
+                { error: "NOT_FOUND", message: "الفاتورة غير موجودة." },
+                { status: 404 }
+            );
+        }
+
+        if (session.user.role === "CASHIER" && invoice.userId !== session.user.id) {
+            return NextResponse.json(
+                { error: "FORBIDDEN", message: "لا يمكنك عرض فاتورة موظف آخر." },
+                { status: 403 }
+            );
+        }
+
+        return NextResponse.json({ success: true, invoice });
+    } catch (error) {
+        console.error("Error fetching invoice detail:", error);
+        return NextResponse.json(
+            { error: "SERVER_ERROR", message: "حدث خطأ أثناء جلب تفاصيل الفاتورة." },
+            { status: 500 }
+        );
+    }
+}

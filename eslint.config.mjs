@@ -257,6 +257,24 @@ const eslintConfig = defineConfig([
     },
   },
   {
+    // lib/data/invoices.ts — the allowlisted data-access gateway itself.
+    // Model-level ban lifted (this IS the gateway). Every other
+    // restriction stays fully active. baseUnitId/isBaseUnitOf also stays
+    // fully banned — this file only ever touches it indirectly, via
+    // base-unit.ts's commitBaseUnitLink()/toSafeProductWithUnits().
+    files: ["lib/data/invoices.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        QUERY_RAW_RULE,
+        NESTED_WRITE_RULE,
+        ...BASE_UNIT_ID_RULES,
+        ...CONVERSION_FACTOR_RULES,
+        // Model-level ban lifted (this IS the sanctioned gateway file).
+      ],
+    },
+  },
+  {
     // Route-layer DTO files that legitimately name 'conversionFactor' as
     // a Zod schema field, a JSON response field, or pass it through as a
     // plain argument to toBaseUnit()/createAdditionalUnit() — never read
