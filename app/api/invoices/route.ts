@@ -8,7 +8,7 @@ import {
     ForbiddenRoleError,
     forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
-import { listInvoicesForTenant } from "@/lib/data/invoices";
+import { listInvoicesForTenant, type PaymentStatusBadge } from "@/lib/data/invoices";
 
 /**
  * T4c2 — GET /api/invoices
@@ -28,16 +28,15 @@ import { listInvoicesForTenant } from "@/lib/data/invoices";
  * client sent in `?userId=` — the query param is discarded outright for a
  * CASHIER, never merely validated-then-trusted.
  *
- * [NOTE — role-matrix.ts addition needed] This route calls
- * assertRolePermission(role, "sales_log:view_all_staff") for the one case
- * that needs a NEW permission key (an ADMIN explicitly filtering by another
- * staff member's id) — add that key to lib/auth/role-matrix.ts's permission
- * map (ADMIN: true, CASHIER: false), following the same shape as the
- * existing "ledger:void_invoice" / "inventory:mutate" keys. Every OTHER
- * check in this route (an ADMIN with no ?userId= filter, or any CASHIER
- * request) needs no permission lookup at all — a CASHIER is always
- * automatically scoped to their own invoices without ever touching
- * role-matrix.ts.
+ * [paymentStatus filter — NEW] Has no DB column: CASH_FULL/CREDIT_FULL/
+ * PARTIAL is derived by comparing paidAmountSYP against totalSYP, and
+ * Prisma cannot express a field-to-field comparison in `where` without
+ * raw SQL — which T1 restricts to one sanctioned call site elsewhere in
+ * the codebase (T4c's batch lock). listInvoicesForTenant() handles this
+ * by scanning DB pages in application code until a full result page is
+ * assembled or the table is exhausted (see lib/data/invoices.ts for the
+ * full rationale and the scan-cap safety valve). This route only
+ * validates and forwards the value — no filtering logic lives here.
  *
  * [KNOWN SIMPLIFICATION — flagged, not yet resolved] "Today" (the default
  * date range when `from`/`to` are omitted) is computed in UTC day
@@ -58,6 +57,8 @@ const querySchema = z.object({
     from: z.coerce.date().optional(),
     to: z.coerce.date().optional(),
     status: z.enum(["COMPLETED", "PENDING_REVIEW", "VOIDED", "ALL"]).default("ALL"),
+    // [NEW]
+    paymentStatus: z.enum(["CASH_FULL", "CREDIT_FULL", "PARTIAL"]).optional(),
     userId: z.string().min(1).optional(),
     cursor: z.string().min(1).optional(),
     limit: z.coerce.number().int().positive().max(MAX_LIMIT).default(DEFAULT_LIMIT),
@@ -100,7 +101,7 @@ export async function GET(req: NextRequest) {
     const db = getTenantDb(tenantId);
 
     let { userId } = parsed.data;
-    const { from, to, status, cursor, limit } = parsed.data;
+    const { from, to, status, paymentStatus, cursor, limit } = parsed.data;
 
     if (session.user.role === "CASHIER") {
         // Discarded, never merely validated — see file-header note.
@@ -121,6 +122,7 @@ export async function GET(req: NextRequest) {
             from: from ?? defaultFrom,
             to: to ?? defaultTo,
             status: status === "ALL" ? undefined : (status as InvoiceStatus),
+            paymentStatus: paymentStatus as PaymentStatusBadge | undefined,
             userId,
             cursor,
             limit,

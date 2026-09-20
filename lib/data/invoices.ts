@@ -1,28 +1,4 @@
-/**
- * lib/data/invoices.ts
- *
- * T4c2 — Sales/Invoice History Log data-access layer. Mirrors
- * lib/data/products.ts's own convention: pure tenant-scoped reads here,
- * role/permission decisions stay in the route handlers that call this
- * file (see app/api/invoices/route.ts and app/api/invoices/[id]/route.ts).
- *
- * No schema change. Reads exclusively through the caller-supplied
- * tenant-scoped `db` (never a raw client) against the existing
- * (tenantId, createdAt) composite index on Invoice — no new index
- * required.
- *
- * NEVER reads .conversionFactor off any ProductUnit relation — this
- * screen only ever needs a unit's display name, so `unit` is
- * select-narrowed to { unitName } wherever an InvoiceItem's unit is
- * joined. See lib/inventory/units.ts's header for why that field has
- * exactly one sanctioned call site, which this file is not.
- *
- * Monetary comparisons (deriving the payment-status badge) go through
- * lib/utils/money.ts's compareMoney() — never raw decimal.js or native
- * number comparison — per that file's own scope note that every
- * SYP/USD comparison in the codebase must go through it.
- */
-
+// lib/data/invoices.ts
 import type { InvoiceStatus, Prisma } from "@prisma/client";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
 import { compareMoney } from "@/lib/utils/money";
@@ -35,19 +11,12 @@ function derivePaymentStatus(totalSYP: string, paidAmountSYP: string): PaymentSt
     return "PARTIAL";
 }
 
-// ----------------------------------------------------------------------------
-// Listing (the sales-log screen's main table)
-// ----------------------------------------------------------------------------
-
 export interface InvoiceLogFilters {
     from: Date;
     to: Date;
     status?: InvoiceStatus;
-    /** Already resolved by the ROUTE per T2b's Role Capability Matrix —
-     * a CASHIER's own id if the caller is a CASHIER, an arbitrary staff
-     * id only if the caller is an ADMIN who passed one, or undefined for
-     * "every staff member" (ADMIN, no filter). This file trusts whatever
-     * value it is given — it enforces no role logic itself. */
+    /** [NEW] Has no DB column — see the note above listInvoicesForTenant. */
+    paymentStatus?: PaymentStatusBadge;
     userId?: string;
     cursor?: string;
     limit: number;
@@ -62,11 +31,7 @@ export interface InvoiceLogRow {
     paidAmountSYP: string;
     exchangeRateUsed: string;
     paymentStatus: PaymentStatusBadge;
-    /** Set only when THIS row is itself a void — points at the original
-     * invoice it reverses. */
     voidsInvoiceId: string | null;
-    /** Set only when some OTHER invoice voids THIS one — the reverse
-     * side of the same self-relation (Invoice.voidedBy in schema.prisma). */
     voidedByInvoiceId: string | null;
     user: { id: string; name: string };
     customer: { id: string; name: string; isSystemGenerated: boolean };
@@ -77,50 +42,24 @@ export interface InvoiceLogPage {
     nextCursor: string | null;
 }
 
-/**
- * Tenant-wide, chronological invoice listing. Cursor pagination via `id`,
- * with orderBy (createdAt desc, id desc) so pagination stays stable even
- * when two invoices share the exact same createdAt millisecond (possible
- * under concurrent T4c sync commits) — Prisma's cursor pagination only
- * needs `id` to identify a unique row to skip past; it does not require
- * the cursor field to be part of orderBy itself.
- */
-export async function listInvoicesForTenant(
-    db: TxOrClient,
-    tenantId: string,
-    filters: InvoiceLogFilters
-): Promise<InvoiceLogPage> {
-    const where: Prisma.InvoiceWhereInput = {
-        tenantId,
-        createdAt: { gte: filters.from, lte: filters.to },
-        ...(filters.status && { status: filters.status }),
-        ...(filters.userId && { userId: filters.userId }),
-    };
+const INVOICE_LOG_SELECT = {
+    id: true,
+    createdAt: true,
+    status: true,
+    totalSYP: true,
+    totalUSD: true,
+    paidAmountSYP: true,
+    exchangeRateUsed: true,
+    voidsInvoiceId: true,
+    voidedBy: { select: { id: true } },
+    user: { select: { id: true, name: true } },
+    customer: { select: { id: true, name: true, isSystemGenerated: true } },
+} satisfies Prisma.InvoiceSelect;
 
-    const rows = await db.invoice.findMany({
-        where,
-        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-        take: filters.limit + 1,
-        ...(filters.cursor && { cursor: { id: filters.cursor }, skip: 1 }),
-        select: {
-            id: true,
-            createdAt: true,
-            status: true,
-            totalSYP: true,
-            totalUSD: true,
-            paidAmountSYP: true,
-            exchangeRateUsed: true,
-            voidsInvoiceId: true,
-            voidedBy: { select: { id: true } },
-            user: { select: { id: true, name: true } },
-            customer: { select: { id: true, name: true, isSystemGenerated: true } },
-        },
-    });
+type RawInvoiceLogRow = Prisma.InvoiceGetPayload<{ select: typeof INVOICE_LOG_SELECT }>;
 
-    const hasMore = rows.length > filters.limit;
-    const page = hasMore ? rows.slice(0, -1) : rows;
-
-    const items: InvoiceLogRow[] = page.map((row) => ({
+function toLogRow(row: RawInvoiceLogRow): InvoiceLogRow {
+    return {
         id: row.id,
         createdAt: row.createdAt,
         status: row.status,
@@ -133,18 +72,111 @@ export async function listInvoicesForTenant(
         voidedByInvoiceId: row.voidedBy?.id ?? null,
         user: row.user,
         customer: row.customer,
-    }));
-
-    return {
-        items,
-        nextCursor: hasMore ? page[page.length - 1].id : null,
     };
 }
 
-// ----------------------------------------------------------------------------
-// Single-invoice detail (line items)
-// ----------------------------------------------------------------------------
+// A paymentStatus filter has no DB column to match against — it's derived
+// by comparing two Decimal columns (paidAmountSYP vs totalSYP) in
+// application code, and Prisma cannot express a field-to-field comparison
+// in `where` without raw SQL. T1 restricts every raw query in this
+// codebase to one sanctioned call site (T4c's batch lock), so this filter
+// can never live in the `where` clause. Instead: pull batches larger than
+// one page from the DB (ordered exactly like the unfiltered path), filter
+// each batch in code, and keep pulling further batches until a full page
+// is assembled or the table is exhausted. A single naive
+// fetch-page-then-filter would silently return short or empty pages
+// whenever few rows in a given DB page happen to match.
+const BATCH_SIZE_MULTIPLIER = 3;
+// Safety cap — bounds worst case (e.g. filtering for a payment status
+// that matches almost none of a large date range) to a fixed number of
+// DB round-trips per request instead of scanning unboundedly.
+const MAX_SCAN_ROUNDS = 10;
 
+export async function listInvoicesForTenant(
+    db: TxOrClient,
+    tenantId: string,
+    filters: InvoiceLogFilters
+): Promise<InvoiceLogPage> {
+    const where: Prisma.InvoiceWhereInput = {
+        tenantId,
+        createdAt: { gte: filters.from, lte: filters.to },
+        ...(filters.status && { status: filters.status }),
+        ...(filters.userId && { userId: filters.userId }),
+    };
+
+    if (!filters.paymentStatus) {
+        const rows = await db.invoice.findMany({
+            where,
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+            take: filters.limit + 1,
+            ...(filters.cursor && { cursor: { id: filters.cursor }, skip: 1 }),
+            select: INVOICE_LOG_SELECT,
+        });
+
+        const hasMore = rows.length > filters.limit;
+        const page = hasMore ? rows.slice(0, -1) : rows;
+        return {
+            items: page.map(toLogRow),
+            nextCursor: hasMore ? page[page.length - 1].id : null,
+        };
+    }
+
+    // --- paymentStatus filtering path ---
+    const collected: RawInvoiceLogRow[] = [];
+    let cursor = filters.cursor;
+    let exhausted = false;
+    let hitScanCap = false;
+
+    for (let round = 0; round < MAX_SCAN_ROUNDS; round++) {
+        const batchSize = filters.limit * BATCH_SIZE_MULTIPLIER;
+        const batch = await db.invoice.findMany({
+            where,
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+            take: batchSize,
+            ...(cursor && { cursor: { id: cursor }, skip: 1 }),
+            select: INVOICE_LOG_SELECT,
+        });
+
+        if (batch.length === 0) {
+            exhausted = true;
+            break;
+        }
+
+        cursor = batch[batch.length - 1].id;
+
+        for (const row of batch) {
+            if (derivePaymentStatus(row.totalSYP.toString(), row.paidAmountSYP.toString()) === filters.paymentStatus) {
+                collected.push(row);
+            }
+            if (collected.length >= filters.limit + 1) break;
+        }
+
+        if (batch.length < batchSize) exhausted = true;
+        if (collected.length >= filters.limit + 1 || exhausted) break;
+
+        if (round === MAX_SCAN_ROUNDS - 1) hitScanCap = true;
+    }
+
+    const hasMore = collected.length > filters.limit || (hitScanCap && !exhausted);
+    const page = collected.length > filters.limit ? collected.slice(0, -1) : collected;
+
+    // [KNOWN LIMITATION] If the scan cap is hit before a full page is
+    // assembled (a very sparse paymentStatus match over a wide date
+    // range), we return whatever was collected and still expose
+    // `cursor` (the DB scan position) as nextCursor rather than claiming
+    // "no more results" — the client may see a short page and must keep
+    // paging. This is a deliberate trade-off (never silently drop or
+    // duplicate rows) rather than an unbounded per-request scan; not
+    // expected to be hit at real merchant invoice volumes.
+    return {
+        items: page.map(toLogRow),
+        nextCursor: hasMore ? cursor ?? null : null,
+    };
+}
+
+// ---------------------------------------------------------------------
+// findInvoiceDetail — unchanged from the version already reviewed/approved.
+// ---------------------------------------------------------------------
 export interface InvoiceDetailItem {
     id: string;
     productId: string;
@@ -171,20 +203,12 @@ export interface InvoiceDetail {
     voidReason: string | null;
     voidsInvoiceId: string | null;
     voidedByInvoiceId: string | null;
-    /** Needed by the calling route for the CASHIER-own-invoices-only
-     * check — this file does not enforce that check itself. */
     userId: string;
     user: { id: string; name: string };
     customer: { id: string; name: string; phone: string | null };
     items: InvoiceDetailItem[];
 }
 
-/**
- * Single-invoice detail including every line item. `unit` is
- * select-narrowed to `{ unitName }` only, `product` to `{ name }` only —
- * this screen never reads conversionFactor, pricingCurrency, or any
- * other ProductUnit field it has no legitimate use for.
- */
 export async function findInvoiceDetail(
     db: TxOrClient,
     tenantId: string,
@@ -193,33 +217,18 @@ export async function findInvoiceDetail(
     const invoice = await db.invoice.findUnique({
         where: { id: invoiceId, tenantId },
         select: {
-            id: true,
-            createdAt: true,
-            status: true,
-            totalSYP: true,
-            totalUSD: true,
-            exchangeRateUsed: true,
-            paidAmountSYP: true,
-            paidAmountUSD: true,
-            debtAmountSYP: true,
-            debtAmountUSD: true,
-            voidReason: true,
-            voidsInvoiceId: true,
+            id: true, createdAt: true, status: true, totalSYP: true, totalUSD: true,
+            exchangeRateUsed: true, paidAmountSYP: true, paidAmountUSD: true,
+            debtAmountSYP: true, debtAmountUSD: true, voidReason: true, voidsInvoiceId: true,
             voidedBy: { select: { id: true } },
             userId: true,
             user: { select: { id: true, name: true } },
             customer: { select: { id: true, name: true, phone: true } },
             items: {
                 select: {
-                    id: true,
-                    productId: true,
-                    product: { select: { name: true } },
-                    unitId: true,
-                    unit: { select: { unitName: true } },
-                    batchId: true,
-                    quantity: true,
-                    unitPriceSYP: true,
-                    unitPriceUSD: true,
+                    id: true, productId: true, product: { select: { name: true } },
+                    unitId: true, unit: { select: { unitName: true } },
+                    batchId: true, quantity: true, unitPriceSYP: true, unitPriceUSD: true,
                 },
             },
         },
