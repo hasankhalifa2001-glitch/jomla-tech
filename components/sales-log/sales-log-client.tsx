@@ -62,7 +62,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { ListFilter, Loader2, RefreshCw, ScrollText, ShieldCheck } from "lucide-react";
+import { ChevronDown, ListFilter, Loader2, RefreshCw, ScrollText, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -127,6 +127,22 @@ export function SalesLogClient() {
     const [paymentFilter, setPaymentFilter] = useState<PaymentFilter>("ALL");
     const [staffFilter, setStaffFilter] = useState<string>("ALL");
     const [staffOptions, setStaffOptions] = useState<StaffOption[]>([]);
+
+    // [FIX] Reset staffOptions when losing admin — done in the RENDER
+    // phase, not inside the fetch effect below. Calling setState
+    // synchronously in an effect body (even guarded by an early-return
+    // branch) trips React's own "avoid calling setState() directly within
+    // an effect" lint rule, since it can trigger cascading renders.
+    // Adjusting state during render in response to a detected
+    // prop/derived-value change (comparing against a tracked "previous"
+    // value) is the sanctioned alternative — the same render-phase reset
+    // pattern already used elsewhere in this codebase (e.g.
+    // VoidInvoiceModal's prevOpen tracker, EditBatchModal's prevBatchId).
+    const [prevIsAdmin, setPrevIsAdmin] = useState(isAdmin);
+    if (isAdmin !== prevIsAdmin) {
+        setPrevIsAdmin(isAdmin);
+        if (!isAdmin) setStaffOptions([]);
+    }
 
     // [v4.2] customerName filter. Two states, same debounce pattern used
     // throughout the codebase for free-text search: `customerNameDraft` is
@@ -268,7 +284,9 @@ export function SalesLogClient() {
     }, [isSessionResolved, loadPages, pagesLoaded, requestKey, role]);
 
     // ADMIN-only staff filter options, from the already-existing ADMIN-gated
-    // GET /api/staff. A CASHIER never requests this endpoint at all.
+    // GET /api/staff. A CASHIER never requests this endpoint at all. The
+    // "reset to [] when not admin" concern is now handled entirely by the
+    // render-phase block above — this effect's only job is fetching.
     useEffect(() => {
         if (!isAdmin) return;
 
@@ -488,7 +506,7 @@ export function SalesLogClient() {
                         onClick={handleLoadMore}
                         className="h-9 gap-1.5 text-xs font-bold"
                     >
-                        <Loader2 className="h-3.5 w-3.5" />
+                        <ChevronDown className="h-3.5 w-3.5" />
                         <span>تحميل المزيد</span>
                     </Button>
                 </div>
