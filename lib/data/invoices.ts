@@ -39,9 +39,10 @@ export interface InvoiceLogFilters {
     from: Date;
     to: Date;
     status?: InvoiceStatus;
-    /** Has no DB column — see the note above listInvoicesForTenant. */
     paymentStatus?: PaymentStatusBadge;
     userId?: string;
+    /** [v4.2] Case-insensitive partial match against Customer.name. */
+    customerName?: string;
     cursor?: string;
     limit: number;
 }
@@ -126,6 +127,10 @@ export async function listInvoicesForTenant(
         createdAt: { gte: filters.from, lte: filters.to },
         ...(filters.status && { status: filters.status }),
         ...(filters.userId && { userId: filters.userId }),
+        // [v4.2] Relational filter — standard typed Prisma where, not raw SQL.
+        ...(filters.customerName && {
+            customer: { name: { contains: filters.customerName, mode: "insensitive" } },
+        }),
     };
 
     if (!filters.paymentStatus) {

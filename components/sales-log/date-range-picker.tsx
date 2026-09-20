@@ -17,6 +17,18 @@
  * to confirm), and the preset buttons below cover the common cases in one
  * click.
  *
+ * [TWO-CLICK RANGE STATE] react-day-picker's `range` mode treats a range
+ * as "closed" once BOTH from/to are set — any click after that starts a
+ * brand-new range instead of widening the existing one. Applying the
+ * first click immediately as a single day (from === to) would therefore
+ * closes the range right away, making a genuine multi-day selection by
+ * clicking impossible: every click after the first would be read as a
+ * new one-day start. `pendingFrom` keeps the Calendar's OWN selection
+ * state deliberately "open" (to: undefined) after the first click, while
+ * still applying that single day to `value`/onChange immediately — so the
+ * visible filter updates on every click, but the SECOND click is still
+ * interpreted as widening the first, not starting over.
+ *
  * Both bounds are local-midnight / local-end-of-day at the moment they are
  * applied (sales-log-utils.ts) so the request carries an explicit,
  * timezone-correct window rather than relying on the route's UTC fallback.
@@ -60,6 +72,10 @@ const PRESETS: Array<{ label: string; getRange: () => DateRangeValue }> = [
 export function DateRangePicker({ value, onChange, disabled }: DateRangePickerProps) {
     const [open, setOpen] = useState(false);
 
+    // Tracks an in-progress two-click selection — see the file header's
+    // [TWO-CLICK RANGE STATE] note. Reset to null whenever the pending
+    // selection is abandoned: a preset is chosen instead (below), or the
+    // Popover closes before a second click completes (onOpenChange below).
     const [pendingFrom, setPendingFrom] = useState<Date | null>(null);
 
     const selected: DateRange = pendingFrom
@@ -70,10 +86,11 @@ export function DateRangePicker({ value, onChange, disabled }: DateRangePickerPr
         if (!range?.from) return;
 
         if (!range.to) {
-            // First click of a fresh two-click selection: apply immediately
-            // as a single day (existing behavior), but keep the Calendar's
-            // OWN state "open" (to: undefined) so react-day-picker treats
-            // the next click as widening this range, not starting a new one.
+            // First click of a fresh two-click selection: apply
+            // immediately as a single day (existing behavior), but keep
+            // the Calendar's OWN state "open" (to: undefined) so
+            // react-day-picker treats the next click as widening this
+            // range, not starting a new one.
             setPendingFrom(range.from);
             onChange({ from: startOfLocalDay(range.from), to: endOfLocalDay(range.from) });
             return;
@@ -85,7 +102,17 @@ export function DateRangePicker({ value, onChange, disabled }: DateRangePickerPr
     };
 
     return (
-        <Popover open={open} onOpenChange={setOpen}>
+        <Popover
+            open={open}
+            onOpenChange={(next) => {
+                setOpen(next);
+                // [FIX] Abandoning a half-finished manual selection (closing
+                // the Popover after only one click) must not leave a stale
+                // "open" range behind — reopening should start clean, based
+                // on whatever `value` currently is.
+                if (!next) setPendingFrom(null);
+            }}
+        >
             <PopoverTrigger asChild>
                 <Button
                     type="button"
@@ -112,7 +139,15 @@ export function DateRangePicker({ value, onChange, disabled }: DateRangePickerPr
                             variant="ghost"
                             size="sm"
                             className="h-7 px-2 text-[11px] font-semibold"
-                            onClick={() => onChange(preset.getRange())}
+                            onClick={() => {
+                                // [FIX] A preset supersedes any in-progress
+                                // manual selection — without this, the
+                                // Calendar would keep showing the abandoned
+                                // single-day "open" state instead of the
+                                // preset's actual range.
+                                setPendingFrom(null);
+                                onChange(preset.getRange());
+                            }}
                         >
                             {preset.label}
                         </Button>

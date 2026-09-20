@@ -18,6 +18,17 @@
  * stays open, so the user can hop original ↔ void ↔ back without losing the
  * list, its filters, or pagination state underneath.
  *
+ * [LOADING IS DERIVED, NOT STORED] `loading`, `error` and `detail` are not
+ * separate useStates. The last completed fetch is stored as ONE object tagged
+ * with the invoice id it answered. "Loading" simply means "the id being asked
+ * for has no result yet". That keeps every setState inside the fetch's
+ * .then/.catch callbacks (React's set-state-in-effect rule forbids calling
+ * them synchronously in the effect body) and makes `loading` true in the very
+ * same render in which `invoiceId` changes. The stored result is cleared when
+ * the modal closes, so re-opening an invoice always refetches with a loading
+ * state instead of flashing stale data (e.g. a status that changed after a
+ * void).
+ *
  * Line totals are computed with multiplyMoney() (lib/utils/money.ts), never
  * native `*` — the same rule every other money math site in this codebase
  * follows. SYP stays the primary figure; the USD line is the secondary "≈"
@@ -47,6 +58,13 @@ interface InvoiceDetailModalProps {
     onOpenChange: (open: boolean) => void;
     onNavigate: (invoiceId: string) => void;
 }
+
+/** The last completed fetch, tagged with the invoice id it answered. */
+type FetchResult = {
+    id: string;
+    detail: InvoiceDetail | null;
+    error: string | null;
+};
 
 function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
     if (detail.items.length === 0) {
@@ -107,9 +125,14 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
 }
 
 export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: InvoiceDetailModalProps) {
-    const [detail, setDetail] = useState<InvoiceDetail | null>(null);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+    const [result, setResult] = useState<FetchResult | null>(null);
+
+    // Derived, not stored: only a result that answers the CURRENT invoiceId
+    // counts. A different (or missing) id means we are still loading it.
+    const current = invoiceId !== null && result?.id === invoiceId ? result : null;
+    const loading = invoiceId !== null && current === null;
+    const detail = current?.detail ?? null;
+    const error = current?.error ?? null;
 
     useEffect(() => {
         if (!invoiceId) return;
@@ -117,26 +140,27 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
         const controller = new AbortController();
         let cancelled = false;
 
-        setLoading(true);
-        setError(null);
-        setDetail(null);
-
         fetch(`/api/invoices/${invoiceId}`, { signal: controller.signal })
             .then(async (res) => {
                 const data = await res.json().catch(() => ({}));
                 if (cancelled) return;
                 if (!res.ok || !data.success) {
-                    setError(data.message || "تعذّر جلب تفاصيل الفاتورة.");
+                    setResult({
+                        id: invoiceId,
+                        detail: null,
+                        error: data.message || "تعذّر جلب تفاصيل الفاتورة.",
+                    });
                     return;
                 }
-                setDetail(data.invoice as InvoiceDetail);
+                setResult({ id: invoiceId, detail: data.invoice as InvoiceDetail, error: null });
             })
             .catch((err: unknown) => {
                 if (cancelled || (err as { name?: string })?.name === "AbortError") return;
-                setError("حدث خطأ في الاتصال أثناء جلب تفاصيل الفاتورة.");
-            })
-            .finally(() => {
-                if (!cancelled) setLoading(false);
+                setResult({
+                    id: invoiceId,
+                    detail: null,
+                    error: "حدث خطأ في الاتصال أثناء جلب تفاصيل الفاتورة.",
+                });
             });
 
         return () => {
@@ -145,10 +169,18 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
         };
     }, [invoiceId]);
 
+    // Closing clears the stored result (in an event handler, not an effect),
+    // so re-opening the same invoice always shows a loading state and
+    // refetches instead of flashing the previous, possibly stale, data.
+    const handleOpenChange = (next: boolean) => {
+        if (!next) setResult(null);
+        onOpenChange(next);
+    };
+
     const open = Boolean(invoiceId);
 
     return (
-        <Dialog open={open} onOpenChange={onOpenChange}>
+        <Dialog open={open} onOpenChange={handleOpenChange}>
             <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto" dir="rtl">
                 <DialogHeader>
                     <div className="flex items-center gap-2">
@@ -166,7 +198,7 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                     </div>
                 </DialogHeader>
 
-{loading && (
+                {loading && (
                     <div className="flex items-center justify-center gap-2 py-12 text-xs text-zinc-500">
                         <Loader2 className="h-4 w-4 animate-spin" />
                         <span>جارٍ تحميل تفاصيل الفاتورة...</span>
@@ -317,6 +349,3 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
         </Dialog>
     );
 }
-
-
-

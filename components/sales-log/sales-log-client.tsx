@@ -37,13 +37,36 @@
  *
  * The initial response is never the whole tenant history — see the
  * acceptance criterion in the API's MAX_LIMIT / DEFAULT_LIMIT.
+ *
+ * [LOADING IS DERIVED, NOT STORED] `loading` is not a useState. Every load is
+ * identified by a `requestKey` built from all the inputs that shape the
+ * request (filters, paging depth, reload token). The last completed load is
+ * stored together with the key it answered, and `loading` is simply "no
+ * result for the CURRENT key has arrived yet". This keeps every setState
+ * inside the fetch's .then/.catch callbacks (never synchronously in the
+ * effect body, which React's set-state-in-effect rule forbids), and makes
+ * `loading` flip to true in the very same render in which a filter changes —
+ * no extra render, no one-frame flicker of stale "not loading" UI. While a
+ * new request is in flight the previous rows stay on screen.
+ *
+ * [v4.2 — customerName filter] A free-text, debounced partial match
+ * against the invoice's linked Customer.name — see lib/data/invoices.ts
+ * for the relational `contains`/`insensitive` filter this maps to
+ * server-side. Two local states (customerNameDraft / customerNameFilter)
+ * mirror the debounce pattern used elsewhere in this app: the input
+ * renders the draft live; only the debounced value is sent to the API and
+ * included in buildQuery's dependencies, so typing never fires one
+ * request per keystroke. Composes with every other filter (date range,
+ * status, payment status, staff) as an AND condition and never widens
+ * past whatever the session's role scope already restricts.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ListFilter, Loader2, RefreshCw, ScrollText, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
     Select,
@@ -74,8 +97,18 @@ import type {
 /** Server default is 25 and hard-caps at 100 — see app/api/invoices/route.ts. */
 const PAGE_SIZE = 25;
 
+/** [v4.2] Debounce delay for the free-text customer-name filter. */
+const CUSTOMER_NAME_DEBOUNCE_MS = 350;
+
 type StatusFilter = InvoiceStatusValue | "ALL";
 type PaymentFilter = PaymentStatusBadgeValue | "ALL";
+
+/** The last completed load, tagged with the request key it answered. */
+type LoadResult = {
+    key: string;
+    items: InvoiceLogRow[];
+    nextCursor: string | null;
+};
 
 export function SalesLogClient() {
     const { data: session, status: sessionStatus } = useSessionWithOfflineFallback();
@@ -95,18 +128,63 @@ export function SalesLogClient() {
     const [staffFilter, setStaffFilter] = useState<string>("ALL");
     const [staffOptions, setStaffOptions] = useState<StaffOption[]>([]);
 
-    const [rows, setRows] = useState<InvoiceLogRow[]>([]);
-    const [nextCursor, setNextCursor] = useState<string | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [reloadToken, setReloadToken] = useState(0);
-
-    const [detailInvoiceId, setDetailInvoiceId] = useState<string | null>(null);
-    const [voidTarget, setVoidTarget] = useState<InvoiceLogRow | null>(null);
+    // [v4.2] customerName filter. Two states, same debounce pattern used
+    // throughout the codebase for free-text search: `customerNameDraft` is
+    // what the input renders live; `customerNameFilter` is the debounced
+    // value actually sent to the API and included in buildQuery's deps —
+    // so every keystroke updates the input instantly without firing a
+    // request per character.
+    const [customerNameDraft, setCustomerNameDraft] = useState("");
+    const [customerNameFilter, setCustomerNameFilter] = useState("");
 
     // How many 25-row pages the user has currently paged through. Reset to 1
     // by every filter change; left untouched by a post-void re-fetch so the
     // user keeps their position (see the file header's re-walk rationale).
-    const pagesLoadedRef = useRef(1);
+    // State (not a ref) because it is part of `requestKey`, read in render.
+    const [pagesLoaded, setPagesLoaded] = useState(1);
+    const [reloadToken, setReloadToken] = useState(0);
+
+    const [result, setResult] = useState<LoadResult | null>(null);
+
+    const [detailInvoiceId, setDetailInvoiceId] = useState<string | null>(null);
+    const [voidTarget, setVoidTarget] = useState<InvoiceLogRow | null>(null);
+
+    // Every filter change resets the paging depth, then changes one filter
+    // state — one batched render, one reload.
+    const resetPaging = () => setPagesLoaded(1);
+
+    // Identifies "the request the current UI state is asking for".
+    const requestKey = JSON.stringify([
+        range.from.toISOString(),
+        range.to.toISOString(),
+        statusFilter,
+        paymentFilter,
+        customerNameFilter,
+        isAdmin,
+        isAdmin ? staffFilter : "ALL",
+        pagesLoaded,
+        reloadToken,
+    ]);
+
+    // Derived, not stored: loading until a result for THIS key has arrived.
+    // While a new request is in flight the previous rows stay visible.
+    const rows = result?.items ?? [];
+    const nextCursor = result?.nextCursor ?? null;
+    const loading = !isSessionResolved || !role || result?.key !== requestKey;
+
+    // [v4.2] Debounce the free-text customer-name filter — settles 350ms
+    // after the user stops typing before it resets paging and reaches
+    // buildQuery. Never fires a reload on every keystroke.
+    useEffect(() => {
+        const next = customerNameDraft.trim();
+        if (next === customerNameFilter) return;
+
+        const timer = setTimeout(() => {
+            setPagesLoaded(1);
+            setCustomerNameFilter(next);
+        }, CUSTOMER_NAME_DEBOUNCE_MS);
+        return () => clearTimeout(timer);
+    }, [customerNameDraft, customerNameFilter]);
 
     const buildQuery = useCallback(
         (cursor: string | null) => {
@@ -116,6 +194,11 @@ export function SalesLogClient() {
             params.set("limit", String(PAGE_SIZE));
             if (statusFilter !== "ALL") params.set("status", statusFilter);
             if (paymentFilter !== "ALL") params.set("paymentStatus", paymentFilter);
+            // [v4.2] Free-text partial match against Customer.name — see
+            // lib/data/invoices.ts for the relational `contains` filter this
+            // maps to server-side. Narrows WITHIN whatever the role scope
+            // already restricts; never widens past it.
+            if (customerNameFilter) params.set("customerName", customerNameFilter);
             // Never sent for a CASHIER: the server forces their own id anyway,
             // and not sending it makes the intended scope explicit at the one
             // place a future refactor might be tempted to "simplify" it away.
@@ -123,7 +206,7 @@ export function SalesLogClient() {
             if (cursor) params.set("cursor", cursor);
             return params;
         },
-        [isAdmin, paymentFilter, range, staffFilter, statusFilter]
+        [customerNameFilter, isAdmin, paymentFilter, range, staffFilter, statusFilter]
     );
 
     /**
@@ -159,41 +242,35 @@ export function SalesLogClient() {
     );
 
     // The single loader. Runs on: session resolution, any filter change
-    // (buildQuery identity), and an explicit reload (post-void, refresh).
+    // (buildQuery identity), paging depth change, and an explicit reload
+    // (post-void, refresh). No setState is called synchronously here — the
+    // "loading" state is derived from `requestKey` above, and results are
+    // stored only from the async callbacks below.
     useEffect(() => {
         if (!isSessionResolved || !role) return;
 
         let cancelled = false;
-        setLoading(true);
 
-        loadPages(pagesLoadedRef.current)
-            .then((result) => {
+        loadPages(pagesLoaded)
+            .then((res) => {
                 if (cancelled) return;
-                setRows(result.items);
-                setNextCursor(result.nextCursor);
+                setResult({ key: requestKey, items: res.items, nextCursor: res.nextCursor });
             })
             .catch((error: unknown) => {
                 if (cancelled) return;
-                setRows([]);
-                setNextCursor(null);
+                setResult({ key: requestKey, items: [], nextCursor: null });
                 toast.error(error instanceof Error ? error.message : "تعذّر جلب سجل الفواتير.");
-            })
-            .finally(() => {
-                if (!cancelled) setLoading(false);
             });
 
         return () => {
             cancelled = true;
         };
-    }, [isSessionResolved, loadPages, reloadToken, role]);
+    }, [isSessionResolved, loadPages, pagesLoaded, requestKey, role]);
 
     // ADMIN-only staff filter options, from the already-existing ADMIN-gated
     // GET /api/staff. A CASHIER never requests this endpoint at all.
     useEffect(() => {
-        if (!isAdmin) {
-            setStaffOptions([]);
-            return;
-        }
+        if (!isAdmin) return;
 
         let cancelled = false;
         fetch("/api/staff")
@@ -213,16 +290,7 @@ export function SalesLogClient() {
         };
     }, [isAdmin]);
 
-    // Every filter change resets the paging depth, then changes one filter
-    // state — one batched render, one reload.
-    const resetPaging = () => {
-        pagesLoadedRef.current = 1;
-    };
-
-    const handleLoadMore = () => {
-        pagesLoadedRef.current += 1;
-        setReloadToken((token) => token + 1);
-    };
+    const handleLoadMore = () => setPagesLoaded((p) => p + 1);
 
     const handleRefresh = () => setReloadToken((token) => token + 1);
 
@@ -286,6 +354,20 @@ export function SalesLogClient() {
                             resetPaging();
                             setRange(next);
                         }}
+                    />
+                </div>
+
+                {/* [v4.2] customerName filter — debounced free-text search. */}
+                <div className="flex flex-col gap-1.5">
+                    <Label className="text-[11px] font-bold text-zinc-500">اسم الزبون</Label>
+                    <Input
+                        type="text"
+                        value={customerNameDraft}
+                        onChange={(e) => setCustomerNameDraft(e.target.value)}
+                        placeholder="ابحث بالاسم..."
+                        disabled={loading}
+                        className="h-9 w-40 text-xs"
+                        dir="rtl"
                     />
                 </div>
 
@@ -434,7 +516,3 @@ export function SalesLogClient() {
         </section>
     );
 }
-
-
-
-
