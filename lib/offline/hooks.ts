@@ -5,6 +5,13 @@ import { useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { getOfflineDb, isOfflineDbSupported, type CachedSession } from "./db";
+// [v4.1 — T4d offline void] The read helper behind usePendingOfflineInvoices
+// below. No cycle: pos-service.ts never imports this file.
+import {
+  listPendingOfflineInvoices,
+  type PendingOfflineInvoiceRow,
+  type PendingOfflineInvoicesResult,
+} from "./pos-service";
 import { getCachedRate } from "./exchange-rate";
 import { getCachedSession, setCachedSession, clearCachedSession } from "./session-cache";
 import { useActiveSessionStore } from "@/lib/store/useActiveSessionStore";
@@ -603,4 +610,46 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
 
   // 4. Still genuinely loading, online, within the timeout window.
   return { status: "loading", data: null, update };
+}
+
+// ============================================================================
+// usePendingOfflineInvoices — T4d v4.1's live data source for the POS offline
+// void panel (components/pos/offline-void-panel.tsx).
+//
+// Deliberately its OWN hook rather than a reuse of useSyncWorker's
+// pendingCount: that count is a combined customers+invoices+payments figure
+// and says nothing about WHICH invoices are outstanding, whereas the panel
+// needs per-invoice rows (customer, total, time, status badge). Same
+// useLiveQuery pattern as useSyncWorker's pendingCount (sync-worker.ts),
+// scoped to invoices specifically, so the panel updates the instant the
+// underlying data changes: a newly-queued offline sale makes it appear, a
+// completed sync of the last pending/failed invoice makes it disappear — with
+// no manual refresh and no remount.
+//
+// `isReady` distinguishes "the live query has not resolved yet" from "there is
+// genuinely nothing to show". The panel renders nothing in BOTH cases, but it
+// uses isReady so Dexie's very first read cannot flash a stale/absent state.
+// ============================================================================
+const EMPTY_PENDING_OFFLINE_INVOICES: PendingOfflineInvoicesResult = {
+  rows: [],
+  originals: [],
+  localVoids: [],
+};
+
+export function usePendingOfflineInvoices(tenantId?: string): {
+  rows: PendingOfflineInvoiceRow[];
+  originals: PendingOfflineInvoiceRow[];
+  localVoids: PendingOfflineInvoiceRow[];
+  isReady: boolean;
+} {
+  const result = useLiveQuery(
+    async () => {
+      if (!tenantId || !isOfflineDbSupported()) return EMPTY_PENDING_OFFLINE_INVOICES;
+      return listPendingOfflineInvoices(tenantId);
+    },
+    [tenantId]
+  );
+
+  const resolved = result ?? EMPTY_PENDING_OFFLINE_INVOICES;
+  return { ...resolved, isReady: result !== undefined };
 }

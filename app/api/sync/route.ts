@@ -184,6 +184,32 @@ export const dynamic = "force-dynamic";
  * this is not a rounding bug, it is the schema's own documented design for
  * a multi-batch split, and InvoiceItem.quantity's Decimal(18,4) column
  * exists precisely to hold it exactly.
+ *
+ * [FIX — v4.1, T4d appendix item #4 — SYNC ORDERING] PASS 2 previously
+ * processed every invoice — sales AND voids — in a single loop, sorted
+ * ONLY by createdAt across the combined set. In the overwhelmingly common
+ * case a void's createdAt is later than its original sale's (it can only
+ * be created locally after that sale already exists), so this worked. But
+ * nothing structurally guaranteed that ordering: two records created
+ * within the same millisecond, or a device with a skewed clock, could
+ * produce a void whose createdAt ties with or precedes its original's —
+ * and since this file's void path looks up the original via
+ * `tx.invoice.findFirst({ where: { offlineId: inv.voidsOfflineInvoiceId }
+ * })`, a void processed before its original synced would fail with
+ * "الفاتورة الأصلية المراد إلغاؤها لم تتم مزامنتها بعد" — and per this
+ * route's own per-item FAILED semantics, a FAILED item is never
+ * auto-retried, making that failure PERMANENT for that void.
+ *
+ * Fixed by splitting PASS 2 into two ORDERED SUB-PHASES: every non-void
+ * (sale) invoice in the batch is processed first, in full, before ANY
+ * void is attempted — regardless of createdAt values or the order items
+ * arrived in the payload. This makes void resolution structurally
+ * independent of timestamp precision or payload ordering, rather than
+ * merely relying on the common case holding. The per-invoice processing
+ * logic itself (idempotency check, validation, the isVoid branch with its
+ * own sale/void bodies) is completely unchanged — only extracted into a
+ * named function, processInvoiceSyncItem(), so it can be invoked from two
+ * sequential loops instead of one combined one.
  */
 
 // ============================================================================
@@ -523,15 +549,21 @@ export async function POST(req: NextRequest) {
 
   // ==========================================================================
   // PASS 2 — Invoices (sale or void). Idempotent via Invoice.offlineId.
+  //
+  // [v4.1] Split into two ORDERED SUB-PHASES — see the file-header FIX note
+  // ("SYNC ORDERING") for the full rationale. processInvoiceSyncItem() below
+  // is the exact same per-item logic this route always had; only the outer
+  // loop is now called twice (sales, then voids) instead of once over the
+  // combined, timestamp-sorted set.
   // ==========================================================================
-  for (const inv of invoices as InvoicePayload[]) {
+  async function processInvoiceSyncItem(inv: InvoicePayload): Promise<void> {
     if (inv.voidsOfflineInvoiceId && userRole !== "ADMIN") {
       invoiceResults.push({
         offlineId: inv.offlineId,
         status: "FAILED",
         error: "عملية إلغاء الفاتورة متاحة فقط لحساب المدير (ADMIN).",
       });
-      continue;
+      return;
     }
 
     try {
@@ -1064,7 +1096,7 @@ export async function POST(req: NextRequest) {
             status: "SYNCED",
             realId: existing.id,
           });
-          continue;
+          return;
         }
       }
       if (isRetryableTxError(err)) {
@@ -1072,7 +1104,7 @@ export async function POST(req: NextRequest) {
           `[sync] invoice ${inv.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
           err
         );
-        continue;
+        return;
       }
       invoiceResults.push({
         offlineId: inv.offlineId,
@@ -1080,6 +1112,29 @@ export async function POST(req: NextRequest) {
         error: errorMessage(err, "فشل في مزامنة الفاتورة."),
       });
     }
+  }
+
+  // [v4.1] Sub-phase A — every non-void (sale) invoice, in createdAt order
+  // among themselves (filter() preserves the relative order already
+  // established by sortByCreatedAt() above).
+  const saleInvoices = (invoices as InvoicePayload[]).filter(
+    (inv) => !inv.voidsOfflineInvoiceId
+  );
+  for (const inv of saleInvoices) {
+    await processInvoiceSyncItem(inv);
+  }
+
+  // [v4.1] Sub-phase B — every void, only after ALL sales above have been
+  // attempted. By the time this runs, any original sale present in THIS
+  // SAME payload has already been created (or has already recorded its own
+  // FAILED result) — a void's own "original not synced yet" check can now
+  // only ever fire for a genuinely missing/not-yet-uploaded original, never
+  // one that was simply processed later within the same request.
+  const voidInvoices = (invoices as InvoicePayload[]).filter(
+    (inv) => inv.voidsOfflineInvoiceId
+  );
+  for (const inv of voidInvoices) {
+    await processInvoiceSyncItem(inv);
   }
 
   // ==========================================================================

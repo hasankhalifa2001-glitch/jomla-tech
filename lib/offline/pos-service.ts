@@ -9,14 +9,15 @@
  * - cachedTenantSettings: Daily exchange rate
  *
  * TENANT SCOPING POLICY:
- * - WRITE paths (submitOfflineSale, createOfflineWalkInCustomer,
+ * - WRITE paths (submitOfflineSale, submitOfflineVoid, createOfflineWalkInCustomer,
  *   seedSampleOfflineData) require a real, non-empty tenantId and throw
  *   otherwise. A write is the only path that can create durable,
  *   tenant-attributable data — falling back to a shared sentinel key here
  *   risks silently filing a real sale, customer, or seeded demo data under
  *   a bucket no legitimate tenant will ever query again.
  * - READ paths (getOfflineProducts, getOfflineCustomers,
- *   getOfflineInvoicesList, findMatchingCustomerByPhone) fall back to a
+ *   getOfflineInvoicesList, listPendingOfflineInvoices,
+ *   findMatchingCustomerByPhone) fall back to a
  *   local, read-only sentinel key via resolveTenantId() when no tenantId
  *   is given. This is safe specifically because nothing in this file ever
  *   WRITES under that sentinel — every write path above requires a real
@@ -158,6 +159,10 @@ import {
   isOfflineDbSupported,
   createOfflineCustomerRecord,
   createOfflineInvoiceRecord,
+  // [v4.1 — T4d offline void] The SAME factory the sync engine's void path
+  // ultimately feeds (see db.ts): reused unchanged, so the local void record
+  // is byte-for-byte the shape T4c already knows how to resolve.
+  createOfflineVoidRecord,
   createCachedProductRecord,
   createCachedCustomerRecord,
   type PaymentMethod,
@@ -165,6 +170,7 @@ import {
   type CachedCustomer,
   type CachedProductUnit,
   type OfflineInvoice,
+  type OfflineSyncStatus,
 } from "./db";
 import { setCachedRate } from "./exchange-rate";
 import { generateOfflineId } from "./id";
@@ -1185,6 +1191,318 @@ export async function getOfflineInvoicesList(tenantId?: string): Promise<Offline
   const db = getOfflineDb();
   const items = await db.offlineInvoices.where("tenantId").equals(scopedTenantId).toArray();
   return items.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+}
+
+
+// ============================================================================
+// [v4.1 — T4d] OFFLINE VOID / REFUND for invoices that exist ONLY locally.
+//
+// WHY THIS LIVES HERE AND NOT IN T4c2 (components/sales-log/**):
+// T4c2's Sales/Invoice Log reads exclusively from the server via
+// GET /api/invoices — by construction it only ever shows invoices that have
+// isSynced: true. A locally-queued invoice that has not reached the server
+// has NO server row to void, so POST /api/ledger/voids cannot act on it (the
+// server has no record of it at all). The correct move is to queue the void
+// locally, exactly the way the original sale was queued, and let T4c's sync
+// engine resolve both records later — which is precisely what
+// submitOfflineVoid() below does.
+//
+// The two void surfaces are deliberately separate and never share logic:
+// nothing under components/sales-log/** ever imports submitOfflineVoid, and
+// nothing under components/pos/** ever calls /api/ledger/voids. Both facts
+// are verified by static source scans in
+// lib/offline/__tests__/t4d-offline-void.test.ts, not merely by review.
+//
+// NO BASE-UNIT MATH HAPPENS CLIENT-SIDE. The device that created the original
+// sale has no way to know which ProductBatch it drew from — batch allocation
+// only ever happens server-side, at sync time, via commitFifoAllocation. The
+// local void therefore stores NEGATED quantities in the ORIGINAL SOLD UNIT
+// (same unitId, per item), and the one and only sold-unit → base-unit
+// conversion happens inside the sync engine's void pass
+// (app/api/sync/route.ts) when this record is eventually processed.
+// ============================================================================
+
+export type OfflineVoidActorRole = "ADMIN" | "CASHIER";
+
+export interface PendingOfflineInvoiceRow {
+  invoice: OfflineInvoice;
+  /** Resolved from cachedCustomers / offlineCustomers — never a raw id. */
+  customerName: string;
+  /** This row IS a local void (its voidsOfflineInvoiceId is set). */
+  isLocalVoid: boolean;
+  /** A local void row exists that reverses THIS invoice. */
+  hasLocalVoid: boolean;
+}
+
+export interface PendingOfflineInvoicesResult {
+  /** Every local invoice whose status !== "SYNCED", newest first. */
+  rows: PendingOfflineInvoiceRow[];
+  /** rows.filter((r) => !r.isLocalVoid) — the voidable candidates. */
+  originals: PendingOfflineInvoiceRow[];
+  /** rows.filter((r) => r.isLocalVoid) — the locally-queued voids. */
+  localVoids: PendingOfflineInvoiceRow[];
+}
+
+/**
+ * Pure predicate — whether the offline void action may be offered for a row.
+ *
+ * Mirrors components/sales-log/invoice-log-table.tsx's canVoidInvoice() for
+ * the ONLINE side, with ONE deliberate difference: the online predicate
+ * requires status === "COMPLETED", whereas this one requires
+ * status !== "SYNCED". A local invoice is COMPLETED-equivalent by the time it
+ * exists at all (a sale is only ever written locally after it succeeded), so
+ * the meaningful local question is "has it since been synced?" — once it has,
+ * the invoice belongs exclusively to T4c2 / the online void path and must no
+ * longer be voidable from here.
+ *
+ * `localVoidExists` is passed in explicitly rather than read off the row, so
+ * this stays a pure function of its inputs (unit-testable with no Dexie
+ * handle), exactly like the online predicate.
+ */
+export function canVoidOfflineInvoice(
+  row: { status: OfflineSyncStatus; voidsOfflineInvoiceId?: string },
+  isAdmin: boolean,
+  localVoidExists: boolean
+): boolean {
+  return (
+    isAdmin &&
+    row.status !== "SYNCED" &&
+    !row.voidsOfflineInvoiceId &&
+    !localVoidExists
+  );
+}
+
+/**
+ * Pure decision function for the panel's visibility: TRUE iff at least one
+ * local invoice is not yet SYNCED. The panel component renders NOTHING (not a
+ * collapsed header, not an empty state) when this returns false, so a device
+ * with zero outstanding local invoices has no such element in the DOM at all.
+ */
+export function shouldShowOfflineVoidPanel(
+  rows: Array<{ status: OfflineSyncStatus }>
+): boolean {
+  return rows.some((r) => r.status !== "SYNCED");
+}
+
+/**
+ * Every local invoice still awaiting sync, split into originals and local
+ * voids, with customer names resolved and the "already locally voided" flag
+ * precomputed — the single data source behind both the POS offline void panel
+ * and usePendingOfflineInvoices()'s live query.
+ *
+ * Dexie scan note: `voidsOfflineInvoiceId` is deliberately NOT an indexed key
+ * (offlineInvoices' index list in db.ts is
+ * id/offlineId/tenantId/customerId/offlineCustomerId/status/createdAt, and
+ * db.ts forbids editing an already-shipped version(N) block — adding an index
+ * would require a real version bump plus an upgrade migration). A
+ * tenant-scoped filtered scan is used instead: for a device-local queue of at
+ * most one shift's worth of invoices this is cheap, and it leaves the shipped
+ * schema untouched.
+ */
+export async function listPendingOfflineInvoices(
+  tenantId?: string
+): Promise<PendingOfflineInvoicesResult> {
+  const emptyResult: PendingOfflineInvoicesResult = { rows: [], originals: [], localVoids: [] };
+
+  const scopedTenantId = resolveTenantId(tenantId);
+  if (!isOfflineDbSupported()) return emptyResult;
+
+  const db = getOfflineDb();
+  const [allInvoices, cachedCustomers, offlineCustomers] = await Promise.all([
+    db.offlineInvoices.where("tenantId").equals(scopedTenantId).toArray(),
+    db.cachedCustomers.where("tenantId").equals(scopedTenantId).toArray(),
+    db.offlineCustomers.where("tenantId").equals(scopedTenantId).toArray(),
+  ]);
+
+  const nameByCustomerKey = new Map<string, string>();
+  for (const c of cachedCustomers) nameByCustomerKey.set(c.id, c.name);
+  for (const c of offlineCustomers) nameByCustomerKey.set(c.offlineId, c.name);
+
+  // Built from ALL local invoices — including ones that have already synced —
+  // so a void that synced while its original had not still marks the original
+  // as locally voided, instead of offering a second, doomed void for it.
+  const voidedOfflineIds = new Set<string>();
+  for (const inv of allInvoices) {
+    if (inv.voidsOfflineInvoiceId) voidedOfflineIds.add(inv.voidsOfflineInvoiceId);
+  }
+
+  const rows: PendingOfflineInvoiceRow[] = allInvoices
+    .filter((inv) => inv.status !== "SYNCED")
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+    .map((invoice) => {
+      const customerKey = invoice.customerId ?? invoice.offlineCustomerId ?? "";
+      return {
+        invoice,
+        customerName: nameByCustomerKey.get(customerKey) ?? "زبون غير معروف",
+        isLocalVoid: Boolean(invoice.voidsOfflineInvoiceId),
+        hasLocalVoid: voidedOfflineIds.has(invoice.offlineId),
+      };
+    });
+
+  return {
+    rows,
+    originals: rows.filter((r) => !r.isLocalVoid),
+    localVoids: rows.filter((r) => r.isLocalVoid),
+  };
+}
+
+/**
+ * Queues a local VOID of a local, not-yet-synced invoice (T4d v4.1, offline
+ * path). Mirrors submitOfflineSale()'s guard style and structure: the same
+ * fail-loud, re-check-everything-here posture, because the caller is a UI and
+ * a UI is never the security boundary.
+ *
+ * The reversal is a FULL reversal of the whole sale, never partial (a partial
+ * correction is a CustomerPayment, per T4d) — every line item on the original
+ * is mirrored with its negated sold-unit quantity.
+ *
+ * Guards, in order (cheapest / most fundamental first):
+ *   1. Offline DB support + a non-empty tenantId — throws otherwise.
+ *   2. actorRole !== "ADMIN" → rejected HERE, not just by the UI.
+ *   3. The target row is loaded by offlineId, scoped to tenantId — a lookup
+ *      that resolves to a different tenant's row is treated as not found.
+ *   4. Not found → rejected.
+ *   5. status === "SYNCED" → rejected. Re-verified inside this function rather
+ *      than trusted from the UI's last render: a background sync can complete
+ *      in the gap between the panel rendering and the user clicking void. If
+ *      the target has since become SYNCED, the void is rejected here — the
+ *      invoice now belongs exclusively to T4c2 / the online void endpoint.
+ *   6. The target is itself a void (voidsOfflineInvoiceId set) → rejected;
+ *      voiding a void is nonsensical.
+ *   7. A local void record already exists for this offlineInvoiceId →
+ *      rejected (the offline mirror of the @unique constraint on
+ *      Invoice.voidsInvoiceId that applies once both rows sync).
+ *   8. voidReason is required and non-empty.
+ *
+ * On success the reversed record is derived (negated sold-unit item
+ * quantities, negated money via the same lib/utils/money.ts discipline as the
+ * online path, voidReason trimmed, createdAt = now, status = "PENDING") and
+ * written through the UNCHANGED createOfflineVoidRecord() +
+ * saveOfflineInvoiceWithBalance() pair — no new persistence mechanism, and no
+ * base-unit math client-side (that conversion happens exactly once,
+ * server-side, when T4c's sync engine processes this record).
+ */
+export async function submitOfflineVoid(
+  tenantId: string,
+  params: {
+    offlineInvoiceId: string;
+    voidReason: string;
+    actorRole: OfflineVoidActorRole;
+  }
+): Promise<OfflineInvoice> {
+  // Guard 1 — a real tenant is required, exactly like every other write path
+  // in this file (see the TENANT SCOPING POLICY header). Order matches
+  // submitOfflineSale's own (tenant first, then IndexedDB support).
+  if (!tenantId || !tenantId.trim()) {
+    throw new Error("لا يمكن إلغاء فاتورة دون تحديد هوية المتجر (تسجيل الدخول مطلوب).");
+  }
+  const scopedTenantId = tenantId.trim();
+
+  if (!isOfflineDbSupported()) {
+    throw new Error("IndexedDB is not supported.");
+  }
+
+  // Guard 2 — ADMIN only, RE-CHECKED HERE on purpose. The panel already hides
+  // the button for a CASHIER (absent, not disabled), but a UI bug or a direct
+  // call must not be able to bypass that: this service is the real boundary on
+  // the offline path, exactly the way ledger:void_invoice is on the server.
+  if (params.actorRole !== "ADMIN") {
+    throw new Error("عملية إلغاء الفاتورة متاحة فقط لحساب المدير (ADMIN).");
+  }
+
+  const db = getOfflineDb();
+
+  // Guard 3/4 — tenant-scoped lookup; a foreign tenant's row is not found.
+  const original = await db.offlineInvoices
+    .where("offlineId")
+    .equals(params.offlineInvoiceId)
+    .filter((inv) => inv.tenantId === scopedTenantId)
+    .first();
+
+  if (!original) {
+    throw new Error("الفاتورة المحلية غير موجودة على هذا الجهاز.");
+  }
+
+  // Guard 5 — already synced: no longer ours to void.
+  if (original.status === "SYNCED") {
+    throw new Error(
+      "هذه الفاتورة تمت مزامنتها — يجب إلغاؤها من سجل الفواتير (T4c2) وليس من هنا."
+    );
+  }
+
+  // Guard 6 — void of a void.
+  if (original.voidsOfflineInvoiceId) {
+    throw new Error("لا يمكن إلغاء فاتورة إلغاء.");
+  }
+
+  // Guard 7 — local double-void guard (mirrors the server's @unique).
+  const existingLocalVoid = await db.offlineInvoices
+    .where("tenantId")
+    .equals(scopedTenantId)
+    .filter((inv) => inv.voidsOfflineInvoiceId === original.offlineId)
+    .first();
+
+  if (existingLocalVoid) {
+    throw new Error("لا يمكن إلغاء هذه الفاتورة لأنها ملغاة محلياً بالفعل.");
+  }
+
+  // Guard 8 — mandatory free-text reason, no exceptions on either path.
+  if (!params.voidReason || !params.voidReason.trim()) {
+    throw new Error("يجب تحديد سبب الإلغاء.");
+  }
+
+  // Passed through so createOfflineVoidRecord()'s own "the system-generated
+  // cash customer must never carry debt or credit" guard actually runs — that
+  // factory re-validates it itself rather than trusting this call site.
+  const isSystemCustomer = original.offlineCustomerId
+    ? false
+    : Boolean(
+        original.customerId
+          ? (await db.cachedCustomers.get(original.customerId))?.isSystemGenerated
+          : false
+      );
+
+  const voidRecord = createOfflineVoidRecord({
+    tenantId: scopedTenantId,
+    voidsOfflineInvoiceId: original.offlineId,
+    voidReason: params.voidReason.trim(),
+    customerId: original.customerId,
+    offlineCustomerId: original.offlineCustomerId,
+    isSystemCustomer,
+    // Mirrors how the original was built: createOfflineInvoiceRecord throws
+    // when requiresExchangeRate is true and the rate is null, so "rate === null"
+    // on the stored original is exactly the case where a rate was never
+    // required. Reusing that equivalence avoids inventing a requirement the
+    // original sale never had.
+    requiresExchangeRate: original.exchangeRateUsed !== null,
+    items: original.items.map((item) => ({
+      productId: item.productId,
+      // The ORIGINAL sold unit — never the base unit, and no conversion here.
+      unitId: item.unitId,
+      // Negated through lib/utils/money.ts's subtractMoney (the sanctioned
+      // negation path), in the SOLD unit — display/queue only. The base-unit
+      // figure the server actually restores is computed once, at sync time.
+      quantity: subtractMoney("0", item.quantity),
+      // Deliberately NOT negated: negating the price as well would
+      // double-negate the line total and break the ledger's zero-sum property.
+      unitPriceSYP: item.unitPriceSYP,
+    })),
+    // Money is negated by the factory itself, from these originals, via the
+    // same subtractMoney("0", …) discipline the online route uses.
+    originalTotalSYP: original.totalSYP,
+    originalPaidAmountSYP: original.paidAmountSYP,
+    originalDebtAmountSYP: original.debtAmountSYP,
+    exchangeRateUsed: original.exchangeRateUsed,
+    createdAt: new Date(),
+    status: "PENDING",
+  });
+
+  // Same transactional helper every offline sale already uses: the row's
+  // negative debtAmountSYP decrements the cached customer balance inside the
+  // same Dexie transaction, with no void-specific balance logic anywhere.
+  await saveOfflineInvoiceWithBalance(voidRecord);
+
+  return voidRecord;
 }
 
 /**

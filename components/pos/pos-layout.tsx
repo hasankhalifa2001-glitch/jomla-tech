@@ -26,6 +26,11 @@ import { CartPanel } from "./cart-panel";
 import { WalkInCustomerModal } from "./walk-in-customer-modal";
 import { PaymentModal } from "./payment-modal";
 import { CheckoutSuccessModal } from "./checkout-success-modal";
+// [v4.1 — T4d] The OFFLINE void entry point. Deliberately a separate surface
+// from T4c2's online void flow: it reads only local Dexie data and calls
+// only the local submitOfflineVoid() service — never the server-side ledger
+// void endpoint T4c2 itself uses.
+import { OfflineVoidPanel } from "./offline-void-panel";
 import {
   Drawer,
   DrawerContent,
@@ -779,6 +784,25 @@ export function PosLayout() {
           </Button>
         </div>
       </div>
+
+      {/*
+        [v4.1 — T4d §6.3] Offline void panel.
+
+        Mounted directly under the top status bar so it is visible on BOTH the
+        mobile and desktop layouts of this screen. It is conditionally
+        self-rendering: with zero not-yet-synced local invoices it returns null
+        and is genuinely absent from the DOM (see offline-void-panel.tsx).
+
+        `triggerSync` is the ONE instance owned by the useSyncWorker() call at
+        the top of this component — passed down instead of mounting a second
+        useSyncWorker() inside the panel, which would duplicate that hook's own
+        debounced 0->positive scheduling effect.
+      */}
+      <OfflineVoidPanel
+        tenantId={tenantId}
+        isAdmin={session?.role === "ADMIN"}
+        triggerSync={triggerSync}
+      />
 
       {/*
         Main Split Layout: Desktop 2-column, Mobile 1-column.
