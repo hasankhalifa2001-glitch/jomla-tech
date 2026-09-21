@@ -624,6 +624,29 @@ export async function POST(req: NextRequest) {
             if (originalInvoice.status === InvoiceStatus.VOIDED) {
               throw new Error("لا يمكن إلغاء فاتورة ملغاة مسبقاً.");
             }
+
+            // [v4.1 — parity with POST /api/ledger/voids] A void is the
+            // physical reversal of a FULFILLED sale: only a COMPLETED
+            // invoice has a batch deduction to give back. The online route
+            // rejects anything else with this exact message (see
+            // app/api/ledger/voids/route.ts), and this pass mirrors it so
+            // both void paths are structurally identical instead of relying
+            // on one of them never being exercised with an unexpected
+            // status. Deliberately placed AFTER the VOIDED check above, so a
+            // void-of-void keeps its own more specific Arabic message — this
+            // check never shadows the pre-existing one.
+            //
+            // A no-op in practice today: the sale path below only ever
+            // creates InvoiceStatus.COMPLETED rows, so PENDING_REVIEW can
+            // never be the original here (PENDING_REVIEW is T5's own B2B
+            // approval state, corrected through T5's reject flow, never
+            // through a void).
+            if (originalInvoice.status !== InvoiceStatus.COMPLETED) {
+              throw new Error(
+                "لا يمكن إلغاء إلا الفواتير المكتملة — الفواتير قيد المراجعة تُرفض عبر مسار الطلبات."
+              );
+            }
+
             const alreadyVoided = await tx.invoice.findFirst({
               where: { voidsInvoiceId: originalInvoice.id, tenantId },
               select: { id: true },
