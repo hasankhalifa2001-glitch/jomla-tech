@@ -6,23 +6,25 @@ import {
   Boxes,
   Check,
   ChevronDown,
-  Clock,
   Coins,
   Minus,
   Printer,
   Store,
   WifiOff,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
+import OfflineSection from "./OfflineSection";
 import s from "./marketing.module.css";
 
 /**
- * app/(marketing)/page.tsx  (+ app/(marketing)/marketing.module.css)
+ * app/(marketing)/page.tsx
+ * + app/(marketing)/marketing.module.css
+ * + app/(marketing)/OfflineSection.tsx  (the only client component)
  *
- * Server component, no client JS. Styling lives in marketing.module.css so the
- * layout does not depend on Tailwind's class generation.
- * Colors follow the platform design system (T2): slate-900 frames, emerald = SYP,
- * purple = derived USD, amber = debt / pending.
+ * Server component. Styling and motion live in marketing.module.css so the
+ * layout does not depend on Tailwind's class generation. Colors follow the
+ * platform design system (T2): emerald = SYP, purple = derived USD,
+ * amber = debt / pending.
  *
  * All amounts, names and rates below are illustrative sample data.
  */
@@ -32,6 +34,8 @@ export const metadata: Metadata = {
   description:
     "نظام لإدارة تجارة الجملة: نقطة بيع تعمل بدون إنترنت، مخزون بالدفعات وتواريخ الصلاحية، دفتر ديون بالليرة السورية، ومتجر إلكتروني لتجار المفرّق.",
 };
+
+const delay = (seconds: number): CSSProperties => ({ animationDelay: `${seconds}s` });
 
 /* ------------------------------------------------------------------ */
 /* Small building blocks                                               */
@@ -91,9 +95,16 @@ const receiptLines = [
 function Receipt() {
   return (
     <div className={s.receiptWrap}>
-      <div className={s.receiptStamp}>
-        <WifiOff size={14} aria-hidden />
-        محفوظة على الجهاز، بانتظار المزامنة
+      {/* The stamp alternates between "saved locally" and "synced" (CSS only). */}
+      <div className={s.stampSlot}>
+        <div className={`${s.stamp} ${s.stampOffline}`}>
+          <WifiOff size={14} aria-hidden />
+          محفوظة على الجهاز، بانتظار المزامنة
+        </div>
+        <div aria-hidden className={`${s.stamp} ${s.stampSynced}`}>
+          <Check size={14} aria-hidden />
+          تمت المزامنة مع الخادم
+        </div>
       </div>
 
       <div className={s.receiptPaper}>
@@ -164,6 +175,42 @@ function Receipt() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Marquee                                                             */
+/* ------------------------------------------------------------------ */
+
+const marqueeItems = [
+  "نقطة بيع بدون إنترنت",
+  "دفتر ديون وكشف حساب",
+  "مخزون بالدفعات وتواريخ الصلاحية",
+  "فاتورة بالليرة ومكافئ بالدولار",
+  "متجر إلكتروني لتجار المفرّق",
+  "طباعة حرارية 58 و80 مم",
+  "كشف حساب عبر واتساب",
+];
+
+function Marquee() {
+  // Two identical groups; the track moves by exactly one group width, so the
+  // loop is seamless. Each group repeats the list so it is wider than the screen.
+  const group = [...marqueeItems, ...marqueeItems];
+  return (
+    <div aria-hidden className={s.marquee}>
+      <div className={s.marqueeTrack}>
+        {[0, 1].map((g) => (
+          <div key={g} className={s.marqueeGroup}>
+            {group.map((text, i) => (
+              <span key={i} className={s.marqueeItem}>
+                {text}
+                <i className={`${s.dot} ${s[`dot${i % 3}`]}`} />
+              </span>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Features (ledger rows)                                              */
 /* ------------------------------------------------------------------ */
 
@@ -219,52 +266,6 @@ const featureRows: FeatureRow[] = [
     body: "أرسل الإيصال إلى طابعة حرارية مقاس 58 أو 80 مم عبر البلوتوث من متصفح Chrome، أو شاركه مع الزبون كرابط PDF على واتساب.",
   },
 ];
-
-/* ------------------------------------------------------------------ */
-/* Offline queue panel                                                 */
-/* ------------------------------------------------------------------ */
-
-const queueRows = [
-  { title: "فاتورة #1041", meta: "متجر الأمل", done: true },
-  { title: "فاتورة #1042", meta: "متجر الأمل", done: false },
-  { title: "دفعة 500,000 ل.س", meta: "بقالة النور", done: false },
-  { title: "زبون جديد", meta: "مخبز الفجر", done: false },
-];
-
-function QueuePanel() {
-  return (
-    <div className={s.queue}>
-      <div className={s.queueHead}>
-        <p className={s.queueTitle}>طابور المزامنة</p>
-        <span className={s.offlinePill}>
-          <WifiOff size={14} aria-hidden />
-          غير متصل
-        </span>
-      </div>
-      <ul>
-        {queueRows.map((row) => (
-          <li key={row.title} className={s.queueRow}>
-            <div>
-              <p className={s.queueName}>{row.title}</p>
-              <p className={s.queueMeta}>{row.meta}</p>
-            </div>
-            {row.done ? (
-              <span className={s.stateDone}>
-                <Check size={16} aria-hidden />
-                تمت المزامنة
-              </span>
-            ) : (
-              <span className={s.statePending}>
-                <Clock size={16} aria-hidden />
-                بانتظار الاتصال
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
 
 /* ------------------------------------------------------------------ */
 /* Permissions table                                                   */
@@ -375,25 +376,31 @@ export default function MarketingPage() {
             <Link href="/register" className={`${s.btnPrimary} ${s.btnSm}`}>أنشئ حساباً</Link>
           </div>
         </div>
+        <div aria-hidden className={s.progress} />
       </header>
 
       <main>
         {/* Hero */}
         <section className={s.hero}>
           <div aria-hidden className={s.heroRules} />
+          <div aria-hidden className={`${s.orb} ${s.orbEmerald}`} />
+          <div aria-hidden className={`${s.orb} ${s.orbPurple}`} />
+          <div aria-hidden className={`${s.orb} ${s.orbAmber}`} />
+
           <div className={`${s.container} ${s.heroGrid}`}>
             <div>
-              <h1 className={s.heroTitle}>
-                بيع، وسجّل الدين، واطبع الفاتورة، حتى لو انقطع الإنترنت
+              <h1 className={`${s.heroTitle} ${s.enter}`} style={delay(0.05)}>
+                بيع، وسجّل الدين، واطبع الفاتورة،{" "}
+                <span className={s.mark}>حتى لو انقطع الإنترنت</span>
               </h1>
-              <p className={s.heroLead}>
+              <p className={`${s.heroLead} ${s.enter}`} style={delay(0.2)}>
                 جملة تك نظام لمحلات وتجار الجملة: نقطة بيع تعمل بدون اتصال، ومخزون بالدفعات وتواريخ الصلاحية، ودفتر ديون بالليرة السورية، ومتجر إلكتروني تستقبل منه طلبات تجار المفرّق.
               </p>
-              <div className={s.heroActions}>
+              <div className={`${s.heroActions} ${s.enter}`} style={delay(0.35)}>
                 <Link href="/register" className={s.btnPrimary}>أنشئ حساب متجرك</Link>
                 <a href="#offline" className={s.textLink}>كيف تعمل المزامنة؟</a>
               </div>
-              <p className={s.heroNote}>
+              <p className={`${s.heroNote} ${s.enter}`} style={delay(0.5)}>
                 الاشتراك بتحويل محلي عبر محفظة إلكترونية أو حوالة بنكية، دون بطاقة بنكية.
               </p>
             </div>
@@ -402,10 +409,12 @@ export default function MarketingPage() {
           </div>
         </section>
 
+        <Marquee />
+
         {/* Features */}
-        <section id="features" className={`${s.bgWhite} ${s.borderTop}`}>
+        <section id="features" className={`${s.bgWhite}`}>
           <div className={`${s.container} ${s.section}`}>
-            <div className={s.headBlock}>
+            <div className={`${s.headBlock} ${s.reveal}`}>
               <h2 className={s.h2}>كل ما يحتاجه محل الجملة في نظام واحد</h2>
               <p className={s.sectionLead}>
                 من لحظة دخول البضاعة إلى المخزن حتى تحصيل آخر ليرة من دين الزبون.
@@ -414,9 +423,11 @@ export default function MarketingPage() {
 
             <ul className={s.rows}>
               {featureRows.map((row) => (
-                <li key={row.title} className={s.row}>
+                <li key={row.title} className={`${s.row} ${s[row.tone]} ${s.reveal}`}>
                   <div className={s.rowHead}>
-                    <row.icon size={24} aria-hidden className={`${s.rowIcon} ${s[row.tone]}`} />
+                    <span className={s.iconTile}>
+                      <row.icon size={22} aria-hidden />
+                    </span>
                     <h3 className={s.rowTitle}>{row.title}</h3>
                   </div>
                   <div>
@@ -429,40 +440,13 @@ export default function MarketingPage() {
           </div>
         </section>
 
-        {/* Offline */}
-        <section id="offline" className={s.dark}>
-          <div className={`${s.container} ${s.darkGrid}`}>
-            <div>
-              <h2 className={s.h2}>
-                الفاتورة تُحفظ عندك أولاً، ثم تُرفع عندما يعود الإنترنت
-              </h2>
-              <p className={s.darkLead}>
-                لكل فاتورة ودفعة وزبون جديد معرّف فريد، فإذا انقطع الاتصال في منتصف الرفع تُعاد المحاولة دون أن تتكرر الفاتورة. وإذا فشلت فاتورة واحدة لا تتعطل بقية الفواتير، ويجد المدير سببها في شاشة الفواتير الفاشلة.
-              </p>
-              <ol className={s.seq}>
-                {[
-                  ["تُحفظ على جهازك", "لحظة إتمام البيع، دون أي طلب إلى الإنترنت."],
-                  ["تنتظر في الطابور", "بنفس ترتيب البيع الفعلي."],
-                  ["تُرفع تلقائياً", "عند عودة الاتصال، ولا تتكرر إن أُعيد الإرسال."],
-                ].map(([title, body], i) => (
-                  <li key={title} className={s.seqItem}>
-                    <span className={s.seqNum}>{i + 1}</span>
-                    <div>
-                      <p className={s.seqTitle}>{title}</p>
-                      <p className={s.seqBody}>{body}</p>
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            </div>
-            <QueuePanel />
-          </div>
-        </section>
+        {/* Offline (client component: plays the sync story) */}
+        <OfflineSection />
 
         {/* Currency */}
         <section className={s.borderBottom}>
           <div className={`${s.container} ${s.split}`}>
-            <div>
+            <div className={s.reveal}>
               <h2 className={s.h2}>الليرة هي الحساب، والدولار للاطلاع فقط</h2>
               <p className={s.sectionLead}>
                 تُسجَّل كل فاتورة ودين ودفعة بالليرة السورية. أما المكافئ بالدولار فيُحسب بسعر الصرف لحظة البيع ويبقى ثابتاً على تلك الفاتورة، فتغيير السعر لاحقاً لا يمسّ فواتيرك القديمة.
@@ -475,7 +459,7 @@ export default function MarketingPage() {
                   { day: "فاتورة الأحد", rate: "13,000", usd: "$373.08" },
                   { day: "فاتورة الخميس", rate: "13,500", usd: "$359.26" },
                 ].map((c) => (
-                  <div key={c.day} className={s.compareCol}>
+                  <div key={c.day} className={`${s.compareCol} ${s.revealPop}`}>
                     <p className={s.compareDay}>{c.day}</p>
                     <p className={s.sypCell}>
                       4,850,000 <small>ل.س</small>
@@ -499,7 +483,7 @@ export default function MarketingPage() {
         {/* Roles */}
         <section className={s.bgWhite}>
           <div className={`${s.container} ${s.split} ${s.splitRoles}`}>
-            <div>
+            <div className={s.reveal}>
               <h2 className={s.h2}>المدير يقرر، والكاشير يبيع</h2>
               <p className={s.sectionLead}>
                 تُفرض الصلاحيات من الخادم وليس بإخفاء الأزرار فقط، فلا يستطيع الكاشير تجاوزها حتى لو حاول.
@@ -509,7 +493,7 @@ export default function MarketingPage() {
               </p>
             </div>
 
-            <div className={s.tableWrap}>
+            <div className={`${s.tableWrap} ${s.revealPop}`}>
               <table className={s.table}>
                 <thead>
                   <tr>
@@ -535,19 +519,19 @@ export default function MarketingPage() {
         {/* How to start */}
         <section id="start" className={`${s.borderTop} ${s.borderBottom}`}>
           <div className={`${s.container} ${s.section}`}>
-            <h2 className={`${s.h2} ${s.headBlock}`}>
+            <h2 className={`${s.h2} ${s.headBlock} ${s.reveal}`}>
               من التسجيل إلى أول فاتورة في ثلاث خطوات
             </h2>
             <ol className={s.stepsGrid}>
               {steps.map((step, i) => (
-                <li key={step.title} className={s.stepCard}>
+                <li key={step.title} className={`${s.stepCard} ${s.reveal}`}>
                   <span className={s.stepBadge}>{i + 1}</span>
                   <h3 className={s.stepTitle}>{step.title}</h3>
                   <p className={s.stepText}>{step.body}</p>
                 </li>
               ))}
             </ol>
-            <p className={s.notice}>
+            <p className={`${s.notice} ${s.reveal}`}>
               يبقى الحساب في وضع الانتظار من لحظة التسجيل حتى مراجعة أول حوالة، ثم يُفعَّل مباشرة.
             </p>
           </div>
@@ -556,13 +540,15 @@ export default function MarketingPage() {
         {/* FAQ */}
         <section id="faq" className={s.bgWhite}>
           <div className={`${s.container} ${s.section} ${s.faqGrid}`}>
-            <h2 className={s.h2}>أسئلة يسألها التجار قبل الاشتراك</h2>
+            <h2 className={`${s.h2} ${s.reveal}`}>أسئلة يسألها التجار قبل الاشتراك</h2>
             <div className={s.faqList}>
               {faqs.map((item) => (
                 <details key={item.q} className={s.faqItem}>
                   <summary className={s.faqSummary}>
                     {item.q}
-                    <ChevronDown size={20} aria-hidden className={s.faqChevron} />
+                    <span className={s.faqChevron}>
+                      <ChevronDown size={18} aria-hidden />
+                    </span>
                   </summary>
                   <p className={s.faqAnswer}>{item.a}</p>
                 </details>
@@ -572,15 +558,19 @@ export default function MarketingPage() {
         </section>
 
         {/* Final CTA */}
-        <section className={s.borderTop}>
-          <div className={`${s.container} ${s.ctaInner}`}>
-            <div>
-              <h2 className={s.ctaTitle}>جهّز متجرك قبل موسم الحركة القادم</h2>
-              <p className={s.ctaLead}>سجّل الآن، وابدأ بإدخال أصنافك وزبائنك.</p>
-            </div>
-            <div className={s.ctaActions}>
-              <Link href="/register" className={s.btnPrimary}>أنشئ حساب متجرك</Link>
-              <Link href="/login" className={s.btnOutline}>تسجيل الدخول</Link>
+        <section className={s.ctaSection}>
+          <div className={s.container}>
+            <div className={`${s.ctaBanner} ${s.revealPop}`}>
+              <div aria-hidden className={`${s.ctaBubble} ${s.ctaBubble1}`} />
+              <div aria-hidden className={`${s.ctaBubble} ${s.ctaBubble2}`} />
+              <div className={s.ctaText}>
+                <h2 className={s.ctaTitle}>جهّز متجرك قبل موسم الحركة القادم</h2>
+                <p className={s.ctaLead}>سجّل الآن، وابدأ بإدخال أصنافك وزبائنك.</p>
+              </div>
+              <div className={s.ctaActions}>
+                <Link href="/register" className={s.btnLight}>أنشئ حساب متجرك</Link>
+                <Link href="/login" className={s.btnGhost}>تسجيل الدخول</Link>
+              </div>
             </div>
           </div>
         </section>
