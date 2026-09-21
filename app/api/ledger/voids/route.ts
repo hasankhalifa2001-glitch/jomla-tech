@@ -12,7 +12,10 @@ import {
 } from "@/lib/auth/role-matrix";
 import { getTenantDb, tenantScopedRawQuery } from "@/lib/db/tenant-scope";
 import { Prisma } from "@prisma/client";
-import Decimal from "decimal.js";
+// [v4.1] Money negation goes through lib/utils/money.ts — never a raw
+// new Decimal(x).negated() — per that file's own scope note. The sync
+// engine's void path (app/api/sync/route.ts) negates identically.
+import { subtractMoney } from "@/lib/utils/money";
 import {
   getUnitConversionFactor,
   toBaseUnit,
@@ -72,6 +75,33 @@ export async function POST(req: Request) {
     if (originalInvoice.status === "VOIDED" || originalInvoice.voidsInvoiceId) {
       return NextResponse.json(
         { error: "INVALID_STATE", message: "لا يمكن إلغاء فاتورة إلغاء أو فاتورة غير صالحة للإلغاء." },
+        { status: 400 }
+      );
+    }
+
+    // [v4.1] A void is the physical reversal of a FULFILLED sale — only a
+    // COMPLETED invoice has a batch deduction to give back. A PENDING_REVIEW
+    // invoice (a not-yet-approved B2B order) has no stock deduction yet, so
+    // voiding it here is a semantic misuse of this endpoint; that correction
+    // belongs to T5's reject flow instead.
+    //
+    // Deliberately a plain pre-transaction guard: Invoice.status is immutable
+    // in this codebase (there is no invoice.update(...) call site anywhere —
+    // invoice rows are append-only), so unlike the double-void guard below
+    // this check can never be invalidated by a concurrent writer and needs no
+    // in-transaction re-verification.
+    //
+    // VOIDED rows, and rows that are themselves a void of something else, are
+    // already rejected above with their own more specific message — so today
+    // this check only ever fires for PENDING_REVIEW. Placed BEFORE the
+    // existing-void query below, so the cheapest rejection happens first,
+    // with no extra round-trip for an invoice that can never be voided.
+    if (originalInvoice.status !== "COMPLETED") {
+      return NextResponse.json(
+        {
+          error: "INVALID_STATE",
+          message: "لا يمكن إلغاء إلا الفواتير المكتملة — الفواتير قيد المراجعة تُرفض عبر مسار الطلبات.",
+        },
         { status: 400 }
       );
     }
@@ -140,16 +170,22 @@ export async function POST(req: Request) {
       // The increment itself is already atomic per row — this lock
       // guards against deadlock across transactions, not against
       // corruption within one.
+      // Ascending id order, built with Prisma.join() — the exact shape the
+      // other two T1 lock sites already use (lib/inventory/batch-locking.ts
+      // and app/api/sync/route.ts's lockBatchesById), so every transaction
+      // that can touch ProductBatch acquires its row locks in one globally
+      // consistent order.
       const distinctBatchIds = Array.from(
         new Set(originalInvoice.items.map((item) => item.batchId))
-      );
+      ).sort();
 
       await tenantScopedRawQuery(
         tx,
         tenantId,
         (tenantCondition) => Prisma.sql`
           SELECT id FROM "ProductBatch"
-          WHERE id = ANY(${distinctBatchIds}) AND ${tenantCondition}
+          WHERE id IN (${Prisma.join(distinctBatchIds)})
+            AND ${tenantCondition}
           ORDER BY id ASC
           FOR UPDATE
         `
@@ -160,24 +196,26 @@ export async function POST(req: Request) {
       const voidInvoice = await tx.invoice.create({
         data: {
           tenantId,
-          // [FIX — pre-existing type error, runtime-identical] These six
-          // figures arrive as Prisma's own Decimal instances, and
-          // @types/decimal.js types the decimal.js constructor's parameter as
-          // `string | number | decimal.js.Decimal` — a structurally different
-          // class from Prisma's, so passing the instance straight in failed
-          // `next build`'s type-check (7 errors: these six + the item
-          // quantity below). `.toString()` preserves the exact value and is
-          // what every other call site in this codebase already does
-          // (e.g. lib/data/invoices.ts). No runtime behaviour change.
+          // [FIX — v4.1, money.ts is the sanctioned path] Every monetary
+          // figure here is negated via lib/utils/money.ts's
+          // subtractMoney("0", x), never a raw new Decimal(x).negated() — see
+          // that file's scope note (no call site handling a monetary value
+          // should construct a Decimal directly). The explicit .toString()
+          // stays because Prisma's bundled Decimal type is structurally
+          // distinct from decimal.js's, so passing the instance straight into
+          // a helper typed string | number | Decimal fails tsc; the value is
+          // identical either way, and subtractMoney rounds to the schema's
+          // Decimal(18,4) precision. The sync engine's void path negates the
+          // same way.
           userId: adminUserId,
           customerId: originalInvoice.customerId,
-          totalSYP: new Decimal(originalInvoice.totalSYP.toString()).negated().toString(),
-          totalUSD: new Decimal(originalInvoice.totalUSD.toString()).negated().toString(),
+          totalSYP: subtractMoney("0", originalInvoice.totalSYP.toString()),
+          totalUSD: subtractMoney("0", originalInvoice.totalUSD.toString()),
           exchangeRateUsed: originalInvoice.exchangeRateUsed,
-          paidAmountSYP: new Decimal(originalInvoice.paidAmountSYP.toString()).negated().toString(),
-          paidAmountUSD: new Decimal(originalInvoice.paidAmountUSD.toString()).negated().toString(),
-          debtAmountSYP: new Decimal(originalInvoice.debtAmountSYP.toString()).negated().toString(),
-          debtAmountUSD: new Decimal(originalInvoice.debtAmountUSD.toString()).negated().toString(),
+          paidAmountSYP: subtractMoney("0", originalInvoice.paidAmountSYP.toString()),
+          paidAmountUSD: subtractMoney("0", originalInvoice.paidAmountUSD.toString()),
+          debtAmountSYP: subtractMoney("0", originalInvoice.debtAmountSYP.toString()),
+          debtAmountUSD: subtractMoney("0", originalInvoice.debtAmountUSD.toString()),
           isPaid: originalInvoice.isPaid,
           status: "VOIDED",
           isSynced: true,
@@ -201,7 +239,12 @@ export async function POST(req: Request) {
             productId: item.productId,
             unitId: item.unitId,
             batchId: item.batchId,
-            quantity: new Decimal(item.quantity.toString()).negated().toString(),
+            // Negated in the SOLD unit — display only, never the base-unit
+            // figure applied to the batch below (two distinct values, equal
+            // only when the sold unit IS the base unit). subtractMoney(0, x)
+            // is the same negation the sync engine's void path applies to
+            // each original batch portion.
+            quantity: subtractMoney("0", item.quantity.toString()),
             unitPriceSYP: item.unitPriceSYP,
             unitPriceUSD: item.unitPriceUSD,
           },
