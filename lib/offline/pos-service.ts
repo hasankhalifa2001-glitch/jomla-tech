@@ -108,7 +108,7 @@
  *
  * [FIX — review pass 9, this revision] Two gaps closed:
  *   1. CartLineItem.conversionFactor was typed `number` — the only
- *      Decimal-precision field in this entire file (and one of the very
+ *      Decimal-precision field on this entire file (and one of the very
  *      few anywhere in the codebase) not typed as a decimal-serialized
  *      string. Every sibling field on this exact interface
  *      (unitPriceSYP), every field on OfflineInvoiceItem (db.ts), and the
@@ -152,6 +152,40 @@
  * totalCachedStock. Void records' negated item quantities correctly add
  * reversed stock back with no special-casing, since the same summation
  * handles both signs uniformly.
+ *
+ * [FIX — T4d v4.1, this revision] submitOfflineVoid()'s guard 7 (the
+ * "does a local void already exist for this original" check) was a
+ * plain, unguarded read followed — several statements and one more async
+ * lookup later — by a separate write via saveOfflineInvoiceWithBalance().
+ * Nothing serialized those two steps against a SECOND, near-simultaneous
+ * call to this same function (a double-tap on the void button before the
+ * UI disabled it, or a slow re-render leaving it clickable for an extra
+ * moment): both calls could read "no existing local void" before either
+ * had written one, both pass guard 7, and both go on to create a
+ * SEPARATE local void record — with the same voidsOfflineInvoiceId — via
+ * two independent generateOfflineId() calls. The ONLY thing that then
+ * caught the duplicate was the SERVER's own alreadyVoided check /
+ * voidsInvoiceId @unique constraint at sync time — which worked exactly
+ * as designed, but left one of the two local records permanently stuck
+ * in FAILED status (FAILED items are never auto-retried), since the
+ * client had no way to know in advance which of the two would "win."
+ *
+ * Fixed: every guard from the existing-row lookup through the
+ * existing-local-void check, AND the eventual write, now run inside ONE
+ * Dexie read-write transaction on [offlineInvoices, cachedCustomers].
+ * Dexie serializes concurrent read-write transactions touching the same
+ * tables, so a second near-simultaneous call's guard-7 read now genuinely
+ * waits for the first call's write to commit, and correctly observes the
+ * just-created local void — closing the race at its actual source for
+ * the common (same-tab, same-device) case. This does NOT, and cannot,
+ * close a genuinely cross-DEVICE race (two different phones/browsers
+ * voiding the same invoice at the same instant) — that remains, correctly,
+ * the server's job alone, via the same constraint that already caught it
+ * here. saveOfflineInvoiceWithBalance() itself needed no change: called
+ * synchronously from within the surrounding transaction's callback (no
+ * intervening network/timer boundary), Dexie automatically joins its
+ * own db.transaction(...) call to the already-open outer transaction
+ * rather than opening a second, independent one.
  */
 
 import {
@@ -1359,20 +1393,28 @@ export async function listPendingOfflineInvoices(
  * Guards, in order (cheapest / most fundamental first):
  *   1. Offline DB support + a non-empty tenantId — throws otherwise.
  *   2. actorRole !== "ADMIN" → rejected HERE, not just by the UI.
- *   3. The target row is loaded by offlineId, scoped to tenantId — a lookup
+ *   3. voidReason is required and non-empty — checked before opening the
+ *      transaction below, since it needs no data from it.
+ *   4. The target row is loaded by offlineId, scoped to tenantId — a lookup
  *      that resolves to a different tenant's row is treated as not found.
- *   4. Not found → rejected.
- *   5. status === "SYNCED" → rejected. Re-verified inside this function rather
+ *   5. Not found → rejected.
+ *   6. status === "SYNCED" → rejected. Re-verified inside this function rather
  *      than trusted from the UI's last render: a background sync can complete
  *      in the gap between the panel rendering and the user clicking void. If
  *      the target has since become SYNCED, the void is rejected here — the
  *      invoice now belongs exclusively to T4c2 / the online void endpoint.
- *   6. The target is itself a void (voidsOfflineInvoiceId set) → rejected;
+ *   7. The target is itself a void (voidsOfflineInvoiceId set) → rejected;
  *      voiding a void is nonsensical.
- *   7. A local void record already exists for this offlineInvoiceId →
+ *   8. A local void record already exists for this offlineInvoiceId →
  *      rejected (the offline mirror of the @unique constraint on
  *      Invoice.voidsInvoiceId that applies once both rows sync).
- *   8. voidReason is required and non-empty.
+ *
+ * [FIX — T4d v4.1, this revision] Guards 4 through 8 AND the eventual write
+ * now all run inside ONE Dexie read-write transaction on
+ * [offlineInvoices, cachedCustomers] — see the file-header FIX note
+ * ("submitOfflineVoid()'s guard 7...") for the full race-condition this
+ * closes. Guards 1-3 stay outside the transaction since they need no data
+ * from it and there's nothing to gain by holding a table lock for them.
  *
  * On success the reversed record is derived (negated sold-unit item
  * quantities, negated money via the same lib/utils/money.ts discipline as the
@@ -1410,97 +1452,121 @@ export async function submitOfflineVoid(
     throw new Error("عملية إلغاء الفاتورة متاحة فقط لحساب المدير (ADMIN).");
   }
 
-  const db = getOfflineDb();
-
-  // Guard 3/4 — tenant-scoped lookup; a foreign tenant's row is not found.
-  const original = await db.offlineInvoices
-    .where("offlineId")
-    .equals(params.offlineInvoiceId)
-    .filter((inv) => inv.tenantId === scopedTenantId)
-    .first();
-
-  if (!original) {
-    throw new Error("الفاتورة المحلية غير موجودة على هذا الجهاز.");
-  }
-
-  // Guard 5 — already synced: no longer ours to void.
-  if (original.status === "SYNCED") {
-    throw new Error(
-      "هذه الفاتورة تمت مزامنتها — يجب إلغاؤها من سجل الفواتير (T4c2) وليس من هنا."
-    );
-  }
-
-  // Guard 6 — void of a void.
-  if (original.voidsOfflineInvoiceId) {
-    throw new Error("لا يمكن إلغاء فاتورة إلغاء.");
-  }
-
-  // Guard 7 — local double-void guard (mirrors the server's @unique).
-  const existingLocalVoid = await db.offlineInvoices
-    .where("tenantId")
-    .equals(scopedTenantId)
-    .filter((inv) => inv.voidsOfflineInvoiceId === original.offlineId)
-    .first();
-
-  if (existingLocalVoid) {
-    throw new Error("لا يمكن إلغاء هذه الفاتورة لأنها ملغاة محلياً بالفعل.");
-  }
-
-  // Guard 8 — mandatory free-text reason, no exceptions on either path.
+  // Guard 3 — mandatory free-text reason, no exceptions on either path.
+  // Checked here, before opening the transaction below, since it needs no
+  // data from Dexie at all.
   if (!params.voidReason || !params.voidReason.trim()) {
     throw new Error("يجب تحديد سبب الإلغاء.");
   }
+  const trimmedReason = params.voidReason.trim();
 
-  // Passed through so createOfflineVoidRecord()'s own "the system-generated
-  // cash customer must never carry debt or credit" guard actually runs — that
-  // factory re-validates it itself rather than trusting this call site.
-  const isSystemCustomer = original.offlineCustomerId
-    ? false
-    : Boolean(
-        original.customerId
-          ? (await db.cachedCustomers.get(original.customerId))?.isSystemGenerated
-          : false
-      );
+  const db = getOfflineDb();
 
-  const voidRecord = createOfflineVoidRecord({
-    tenantId: scopedTenantId,
-    voidsOfflineInvoiceId: original.offlineId,
-    voidReason: params.voidReason.trim(),
-    customerId: original.customerId,
-    offlineCustomerId: original.offlineCustomerId,
-    isSystemCustomer,
-    // Mirrors how the original was built: createOfflineInvoiceRecord throws
-    // when requiresExchangeRate is true and the rate is null, so "rate === null"
-    // on the stored original is exactly the case where a rate was never
-    // required. Reusing that equivalence avoids inventing a requirement the
-    // original sale never had.
-    requiresExchangeRate: original.exchangeRateUsed !== null,
-    items: original.items.map((item) => ({
-      productId: item.productId,
-      // The ORIGINAL sold unit — never the base unit, and no conversion here.
-      unitId: item.unitId,
-      // Negated through lib/utils/money.ts's subtractMoney (the sanctioned
-      // negation path), in the SOLD unit — display/queue only. The base-unit
-      // figure the server actually restores is computed once, at sync time.
-      quantity: subtractMoney("0", item.quantity),
-      // Deliberately NOT negated: negating the price as well would
-      // double-negate the line total and break the ledger's zero-sum property.
-      unitPriceSYP: item.unitPriceSYP,
-    })),
-    // Money is negated by the factory itself, from these originals, via the
-    // same subtractMoney("0", …) discipline the online route uses.
-    originalTotalSYP: original.totalSYP,
-    originalPaidAmountSYP: original.paidAmountSYP,
-    originalDebtAmountSYP: original.debtAmountSYP,
-    exchangeRateUsed: original.exchangeRateUsed,
-    createdAt: new Date(),
-    status: "PENDING",
-  });
+  // [FIX — T4d v4.1, race condition] Guards 4-8 and the eventual write are
+  // wrapped in ONE Dexie read-write transaction — see this function's own
+  // doc comment and the file-header FIX note for the full "double-tap
+  // creates two local void records" race this closes. Dexie serializes
+  // concurrent rw transactions touching the same tables, so a second
+  // near-simultaneous call now genuinely waits here rather than racing
+  // guard 8's read against the first call's write.
+  const voidRecord = await db.transaction(
+    "rw",
+    [db.offlineInvoices, db.cachedCustomers],
+    async () => {
+      // Guard 4/5 — tenant-scoped lookup; a foreign tenant's row is not found.
+      const original = await db.offlineInvoices
+        .where("offlineId")
+        .equals(params.offlineInvoiceId)
+        .filter((inv) => inv.tenantId === scopedTenantId)
+        .first();
 
-  // Same transactional helper every offline sale already uses: the row's
-  // negative debtAmountSYP decrements the cached customer balance inside the
-  // same Dexie transaction, with no void-specific balance logic anywhere.
-  await saveOfflineInvoiceWithBalance(voidRecord);
+      if (!original) {
+        throw new Error("الفاتورة المحلية غير موجودة على هذا الجهاز.");
+      }
+
+      // Guard 6 — already synced: no longer ours to void.
+      if (original.status === "SYNCED") {
+        throw new Error(
+          "هذه الفاتورة تمت مزامنتها — يجب إلغاؤها من سجل الفواتير (T4c2) وليس من هنا."
+        );
+      }
+
+      // Guard 7 — void of a void.
+      if (original.voidsOfflineInvoiceId) {
+        throw new Error("لا يمكن إلغاء فاتورة إلغاء.");
+      }
+
+      // Guard 8 — local double-void guard (mirrors the server's @unique).
+      // Now genuinely race-free: any concurrent call attempting the same
+      // check waits for this transaction to commit before it can read.
+      const existingLocalVoid = await db.offlineInvoices
+        .where("tenantId")
+        .equals(scopedTenantId)
+        .filter((inv) => inv.voidsOfflineInvoiceId === original.offlineId)
+        .first();
+
+      if (existingLocalVoid) {
+        throw new Error("لا يمكن إلغاء هذه الفاتورة لأنها ملغاة محلياً بالفعل.");
+      }
+
+      // Passed through so createOfflineVoidRecord()'s own "the
+      // system-generated cash customer must never carry debt or credit"
+      // guard actually runs — that factory re-validates it itself rather
+      // than trusting this call site.
+      const isSystemCustomer = original.offlineCustomerId
+        ? false
+        : Boolean(
+          original.customerId
+            ? (await db.cachedCustomers.get(original.customerId))?.isSystemGenerated
+            : false
+        );
+
+      const record = createOfflineVoidRecord({
+        tenantId: scopedTenantId,
+        voidsOfflineInvoiceId: original.offlineId,
+        voidReason: trimmedReason,
+        customerId: original.customerId,
+        offlineCustomerId: original.offlineCustomerId,
+        isSystemCustomer,
+        // Mirrors how the original was built: createOfflineInvoiceRecord
+        // throws when requiresExchangeRate is true and the rate is null, so
+        // "rate === null" on the stored original is exactly the case where a
+        // rate was never required. Reusing that equivalence avoids inventing
+        // a requirement the original sale never had.
+        requiresExchangeRate: original.exchangeRateUsed !== null,
+        items: original.items.map((item) => ({
+          productId: item.productId,
+          // The ORIGINAL sold unit — never the base unit, and no conversion here.
+          unitId: item.unitId,
+          // Negated through lib/utils/money.ts's subtractMoney (the sanctioned
+          // negation path), in the SOLD unit — display/queue only. The base-unit
+          // figure the server actually restores is computed once, at sync time.
+          quantity: subtractMoney("0", item.quantity),
+          // Deliberately NOT negated: negating the price as well would
+          // double-negate the line total and break the ledger's zero-sum property.
+          unitPriceSYP: item.unitPriceSYP,
+        })),
+        // Money is negated by the factory itself, from these originals, via the
+        // same subtractMoney("0", …) discipline the online route uses.
+        originalTotalSYP: original.totalSYP,
+        originalPaidAmountSYP: original.paidAmountSYP,
+        originalDebtAmountSYP: original.debtAmountSYP,
+        exchangeRateUsed: original.exchangeRateUsed,
+        createdAt: new Date(),
+        status: "PENDING",
+      });
+
+      // Same transactional helper every offline sale already uses: the row's
+      // negative debtAmountSYP decrements the cached customer balance inside
+      // the same Dexie transaction, with no void-specific balance logic
+      // anywhere. Called synchronously here (no intervening network/timer
+      // boundary), so Dexie joins this already-open outer transaction rather
+      // than opening a second, independent one — see the FIX note above.
+      await saveOfflineInvoiceWithBalance(record, db);
+
+      return record;
+    }
+  );
 
   return voidRecord;
 }

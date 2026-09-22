@@ -210,6 +210,38 @@ export const dynamic = "force-dynamic";
  * own sale/void bodies) is completely unchanged — only extracted into a
  * named function, processInvoiceSyncItem(), so it can be invoked from two
  * sequential loops instead of one combined one.
+ *
+ * [FIX — v4.1, LOST-ACK IDEMPOTENCY ON THE VOID PATH] The "already voided"
+ * pre-check below previously rejected UNCONDITIONALLY whenever a void row
+ * already existed for the original invoice — even when that existing void
+ * row was the exact SAME logical void this request is retrying (same
+ * offlineId). This is the classic "lost acknowledgment" gap: a prior sync
+ * attempt for this same void could have COMMITTED successfully server-side
+ * (the Invoice + InvoiceItem rows created, the batch already restored),
+ * but the HTTP response back to the client never arrived (a connection
+ * drop right as connectivity returned, an app close before the response
+ * was read, etc.) — so the client's local copy never got marked SYNCED
+ * and legitimately retried the exact same offlineId on the next sync pass.
+ * The old code could not tell that case apart from a genuine conflict (a
+ * DIFFERENT void racing in from elsewhere) and rejected both identically,
+ * leaving the retried void permanently stuck FAILED (this route's FAILED
+ * items are never auto-retried) despite having actually succeeded — which
+ * in turn fed a real, user-visible bug: pos-service.ts's
+ * getOfflineProducts() keeps subtracting any non-SYNCED invoice's items
+ * from the displayed stock count, so a void wrongly stuck FAILED kept
+ * being subtracted a SECOND time on top of the restoration the server had
+ * already applied, inflating the POS's displayed stock above the real,
+ * already-correct server total (confirmed by comparing against the
+ * Inventory screen, which reads the server snapshot directly with no such
+ * extra subtraction).
+ *
+ * Fixed by distinguishing the two cases via offlineId: if the existing
+ * void row's offlineId matches THIS request's offlineId, it is the exact
+ * same void that already succeeded — return it as a normal idempotent
+ * success (mirrors the identical existing-row idempotency check earlier in
+ * this same function, for the non-void case) rather than throwing. Only a
+ * genuinely DIFFERENT offlineId — a real second void racing in — still
+ * throws the original Arabic conflict message.
  */
 
 // ============================================================================
@@ -679,11 +711,25 @@ export async function POST(req: NextRequest) {
               );
             }
 
+            // [FIX — v4.1, LOST-ACK IDEMPOTENCY] Now also selects offlineId
+            // so the code below can distinguish "this exact void already
+            // succeeded, the ack was just lost" from "a genuinely different
+            // void is already there" — see the file-header FIX note for the
+            // full rationale and the real bug (inflated POS stock display)
+            // this closes.
             const alreadyVoided = await tx.invoice.findFirst({
               where: { voidsInvoiceId: originalInvoice.id, tenantId },
-              select: { id: true },
+              select: { id: true, offlineId: true },
             });
             if (alreadyVoided) {
+              if (alreadyVoided.offlineId === inv.offlineId) {
+                // Same logical void as this request, already committed on a
+                // prior attempt whose response never reached the client —
+                // idempotent success, not a conflict. Mirrors the identical
+                // `if (existing) return existing;` idempotency check earlier
+                // in this same function.
+                return alreadyVoided;
+              }
               throw new Error("تم إلغاء هذه الفاتورة مسبقاً عبر مزامنة أخرى.");
             }
 
