@@ -1,15 +1,25 @@
 /* app/(auth)/register/page.tsx */
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { signIn } from "next-auth/react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Store, User, Mail, Lock, Phone, Loader2, AlertCircle } from "lucide-react";
+import {
+  AlertCircle,
+  Check,
+  Eye,
+  EyeOff,
+  Loader2,
+  Lock,
+  Mail,
+  Phone,
+  Store,
+  User,
+} from "lucide-react";
+import s from "@/components/auth/auth.module.css";
+import { AuthShell } from "@/components/auth/auth-shell";
 
 // Kept in sync with the server's RESERVED_SLUGS (app/api/auth/register/route.ts)
 // so the client can reject/avoid these instantly instead of round-tripping
@@ -20,9 +30,8 @@ const RESERVED_SLUGS = new Set([
   "ledger", "orders", "settings", "account-locked", "store", "www", "app",
 ]);
 
-// FIX: strips leading/trailing dashes too (the old regex only collapsed
-// consecutive dashes in the middle), and the caller below now checks the
-// RESULT length rather than trusting any non-empty string.
+// Strips leading/trailing dashes too, and callers check the RESULT length
+// rather than trusting any non-empty string.
 function toSlug(val: string): string {
   return val
     .toLowerCase()
@@ -30,6 +39,33 @@ function toSlug(val: string): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 }
+
+// Purely informational (the only enforced rule stays "at least 6 characters").
+function passwordLevel(pw: string): 0 | 1 | 2 | 3 | 4 {
+  if (!pw) return 0;
+  let score = 0;
+  if (pw.length >= 6) score++;
+  if (pw.length >= 10) score++;
+  if (/[a-zA-Z]/.test(pw) && /\d/.test(pw)) score++;
+  if (/[^a-zA-Z0-9]/.test(pw) || (/[a-z]/.test(pw) && /[A-Z]/.test(pw))) score++;
+  return Math.max(1, score) as 1 | 2 | 3 | 4;
+}
+const LEVEL_LABEL = ["", "ضعيفة", "متوسطة", "جيدة", "قوية"] as const;
+
+const PANEL_POINTS = [
+  {
+    title: "سجّل متجرك",
+    body: "ينشأ حساب المدير الأول، ويُجهَّز لك تلقائياً «زبون نقدي» للبيع النقدي السريع.",
+  },
+  {
+    title: "حوّل قيمة الاشتراك",
+    body: "اكتب رمز المرجع الذي يولّده النظام على الحوالة، وارفع صورة الإيصال.",
+  },
+  {
+    title: "يُفعَّل حسابك",
+    body: "بعد مطابقة الإيصال تفتح لك جميع الشاشات دون إعادة تسجيل دخول.",
+  },
+];
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -41,24 +77,29 @@ export default function RegisterPage() {
   const [adminName, setAdminName] = useState("");
   const [adminEmail, setAdminEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const alertRef = useRef<HTMLDivElement>(null);
+
+  // Bring the error into view (the form is long on small screens).
+  useEffect(() => {
+    if (errorMessage) {
+      alertRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [errorMessage]);
 
   const handleSlugChange = (val: string) => {
     setSlugTouchedManually(true);
     setTenantSlug(toSlug(val));
   };
 
-  // FIX: for an Arabic business name (the expected common case on an
-  // Arabic-first platform), every character maps to "-", collapsing to a
-  // single "-" — useless as a slug. Only auto-fill when the derived slug is
-  // actually usable (length >= 2 after stripping edge dashes); otherwise
-  // leave the field for the merchant to fill in manually with a Latin
-  // identifier, same as they'd have to do anyway once toSlug() empties out
-  // a pure-Arabic name. Also stops overwriting a slug the merchant already
-  // edited by hand, tracked via slugTouchedManually instead of re-deriving
-  // and comparing against the previous name on every keystroke.
+  // For an Arabic business name every character maps to "-", collapsing to
+  // nothing usable. Only auto-fill when the derived slug is usable (>= 2
+  // chars after stripping edge dashes); otherwise leave the field for the
+  // merchant to fill in with a Latin identifier. Never overwrite a slug the
+  // merchant already edited by hand (tracked via slugTouchedManually).
   const handleNameChange = (val: string) => {
     setTenantName(val);
     if (slugTouchedManually) return;
@@ -68,7 +109,7 @@ export default function RegisterPage() {
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
 
@@ -84,6 +125,12 @@ export default function RegisterPage() {
 
     if (RESERVED_SLUGS.has(tenantSlug)) {
       setErrorMessage("معرف المتجر هذا محجوز، الرجاء اختيار معرف آخر.");
+      return;
+    }
+
+    // The form uses noValidate (so every message is Arabic), hence this check.
+    if (!/^\S+@\S+\.\S+$/.test(adminEmail)) {
+      setErrorMessage("يرجى إدخال بريد إلكتروني صحيح.");
       return;
     }
 
@@ -125,13 +172,9 @@ export default function RegisterPage() {
       if (loginRes?.error) {
         router.push("/login?registered=true");
       } else {
-        // FIX: was router.push("/dashboard") — middleware would still
-        // catch the PENDING lockout and bounce an ADMIN to
-        // /settings/billing (see middleware.ts §3), so the old code wasn't
-        // wrong, just an unnecessary extra redirect hop. Going straight
-        // there skips it. Still relies on the middleware as the real
-        // enforcement point — this is a UX shortcut, not a new access
-        // control decision made here.
+        // Straight to billing: middleware would bounce a PENDING ADMIN there
+        // anyway (see middleware.ts §3), this only skips one redirect hop.
+        // The middleware stays the real enforcement point.
         router.push("/settings/billing?reason=pending");
         router.refresh();
       }
@@ -142,176 +185,239 @@ export default function RegisterPage() {
     }
   };
 
+  // Live feedback for the slug field (does not replace the submit checks).
+  const slugStatus: "empty" | "short" | "reserved" | "ok" = !tenantSlug
+    ? "empty"
+    : tenantSlug.length < 2
+      ? "short"
+      : RESERVED_SLUGS.has(tenantSlug)
+        ? "reserved"
+        : "ok";
+
+  const level = passwordLevel(password);
+
   return (
-    <main className="flex min-h-screen flex-1 items-center justify-center bg-zinc-50 dark:bg-zinc-950 px-4 py-12 font-sans">
-      <Card className="w-full max-w-lg border-zinc-200 shadow-xl dark:border-zinc-800 dark:bg-zinc-900">
-        <CardHeader className="space-y-1 text-center pb-4">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-600 text-white shadow-lg shadow-emerald-600/20 mb-2">
-            <Store className="h-7 w-7" />
+    <AuthShell
+      panelTitle="جهّز متجرك قبل موسم الحركة القادم"
+      panelLead="يبقى الحساب في وضع الانتظار من لحظة التسجيل حتى مراجعة أول حوالة، ثم يُفعَّل مباشرة."
+      points={PANEL_POINTS}
+    >
+      <div className={s.card}>
+        <h1 className={s.title}>تسجيل تجار الجملة</h1>
+        <p className={s.sub}>
+          أنشئ مساحة العمل الخاصة بمنشأتك وادعُ فريق العمل لإدارة المبيعات والمخزون.
+        </p>
+
+        {errorMessage && (
+          <div ref={alertRef} role="alert" className={s.alert}>
+            <AlertCircle size={18} aria-hidden />
+            <span>{errorMessage}</span>
           </div>
-          <CardTitle className="text-2xl font-extrabold text-zinc-900 dark:text-zinc-100">
-            تسجيل تجار الجملة
-          </CardTitle>
-          <CardDescription className="text-xs text-zinc-500 dark:text-zinc-400">
-            أنشئ مساحة العمل الخاصة بمنشأتك وادعُ فريق العمل لإدارة المبيعات والمخزون.
-          </CardDescription>
-        </CardHeader>
+        )}
 
-        <CardContent className="space-y-4">
-          {errorMessage && (
-            <div className="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-semibold text-red-700 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300">
-              <AlertCircle className="h-4 w-4 shrink-0" />
-              <span>{errorMessage}</span>
-            </div>
-          )}
+        <form onSubmit={handleSubmit} noValidate className={s.form}>
+          {/* 1. Business */}
+          <fieldset className={s.group}>
+            <p className={s.groupTitle}>
+              <span className={s.groupNum}>1</span>
+              بيانات المنشأة والمتجر
+            </p>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-3 rounded-xl border border-zinc-200 bg-zinc-50/50 p-3.5 dark:border-zinc-800 dark:bg-zinc-900/50">
-              <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400 block">
-                1. بيانات المنشأة والمتجر
-              </span>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="tenantName" className="text-xs font-semibold">
-                  اسم المتجر / الشركة <span className="text-red-500">*</span>
-                </Label>
-                <div className="relative">
-                  <Store className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-                  <Input
-                    id="tenantName"
-                    placeholder="مثال: تجارة البركة بالجملة"
-                    value={tenantName}
-                    onChange={(e) => handleNameChange(e.target.value)}
-                    className="pr-9 text-xs"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="tenantSlug" className="text-xs font-semibold">
-                  معرف المتجر بالإنجليزية (Slug) <span className="text-red-500">*</span>
-                </Label>
-                <div className="relative">
-                  <Input
-                    id="tenantSlug"
-                    placeholder="al-baraka"
-                    value={tenantSlug}
-                    onChange={(e) => handleSlugChange(e.target.value)}
-                    className="text-xs font-mono ltr text-left"
-                    required
-                  />
-                </div>
-                <p className="text-[11px] text-zinc-500">
-                  سيكون رابط متجركم: <code className="font-mono text-emerald-600">/store/{tenantSlug || "slug"}</code>
-                </p>
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="phone" className="text-xs font-semibold">
-                  رقم الهاتف (اختياري)
-                </Label>
-                <div className="relative">
-                  <Phone className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-                  <Input
-                    id="phone"
-                    placeholder="+963 911 223 344"
-                    value={phone}
-                    onChange={(e) => setPhone(e.target.value)}
-                    className="pr-9 text-xs ltr text-left"
-                  />
-                </div>
+            <div className={s.field}>
+              <label htmlFor="tenantName" className={s.label}>
+                اسم المتجر / الشركة<span className={s.req}>*</span>
+              </label>
+              <div className={s.control}>
+                <Store size={18} className={s.icon} aria-hidden />
+                <input
+                  id="tenantName"
+                  name="organization"
+                  autoComplete="organization"
+                  placeholder="مثال: تجارة البركة بالجملة"
+                  value={tenantName}
+                  onChange={(e) => handleNameChange(e.target.value)}
+                  className={s.input}
+                  required
+                />
               </div>
             </div>
 
-            <div className="space-y-3 rounded-xl border border-zinc-200 bg-zinc-50/50 p-3.5 dark:border-zinc-800 dark:bg-zinc-900/50">
-              <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400 block">
-                2. حساب مدير المتجر (Admin)
-              </span>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="adminName" className="text-xs font-semibold">
-                  اسم المدير المسؤول <span className="text-red-500">*</span>
-                </Label>
-                <div className="relative">
-                  <User className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-                  <Input
-                    id="adminName"
-                    placeholder="مثال: أحمد خليل"
-                    value={adminName}
-                    onChange={(e) => setAdminName(e.target.value)}
-                    className="pr-9 text-xs"
-                    required
-                  />
-                </div>
+            <div className={s.field}>
+              <label htmlFor="tenantSlug" className={s.label}>
+                معرف المتجر بالإنجليزية (Slug)<span className={s.req}>*</span>
+              </label>
+              <div className={s.slugGroup}>
+                <span className={s.slugPrefix} aria-hidden>/store/</span>
+                <input
+                  id="tenantSlug"
+                  name="slug"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  placeholder="al-baraka"
+                  value={tenantSlug}
+                  onChange={(e) => handleSlugChange(e.target.value)}
+                  className={s.slugInput}
+                  aria-describedby="slugHint"
+                  aria-invalid={slugStatus === "reserved" || slugStatus === "short"}
+                  required
+                />
               </div>
+              <p
+                id="slugHint"
+                className={`${s.hint} ${slugStatus === "ok" ? s.hintOk : slugStatus === "reserved" ? s.hintErr : ""
+                  }`}
+              >
+                {slugStatus === "ok" && (
+                  <>
+                    <Check size={14} aria-hidden />
+                    <span>
+                      رابط متجركم: <span dir="ltr" className={s.mono}>/store/{tenantSlug}</span>
+                    </span>
+                  </>
+                )}
+                {slugStatus === "reserved" && (
+                  <>
+                    <AlertCircle size={14} aria-hidden />
+                    <span>هذا المعرف محجوز، اختر معرفاً آخر.</span>
+                  </>
+                )}
+                {slugStatus === "short" && <span>معرف المتجر يجب أن يكون حرفين على الأقل.</span>}
+                {slugStatus === "empty" && (
+                  <span>
+                    {tenantName
+                      ? "الاسم العربي لا يُحوَّل تلقائياً، اكتب المعرف بأحرف إنجليزية (مثال: al-baraka)."
+                      : "أحرف إنجليزية صغيرة وأرقام وشرطات فقط. سيكون رابط متجركم /store/المعرف."}
+                  </span>
+                )}
+              </p>
+            </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="adminEmail" className="text-xs font-semibold">
-                  البريد الإلكتروني <span className="text-red-500">*</span>
-                </Label>
-                <div className="relative">
-                  <Mail className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-                  <Input
-                    id="adminEmail"
-                    type="email"
-                    placeholder="admin@example.com"
-                    value={adminEmail}
-                    onChange={(e) => setAdminEmail(e.target.value)}
-                    className="pr-9 text-xs ltr text-left"
-                    required
-                  />
-                </div>
+            <div className={s.field}>
+              <label htmlFor="phone" className={s.label}>
+                رقم الهاتف (اختياري)
+              </label>
+              <div className={s.control}>
+                <Phone size={18} className={s.icon} aria-hidden />
+                <input
+                  id="phone"
+                  name="tel"
+                  type="tel"
+                  inputMode="tel"
+                  autoComplete="tel"
+                  placeholder="+963 911 223 344"
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  className={`${s.input} ${s.inputLtr}`}
+                />
               </div>
+            </div>
+          </fieldset>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="password" className="text-xs font-semibold">
-                  كلمة المرور <span className="text-red-500">*</span>
-                </Label>
-                <div className="relative">
-                  <Lock className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-                  <Input
-                    id="password"
-                    type="password"
-                    placeholder="••••••••"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="pr-9 text-xs ltr text-left"
-                    required
-                  />
-                </div>
+          {/* 2. Admin account */}
+          <fieldset className={s.group}>
+            <p className={s.groupTitle}>
+              <span className={s.groupNum}>2</span>
+              حساب مدير المتجر (Admin)
+            </p>
+
+            <div className={s.field}>
+              <label htmlFor="adminName" className={s.label}>
+                اسم المدير المسؤول<span className={s.req}>*</span>
+              </label>
+              <div className={s.control}>
+                <User size={18} className={s.icon} aria-hidden />
+                <input
+                  id="adminName"
+                  name="name"
+                  autoComplete="name"
+                  placeholder="مثال: أحمد خليل"
+                  value={adminName}
+                  onChange={(e) => setAdminName(e.target.value)}
+                  className={s.input}
+                  required
+                />
               </div>
             </div>
 
-            <Button
-              type="submit"
-              disabled={isLoading}
-              className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs h-10 gap-2 shadow-md shadow-emerald-600/20"
-            >
-              {isLoading ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>جاري إنشاء الحساب والمساحة...</span>
-                </>
-              ) : (
-                <span>إنشاء متجر جديد للشركة</span>
-              )}
-            </Button>
-          </form>
-        </CardContent>
+            <div className={s.field}>
+              <label htmlFor="adminEmail" className={s.label}>
+                البريد الإلكتروني<span className={s.req}>*</span>
+              </label>
+              <div className={s.control}>
+                <Mail size={18} className={s.icon} aria-hidden />
+                <input
+                  id="adminEmail"
+                  name="email"
+                  type="email"
+                  inputMode="email"
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  placeholder="admin@example.com"
+                  value={adminEmail}
+                  onChange={(e) => setAdminEmail(e.target.value)}
+                  className={`${s.input} ${s.inputLtr}`}
+                  required
+                />
+              </div>
+            </div>
 
-        <CardFooter className="flex flex-col items-center gap-2 border-t border-zinc-100 dark:border-zinc-800 pt-4 bg-zinc-50/50 dark:bg-zinc-900/30">
-          <p className="text-xs text-zinc-600 dark:text-zinc-400">
-            لديك حساب مسجل بالفعل؟{" "}
-            <Link
-              href="/login"
-              className="font-bold text-emerald-700 hover:underline dark:text-emerald-400"
-            >
-              تسجيل الدخول
-            </Link>
-          </p>
-        </CardFooter>
-      </Card>
-    </main>
+            <div className={s.field}>
+              <label htmlFor="password" className={s.label}>
+                كلمة المرور<span className={s.req}>*</span>
+              </label>
+              <div className={s.control}>
+                <Lock size={18} className={s.icon} aria-hidden />
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? "text" : "password"}
+                  autoComplete="new-password"
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className={`${s.input} ${s.inputLtr} ${s.inputPw}`}
+                  aria-describedby="pwHint"
+                  required
+                />
+                <button
+                  type="button"
+                  className={s.toggle}
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? "إخفاء كلمة المرور" : "إظهار كلمة المرور"}
+                  aria-pressed={showPassword}
+                >
+                  {showPassword ? <EyeOff size={18} aria-hidden /> : <Eye size={18} aria-hidden />}
+                </button>
+              </div>
+              <div className={s.meter} data-level={level} aria-hidden>
+                <i />
+                <i />
+                <i />
+                <i />
+              </div>
+              <p id="pwHint" className={s.meterText}>
+                {level === 0 ? "6 أحرف على الأقل." : `قوة كلمة المرور: ${LEVEL_LABEL[level]}`}
+              </p>
+            </div>
+          </fieldset>
+
+          <button type="submit" disabled={isLoading} className={s.submit}>
+            {isLoading ? (
+              <>
+                <Loader2 size={20} className={s.spin} aria-hidden />
+                <span>جاري إنشاء الحساب والمساحة...</span>
+              </>
+            ) : (
+              <span>إنشاء متجر جديد للشركة</span>
+            )}
+          </button>
+        </form>
+
+        <p className={s.foot}>
+          لديك حساب مسجل بالفعل؟ <Link href="/login">تسجيل الدخول</Link>
+        </p>
+      </div>
+    </AuthShell>
   );
 }

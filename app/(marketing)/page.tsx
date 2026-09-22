@@ -13,6 +13,7 @@ import {
   WifiOff,
 } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
+import { Logo } from "@/components/brand/logo";
 import OfflineSection from "./OfflineSection";
 import s from "./marketing.module.css";
 
@@ -359,9 +360,8 @@ export default function MarketingPage() {
       {/* Header */}
       <header className={s.header}>
         <div className={`${s.container} ${s.headerInner}`}>
-          <Link href="/" className={s.brand}>
-            <span aria-hidden className={s.brandMark}>ج</span>
-            جملة تك
+          <Link href="/" className={s.brand} aria-label="جملة تك، الصفحة الرئيسية">
+            <Logo className={s.headerLogo} animated />
           </Link>
 
           <nav aria-label="أقسام الصفحة" className={s.nav}>
@@ -580,8 +580,7 @@ export default function MarketingPage() {
       <footer className={s.footer}>
         <div className={`${s.container} ${s.footerInner}`}>
           <div className={s.footerBrand}>
-            <span aria-hidden className={s.footerMark}>ج</span>
-            جملة تك
+            <Logo tone="dark" size={32} />
           </div>
           <nav aria-label="روابط التذييل" className={s.footerNav}>
             <a href="#features">المزايا</a>

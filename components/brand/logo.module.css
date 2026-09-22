@@ -1,0 +1,77 @@
+/* components/brand/logo.module.css
+   Wordmark styling for <Logo />. The mark itself is inline SVG. */
+
+.root {
+  --logo-size: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--logo-size) * 0.3);
+  line-height: 1;
+}
+
+.svg {
+  display: block;
+  flex-shrink: 0;
+}
+.root .svg {
+  width: var(--logo-size);
+  height: var(--logo-size);
+}
+
+.word {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--logo-size) * 0.13);
+  font-size: calc(var(--logo-size) * 0.6);
+  font-weight: 900;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.name {
+  color: #0f172a;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.16em 0.4em 0.24em;
+  border-radius: 0.3em;
+  background: linear-gradient(135deg, #047857, #0f766e);
+  color: #ffffff;
+  font-size: 0.72em;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+/* On dark backgrounds */
+.root[data-tone="dark"] .name {
+  color: #ffffff;
+}
+.root[data-tone="dark"] .tag {
+  background: #34d399;
+  color: #0f172a;
+}
+
+/* "Online" pulse around the dot (only when <Logo animated />) */
+.ring {
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: logoPing 3.6s ease-out 1.2s infinite;
+}
+@keyframes logoPing {
+  0% {
+    opacity: 0.75;
+    transform: scale(1);
+  }
+  65%,
+  100% {
+    opacity: 0;
+    transform: scale(2.4);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ring {
+    animation: none;
+  }
+}
