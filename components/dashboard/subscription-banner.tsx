@@ -4,8 +4,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import Link from "next/link";
-import { AlertTriangle, Clock, RefreshCw } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { AlertTriangle, RefreshCw } from "lucide-react";
+import s from "./shell.module.css";
 
 const PENDING_POLL_INTERVAL_MS = 30_000;
 
@@ -52,50 +52,41 @@ export function SubscriptionBanner() {
 
     if (status === "EXPIRED") {
         return (
-            <div className="flex flex-col items-stretch gap-2 bg-red-600 px-4 py-2.5 text-white shadow-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-                <div className="flex items-center gap-2.5 text-sm font-medium">
-                    <AlertTriangle className="h-5 w-5 shrink-0" />
+            <div role="alert" className={`${s.banner} ${s.bannerExpired}`}>
+                <div className={s.bannerText}>
+                    <AlertTriangle size={20} aria-hidden />
                     <span>
                         تنبيه: اشتراك هذا المتجر منتهي! تم قفل عمليات التعديل والإنشاء (وضع القراءة فقط).
                     </span>
                 </div>
-                <Button
-                    size="sm"
-                    variant="secondary"
-                    asChild
-                    className="h-8 w-full shrink-0 bg-white text-red-700 hover:bg-zinc-100 text-xs font-semibold sm:w-auto"
-                >
-                    <Link href="/settings/billing">تجديد الاشتراك الآن</Link>
-                </Button>
+                <div className={s.bannerActions}>
+                    <Link href="/settings/billing" className={`${s.bannerBtn} ${s.btnWhite}`}>
+                        تجديد الاشتراك الآن
+                    </Link>
+                </div>
             </div>
         );
     }
 
     return (
-        <div className="flex flex-col items-stretch gap-2 bg-amber-500 px-4 py-2.5 text-slate-950 shadow-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-            <div className="flex items-center gap-2 text-sm font-medium">
-                <Clock className="h-5 w-5 shrink-0" />
-                <span>طلب تمديد الاشتراك قيد المراجعه والتحقق من الإيصال المرفق.</span>
+        <div role="status" className={`${s.banner} ${s.bannerPending}`}>
+            <div className={s.bannerText}>
+                <span className={s.pendingDot} aria-hidden />
+                <span>طلب تمديد الاشتراك قيد المراجعة والتحقق من الإيصال المرفق.</span>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-                <Button
-                    size="sm"
-                    variant="ghost"
+            <div className={s.bannerActions}>
+                <button
+                    type="button"
                     onClick={checkStatus}
                     disabled={isChecking}
-                    className="h-8 flex-1 text-slate-950 hover:bg-amber-600 text-xs font-semibold gap-1.5 sm:flex-none"
+                    className={`${s.bannerBtn} ${s.btnAmberSolid}`}
                 >
-                    <RefreshCw className={`h-3.5 w-3.5 ${isChecking ? "animate-spin" : ""}`} />
+                    <RefreshCw size={14} className={isChecking ? s.spin : undefined} aria-hidden />
                     تحقق من الحالة
-                </Button>
-                <Button
-                    size="sm"
-                    variant="outline"
-                    asChild
-                    className="h-8 flex-1 border-slate-900 bg-transparent text-slate-950 hover:bg-amber-600 text-xs font-semibold sm:flex-none"
-                >
-                    <Link href="/settings/billing">عرض الإيصالات</Link>
-                </Button>
+                </button>
+                <Link href="/settings/billing" className={`${s.bannerBtn} ${s.btnAmber}`}>
+                    عرض الإيصالات
+                </Link>
             </div>
         </div>
     );

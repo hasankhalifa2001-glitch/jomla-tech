@@ -5,6 +5,8 @@ import { usePathname } from "next/navigation";
 import { ExchangeRateTopbar } from "@/components/dashboard/exchange-rate-topbar";
 import { ConnectionStatus } from "@/components/dashboard/connection-status";
 import { SublinkLauncher } from "@/components/dashboard/sublink-launcher";
+import { LogoMark } from "@/components/brand/logo";
+import s from "./shell.module.css";
 
 const pathMap: Record<string, string> = {
     "/dashboard": "لوحة التحكم والتحليلات",
@@ -36,14 +38,17 @@ export function DashboardTopBar() {
     const title = resolveTitle(pathname);
 
     return (
-        <header className="sticky top-0 z-30 flex flex-col gap-3 border-b border-zinc-200 bg-white/95 px-4 py-3 backdrop-blur-md dark:border-zinc-800 dark:bg-zinc-950/95 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-4 sm:px-6 sm:py-2.5">
-            {/* Current Page Title / Breadcrumb */}
-            <div className="flex items-center gap-3">
-                <h1 className="text-base font-bold text-zinc-900 dark:text-zinc-100">{title}</h1>
+        <header className={s.topbar}>
+            {/* Current page title (the brand mark shows on mobile only, where the sidebar is hidden) */}
+            <div className={s.tbTitle}>
+                <span className={s.tbBrand}>
+                    <LogoMark size={30} decorative />
+                </span>
+                <h1 className={s.title}>{title}</h1>
             </div>
 
-            {/* Top Bar Right Controls (Arabic RTL: Right side controls are placed logically) */}
-            <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+            {/* Controls: exchange rate, storefront link, connection / sync status */}
+            <div className={s.controls}>
                 <ExchangeRateTopbar />
                 <SublinkLauncher />
                 <ConnectionStatus />

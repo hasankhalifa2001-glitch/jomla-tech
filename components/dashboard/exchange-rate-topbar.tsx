@@ -4,12 +4,10 @@
 import { useEffect, useState } from "react";
 import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { formatMoney } from "@/lib/utils/money";
 import { toast } from "sonner";
 import { DollarSign, RefreshCw, CheckCircle2 } from "lucide-react";
+import s from "./shell.module.css";
 
 export function ExchangeRateTopbar() {
     const { data: session } = useSessionWithOfflineFallback();
@@ -91,80 +89,77 @@ export function ExchangeRateTopbar() {
         if (success) {
             toast.success(
                 `تم تحديث سعر الصرف اليومي بنجاح (${numericRate.toLocaleString("ar-SY")} ل.س / 1$)`,
-                { icon: <CheckCircle2 className="h-4 w-4 text-emerald-500" /> }
+                { icon: <CheckCircle2 size={16} color="#10b981" /> }
             );
             setIsEditing(false);
         }
     };
 
-    // CASHIER view: purely read-only badge with zero input controls or buttons
+    // CASHIER view: purely read-only value with zero input controls or buttons
     if (!isAdmin) {
         return (
-            <div className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-1.5 dark:border-zinc-800 dark:bg-zinc-900/80">
-                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
-                    <DollarSign className="h-3.5 w-3.5" />
-                </div>
-                <div className="flex items-center gap-1.5 text-xs font-semibold">
-                    <span className="text-zinc-600 dark:text-zinc-400 hidden sm:inline">سعر الصرف اليومي:</span>
-                    <span className="text-zinc-600 dark:text-zinc-400 sm:hidden">الصرف:</span>
-                    {dailyExchangeRate ? (
-                        <Badge variant="outline" className="font-mono font-bold bg-white text-emerald-700 border-emerald-200 dark:bg-zinc-950 dark:text-emerald-300 dark:border-emerald-900/60 px-2 py-0.5 text-xs">
-                            {formatMoney(dailyExchangeRate, "SYP", 0)} ل.س / $
-                        </Badge>
-                    ) : (
-                        <span className="text-zinc-400 font-normal">غير محدد</span>
-                    )}
-                </div>
+            <div className={`${s.chip} ${s.rate}`}>
+                <span className={s.rateIcon} aria-hidden>
+                    <DollarSign size={15} />
+                </span>
+                <span className={s.rateLabel}>
+                    <span className={s.onlyDesktop}>سعر الصرف اليومي:</span>
+                    <span className={s.onlyMobile}>الصرف:</span>
+                </span>
+                {dailyExchangeRate ? (
+                    <span className={s.rateValue}>
+                        <span className={s.rateNum}>{formatMoney(dailyExchangeRate, "SYP", 0)}</span>
+                        <span className={s.rateUnit}>ل.س / $</span>
+                    </span>
+                ) : (
+                    <span className={s.rateNone}>غير محدد</span>
+                )}
             </div>
         );
     }
 
     return (
-        <form
-            onSubmit={handleSave}
-            className="flex w-full flex-wrap items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-1.5 dark:border-zinc-800 dark:bg-zinc-900/80 sm:w-auto sm:flex-nowrap"
-        >
-            <div className="flex shrink-0 items-center gap-1.5 text-zinc-700 dark:text-zinc-300">
-                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
-                    <DollarSign className="h-3.5 w-3.5" />
-                </div>
-                <span className="text-xs font-semibold whitespace-nowrap">
-                    <span className="sm:hidden">سعر الصرف:</span>
-                    <span className="hidden sm:inline">سعر الصرف اليومي (SYP/$):</span>
-                </span>
-            </div>
+        <form onSubmit={handleSave} className={`${s.chip} ${s.rate}`}>
+            <span className={s.rateIcon} aria-hidden>
+                <DollarSign size={15} />
+            </span>
+            <label htmlFor="daily-exchange-rate" className={s.rateLabel}>
+                <span className={s.onlyMobile}>سعر الصرف:</span>
+                <span className={s.onlyDesktop}>سعر الصرف اليومي (SYP/$):</span>
+            </label>
 
-            <div className="flex flex-1 items-center gap-2 sm:flex-none">
-                <Input
+            <div className={s.rateField}>
+                <input
+                    id="daily-exchange-rate"
                     type="number"
                     step="any"
+                    inputMode="decimal"
                     placeholder="أدخل سعر اليوم..."
                     value={inputValue}
                     onChange={(e) => {
                         setInputValue(e.target.value);
                         setIsEditing(true);
                     }}
-                    className="h-8 w-full min-w-0 text-center text-xs font-mono font-bold bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 border-zinc-300 focus-visible:ring-emerald-500 sm:w-28"
+                    className={s.rateInput}
                     disabled={isUpdating}
                 />
 
-                <Button
+                <button
                     type="submit"
-                    size="sm"
                     disabled={
                         isUpdating ||
                         inputValue.trim() === "" ||
                         isNaN(parseFloat(inputValue)) ||
                         (!isEditing && dailyExchangeRate === parseFloat(inputValue))
                     }
-                    className="h-8 shrink-0 px-2.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white dark:bg-emerald-600 dark:hover:bg-emerald-500"
+                    className={s.rateBtn}
                 >
                     {isUpdating ? (
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        <RefreshCw size={14} className={s.spin} aria-label="جاري التحديث" />
                     ) : (
-                        <span className="font-medium">تحديث</span>
+                        <span>تحديث</span>
                     )}
-                </Button>
+                </button>
             </div>
         </form>
     );

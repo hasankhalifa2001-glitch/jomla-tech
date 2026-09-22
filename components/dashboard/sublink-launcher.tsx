@@ -3,24 +3,24 @@
 
 import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
 import Link from "next/link";
-import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Store, ExternalLink } from "lucide-react";
+import s from "./shell.module.css";
 
 export function SublinkLauncher() {
     const { data: session, status } = useSessionWithOfflineFallback();
 
     if (status === "loading" || !session?.tenantSlug) {
         return (
-            <Button
-                variant="outline"
-                size="sm"
+            <button
+                type="button"
                 disabled
-                className="shrink-0 gap-2 border-zinc-200 bg-zinc-50/50 text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900/30"
+                className={`${s.chip} ${s.linkChip} ${s.linkChipOff}`}
+                aria-label="المتجر الإلكتروني"
             >
-                <Store className="h-4 w-4" />
-                <span className="hidden sm:inline font-medium text-xs">المتجر الإلكتروني</span>
-            </Button>
+                <Store size={18} aria-hidden />
+                <span className={s.onlyDesktop}>المتجر الإلكتروني</span>
+            </button>
         );
     }
 
@@ -31,18 +31,17 @@ export function SublinkLauncher() {
         <TooltipProvider>
             <Tooltip>
                 <TooltipTrigger asChild>
-                    <Button
-                        variant="outline"
-                        size="sm"
-                        asChild
-                        className="shrink-0 gap-2 border-emerald-200 bg-emerald-50/50 text-emerald-800 hover:bg-emerald-100 hover:text-emerald-900 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300"
+                    <Link
+                        href={sublinkUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label="المتجر الإلكتروني"
+                        className={`${s.chip} ${s.linkChip} ${s.linkChipOn}`}
                     >
-                        <Link href={sublinkUrl} target="_blank" rel="noopener noreferrer">
-                            <Store className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                            <span className="hidden sm:inline font-medium text-xs">المتجر الإلكتروني</span>
-                            <ExternalLink className="h-3 w-3 opacity-70" />
-                        </Link>
-                    </Button>
+                        <Store size={18} aria-hidden />
+                        <span className={s.onlyDesktop}>المتجر الإلكتروني</span>
+                        <ExternalLink size={13} className={`${s.linkExt} ${s.onlyDesktop}`} aria-hidden />
+                    </Link>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="text-xs">
                     فتح رابط المتجر المباشر: {sublinkUrl}

@@ -1,8 +1,8 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import { Badge } from "@/components/ui/badge";
 import { Wifi, WifiOff } from "lucide-react";
+import s from "./shell.module.css";
 
 function subscribe(callback: () => void) {
     window.addEventListener("online", callback);
@@ -28,28 +28,14 @@ export function ConnectionStatus() {
     const isOnline = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 
     return (
-        <Badge
-            variant="outline"
-            className={`flex shrink-0 items-center gap-1.5 px-3 py-1 text-xs font-medium transition-colors ${isOnline
-                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-400"
-                : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-400"
-                }`}
+        <div
+            role="status"
+            aria-live="polite"
+            className={`${s.chip} ${s.conn} ${isOnline ? s.connOn : s.connOff}`}
         >
-            <span
-                className={`h-2 w-2 rounded-full ${isOnline ? "bg-emerald-500 animate-pulse" : "bg-amber-500"
-                    }`}
-            />
-            {isOnline ? (
-                <>
-                    <Wifi className="h-3.5 w-3.5" />
-                    <span>متصل</span>
-                </>
-            ) : (
-                <>
-                    <WifiOff className="h-3.5 w-3.5" />
-                    <span>غير متصل</span>
-                </>
-            )}
-        </Badge>
+            <span className={`${s.dot} ${isOnline ? s.dotOn : s.dotOff}`} aria-hidden />
+            {isOnline ? <Wifi size={16} aria-hidden /> : <WifiOff size={16} aria-hidden />}
+            <span>{isOnline ? "متصل" : "غير متصل"}</span>
+        </div>
     );
 }
