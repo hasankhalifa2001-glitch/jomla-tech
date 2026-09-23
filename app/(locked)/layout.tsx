@@ -1,5 +1,6 @@
 import { SessionProvider } from "@/components/providers/session-provider";
 import { auth } from "@/auth";
+import s from "@/components/lockout/lockout.module.css";
 
 /**
  * Standalone layout for routes that must render with ZERO dashboard chrome
@@ -27,7 +28,8 @@ export default async function LockedLayout({
 
   return (
     <SessionProvider session={session}>
-      <div className="flex min-h-screen w-full items-center justify-center bg-zinc-50 p-6 dark:bg-zinc-950">
+      <div className={s.screen}>
+        <div aria-hidden className={s.rules} />
         {children}
       </div>
     </SessionProvider>

@@ -1,8 +1,10 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { signOutAction } from "@/lib/actions/auth";
-import { LockKeyhole, Clock } from "lucide-react";
+import { LockKeyhole, Clock, ShieldAlert } from "lucide-react";
 import { LogoutSubmitButton } from "@/components/auth/logout-submit-button";
+import { Logo } from "@/components/brand/logo";
+import s from "@/components/lockout/lockout.module.css";
 
 /**
  * T1 / T2 — /account-locked
@@ -35,33 +37,39 @@ export default async function AccountLockedPage() {
   const isPending = status === "PENDING";
 
   return (
-    <div
-      dir="rtl"
-      className="w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-8 text-center shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
-    >
-      <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-amber-100 text-amber-600 dark:bg-amber-950 dark:text-amber-400">
-        {isPending ? <Clock className="h-7 w-7" /> : <LockKeyhole className="h-7 w-7" />}
+    <div className={s.wrap}>
+      <div className={s.brand}>
+        <Logo size={34} />
       </div>
 
-      <h1 className="mb-2 text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-        {isPending ? "الحساب قيد المراجعة" : "انتهى اشتراك المتجر"}
-      </h1>
+      <div className={s.card}>
+        <div className={`${s.iconRing} ${isPending ? s.ringPending : s.ringExpired} ${isPending ? s.pulse : ""}`}>
+          {isPending ? <Clock size={28} aria-hidden /> : <LockKeyhole size={28} aria-hidden />}
+        </div>
 
-      <p className="mb-6 text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
-        {isPending
-          ? "لم تتم الموافقة على اشتراك هذا المتجر بعد من قبل إدارة المنصة. يرجى التواصل مع مدير المتجر لمتابعة حالة الاشتراك."
-          : "انتهت صلاحية اشتراك هذا المتجر. لا يمكن إجراء أي عمليات بيع أو مزامنة حتى يتم تجديد الاشتراك."}
-      </p>
+        <h1 className={s.title}>
+          {isPending ? "الحساب قيد المراجعة" : "انتهى اشتراك المتجر"}
+        </h1>
 
-      <p className="mb-6 text-sm font-medium text-zinc-900 dark:text-zinc-50">
-        فقط مدير المتجر (ADMIN) يمكنه تجديد الاشتراك أو متابعة حالة الموافقة.
-      </p>
+        <p className={s.lead}>
+          {isPending
+            ? "لم تتم الموافقة على اشتراك هذا المتجر بعد من قبل إدارة المنصة. يرجى التواصل مع مدير المتجر لمتابعة حالة الاشتراك."
+            : "انتهت صلاحية اشتراك هذا المتجر. لا يمكن إجراء أي عمليات بيع أو مزامنة حتى يتم تجديد الاشتراك."}
+        </p>
 
-      <form action={signOutAction}>
-        <LogoutSubmitButton className="w-full rounded-lg border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800">
-          تسجيل الخروج
-        </LogoutSubmitButton>
-      </form>
+        <div className={`${s.note} ${isPending ? s.noteAmber : s.noteRose}`}>
+          <ShieldAlert size={16} aria-hidden />
+          <span>فقط مدير المتجر (ADMIN) يمكنه تجديد الاشتراك أو متابعة حالة الموافقة.</span>
+        </div>
+
+        <div className={s.divider} />
+
+        <form action={signOutAction}>
+          <LogoutSubmitButton className={s.signOut}>
+            تسجيل الخروج
+          </LogoutSubmitButton>
+        </form>
+      </div>
     </div>
   );
 }

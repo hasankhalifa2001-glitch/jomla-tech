@@ -1,0 +1,223 @@
+/* components/lockout/lockout.module.css
+   Standalone styles for the /account-locked screen — this route
+   deliberately renders with zero dashboard chrome (see its layout.tsx),
+   so it gets its own small, self-contained stylesheet rather than reusing
+   the dashboard shell's. Visually it belongs to the same "auth family" as
+   login/register (centered card, same palette), so the tokens mirror
+   components/auth/auth.module.css. */
+
+.screen {
+    --slate-50: #f8fafc;
+    --slate-200: #e2e8f0;
+    --slate-300: #cbd5e1;
+    --slate-500: #64748b;
+    --slate-600: #475569;
+    --slate-700: #334155;
+    --slate-900: #0f172a;
+    --amber-100: #fef3c7;
+    --amber-600: #d97706;
+    --amber-800: #92400e;
+    --rose-100: #ffe4e6;
+    --rose-600: #e11d48;
+    --rose-800: #9f1239;
+    --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+    position: relative;
+    display: flex;
+    min-height: 100vh;
+    min-height: 100dvh;
+    width: 100%;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 24px;
+    background: var(--slate-50);
+    color: var(--slate-900);
+    line-height: 1.6;
+}
+
+.screen,
+.screen *,
+.screen *::before,
+.screen *::after {
+    box-sizing: border-box;
+}
+
+.screen :where(h1, p) {
+    margin: 0;
+}
+
+.screen :where(svg) {
+    display: block;
+    flex-shrink: 0;
+}
+
+.rules {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: repeating-linear-gradient(to bottom,
+            transparent 0,
+            transparent 31px,
+            rgba(148, 163, 184, 0.22) 31px,
+            rgba(148, 163, 184, 0.22) 32px);
+    -webkit-mask-image: radial-gradient(ellipse at center, #000 5%, transparent 70%);
+    mask-image: radial-gradient(ellipse at center, #000 5%, transparent 70%);
+}
+
+.wrap {
+    position: relative;
+    width: 100%;
+    max-width: 26rem;
+    animation: fadeUp 0.6s var(--ease-out) backwards;
+}
+
+@keyframes fadeUp {
+    from {
+        opacity: 0;
+        transform: translateY(18px);
+    }
+
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+.brand {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 20px;
+}
+
+.card {
+    padding: 32px 28px;
+    border: 1px solid var(--slate-200);
+    border-radius: 20px;
+    background: #fff;
+    box-shadow: 0 24px 50px rgba(15, 23, 42, 0.08);
+    text-align: center;
+}
+
+.iconRing {
+    display: grid;
+    place-items: center;
+    width: 64px;
+    height: 64px;
+    margin: 0 auto 18px;
+    border-radius: 50%;
+}
+
+.ringPending {
+    background: var(--amber-100);
+    color: var(--amber-600);
+}
+
+.ringExpired {
+    background: var(--rose-100);
+    color: var(--rose-600);
+}
+
+.pulse {
+    animation: pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+
+    0%,
+    100% {
+        box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.35);
+    }
+
+    50% {
+        box-shadow: 0 0 0 10px rgba(217, 119, 6, 0);
+    }
+}
+
+.title {
+    font-size: 1.375rem;
+    font-weight: 900;
+    line-height: 1.5;
+}
+
+.lead {
+    margin-top: 12px;
+    font-size: 0.9375rem;
+    line-height: 1.9;
+    color: var(--slate-600);
+}
+
+.note {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 20px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    font-size: 0.875rem;
+    font-weight: 700;
+    line-height: 1.8;
+    text-align: start;
+}
+
+.noteAmber {
+    background: #fffbeb;
+    color: var(--amber-800);
+}
+
+.noteRose {
+    background: #fff1f2;
+    color: var(--rose-800);
+}
+
+.note svg {
+    margin-top: 2px;
+}
+
+.divider {
+    margin: 24px 0 20px;
+    border-top: 1px dashed var(--slate-300);
+}
+
+.signOut {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    height: 46px;
+    border: 1px solid var(--slate-300);
+    border-radius: 12px;
+    background: #fff;
+    color: var(--slate-700);
+    font: inherit;
+    font-size: 0.9375rem;
+    font-weight: 800;
+    cursor: pointer;
+    transition:
+        background 0.2s,
+        border-color 0.2s,
+        transform 0.2s var(--ease-out);
+}
+
+.signOut:hover {
+    background: var(--slate-50);
+    border-color: var(--slate-500);
+    transform: translateY(-1px);
+}
+
+.signOut:disabled {
+    opacity: 0.6;
+    cursor: progress;
+    transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+    .screen *,
+    .screen *::before,
+    .screen *::after {
+        animation: none !important;
+        transition: none !important;
+    }
+}
