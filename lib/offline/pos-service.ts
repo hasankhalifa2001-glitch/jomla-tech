@@ -136,56 +136,56 @@
  *      product's batches always land on the base unit and copy that
  *      pattern elsewhere without the same justification.
  *
- * [FIX — review pass 10] getOfflineProducts()'s totalCachedStock
- * previously reflected ONLY the last-synced server snapshot
- * (cachedProducts.batches) — it never accounted for sales already
- * recorded locally in offlineInvoices but not yet synced. Since
+ * [FIX — review pass 10, REVISED this revision] getOfflineProducts()'s
+ * totalCachedStock previously reflected ONLY the last-synced server
+ * snapshot (cachedProducts.batches) — it never accounted for sales
+ * already recorded locally in offlineInvoices but not yet synced. Since
  * ProductBatch.quantity is only ever decremented server-side at sync
  * time (T4c's commitFifoAllocation), the displayed stock count never
  * moved after an offline sale until the next successful sync — the SAME
  * cashier could oversell the same physical stock repeatedly within one
  * offline session with no warning. Fixed: getOfflineProducts() now
  * subtracts, locally and immediately, the base-unit-converted sum of
- * every item across every offlineInvoices row whose status is not
- * SYNCED (PENDING or FAILED — see the function's own comment for why
- * FAILED is deliberately included too) before reporting
+ * every relevant item across offlineInvoices before reporting
  * totalCachedStock. Void records' negated item quantities correctly add
  * reversed stock back with no special-casing, since the same summation
  * handles both signs uniformly.
  *
- * [FIX — T4d v4.1, this revision] submitOfflineVoid()'s guard 7 (the
- * "does a local void already exist for this original" check) was a
- * plain, unguarded read followed — several statements and one more async
- * lookup later — by a separate write via saveOfflineInvoiceWithBalance().
- * Nothing serialized those two steps against a SECOND, near-simultaneous
- * call to this same function (a double-tap on the void button before the
- * UI disabled it, or a slow re-render leaving it clickable for an extra
- * moment): both calls could read "no existing local void" before either
- * had written one, both pass guard 7, and both go on to create a
- * SEPARATE local void record — with the same voidsOfflineInvoiceId — via
- * two independent generateOfflineId() calls. The ONLY thing that then
- * caught the duplicate was the SERVER's own alreadyVoided check /
- * voidsInvoiceId @unique constraint at sync time — which worked exactly
- * as designed, but left one of the two local records permanently stuck
- * in FAILED status (FAILED items are never auto-retried), since the
- * client had no way to know in advance which of the two would "win."
+ * [FIX — REVISED, this revision — a real "phantom unit" bug closed] The
+ * original version of this fix included EVERY invoice whose status was
+ * not SYNCED — i.e. `status !== "SYNCED"` — in the local subtraction,
+ * covering both PENDING and FAILED. That's correct for a SALE that ends
+ * up FAILED: the goods were physically handed over (a receipt was likely
+ * already printed) regardless of what the server says, so the stock must
+ * stay subtracted until an admin manually resolves it (T4e's Failed Sync
+ * Items view) — reverting it automatically would risk that same physical
+ * stock being sold a second time.
  *
- * Fixed: every guard from the existing-row lookup through the
- * existing-local-void check, AND the eventual write, now run inside ONE
- * Dexie read-write transaction on [offlineInvoices, cachedCustomers].
- * Dexie serializes concurrent read-write transactions touching the same
- * tables, so a second near-simultaneous call's guard-7 read now genuinely
- * waits for the first call's write to commit, and correctly observes the
- * just-created local void — closing the race at its actual source for
- * the common (same-tab, same-device) case. This does NOT, and cannot,
- * close a genuinely cross-DEVICE race (two different phones/browsers
- * voiding the same invoice at the same instant) — that remains, correctly,
- * the server's job alone, via the same constraint that already caught it
- * here. saveOfflineInvoiceWithBalance() itself needed no change: called
- * synchronously from within the surrounding transaction's callback (no
- * intervening network/timer boundary), Dexie automatically joins its
- * own db.transaction(...) call to the already-open outer transaction
- * rather than opening a second, independent one.
+ * But a VOID that ends up FAILED is the OPPOSITE case: a failed void
+ * means NOTHING physically happened as a result of that specific attempt
+ * — no stock was actually returned by it (the confirmed, real T4d
+ * scenario: a duplicate/losing void attempt correctly rejected by the
+ * server's own @unique/idempotency guard after a different device's void
+ * for the same invoice already won and already restored the stock via
+ * its own SYNCED record). Because a void's item quantities are stored
+ * NEGATIVE (see createOfflineVoidRecord, db.ts), including a FAILED
+ * void's negative quantities in this same subtraction SUBTRACTS a
+ * negative number — i.e. silently ADDS a phantom unit of stock that was
+ * never actually restored, permanently (a FAILED record is never
+ * auto-retried), until the next full refreshProductCache() happens to
+ * paper over it by pulling the real server snapshot.
+ *
+ * Fixed: the query now distinguishes the two cases explicitly —
+ *   - status === "PENDING" → always included, sale or void alike (the
+ *     ordinary in-flight case, no physical-event ambiguity either way).
+ *   - status === "FAILED" AND NOT a void (`!voidsOfflineInvoiceId`) →
+ *     included, per the original "goods were physically handed over"
+ *     reasoning above.
+ *   - status === "FAILED" AND IS a void (`voidsOfflineInvoiceId` set) →
+ *     EXCLUDED. Nothing physically happened as a result of this specific
+ *     failed attempt, so it must contribute nothing to the local stock
+ *     calculation — leaving it in was fabricating stock that doesn't
+ *     exist.
  */
 
 import {
@@ -739,38 +739,38 @@ export async function getOfflineProducts(
   const db = getOfflineDb();
   const products = await db.cachedProducts.where("tenantId").equals(scopedTenantId).toArray();
 
-  // [FIX — review pass 10] totalCachedStock previously reflected ONLY the
-  // last-synced server snapshot (p.batches) — it never accounted for
-  // sales already recorded locally in offlineInvoices but not yet synced.
-  // Per T4c, ProductBatch.quantity is only ever decremented server-side
-  // at sync time (commitFifoAllocation); an offline sale never touches
-  // cachedProducts.batches directly. Without this, the displayed stock
-  // count never moved after an offline sale until the next successful
-  // sync — the SAME cashier could oversell the same physical stock
-  // repeatedly within one offline session with no warning at all.
+  // [FIX — review pass 10, REVISED this revision] totalCachedStock must
+  // reflect the last-synced server snapshot (p.batches) ADJUSTED for
+  // everything recorded locally but not yet confirmed synced — see the
+  // file-header FIX note for the full reasoning, including the "phantom
+  // unit" bug this revision closes.
   //
-  // Fix: subtract, locally and immediately, the base-unit-converted sum
-  // of every item across every NOT-YET-SYNCED offlineInvoices row for
-  // this tenant — using the same per-unit conversionFactor lookup already
-  // used for batches. A void record's items carry NEGATIVE quantities
-  // (see createOfflineVoidRecord, db.ts), so summing them alongside
-  // ordinary sale items correctly ADDS the reversed stock back with no
-  // special-casing needed.
-  //
-  // PENDING and FAILED are BOTH included (i.e. every status !== SYNCED)
-  // — deliberately, not just PENDING: a FAILED sync still means the goods
-  // were physically handed over and a receipt was likely already
-  // printed. Reverting a FAILED sale's stock back into "available" before
-  // an admin has manually resolved it (T4e's Failed Sync Items view)
-  // would risk that exact same physical stock being sold a second time —
-  // the same "fail loud, never silently paper over" posture the rest of
-  // this codebase takes. A SYNCED invoice drops out of this calculation
-  // entirely and relies on the next refreshProductCache() to reflect its
-  // real server-side deduction in p.batches instead.
+  // Three-way split, by (status, isVoid):
+  //   - PENDING (sale or void) → always included. This is the ordinary
+  //     in-flight case, no physical-event ambiguity: a PENDING sale's
+  //     goods are out the door; a PENDING void's restoration hasn't been
+  //     confirmed by the server yet either way.
+  //   - FAILED, NOT a void (a failed SALE) → included. The goods were
+  //     physically handed over regardless of what the server says; an
+  //     admin must manually resolve this (T4e's Failed Sync Items view)
+  //     before it's safe to treat that stock as available again.
+  //   - FAILED, IS a void (a failed VOID) → EXCLUDED. A failed void
+  //     means NOTHING physically happened as a result of THIS specific
+  //     attempt — the confirmed real-world case is a duplicate/losing
+  //     void correctly rejected by the server after a different device's
+  //     void for the same invoice already won and already restored the
+  //     stock via its own SYNCED record. Since a void's item quantities
+  //     are stored NEGATIVE, including a failed void here would subtract
+  //     a negative number — i.e. fabricate stock that was never actually
+  //     restored by this attempt.
   const pendingInvoices = await db.offlineInvoices
     .where("tenantId")
     .equals(scopedTenantId)
-    .filter((inv) => inv.status !== "SYNCED")
+    .filter(
+      (inv) =>
+        inv.status === "PENDING" ||
+        (inv.status === "FAILED" && !inv.voidsOfflineInvoiceId)
+    )
     .toArray();
 
   // unitId is a cuid, globally unique across the whole tenant's catalog
@@ -819,13 +819,14 @@ export async function getOfflineProducts(
     });
     const syncedBaseStock = sumMoney(["0", ...perBatchBaseQuantities]);
 
-    // [FIX — review pass 10] Subtract everything already sold locally but
-    // not yet confirmed synced — see the note above this function.
-    // Deliberately NOT clamped to zero: a negative result here is a real,
-    // meaningful signal (this device has locally recorded selling more
-    // than the last known synced stock), not an error to hide — the
-    // existing isOutOfStock / negative-stock handling downstream already
-    // treats <= 0 correctly.
+    // [FIX — review pass 10] Subtract everything already sold/queued
+    // locally but not yet confirmed synced — see the note above this
+    // function for exactly which records qualify. Deliberately NOT
+    // clamped to zero: a negative result here is a real, meaningful
+    // signal (this device has locally recorded selling more than the
+    // last known synced stock), not an error to hide — the existing
+    // isOutOfStock / negative-stock handling downstream already treats
+    // <= 0 correctly.
     const pendingBaseSold = pendingBaseQuantityByProduct.get(p.id) ?? "0";
     const totalStock = toDecimal(subtractMoney(syncedBaseStock, pendingBaseSold)).toNumber();
 

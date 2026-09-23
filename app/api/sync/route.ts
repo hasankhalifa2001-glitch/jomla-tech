@@ -3,53 +3,16 @@ import { z } from "zod";
 import { Prisma, InvoiceStatus, type PaymentMethod } from "@prisma/client";
 import { auth } from "@/auth";
 // commitFifoAllocation() and tenantScopedRawQuery() are both typed to accept
-// exactly `Prisma.TransactionClient` (see fifo.ts's own header comment on
-// why it deliberately does NOT accept the Client Extension's dynamic
-// transaction type). getTenantDb(tenantId).$transaction(...)'s callback
-// produces a `DynamicClientExtensionThis<...>` that is NOT structurally
-// assignable to `Prisma.TransactionClient` — passing it into either helper
-// fails to compile. tenantId is therefore injected manually into every
-// where/data clause below instead of relying on the extension. This route
-// IS on lib/db.ts's documented raw-client allowlist — see that file's
-// header comment.
-//
-// [FLAGGED — CRITICAL, UNRESOLVED] This rationale is now STALE relative to
-// the current lib/inventory/fifo.ts / lib/inventory/base-unit.ts /
-// lib/inventory/units.ts, which were migrated (in a later revision than
-// this file) to require `TenantTransactionClient` (derived from
-// getTenantDb()'s EXTENDED client) instead of plain `Prisma.TransactionClient`
-// — see fifo.ts's own current signature: `commitFifoAllocation(tx:
-// TenantTransactionClient, ...)`. This route still opens its transaction
-// via raw `prisma.$transaction(async (tx) => {...})`, which produces a
-// plain `Prisma.TransactionClient` — NOT `TenantTransactionClient`. Per
-// products.ts's own documented compile error ("DynamicClientExtensionThis
-// is not assignable to TransactionClient"), the extended type generally
-// does NOT structurally satisfy the raw type; the reverse direction (raw
-// satisfying extended) is equally unconfirmed without seeing
-// lib/db/tenant-scope.ts's actual `TenantTransactionClient` definition.
-// This file now calls requireBaseUnit()/getUnitConversionFactor()/
-// commitFifoAllocation() with this raw `tx` — if `TenantTransactionClient`
-// truly cannot be satisfied by a raw `Prisma.TransactionClient`, this will
-// not compile. Two possible fixes, neither applied here pending
-// confirmation: (a) switch this route to
-// `getTenantDb(tenantId).$transaction(...)`, which then requires
-// tenantScopedRawQuery()/lockBatchesById() below to also accept the
-// extended client type; or (b) widen requireBaseUnit()/
-// getUnitConversionFactor()/commitFifoAllocation() to accept `TxOrClient`
-// (a union covering both), as lib/data/products.ts's read-only functions
-// already do. Resolving this needs lib/db/tenant-scope.ts's current
-// content — flagging rather than guessing.
+// TxOrClient (see lib/db/tenant-scope.ts for the full type derivation, and
+// lib/inventory/fifo.ts / lib/inventory/base-unit.ts for how it's consumed).
+// This route opens its transaction via raw `prisma.$transaction(...)`,
+// producing a plain `Prisma.TransactionClient` — now structurally covered
+// by TxOrClient's union. This route IS on lib/db.ts's documented raw-client
+// allowlist (category 5) — see that file's header comment.
 import { prisma } from "@/lib/db";
 import { tenantScopedRawQuery } from "@/lib/db/tenant-scope";
 import { commitFifoAllocation } from "@/lib/inventory/fifo";
 import { lockBatchesForFifoAllocations } from "@/lib/inventory/batch-locking";
-// [FIX — v4.0 base-unit conversion was entirely missing from this route]
-// See the large FIX block below, at both the sale-path and void-path
-// sections, for the full explanation. Sole gateways for base-unit
-// resolution and conversionFactor arithmetic — this file must never read
-// `.conversionFactor` off a `tx.productUnit.*` result directly (it
-// previously did, in the now-removed "leftover" fallback block — a real
-// ESLint violation this fix also closes).
 import { requireBaseUnit, MissingBaseUnitError } from "@/lib/inventory/base-unit";
 import { getUnitConversionFactor, toBaseUnit, fromBaseUnit } from "@/lib/inventory/units";
 import {
@@ -61,6 +24,7 @@ import {
   sumMoney,
   MoneyError,
 } from "@/lib/utils/money";
+import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
 import {
   assertTenantWritable,
   SubscriptionLockedError,
@@ -72,176 +36,61 @@ export const dynamic = "force-dynamic";
 /**
  * T4c — /api/sync
  *
- * [... existing header documentation unchanged ...]
+ * [... prior header documentation on nullable USD fields, quantity type
+ * coercion, double-rounding fix, v4.0 base-unit conversion fix, v4.1 sync
+ * ordering fix, and v4.1 lost-ack idempotency fix — all unchanged and
+ * still in effect, see earlier revisions of this file for the full text
+ * of each ...]
  *
- * [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] lib/offline/db.ts's
- * review pass 6 allows a purely SYP-priced offline sale to be created and
- * persisted LOCALLY (Dexie) with exchangeRateUsed — and every USD-derived
- * field it feeds (totalUSD, paidAmountUSD, debtAmountUSD, each item's
- * unitPriceUSD) — stored as `null`, genuinely meaning "this sale never
- * needed a rate to resolve," per T4b's own acceptance criterion ("checkout
- * blocks only for a USD-priced item with no cached rate, never for
- * SYP-only carts"). But on the SERVER, Invoice.exchangeRateUsed/totalUSD/
- * paidAmountUSD/debtAmountUSD and InvoiceItem.unitPriceUSD are all
- * REQUIRED, non-nullable Decimal columns (schema.prisma) — a straight
- * pass-through of `null` would fail a NOT NULL constraint the moment this
- * route tried to write it, immediately after Zod validation was loosened
- * to accept it.
+ * [FIX — RETRY_LATER, prior revision — closes a real "false success" bug]
+ * When a retryable transaction error (deadlock, serialization failure)
+ * exhausted all MAX_TX_ATTEMPTS retries, the per-item catch block used to
+ * `console.error(...)` followed by a bare `continue`/`return` — the item
+ * was NEVER pushed into customerResults/invoiceResults/paymentResults at
+ * all, so `success = allResults.every(r => r.status === "SYNCED")`
+ * silently ignored it and reported `success: true` even though a real
+ * record never reached the server.
  *
- * Two changes close this gap:
- *   1. The Zod schemas below now accept `null` on every USD-derived field
- *      (they must — this is what the client legitimately sends for a
- *      SYP-only sale) — but the invoice-processing logic no longer READS
- *      any of them as input. Every USD-derived figure written to the
- *      database is now computed HERE, server-side, from the authoritative
- *      SYP figures plus a resolved exchangeRateUsed — never trusted from
- *      the client payload, consistent with USD being purely
- *      derived/informational under the v3.6 currency re-anchoring.
- *   2. exchangeRateUsed itself is resolved with a fallback: if the client
- *      sent a real rate, it's used (after the same > 0 validation as
- *      before). If the client sent `null` (a SYP-only sale), the tenant's
- *      CURRENT `dailyExchangeRate` is read fresh from the database and
- *      used instead — this is exactly the server-side "a valid exchange
- *      rate is required and validated before [a record] is ever created"
- *      check T1 describes, just performed at the one point every offline
- *      invoice must actually pass through before being persisted. If the
- *      tenant has no dailyExchangeRate set at all, the sync fails loud
- *      with an actionable Arabic message rather than writing a fabricated
- *      or zero rate that would silently corrupt every USD-derived figure
- *      on this invoice going forward.
+ * FIX: every such item is now pushed into its results array with a THIRD,
+ * explicit status — "RETRY_LATER" — distinct from both "SYNCED" and
+ * "FAILED". The client-side sync worker treats "FAILED" as terminal (per
+ * this route's documented per-item semantics) and treats "RETRY_LATER" as
+ * still-PENDING (eligible for automatic retry on the next sync pass, with
+ * no local status change at all).
  *
- * [FIX — QUANTITY TYPE MISMATCH] OfflineInvoiceItem.quantity is a
- * decimal.js-serialized STRING on the client (db.ts, per T1's mandate
- * that quantity is never a native JS number over the wire/in storage) —
- * the Zod schema previously required `z.number()`, rejecting every real
- * payload outright with "expected number, received string". Changed to
- * `z.coerce.number()`, which parses the incoming decimal string into the
- * JS number every downstream FIFO/quantity calculation in this file
- * already expects.
+ * [FIX — TRANSIENT CUSTOMER DEPENDENCY, this revision — restores a
+ * regression] A single sync request can contain a brand-new walk-in
+ * customer AND a sale/void/payment that references that same customer,
+ * created moments apart on the same device (T4b's ordinary "create
+ * customer, sell to them" flow). If that customer's own PASS 1 sync hit a
+ * TRANSIENT error and exhausted all MAX_TX_ATTEMPTS retries, PASS 1
+ * correctly records it as RETRY_LATER (per the FIX above) rather than
+ * FAILED.
  *
- * [FIX — DOUBLE-ROUNDING PRECISION BUG] fifo.ts's commitFifoAllocation now
- * returns allocatedQty/deductQtyInBatchUnit (and remainingQty) as
- * decimal-serialized STRINGS, not rounded JS numbers. Every place below
- * that does arithmetic on those fields goes through lib/utils/money.ts's
- * decimal.js-backed helpers or lib/inventory/units.ts's toBaseUnit()/
- * fromBaseUnit() instead of native JS `*`/`/`.
+ * But without this fix, nothing connects that outcome to the
+ * invoice/payment that depends on it: when PASS 2/3 then calls
+ * resolveTargetCustomerId() for the same offlineCustomerId, it correctly
+ * finds no matching Customer row yet and throws the GENERIC "الزبون
+ * المرتبط... غير موجود" error — which is NOT recognized by
+ * isRetryableTxError() (it's not a deadlock/serialization message), so
+ * the invoice/payment would be marked permanently FAILED even though the
+ * only real problem is a passing, already-self-healing hiccup on an
+ * unrelated row earlier in this SAME request. The next sync pass would
+ * have synced the customer fine — but the invoice/payment that depended
+ * on it would already be burned into FAILED and never retried.
  *
- * [FIX — v4.0 BASE-UNIT CONVERSION WAS ENTIRELY MISSING — the critical fix
- * in this revision] Neither the sale path nor the void path in the
- * previous version of this file resolved or converted anything against
- * the product's base unit. Concretely, three real bugs:
- *
- *   1. SALE PATH: `commitFifoAllocation()` was called with `unitId:
- *      item.unitId` — the unit the CASHIER selected at the register (e.g.
- *      "طرد") — and `requestedQty: item.quantity`, the raw quantity in
- *      THAT unit, completely unconverted. But per T1's Unit Conversion
- *      Architecture (and fifo.ts's own `assertUnitIsBaseUnit()` guard,
- *      confirmed in this file's current signature), `commitFifoAllocation`
- *      now REQUIRES `unitId` to be the product's actual base unit and
- *      `requestedQty` to already be expressed in it — a mismatch throws
- *      `Unit mismatch: ...` immediately. This meant EVERY sale of a
- *      non-base-unit item (the ordinary case for most wholesale sales)
- *      would fail sync outright.
- *
- *   2. SALE PATH — the "insufficient stock" leftover-conversion block
- *      previously read `.conversionFactor` directly off two
- *      `tx.productUnit.findFirst(...)` results — a real ESLint violation
- *      (PRODUCT_MODEL_RULES / CONVERSION_FACTOR_RULES ban this file from
- *      naming that field; this route has no per-file exemption for it,
- *      unlike products/route.ts). It also manually re-derived a
- *      conversion this file has no business performing itself.
- *
- *   3. VOID PATH: `batchAdjustments` restored `Math.abs(it.quantity)`
- *      directly onto `ProductBatch.quantity` — but `it.quantity` is in
- *      the SOLD unit (per InvoiceItem.quantity's own documented meaning:
- *      "e.g. 3 meaning 3 طرد"), while `ProductBatch.quantity` is ALWAYS in
- *      the base unit. Voiding a 3-طرد sale (= 72 قطعة at a factor of 24)
- *      restored only 3 قطعة instead of 72 — silently corrupting stock on
- *      every void of a non-base-unit sale.
- *
- * FIX, applied consistently to both paths, using the corrected T4c/T5
- * pattern already established elsewhere in this codebase (batch-creation
- * route, T5's B2B approval): two separate lookups, never conflated —
- *   (a) requireBaseUnit(tx, tenantId, productId) — resolves the REAL base
- *       unit, used only to know which unitId ProductBatch/FIFO is scoped
- *       under. Never a source of a conversion factor (it's always 1).
- *   (b) getUnitConversionFactor(tx, tenantId, unitId) — resolves the
- *       SOLD/ORDERED unit's OWN factor, fetched fresh from the database
- *       for the unitId actually on the item — never trusted from the
- *       client payload, never taken from (a).
- * `toBaseUnit()` converts a sold-unit quantity into base units before it
- * ever reaches commitFifoAllocation or a ProductBatch decrement/increment.
- * `fromBaseUnit()` converts each FIFO allocation (necessarily in base
- * units, since fifo.ts only ever operates in base units — see that file's
- * own CORRECTION NOTE) back into the SOLD unit for InvoiceItem.quantity,
- * per schema.prisma's own InvoiceItem.unitId/quantity comments: "Quantity
- * SOLD, expressed in unitId... NOT automatically the same number as how
- * much was deducted from ProductBatch.quantity... batchQuantityDeducted =
- * quantity × unitId.conversionFactor." A sale split across multiple
- * batches therefore legitimately produces a FRACTIONAL sold-unit quantity
- * on one or more of its InvoiceItem rows (e.g. 50 قطعة of a 72-قطعة, 3-طرد
- * sale drawn from one batch becomes "50 ÷ 24 = 2.0833 طرد" on that row) —
- * this is not a rounding bug, it is the schema's own documented design for
- * a multi-batch split, and InvoiceItem.quantity's Decimal(18,4) column
- * exists precisely to hold it exactly.
- *
- * [FIX — v4.1, T4d appendix item #4 — SYNC ORDERING] PASS 2 previously
- * processed every invoice — sales AND voids — in a single loop, sorted
- * ONLY by createdAt across the combined set. In the overwhelmingly common
- * case a void's createdAt is later than its original sale's (it can only
- * be created locally after that sale already exists), so this worked. But
- * nothing structurally guaranteed that ordering: two records created
- * within the same millisecond, or a device with a skewed clock, could
- * produce a void whose createdAt ties with or precedes its original's —
- * and since this file's void path looks up the original via
- * `tx.invoice.findFirst({ where: { offlineId: inv.voidsOfflineInvoiceId }
- * })`, a void processed before its original synced would fail with
- * "الفاتورة الأصلية المراد إلغاؤها لم تتم مزامنتها بعد" — and per this
- * route's own per-item FAILED semantics, a FAILED item is never
- * auto-retried, making that failure PERMANENT for that void.
- *
- * Fixed by splitting PASS 2 into two ORDERED SUB-PHASES: every non-void
- * (sale) invoice in the batch is processed first, in full, before ANY
- * void is attempted — regardless of createdAt values or the order items
- * arrived in the payload. This makes void resolution structurally
- * independent of timestamp precision or payload ordering, rather than
- * merely relying on the common case holding. The per-invoice processing
- * logic itself (idempotency check, validation, the isVoid branch with its
- * own sale/void bodies) is completely unchanged — only extracted into a
- * named function, processInvoiceSyncItem(), so it can be invoked from two
- * sequential loops instead of one combined one.
- *
- * [FIX — v4.1, LOST-ACK IDEMPOTENCY ON THE VOID PATH] The "already voided"
- * pre-check below previously rejected UNCONDITIONALLY whenever a void row
- * already existed for the original invoice — even when that existing void
- * row was the exact SAME logical void this request is retrying (same
- * offlineId). This is the classic "lost acknowledgment" gap: a prior sync
- * attempt for this same void could have COMMITTED successfully server-side
- * (the Invoice + InvoiceItem rows created, the batch already restored),
- * but the HTTP response back to the client never arrived (a connection
- * drop right as connectivity returned, an app close before the response
- * was read, etc.) — so the client's local copy never got marked SYNCED
- * and legitimately retried the exact same offlineId on the next sync pass.
- * The old code could not tell that case apart from a genuine conflict (a
- * DIFFERENT void racing in from elsewhere) and rejected both identically,
- * leaving the retried void permanently stuck FAILED (this route's FAILED
- * items are never auto-retried) despite having actually succeeded — which
- * in turn fed a real, user-visible bug: pos-service.ts's
- * getOfflineProducts() keeps subtracting any non-SYNCED invoice's items
- * from the displayed stock count, so a void wrongly stuck FAILED kept
- * being subtracted a SECOND time on top of the restoration the server had
- * already applied, inflating the POS's displayed stock above the real,
- * already-correct server total (confirmed by comparing against the
- * Inventory screen, which reads the server snapshot directly with no such
- * extra subtraction).
- *
- * Fixed by distinguishing the two cases via offlineId: if the existing
- * void row's offlineId matches THIS request's offlineId, it is the exact
- * same void that already succeeded — return it as a normal idempotent
- * success (mirrors the identical existing-row idempotency check earlier in
- * this same function, for the non-void case) rather than throwing. Only a
- * genuinely DIFFERENT offlineId — a real second void racing in — still
- * throws the original Arabic conflict message.
+ * Fixed by tracking every offlineId that PASS 1 left RETRY_LATER
+ * specifically because of a transient (retryable) error, in
+ * `retryableCustomerOfflineIds`. resolveTargetCustomerId() now checks
+ * this set before falling back to the generic "not found" error: if the
+ * missing customer is in it, it throws the new `TransientDependencyError`
+ * instead — which processInvoiceSyncItem and PASS 3's payment loop both
+ * handle by recording the item as RETRY_LATER (never FAILED, never
+ * silently dropped) rather than as a permanent failure. A customer that
+ * is missing for any OTHER reason (never submitted, a genuinely bad id)
+ * still falls through to the original generic error and is still marked
+ * FAILED as before — this only changes behavior for the specific "my own
+ * dependency is still mid-retry" case.
  */
 
 // ============================================================================
@@ -264,19 +113,11 @@ const paymentMethodEnum = z.enum([
 const offlineInvoiceItemSchema = z.object({
   productId: z.string().min(1),
   unitId: z.string().min(1),
-  // [FIX — QUANTITY TYPE MISMATCH] See file-header note above.
   quantity: z.coerce.number().refine((n) => n !== 0, {
     message: "الكمية يجب ألا تساوي صفر.",
   }),
-  // unitPriceSYP is AUTHORITATIVE (InvoiceItem.unitPriceSYP is a required,
-  // no-default Decimal column).
   unitPriceSYP: z.string().min(1),
-  // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see
-  // file-header note above. No longer read as input anywhere below; every
-  // unitPriceUSD actually written is computed server-side from
-  // unitPriceSYP plus the resolved exchangeRateUsed.
   unitPriceUSD: z.string().min(1).nullable(),
-  // Present only on a void item, mirroring the original sale's batch.
   batchId: z.string().min(1).optional(),
 });
 
@@ -286,23 +127,12 @@ const offlineInvoiceSchema = z
     customerId: z.string().min(1).optional(),
     offlineCustomerId: z.string().min(1).optional(),
     items: z.array(offlineInvoiceItemSchema).min(1),
-    // totalSYP / paidAmountSYP / debtAmountSYP are AUTHORITATIVE
-    // (Invoice's required, no-default Decimal columns).
     totalSYP: z.string().min(1),
-    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see
-    // file-header note above. No longer read as input; server always
-    // computes this from totalSYP + the resolved exchangeRateUsed.
     totalUSD: z.string().min(1).nullable(),
-    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — a
-    // SYP-only sale genuinely has no rate on the client. See the
-    // exchangeRateUsed resolution block in POST below for the
-    // server-side fallback (tenant.dailyExchangeRate) this now triggers.
     exchangeRateUsed: z.string().min(1).nullable(),
     paidAmountSYP: z.string().min(1),
-    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see above.
     paidAmountUSD: z.string().min(1).nullable(),
     debtAmountSYP: z.string().min(1),
-    // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Nullable — see above.
     debtAmountUSD: z.string().min(1).nullable(),
     paymentMethod: paymentMethodEnum.optional(),
     voidsOfflineInvoiceId: z.string().min(1).optional(),
@@ -333,12 +163,6 @@ const offlinePaymentSchema = z
     offlineId: z.string().min(1),
     customerId: z.string().min(1).optional(),
     offlineCustomerId: z.string().min(1).optional(),
-    // CustomerPayment.amountSYP is AUTHORITATIVE. amountUSD/exchangeRate
-    // are deliberately left required/non-nullable here — a repayment is
-    // always collected at a real, known moment (db.ts's
-    // createOfflinePaymentRecord never allows a null rate for this
-    // record type), unlike a cart that might contain zero USD-priced
-    // lines. No change needed for payments.
     amountSYP: z.string().min(1),
     amountUSD: z.string().min(1),
     exchangeRate: z.string().min(1),
@@ -370,15 +194,22 @@ type InvoicePayload = SyncRequest["invoices"][number];
 type PaymentPayload = SyncRequest["payments"][number];
 type CustomerPayload = SyncRequest["customers"][number];
 
+// Third status added (see RETRY_LATER FIX note above).
 interface ItemResult {
   offlineId: string;
-  status: "SYNCED" | "FAILED";
+  status: "SYNCED" | "FAILED" | "RETRY_LATER";
   realId?: string;
   error?: string;
 }
 
 const TX_OPTIONS = { maxWait: 10_000, timeout: 20_000 } as const;
 const MAX_TX_ATTEMPTS = 3;
+
+// [FIX — TRANSIENT CUSTOMER DEPENDENCY] Thrown by resolveTargetCustomerId()
+// specifically when the missing customer's OWN sync failed transiently in
+// PASS 1 of this same request — handled by every caller as RETRY_LATER,
+// never as a permanent FAILED result and never silently dropped.
+class TransientDependencyError extends Error { }
 
 function isUniqueConflict(err: unknown): boolean {
   return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -396,6 +227,17 @@ function errorMessage(err: unknown, fallback: string): string {
   if (err instanceof MoneyError || err instanceof Error) return err.message;
   return fallback;
 }
+
+// Shared, human-readable Arabic message for every RETRY_LATER push below —
+// kept as one constant so the wording never drifts between the three passes.
+const RETRY_LATER_MESSAGE =
+  "تعارض مؤقت في قاعدة البيانات — سيُعاد المحاولة تلقائياً عند المزامنة التالية.";
+
+// [FIX — TRANSIENT CUSTOMER DEPENDENCY] Dedicated message for the
+// dependency-specific case, distinguishable in logs/UI from a raw DB
+// conflict on the item's own transaction.
+const RETRY_LATER_DEPENDENCY_MESSAGE =
+  "بانتظار مزامنة الزبون المرتبط (تعارض مؤقت) — سيُعاد المحاولة تلقائياً عند المزامنة التالية.";
 
 function sortByCreatedAt<T extends { createdAt: string }>(items: T[]): T[] {
   return [...items].sort(
@@ -421,31 +263,54 @@ async function lockBatchesById(
   `);
 }
 
+// [FIX — TRANSIENT CUSTOMER DEPENDENCY] New optional last parameter,
+// `retryableCustomerOfflineIds` — see the file-header FIX note. Only
+// changes behavior when the missing customer is a member of that set;
+// every other call site/scenario is unchanged.
 async function resolveTargetCustomerId(
   tx: Prisma.TransactionClient,
   tenantId: string,
   customerMap: Map<string, string>,
   refs: { offlineCustomerId?: string; customerId?: string },
-  missingMessage: string
+  missingMessage: string,
+  retryableCustomerOfflineIds?: Set<string>
 ): Promise<string> {
   if (refs.offlineCustomerId) {
     const mapped = customerMap.get(refs.offlineCustomerId);
-    if (mapped) return mapped;
+    if (mapped) {
+      // [v4.2] Auto-Redirect on Write: resolve active customer in case of merge
+      return await resolveActiveCustomerId(tx, tenantId, mapped);
+    }
 
     const matched = await tx.customer.findFirst({
       where: { offlineId: refs.offlineCustomerId, tenantId },
       select: { id: true },
     });
     if (matched) {
-      customerMap.set(refs.offlineCustomerId, matched.id);
-      return matched.id;
+      // [v4.2] Auto-Redirect on Write: resolve active customer in case of merge
+      const activeId = await resolveActiveCustomerId(tx, tenantId, matched.id);
+      customerMap.set(refs.offlineCustomerId, activeId);
+      return activeId;
+    }
+
+    // [FIX — TRANSIENT CUSTOMER DEPENDENCY] Not found — but if this
+    // customer's own sync failed transiently in PASS 1 of THIS SAME
+    // request, the right response is "try again next pass", not a
+    // permanent failure.
+    if (retryableCustomerOfflineIds?.has(refs.offlineCustomerId)) {
+      throw new TransientDependencyError(
+        `العميل المرتبط (${refs.offlineCustomerId}) لم تتم مزامنته بعد بسبب خطأ مؤقت — سيُعاد المحاولة تلقائياً.`
+      );
     }
   } else if (refs.customerId) {
     const matched = await tx.customer.findFirst({
       where: { id: refs.customerId, tenantId },
       select: { id: true },
     });
-    if (matched) return matched.id;
+    if (matched) {
+      // [v4.2] Auto-Redirect on Write: resolve active customer in case of merge
+      return await resolveActiveCustomerId(tx, tenantId, matched.id);
+    }
   }
 
   throw new Error(missingMessage);
@@ -501,6 +366,13 @@ export async function POST(req: NextRequest) {
   const payments = sortByCreatedAt(parsed.data.payments);
 
   const customerMap = new Map<string, string>();
+  // [FIX — TRANSIENT CUSTOMER DEPENDENCY] Populated during PASS 1 below
+  // whenever a customer's sync exhausts all retries on a TRANSIENT error
+  // and is recorded RETRY_LATER — see the file-header FIX note.
+  // resolveTargetCustomerId() consults this to distinguish "genuinely
+  // missing" from "my dependency is mid-retry" for every invoice/payment
+  // that references one of these offlineCustomerIds.
+  const retryableCustomerOfflineIds = new Set<string>();
 
   const customerResults: ItemResult[] = [];
   const invoiceResults: ItemResult[] = [];
@@ -566,9 +438,21 @@ export async function POST(req: NextRequest) {
       }
       if (isRetryableTxError(err)) {
         console.error(
-          `[sync] customer ${c.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
+          `[sync] customer ${c.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, marking RETRY_LATER`,
           err
         );
+        // [FIX — TRANSIENT CUSTOMER DEPENDENCY] Record this offlineId so
+        // any invoice/payment referencing it below is treated as
+        // transiently blocked (RETRY_LATER), not permanently failed.
+        retryableCustomerOfflineIds.add(c.offlineId);
+        // [FIX — RETRY_LATER] Explicitly recorded — never silently
+        // dropped — so `allResults.every(status === "SYNCED")` correctly
+        // reflects that this pass did not fully succeed.
+        customerResults.push({
+          offlineId: c.offlineId,
+          status: "RETRY_LATER",
+          error: RETRY_LATER_MESSAGE,
+        });
         continue;
       }
       customerResults.push({
@@ -581,12 +465,7 @@ export async function POST(req: NextRequest) {
 
   // ==========================================================================
   // PASS 2 — Invoices (sale or void). Idempotent via Invoice.offlineId.
-  //
-  // [v4.1] Split into two ORDERED SUB-PHASES — see the file-header FIX note
-  // ("SYNC ORDERING") for the full rationale. processInvoiceSyncItem() below
-  // is the exact same per-item logic this route always had; only the outer
-  // loop is now called twice (sales, then voids) instead of once over the
-  // combined, timestamp-sorted set.
+  // Split into two ORDERED SUB-PHASES (v4.1) — sales first, then voids.
   // ==========================================================================
   async function processInvoiceSyncItem(inv: InvoicePayload): Promise<void> {
     if (inv.voidsOfflineInvoiceId && userRole !== "ADMIN") {
@@ -611,13 +490,6 @@ export async function POST(req: NextRequest) {
           const paidSYP = serializeMoney(inv.paidAmountSYP);
           const debtSYP = serializeMoney(inv.debtAmountSYP);
 
-          // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] See the
-          // file-header note above for the full reasoning. Resolves a
-          // real, positive exchangeRateUsed either from the client
-          // payload (an item was USD-priced) or, when the client sent
-          // null (a SYP-only sale), from the tenant's current
-          // dailyExchangeRate — the server-side "a valid exchange rate is
-          // required and validated before creation" check T1 describes.
           let exchangeRateUsed: string;
           if (inv.exchangeRateUsed !== null) {
             exchangeRateUsed = serializeMoney(inv.exchangeRateUsed);
@@ -638,17 +510,10 @@ export async function POST(req: NextRequest) {
             exchangeRateUsed = serializeMoney(tenantRow.dailyExchangeRate.toString());
           }
 
-          // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Every
-          // USD-derived figure is computed HERE, from the authoritative
-          // SYP figures plus the resolved exchangeRateUsed above — never
-          // read from inv.totalUSD/paidAmountUSD/debtAmountUSD, which may
-          // be null on the payload and are purely informational even
-          // when present (v3.6 currency re-anchoring).
           const totalUSD = convertCurrency(totalSYP, exchangeRateUsed, "SYP", "USD");
           const paidUSD = convertCurrency(paidSYP, exchangeRateUsed, "SYP", "USD");
           const debtUSD = convertCurrency(debtSYP, exchangeRateUsed, "SYP", "USD");
 
-          // AUTHORITATIVE (v3.6): debtAmountSYP ≈ totalSYP − paidAmountSYP.
           const expectedDebtSYP = subtractMoney(totalSYP, paidSYP);
           if (compareMoney(expectedDebtSYP, debtSYP) !== 0) {
             throw new Error(
@@ -656,11 +521,6 @@ export async function POST(req: NextRequest) {
             );
           }
 
-          // Recomputes totalSYP independently from the line items
-          // (unitPriceSYP × quantity, in the SOLD unit — totals were
-          // always computed on sold-unit quantities, unaffected by the
-          // base-unit conversion fix below) and requires it to match what
-          // the client claims — AUTHORITATIVE.
           const isVoidForTotalCheck = Boolean(inv.voidsOfflineInvoiceId);
           const computedItemsTotalSYP = sumMoney(
             inv.items.map((item) => multiplyMoney(Math.abs(item.quantity), item.unitPriceSYP))
@@ -688,77 +548,31 @@ export async function POST(req: NextRequest) {
             if (originalInvoice.status === InvoiceStatus.VOIDED) {
               throw new Error("لا يمكن إلغاء فاتورة ملغاة مسبقاً.");
             }
-
-            // [v4.1 — parity with POST /api/ledger/voids] A void is the
-            // physical reversal of a FULFILLED sale: only a COMPLETED
-            // invoice has a batch deduction to give back. The online route
-            // rejects anything else with this exact message (see
-            // app/api/ledger/voids/route.ts), and this pass mirrors it so
-            // both void paths are structurally identical instead of relying
-            // on one of them never being exercised with an unexpected
-            // status. Deliberately placed AFTER the VOIDED check above, so a
-            // void-of-void keeps its own more specific Arabic message — this
-            // check never shadows the pre-existing one.
-            //
-            // A no-op in practice today: the sale path below only ever
-            // creates InvoiceStatus.COMPLETED rows, so PENDING_REVIEW can
-            // never be the original here (PENDING_REVIEW is T5's own B2B
-            // approval state, corrected through T5's reject flow, never
-            // through a void).
             if (originalInvoice.status !== InvoiceStatus.COMPLETED) {
               throw new Error(
                 "لا يمكن إلغاء إلا الفواتير المكتملة — الفواتير قيد المراجعة تُرفض عبر مسار الطلبات."
               );
             }
 
-            // [FIX — v4.1, LOST-ACK IDEMPOTENCY] Now also selects offlineId
-            // so the code below can distinguish "this exact void already
-            // succeeded, the ack was just lost" from "a genuinely different
-            // void is already there" — see the file-header FIX note for the
-            // full rationale and the real bug (inflated POS stock display)
-            // this closes.
             const alreadyVoided = await tx.invoice.findFirst({
               where: { voidsInvoiceId: originalInvoice.id, tenantId },
               select: { id: true, offlineId: true },
             });
             if (alreadyVoided) {
               if (alreadyVoided.offlineId === inv.offlineId) {
-                // Same logical void as this request, already committed on a
-                // prior attempt whose response never reached the client —
-                // idempotent success, not a conflict. Mirrors the identical
-                // `if (existing) return existing;` idempotency check earlier
-                // in this same function.
                 return alreadyVoided;
               }
               throw new Error("تم إلغاء هذه الفاتورة مسبقاً عبر مزامنة أخرى.");
             }
 
-            // [FIX — offline void, batchId dependency removed] The device that
-            // creates an offline void has NO WAY to know which specific batchId
-            // an original sale item drew from — batch allocation only happens
-            // server-side, at sync time, via commitFifoAllocation. The old
-            // "items.length must match" + "match on batchId" logic therefore
-            // rejected EVERY offline void unconditionally, and additionally could
-            // never handle a sale that FIFO-split across more than one batch (one
-            // cart line → multiple InvoiceItem rows server-side).
-            //
-            // Fixed: match on (productId, unitId) instead — information the
-            // offline device DOES have, straight from its own cart. Every
-            // original InvoiceItem row sharing the same (productId, unitId) is
-            // grouped together; the void is validated against the GROUP's total
-            // quantity and price, not against any single row's batchId. The
-            // group's own batch breakdown (batchId + quantity per batch, exactly
-            // as FIFO originally split it) is then reused to distribute the
-            // restoration — the void device never needs to supply or know any
-            // batchId at all.
             interface OriginalBatchPortion {
               batchId: string;
-              quantity: string; // sold-unit quantity originally drawn from this batch
+              quantity: string;
               unitPriceSYP: string;
             }
             interface OriginalGroup {
               batches: OriginalBatchPortion[];
-              totalQuantity: string; // sum of the above, sold-unit
+              totalQuantity: string;
             }
 
             const originalByProductUnit = new Map<string, OriginalGroup>();
@@ -774,12 +588,6 @@ export async function POST(req: NextRequest) {
               originalByProductUnit.set(key, group);
             }
 
-            // Every (productId, unitId) group on the original invoice must be
-            // fully accounted for by the void payload — a void is always a
-            // complete reversal of the whole sale, never partial (a partial
-            // correction is a CustomerPayment, per T4d). This replaces the old
-            // items.length check, which compared raw row counts and broke the
-            // moment a sale had been FIFO-split.
             if (originalByProductUnit.size !== inv.items.length) {
               throw new Error(
                 "عدد عناصر الإلغاء لا يطابق عدد المنتجات/الوحدات المختلفة بالفاتورة الأصلية."
@@ -795,8 +603,6 @@ export async function POST(req: NextRequest) {
                 );
               }
 
-              // Price must match every batch portion in the group — in practice
-              // always the same price per (productId, unitId) on one invoice.
               const priceMismatch = group.batches.some(
                 (b) =>
                   compareMoney(serializeMoney(voidItem.unitPriceSYP), serializeMoney(b.unitPriceSYP)) !== 0
@@ -808,8 +614,6 @@ export async function POST(req: NextRequest) {
                 );
               }
 
-              // Quantity must match the GROUP'S TOTAL, not any single row —
-              // this is what makes a multi-batch-split sale voidable at all.
               if (
                 compareMoney(serializeMoney(Math.abs(voidItem.quantity)), group.totalQuantity) !== 0
               ) {
@@ -854,13 +658,12 @@ export async function POST(req: NextRequest) {
               );
             }
 
-            const targetCustomerId = originalInvoice.customerId;
+            const targetCustomerId = await resolveActiveCustomerId(
+              tx,
+              tenantId,
+              originalInvoice.customerId
+            );
 
-            // [FIX — v4.0 base-unit conversion, void path, per-batch] Each batch
-            // portion in each group is restored individually, in the SAME split
-            // it was originally deducted in — never merged into one lump sum
-            // against a single arbitrary batch. This preserves FIFO history
-            // exactly: batch A gets back exactly what batch A gave up.
             const batchAdjustments: Array<{ batchId: string; qtyToRestore: string }> = [];
             for (const matched of matchedGroups) {
               const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, matched.unitId);
@@ -895,9 +698,6 @@ export async function POST(req: NextRequest) {
               select: { id: true },
             });
 
-            // [FIX] One InvoiceItem per ORIGINAL BATCH PORTION, not one per
-            // void-payload item — mirrors exactly how the original sale itself
-            // was recorded (one row per batch a FIFO-split sale drew from).
             for (const matched of matchedGroups) {
               for (const portion of matched.group.batches) {
                 await tx.invoiceItem.create({
@@ -907,9 +707,6 @@ export async function POST(req: NextRequest) {
                     productId: matched.productId,
                     unitId: matched.unitId,
                     batchId: portion.batchId,
-                    // Negated sold-unit quantity for THIS specific batch portion —
-                    // never the group total — so this void row mirrors the
-                    // original row it reverses exactly.
                     quantity: subtractMoney("0", portion.quantity),
                     unitPriceSYP: matched.unitPriceSYP,
                     unitPriceUSD: matched.unitPriceUSD,
@@ -934,7 +731,9 @@ export async function POST(req: NextRequest) {
             tenantId,
             customerMap,
             { offlineCustomerId: inv.offlineCustomerId, customerId: inv.customerId },
-            "الزبون المرتبط بهذه الفاتورة غير موجود."
+            "الزبون المرتبط بهذه الفاتورة غير موجود.",
+            // [FIX — TRANSIENT CUSTOMER DEPENDENCY]
+            retryableCustomerOfflineIds
           );
 
           const customerRecord = await tx.customer.findFirst({
@@ -949,30 +748,20 @@ export async function POST(req: NextRequest) {
 
           interface ResolvedAllocation {
             productId: string;
-            unitId: string; // Always the SOLD unit — see below.
+            unitId: string;
             batchId: string;
             unitPriceSYP: string;
             unitPriceUSD: string;
-            // InvoiceItem.quantity — in the SOLD unit, possibly
-            // fractional on a multi-batch split (see file-header FIX
-            // note on why this is the correct, documented design).
             quantitySold: string;
-            // ProductBatch decrement — always base-unit.
             deductQtyInBaseUnit: string;
           }
 
           const resolvedAllocations: ResolvedAllocation[] = [];
 
           const productIdsInInvoice = [...new Set(inv.items.map((it) => it.productId))];
-          await lockBatchesForFifoAllocations(
-            tx,
-            tenantId,
-            productIdsInInvoice
-          );
+          await lockBatchesForFifoAllocations(tx, tenantId, productIdsInInvoice);
 
           for (const item of inv.items) {
-            // [FIX — v4.0 base-unit conversion, sale path] Two separate
-            // lookups, never conflated — see file-header note above.
             let baseUnit;
             try {
               baseUnit = await requireBaseUnit(tx, tenantId, item.productId);
@@ -986,17 +775,12 @@ export async function POST(req: NextRequest) {
               throw e;
             }
 
-            // The SOLD unit's own factor — fetched fresh from the DB via
-            // item.unitId, never assumed to be 1, never taken from
-            // baseUnit above.
             const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, item.unitId);
             const baseQtyRequested = toBaseUnit(item.quantity, soldUnitFactor);
 
             const resolution = await commitFifoAllocation(tx, {
               tenantId,
               productId: item.productId,
-              // ProductBatch/FIFO always operates against the BASE unit —
-              // never the unit the cashier actually sold in.
               unitId: baseUnit.id,
               requestedQty: baseQtyRequested.toString(),
             });
@@ -1005,9 +789,6 @@ export async function POST(req: NextRequest) {
               throw new Error(`لا توجد أي دفعة متاحة لـ ${item.productId}/${item.unitId}.`);
             }
 
-            // [FIX — NULLABLE CLIENT EXCHANGE RATE / USD FIELDS] Computed
-            // once per item from unitPriceSYP + the resolved
-            // exchangeRateUsed — never trusted from item.unitPriceUSD.
             const itemUnitPriceUSD = convertCurrency(
               serializeMoney(item.unitPriceSYP),
               exchangeRateUsed,
@@ -1016,15 +797,6 @@ export async function POST(req: NextRequest) {
             );
 
             for (const alloc of resolution.allocations) {
-              // [FIX] Each base-unit allocation is converted BACK into
-              // the sold unit for InvoiceItem.quantity — per
-              // schema.prisma's own InvoiceItem comment: quantity is
-              // always "what the customer actually bought," and a
-              // multi-batch split legitimately produces a fractional
-              // sold-unit figure on one or more rows. The actual
-              // ProductBatch decrement (deductQtyInBaseUnit) stays in
-              // base units, exactly as fifo.ts already computed it — no
-              // further conversion needed there.
               const soldQtyForAlloc = fromBaseUnit(alloc.allocatedQty, soldUnitFactor);
               resolvedAllocations.push({
                 productId: item.productId,
@@ -1037,13 +809,6 @@ export async function POST(req: NextRequest) {
               });
             }
 
-            // Insufficient stock: the unallocated remainder is drawn
-            // against the LAST batch anyway, allowed to go negative (see
-            // T1's ProductBatch.quantity note: "can legitimately go
-            // negative — flagged for reconciliation"). remainingQty is
-            // already base-unit (fifo.ts's own output) — no further
-            // conversion needed for the ProductBatch side; only the
-            // InvoiceItem-facing sold-unit figure needs fromBaseUnit().
             if (!resolution.isSufficient && compareMoney(resolution.remainingQty, 0) > 0) {
               const last = resolution.allocations[resolution.allocations.length - 1];
               const remainingSoldQty = fromBaseUnit(resolution.remainingQty, soldUnitFactor);
@@ -1089,7 +854,6 @@ export async function POST(req: NextRequest) {
                 productId: alloc.productId,
                 unitId: alloc.unitId,
                 batchId: alloc.batchId,
-                // [FIX] Sold-unit quantity — never the base-unit figure.
                 quantity: alloc.quantitySold,
                 unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
@@ -1100,8 +864,6 @@ export async function POST(req: NextRequest) {
           for (const alloc of resolvedAllocations) {
             await tx.productBatch.update({
               where: { id: alloc.batchId, tenantId },
-              // [FIX] Base-unit quantity — the exact figure fifo.ts (or
-              // the remainder branch above) computed, never re-derived.
               data: { quantity: { decrement: alloc.deductQtyInBaseUnit } },
             });
           }
@@ -1145,11 +907,31 @@ export async function POST(req: NextRequest) {
           return;
         }
       }
-      if (isRetryableTxError(err)) {
+      // [FIX — TRANSIENT CUSTOMER DEPENDENCY] Recorded as RETRY_LATER —
+      // never FAILED, and never silently dropped (see the earlier
+      // RETRY_LATER regression this restores against).
+      if (err instanceof TransientDependencyError) {
         console.error(
-          `[sync] invoice ${inv.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
+          `[sync] invoice ${inv.offlineId}: blocked on a customer still mid-retry, marking RETRY_LATER`,
           err
         );
+        invoiceResults.push({
+          offlineId: inv.offlineId,
+          status: "RETRY_LATER",
+          error: RETRY_LATER_DEPENDENCY_MESSAGE,
+        });
+        return;
+      }
+      if (isRetryableTxError(err)) {
+        console.error(
+          `[sync] invoice ${inv.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, marking RETRY_LATER`,
+          err
+        );
+        invoiceResults.push({
+          offlineId: inv.offlineId,
+          status: "RETRY_LATER",
+          error: RETRY_LATER_MESSAGE,
+        });
         return;
       }
       invoiceResults.push({
@@ -1160,9 +942,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // [v4.1] Sub-phase A — every non-void (sale) invoice, in createdAt order
-  // among themselves (filter() preserves the relative order already
-  // established by sortByCreatedAt() above).
+  // Sub-phase A — every non-void (sale) invoice.
   const saleInvoices = (invoices as InvoicePayload[]).filter(
     (inv) => !inv.voidsOfflineInvoiceId
   );
@@ -1170,12 +950,7 @@ export async function POST(req: NextRequest) {
     await processInvoiceSyncItem(inv);
   }
 
-  // [v4.1] Sub-phase B — every void, only after ALL sales above have been
-  // attempted. By the time this runs, any original sale present in THIS
-  // SAME payload has already been created (or has already recorded its own
-  // FAILED result) — a void's own "original not synced yet" check can now
-  // only ever fire for a genuinely missing/not-yet-uploaded original, never
-  // one that was simply processed later within the same request.
+  // Sub-phase B — every void, only after ALL sales above have been attempted.
   const voidInvoices = (invoices as InvoicePayload[]).filter(
     (inv) => inv.voidsOfflineInvoiceId
   );
@@ -1212,7 +987,9 @@ export async function POST(req: NextRequest) {
             tenantId,
             customerMap,
             { offlineCustomerId: p.offlineCustomerId, customerId: p.customerId },
-            "الزبون المرتبط بهذه الدفعة غير موجود."
+            "الزبون المرتبط بهذه الدفعة غير موجود.",
+            // [FIX — TRANSIENT CUSTOMER DEPENDENCY]
+            retryableCustomerOfflineIds
           );
 
           const created = await tx.customerPayment.create({
@@ -1252,11 +1029,30 @@ export async function POST(req: NextRequest) {
           continue;
         }
       }
-      if (isRetryableTxError(err)) {
+      // [FIX — TRANSIENT CUSTOMER DEPENDENCY] See processInvoiceSyncItem's
+      // identical branch above and the file-header FIX note.
+      if (err instanceof TransientDependencyError) {
         console.error(
-          `[sync] payment ${p.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, leaving PENDING`,
+          `[sync] payment ${p.offlineId}: blocked on a customer still mid-retry, marking RETRY_LATER`,
           err
         );
+        paymentResults.push({
+          offlineId: p.offlineId,
+          status: "RETRY_LATER",
+          error: RETRY_LATER_DEPENDENCY_MESSAGE,
+        });
+        continue;
+      }
+      if (isRetryableTxError(err)) {
+        console.error(
+          `[sync] payment ${p.offlineId}: transient failure after ${MAX_TX_ATTEMPTS} attempts, marking RETRY_LATER`,
+          err
+        );
+        paymentResults.push({
+          offlineId: p.offlineId,
+          status: "RETRY_LATER",
+          error: RETRY_LATER_MESSAGE,
+        });
         continue;
       }
       paymentResults.push({
@@ -1268,6 +1064,10 @@ export async function POST(req: NextRequest) {
   }
 
   const allResults = [...customerResults, ...invoiceResults, ...paymentResults];
+  // No change needed to this line itself — now that every RETRY_LATER
+  // item (including the dependency-triggered ones) is actually present
+  // in its results array, `.every()` correctly evaluates to false
+  // whenever one exists.
   const success = allResults.every((r) => r.status === "SYNCED");
 
   return NextResponse.json({

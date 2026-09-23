@@ -140,6 +140,11 @@ enum B2BOrderStatus {
   REJECTED
 }
 
+enum CustomerMergeRecordType {
+  INVOICE
+  PAYMENT
+}
+
 model Tenant {
   id                 String                   @id @default(cuid())
   name               String
@@ -152,21 +157,22 @@ model Tenant {
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
 
-  users              User[]
-  products           Product[]
-  productUnits       ProductUnit[]
-  productBatches     ProductBatch[]
-  customers          Customer[]
-  invoices           Invoice[]
-  invoiceItems       InvoiceItem[]
-  customerPayments   CustomerPayment[]
-  subscriptions      Subscription[]
-  b2bOrderRequests   B2BOrderRequest[]
-  customerMergeLogs  CustomerMergeLog[]
-  stockAdjustments   StockAdjustment[]
-  batchDeletionLogs  BatchDeletionLog[]
+  users                 User[]
+  products              Product[]
+  productUnits          ProductUnit[]
+  productBatches        ProductBatch[]
+  customers             Customer[]
+  invoices              Invoice[]
+  invoiceItems          InvoiceItem[]
+  customerPayments      CustomerPayment[]
+  subscriptions         Subscription[]
+  b2bOrderRequests      B2BOrderRequest[]
+  customerMergeLogs     CustomerMergeLog[]
+  customerMergeLogItems CustomerMergeLogItem[]
+  stockAdjustments      StockAdjustment[]
+  batchDeletionLogs     BatchDeletionLog[]
   // [v4.0]
-  baseUnitChangeLogs BaseUnitChangeLog[]
+  baseUnitChangeLogs    BaseUnitChangeLog[]
 
   systemCustomerId     String?               @unique
   systemCustomer       Customer?             @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
@@ -627,13 +633,35 @@ model CustomerMergeLog {
   performedByUserId   String
   createdAt           DateTime @default(now())
 
-  tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  survivingCustomer Customer @relation("MergeSurviving", fields: [survivingCustomerId], references: [id], onDelete: Restrict)
-  mergedCustomer    Customer @relation("MergeMerged", fields: [mergedCustomerId], references: [id], onDelete: Restrict)
-  performedByUser   User     @relation(fields: [performedByUserId], references: [id], onDelete: Restrict)
+  tenant            Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  survivingCustomer Customer               @relation("MergeSurviving", fields: [survivingCustomerId], references: [id], onDelete: Restrict)
+  mergedCustomer    Customer               @relation("MergeMerged", fields: [mergedCustomerId], references: [id], onDelete: Restrict)
+  performedByUser   User                   @relation(fields: [performedByUserId], references: [id], onDelete: Restrict)
+  items             CustomerMergeLogItem[]
 
   @@index([tenantId])
   @@index([survivingCustomerId])
+}
+
+model CustomerMergeLogItem {
+  id         String                  @id @default(cuid())
+  tenantId   String
+  mergeLogId String
+  recordType CustomerMergeRecordType
+  // [v4.2] recordId is a plain String, not a live FK — it can point at either
+  // an Invoice.id or a CustomerPayment.id depending on recordType, and Prisma
+  // has no polymorphic-FK construct to express that. Consistent with
+  // BatchDeletionLog.batchId's own "snapshot, not a live relation" pattern.
+  recordId   String
+  createdAt  DateTime                @default(now())
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  mergeLog CustomerMergeLog @relation(fields: [mergeLogId], references: [id], onDelete: Restrict)
+
+  @@unique([mergeLogId, recordType, recordId])
+  @@index([tenantId])
+  @@index([mergeLogId])
+  @@index([recordId])
 }
 
 model StockAdjustment {

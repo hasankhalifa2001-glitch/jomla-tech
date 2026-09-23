@@ -31,6 +31,7 @@ import { CheckoutSuccessModal } from "./checkout-success-modal";
 // only the local submitOfflineVoid() service — never the server-side ledger
 // void endpoint T4c2 itself uses.
 import { OfflineVoidPanel } from "./offline-void-panel";
+import { useCustomerCacheSync } from "@/lib/offline/customer-sync";
 import {
   Drawer,
   DrawerContent,
@@ -73,6 +74,8 @@ export function PosLayout() {
   // sites (loadData, effect "1a", handleConfirmCheckout) and had no way
   // to reflect a sync that succeeded elsewhere.
   const { pendingCount: pendingInvoicesCount, triggerSync } = useSyncWorker(tenantId);
+  // [v4.2] T4e Addendum: Evicts merged duplicate customers from cachedCustomers across tabs
+  useCustomerCacheSync(tenantId);
 
   // Data states
   const [products, setProducts] = useState<PosProductItem[]>([]);

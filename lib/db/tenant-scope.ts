@@ -61,6 +61,8 @@ export const TENANT_SCOPED_MODELS = new Set([
   "B2BOrderRequest",
   "B2BOrderRequestItem",
   "CustomerMergeLog",
+  // [v4.2] T4e Addendum — audit trail for re-pointed records during customer merge
+  "CustomerMergeLogItem",
   "StockAdjustment",
   "BatchDeletionLog",
   // [FIX] v4.0 addition — see the file-header history note above. Same

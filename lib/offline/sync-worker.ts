@@ -5,71 +5,63 @@
  * 1. Pushes pending offline data (offlineCustomers, offlineInvoices, offlinePayments)
  *    to /api/sync sorted by local `createdAt` ascending.
  * 2. Processes per-item responses from the server, updating local record status
- *    to "SYNCED" or "FAILED" with explicit failure reasons.
+ *    to "SYNCED" or "FAILED" with explicit failure reasons. A third server
+ *    status, "RETRY_LATER", leaves the local record untouched (still PENDING)
+ *    rather than writing any status at all — this covers both a raw transient
+ *    DB conflict on the item's own transaction AND a customer dependency
+ *    still mid-retry (see app/api/sync/route.ts's TransientDependencyError).
  * 3. Enforces that FAILED items are NEVER automatically retried (they remain in
  *    the FAILED state until manual reconciliation / T4e ledger resolution).
+ *    RETRY_LATER items ARE automatically retried — see triggers 1-3 below.
  * 4. Listens for network reconnection (`online` event) and triggers sync within 5 seconds.
+ * 5. Runs a periodic 45s safety-net check while online with pending work — see
+ *    the [FIX — PERIODIC INTERVAL STABILITY] note below for why this needed a
+ *    second look in this revision.
  *
- * [FIX — critical, payload was sending the wrong currency fields] This
- * file previously built its /api/sync payload around unitPriceUSD/
- * totalUSD/paidAmountUSD/debtAmountUSD only — a leftover from the
- * pre-v3.6 USD-authoritative currency model. db.ts and schema.prisma have
- * since re-anchored to SYP as the sole authoritative currency (see
- * db.ts's CURRENCY MODEL note and schema.prisma's v3.6 CURRENCY
- * RE-ANCHORING note): unitPriceSYP/totalSYP/paidAmountSYP/debtAmountSYP
- * are what every validation and business rule actually reads, and the
- * USD fields are informational-only and NULLABLE (a SYP-only cart that
- * never needed a rate has unitPriceUSD/totalUSD/etc. stored as `null` —
- * see db.ts's review-pass-6 note). The old payload never sent the SYP
- * fields at all, so:
- *   - A SYP-only sale (unitPriceUSD/totalUSD/etc. all null) sent a
- *     payload with NO usable price/total/debt figures whatsoever.
- *   - Even a USD-priced sale sent only the derived, informational USD
- *     figures — never the authoritative SYP figures the server is
- *     required to validate (debtAmountSYP ≈ totalSYP − paidAmountSYP)
- *     and persist as the source of truth.
- * Every authoritative SYP field is now included alongside its
- * informational USD counterpart, matching OfflineInvoice/
- * OfflineInvoiceItem's actual shape in db.ts exactly.
+ * [... prior header documentation on SYP/USD payload shape, post-sync
+ * cache-refresh logic, and the original RETRY_LATER handling (false-success
+ * bug + orphaned-retry bug) — unchanged and still in effect, see earlier
+ * revisions of this file for the full text ...]
  *
- * [FIX — critical, this revision] syncPendingRecords() previously never
- * refreshed cachedProducts/cachedCustomers after a successful sync pass
- * at all — it only ever updated each offline record's own status field
- * (SYNCED/FAILED) in Dexie. This produced a real, UNBOUNDED display bug,
- * not a narrow timing edge case:
+ * [FIX — PERIODIC INTERVAL STABILITY, this revision — closes a real
+ * "safety net that resets itself before it ever fires" bug]
  *
- *   1. pos-service.ts's getOfflineProducts() correctly subtracts every
- *      NOT-YET-SYNCED offlineInvoices item from the last-synced batch
- *      total, so a stock count stays accurate WHILE a sale is pending.
- *   2. The instant this file marks that same invoice SYNCED, it drops
- *      out of that subtraction — correctly, since the server has now
- *      committed the real deduction via commitFifoAllocation (T4c/T3b).
- *   3. But nothing in THIS file ever called refreshProductCache() to
- *      pull that real, now-lower server-side quantity back down into
- *      cachedProducts.batches — so the displayed stock count would jump
- *      back UP to its pre-sale value and STAY there indefinitely, until
- *      some unrelated code path happened to trigger a refresh (e.g. the
- *      user manually pressing a "sync products" button, or an app-load
- *      refresh on a completely different screen). There was no bound on
- *      how long this could persist — potentially the rest of the
- *      cashier's shift.
+ * The periodic 45s safety-net `useEffect` previously listed `pendingCount`
+ * in its dependency array:
  *
- * Fixed: syncPendingRecords() now calls refreshProductCache() whenever
- * at least one invoice was actually synced this pass (the only source of
- * stock-affecting writes), and refreshCustomerCache() whenever at least
- * one invoice OR payment was synced (both can change a customer's
- * server-side debt balance). Both are best-effort: a refresh failure
- * (e.g. the network drops again immediately after the sync itself
- * succeeded) is logged but does not flip the overall sync summary to
- * failed — the sync itself genuinely succeeded; only the subsequent
- * cache-refresh attempt didn't, and the next successful refresh (from
- * any trigger) will still catch up correctly, so this is not silently
- * losing data the way the original missing-refresh gap was.
+ *   useEffect(() => {
+ *     periodicIntervalRef.current = setInterval(() => { ... }, 45_000);
+ *     return () => clearInterval(periodicIntervalRef.current);
+ *   }, [tenantId, pendingCount, triggerSync]);
+ *
+ * `pendingCount` is a live, reactive value (useLiveQuery) that changes on
+ * EVERY write to offlineInvoices/offlinePayments/offlineCustomers — a new
+ * sale, a new walk-in customer, a new offline void, and every status
+ * transition a sync pass itself writes. Each such change re-runs this
+ * effect: React tears down the existing interval (clearInterval in the
+ * cleanup function) and starts a brand-new 45s countdown from zero.
+ *
+ * On a device with steady activity (a cashier ringing up sale after sale
+ * more often than once every 45 seconds), the interval could be reset
+ * indefinitely and NEVER actually fire — defeating the entire purpose of
+ * the safety net, which exists specifically to catch a RETRY_LATER item
+ * that triggers 1 and 2 (the 0->positive pendingCount transition and the
+ * browser `online` event) cannot reach.
+ *
+ * Fixed: `pendingCount` is read from a ref (`pendingCountRef`, kept in
+ * sync by a separate, cheap effect) INSIDE the interval callback instead
+ * of being a dependency of the effect that creates the interval. The
+ * interval-creating effect now depends only on `[tenantId, triggerSync]`
+ * — both stable across ordinary pending-count churn — so the interval is
+ * created once per mount (and once per tenant/triggerSync identity
+ * change) and ticks reliably every 45s regardless of how often
+ * `pendingCount` itself changes in between ticks.
  */
 
 import { getOfflineDb, isOfflineDbSupported } from "./db";
 import { refreshProductCache, refreshCustomerCache } from "./cache-refresh";
 import { useEffect, useState, useCallback, useRef } from "react";
+import { useLiveQuery } from "dexie-react-hooks";
 
 export interface SyncSummary {
   success: boolean;
@@ -79,12 +71,24 @@ export interface SyncSummary {
   failedCustomers: number;
   failedInvoices: number;
   failedPayments: number;
+  // Counts of items the server explicitly deferred (transient DB
+  // conflict on the item itself, or a dependency — e.g. its customer —
+  // still mid-retry) — distinct from genuine terminal failures. These
+  // items' local Dexie records are left untouched (still PENDING) and
+  // will be retried automatically.
+  retryLaterCustomers: number;
+  retryLaterInvoices: number;
+  retryLaterPayments: number;
+  // True whenever this pass ended with at least one RETRY_LATER item —
+  // lets a UI show a calm "still syncing" state instead of conflating
+  // this with a genuine, manual-intervention-needed failure.
+  hasPendingRetries: boolean;
   errors: string[];
 }
 
 export interface SyncItemResult {
   offlineId: string;
-  status: "SYNCED" | "FAILED";
+  status: "SYNCED" | "FAILED" | "RETRY_LATER";
   realId?: string;
   error?: string;
 }
@@ -115,6 +119,10 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
     failedCustomers: 0,
     failedInvoices: 0,
     failedPayments: 0,
+    retryLaterCustomers: 0,
+    retryLaterInvoices: 0,
+    retryLaterPayments: 0,
+    hasPendingRetries: false,
     errors: [],
   };
 
@@ -124,7 +132,6 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
 
   const db = getOfflineDb();
 
-  // Fetch only records whose status is PENDING (never FAILED or SYNCED)
   const [pendingCustomers, pendingInvoices, pendingPayments] = await Promise.all([
     db.offlineCustomers
       .where("tenantId")
@@ -143,7 +150,6 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       .toArray(),
   ]);
 
-  // If there is nothing pending, return immediately
   if (
     pendingCustomers.length === 0 &&
     pendingInvoices.length === 0 &&
@@ -152,7 +158,6 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
     return summary;
   }
 
-  // Sort per device by local createdAt ASC
   pendingCustomers.sort(
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
   );
@@ -171,10 +176,6 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       shopName: c.shopName,
       createdAt: c.createdAt,
     })),
-    // [FIX] Every field below now matches OfflineInvoice/OfflineInvoiceItem's
-    // actual shape in db.ts — SYP fields (authoritative) sent alongside
-    // their USD counterparts (informational, possibly null for a
-    // SYP-only sale that never needed a rate).
     invoices: pendingInvoices.map((inv) => ({
       offlineId: inv.offlineId,
       customerId: inv.customerId,
@@ -245,7 +246,6 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
             failureReason: undefined,
           });
 
-          // Also insert into cachedCustomers if realId is provided
           if (res.realId) {
             await db.cachedCustomers.put({
               id: res.realId,
@@ -256,19 +256,19 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
               cachedBalanceDebtSYP: "0.0000",
               cachedBalanceDebtUSD: "0.0000",
               isSystemGenerated: false,
-              // [NOTE] Explicitly false: a walk-in customer synced just
-              // now has no documented invoice history yet — matches
-              // pos-service.ts's isEligibleForCredit(), which only ever
-              // accepts an explicit `true`. This customer becomes
-              // credit-eligible once a real /api/customers refresh
-              // reports a real prior invoice for them.
               hasPriorInvoices: false,
             });
           }
+        } else if (res.status === "RETRY_LATER") {
+          // Deliberately no Dexie write at all — the local record stays
+          // exactly as it was (status: "PENDING"), so it's naturally
+          // re-included in the next sync pass's own PENDING query above,
+          // with zero extra bookkeeping needed here.
+          summary.retryLaterCustomers++;
+          summary.hasPendingRetries = true;
         } else {
           summary.failedCustomers++;
           summary.errors.push(res.error || `Customer ${res.offlineId} failed`);
-          // Mark as FAILED — never retried automatically
           await db.offlineCustomers.update(localCustomer.id, {
             status: "FAILED",
             failureReason: res.error || "فشل المزامنة",
@@ -287,10 +287,17 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
             status: "SYNCED",
             failureReason: undefined,
           });
+        } else if (res.status === "RETRY_LATER") {
+          // Same as above — no Dexie write, stays PENDING. Covers both a
+          // raw transient DB conflict AND a customer dependency still
+          // mid-retry (server-side TransientDependencyError) — this file
+          // does not need to distinguish the two cases, only the server
+          // does, via res.error's wording.
+          summary.retryLaterInvoices++;
+          summary.hasPendingRetries = true;
         } else {
           summary.failedInvoices++;
           summary.errors.push(res.error || `Invoice ${res.offlineId} failed`);
-          // Mark as FAILED — never retried automatically
           await db.offlineInvoices.update(localInvoice.id, {
             status: "FAILED",
             failureReason: res.error || "فشل المزامنة",
@@ -309,10 +316,13 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
             status: "SYNCED",
             failureReason: undefined,
           });
+        } else if (res.status === "RETRY_LATER") {
+          // Same as above — no Dexie write, stays PENDING.
+          summary.retryLaterPayments++;
+          summary.hasPendingRetries = true;
         } else {
           summary.failedPayments++;
           summary.errors.push(res.error || `Payment ${res.offlineId} failed`);
-          // Mark as FAILED — never retried automatically
           await db.offlinePayments.update(localPayment.id, {
             status: "FAILED",
             failureReason: res.error || "فشل المزامنة",
@@ -321,23 +331,21 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       }
     }
 
+    // success is also false whenever anything is still RETRY_LATER —
+    // this pass did not fully complete, even though nothing failed
+    // terminally. hasPendingRetries (set above) lets a UI distinguish
+    // this calmly from a genuine failure requiring intervention.
     summary.success =
       summary.failedCustomers === 0 &&
       summary.failedInvoices === 0 &&
-      summary.failedPayments === 0;
+      summary.failedPayments === 0 &&
+      summary.retryLaterCustomers === 0 &&
+      summary.retryLaterInvoices === 0 &&
+      summary.retryLaterPayments === 0;
 
-    // [FIX — critical, this revision] Refresh the caches that whatever
-    // just got synced actually invalidated — see the file-header FIX
-    // note for the full "stock silently reverts after a successful sync"
-    // bug this closes. Best-effort: a refresh failure here is logged but
-    // does NOT flip summary.success — the sync itself already committed
-    // successfully server-side; only the local cache didn't catch up
-    // this pass, and the next refresh from any trigger still corrects it.
-    //
-    // Product cache: only invoices affect ProductBatch.quantity server-
-    // side (via commitFifoAllocation) — a synced customer or a synced
-    // payment alone never does, so skip this refresh when no invoice
-    // synced, to avoid an unnecessary network round-trip.
+    // Post-sync cache refresh — only triggered by genuinely SYNCED
+    // invoices/payments (RETRY_LATER items changed nothing server-side
+    // yet, so there's nothing new to refresh for them).
     if (summary.syncedInvoices > 0) {
       try {
         const productResult = await refreshProductCache(scopedTenantId);
@@ -352,8 +360,6 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
       }
     }
 
-    // Customer cache: either a synced invoice (debt) or a synced payment
-    // (repayment) can change a customer's server-side balance.
     if (summary.syncedInvoices > 0 || summary.syncedPayments > 0) {
       try {
         const customerResult = await refreshCustomerCache(scopedTenantId);
@@ -409,41 +415,21 @@ export async function getPendingRecordsCount(tenantId?: string): Promise<number>
 
 /**
  * React Hook for managing background sync worker lifecycle.
- * Automatically initiates sync within 5 seconds of network reconnection.
- */
-// أضف هاد الاستيراد فوق مع باقي الاستيرادات
-import { useLiveQuery } from "dexie-react-hooks";
-
-/**
- * React Hook for managing background sync worker lifecycle.
  *
- * [FIX — critical] Previously, automatic sync only ever fired once per
- * mount: a single `useEffect` ran `scheduleSync()` exactly once when the
- * component first mounted (and again only on a genuine browser
- * online/offline transition). Nothing in this hook ever noticed that a
- * NEW PENDING record had been written to Dexie while the page was
- * already open and already online — e.g. right after
- * submitOfflineSale() completes a sale. The invoice sat PENDING
- * indefinitely until the user manually reloaded the page (which
- * remounted this hook and re-ran the one-time scheduleSync()).
- *
- * Fixed by making `pendingCount` itself REACTIVE via useLiveQuery
- * (same pattern lib/offline/hooks.ts's useOfflineDbReady already uses)
- * instead of a one-shot state variable populated by a plain fetch. Any
- * write to offlineInvoices/offlinePayments/offlineCustomers — from
- * anywhere in the app, at any time — now re-runs this query
- * automatically and updates `pendingCount` live. A separate effect below
- * watches for `pendingCount` transitioning from 0 to a positive number
- * (a genuinely NEW pending item appearing) and, if online, schedules a
- * sync the same debounced way the original online-reconnect path
- * already did — no manual triggerSync() call needed anywhere else in
- * the app.
+ * Automatic sync fires on THREE independent triggers:
+ *   1. pendingCount transitioning from 0 to positive (a genuinely NEW
+ *      pending item appearing — e.g. right after submitOfflineSale()).
+ *   2. A real browser `online` reconnect event.
+ *   3. A periodic 45s safety-net check — see file-header
+ *      [FIX — PERIODIC INTERVAL STABILITY] note for why this now reads
+ *      pendingCount from a ref instead of depending on it directly.
  */
 export function useSyncWorker(tenantId?: string) {
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [lastSummary, setLastSummary] = useState<SyncSummary | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const periodicIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isSyncingRef = useRef(false);
 
   const triggerSync = useCallback(async () => {
@@ -462,13 +448,6 @@ export function useSyncWorker(tenantId?: string) {
     }
   }, [tenantId]);
 
-  // [FIX] Reactive pending count — re-evaluates automatically on ANY
-  // write to these three tables, from any code path in the app (a new
-  // sale, a repayment, a walk-in customer, or this hook's own
-  // status-update writes after a sync pass completes). Replaces the
-  // previous one-shot getPendingRecordsCount() call + manual
-  // refreshPendingCount() plumbing entirely — there is nothing left to
-  // manually refresh; the live query IS the source of truth.
   const pendingCount = useLiveQuery(
     async () => {
       if (!tenantId || !isOfflineDbSupported()) return 0;
@@ -477,6 +456,16 @@ export function useSyncWorker(tenantId?: string) {
     [tenantId],
     0
   ) ?? 0;
+
+  // [FIX — PERIODIC INTERVAL STABILITY] Mirrors the live pendingCount into
+  // a ref on every render, so the periodic-interval effect below can read
+  // the CURRENT value inside its callback without needing pendingCount in
+  // its own dependency array (which would tear down and recreate the
+  // interval on every pendingCount change — see the file-header FIX note).
+  const pendingCountRef = useRef(pendingCount);
+  useEffect(() => {
+    pendingCountRef.current = pendingCount;
+  }, [pendingCount]);
 
   const scheduleSync = useCallback(() => {
     if (debounceTimerRef.current) {
@@ -487,15 +476,7 @@ export function useSyncWorker(tenantId?: string) {
     }, 2000);
   }, [triggerSync]);
 
-  // [FIX] Fires a debounced sync attempt whenever pendingCount
-  // transitions from 0 to a positive number (a genuinely NEW pending
-  // item just appeared) — e.g. right after submitOfflineSale() writes
-  // its Dexie record. Also fires on the initial mount if there's already
-  // a nonzero pendingCount (e.g. a reload with leftover PENDING items),
-  // matching the original mount-time behavior. Does NOT fire on every
-  // pendingCount change — only on the 0 -> positive transition, so a
-  // sync pass's own status-update writes (which move items OUT of
-  // PENDING) never re-trigger themselves.
+  // Trigger 1 — 0 -> positive pendingCount transition (new local work).
   const prevPendingCountRef = useRef<number | null>(null);
   useEffect(() => {
     if (!tenantId) return;
@@ -513,15 +494,12 @@ export function useSyncWorker(tenantId?: string) {
     prevPendingCountRef.current = pendingCount;
   }, [tenantId, pendingCount, scheduleSync]);
 
-  // Reconnect handling — unchanged in spirit from the original: a real
-  // browser online transition still schedules a sync (covers PENDING
-  // items that piled up while genuinely offline, where the effect above
-  // deliberately skipped scheduling).
+  // Trigger 2 — real browser online reconnect event.
   useEffect(() => {
     if (!tenantId || typeof window === "undefined") return;
 
     const handleOnline = () => {
-      if (pendingCount > 0) scheduleSync();
+      if (pendingCountRef.current > 0) scheduleSync();
     };
     window.addEventListener("online", handleOnline);
 
@@ -531,7 +509,44 @@ export function useSyncWorker(tenantId?: string) {
         clearTimeout(debounceTimerRef.current);
       }
     };
-  }, [tenantId, pendingCount, scheduleSync]);
+    // [FIX — PERIODIC INTERVAL STABILITY] pendingCount removed from this
+    // effect's dependency array too, for the same reason as trigger 3
+    // below — handleOnline reads the live value via pendingCountRef
+    // instead, so the listener no longer needs to be torn down and
+    // re-added on every pendingCount change.
+  }, [tenantId, scheduleSync]);
+
+  // Trigger 3 — periodic 45s safety net. Covers the case where a
+  // RETRY_LATER item is stuck PENDING on a device that never actually
+  // loses connectivity (so trigger 2 never fires) and where no new local
+  // work is created afterward (so trigger 1 never fires either).
+  //
+  // [FIX — PERIODIC INTERVAL STABILITY] This effect now depends only on
+  // [tenantId, triggerSync] — NOT on pendingCount — so the interval is
+  // created once per mount/tenant and ticks reliably every 45s. The
+  // callback reads the CURRENT pending count via pendingCountRef.current
+  // at fire time, so it still behaves correctly (a no-op when nothing is
+  // pending) without needing pendingCount as a dependency.
+  useEffect(() => {
+    if (!tenantId) return;
+
+    periodicIntervalRef.current = setInterval(() => {
+      if (
+        pendingCountRef.current > 0 &&
+        typeof navigator !== "undefined" &&
+        navigator.onLine &&
+        !isSyncingRef.current
+      ) {
+        void triggerSync();
+      }
+    }, 45_000);
+
+    return () => {
+      if (periodicIntervalRef.current) {
+        clearInterval(periodicIntervalRef.current);
+      }
+    };
+  }, [tenantId, triggerSync]);
 
   return {
     isSyncing,
@@ -539,9 +554,6 @@ export function useSyncWorker(tenantId?: string) {
     lastSyncTime,
     lastSummary,
     triggerSync,
-    // [FIX] refreshPendingCount kept as a no-op-returning-current-value
-    // for backward compatibility with any existing caller — pendingCount
-    // is now always live and needs no manual refresh trigger.
     refreshPendingCount: useCallback(async () => { }, []),
   };
 }

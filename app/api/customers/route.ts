@@ -153,6 +153,9 @@ export async function GET() {
         // CachedCustomer.hasPriorInvoices's doc comment for why this is
         // deliberately not narrowed to e.g. status === "COMPLETED" only.
         hasPriorInvoices: c.invoices.length > 0,
+        // [v4.2] T4e Addendum: Customer merge comparison screen requires invoice & payment counts
+        invoiceCount: c.invoices.length,
+        paymentCount: c.payments.length,
       };
     });
 

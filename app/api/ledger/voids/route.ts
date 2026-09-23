@@ -1,4 +1,4 @@
-﻿import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import {
   assertTenantWritable,
@@ -20,6 +20,7 @@ import {
   getUnitConversionFactor,
   toBaseUnit,
 } from "@/lib/inventory/units";
+import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
 
 export async function POST(req: Request) {
   try {
@@ -208,7 +209,8 @@ export async function POST(req: Request) {
           // Decimal(18,4) precision. The sync engine's void path negates the
           // same way.
           userId: adminUserId,
-          customerId: originalInvoice.customerId,
+          // [v4.2] Auto-Redirect on Write: resolve active customer in case of merge
+          customerId: await resolveActiveCustomerId(tx, tenantId, originalInvoice.customerId),
           totalSYP: subtractMoney("0", originalInvoice.totalSYP.toString()),
           totalUSD: subtractMoney("0", originalInvoice.totalUSD.toString()),
           exchangeRateUsed: originalInvoice.exchangeRateUsed,
