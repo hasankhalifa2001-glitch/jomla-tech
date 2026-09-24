@@ -205,8 +205,8 @@ export function BarcodeSourceModal({
                             {/* GS1 option */}
                             <label
                                 className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-colors ${selected === "GS1"
-                                        ? "border-emerald-500 bg-emerald-50/60 dark:bg-emerald-950/20"
-                                        : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700"
+                                    ? "border-emerald-500 bg-emerald-50/60 dark:bg-emerald-950/20"
+                                    : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700"
                                     }`}
                             >
                                 <input
@@ -235,8 +235,8 @@ export function BarcodeSourceModal({
                             {/* INTERNAL option */}
                             <label
                                 className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-colors ${selected === "INTERNAL"
-                                        ? "border-emerald-500 bg-emerald-50/60 dark:bg-emerald-950/20"
-                                        : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700"
+                                    ? "border-emerald-500 bg-emerald-50/60 dark:bg-emerald-950/20"
+                                    : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700"
                                     }`}
                             >
                                 <input

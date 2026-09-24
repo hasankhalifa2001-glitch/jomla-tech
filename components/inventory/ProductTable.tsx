@@ -1,8 +1,5 @@
 "use client";
 
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Switch } from "@/components/ui/switch";
 import {
   Layers,
   ChevronDown,
@@ -20,14 +17,13 @@ import Decimal from "decimal.js";
 import { ExpiryBadge } from "@/components/inventory/ExpiryBadge";
 import { NegativeStockBadge } from "@/components/inventory/NegativeStockBadge";
 import { formatMoney } from "@/lib/utils/money";
+import s from "./inventory.module.css";
 
 export interface BatchAdjustmentItem {
   id: string;
-  // [FIX] `quantityDelta` is a Decimal(18,4)-backed field — the API
+  // `quantityDelta` is a Decimal(18,4)-backed field — the API
   // (products/route.ts's GET) sends it as `adj.quantityDelta.toString()`,
-  // never a native number. Declaring it `number` here was a lie the
-  // compiler couldn't catch (JSON has no runtime type checking), and it
-  // masked a real bug below (see the [FIX] on the reduce() call).
+  // never a native number.
   quantityDelta: string;
   reason: string;
   adjustedByUserName: string;
@@ -37,8 +33,8 @@ export interface BatchAdjustmentItem {
 export interface BatchItem {
   id: string;
   batchNumber: string;
-  // [FIX] Same as quantityDelta above — the API sends
-  // `batch.quantity.toString()`, always a decimal string.
+  // Same as quantityDelta above — the API sends `batch.quantity.toString()`,
+  // always a decimal string.
   quantity: string;
   unitId: string;
   unitName: string;
@@ -58,18 +54,17 @@ export interface UnitItem {
   unitName: string;
   conversionFactor: number;
   pricingCurrency?: "SYP" | "USD";
-  // [FIX] priceWholesale/priceRetail are sent as decimal strings by the
-  // API (`u.priceWholesale.toString()`) — kept as number|string here
-  // since formatMoney() (lib/utils/money.ts) accepts either via its
-  // MoneyInput type, so no runtime break either way, but the type now
-  // reflects what's actually on the wire.
+  // priceWholesale/priceRetail are sent as decimal strings by the API
+  // (`u.priceWholesale.toString()`) — kept as number|string since
+  // formatMoney() (lib/utils/money.ts) accepts either via its MoneyInput
+  // type.
   priceWholesale: number | string;
   priceRetail?: number | string | null;
   barcode: string | null;
   barcodeSource?: "GS1" | "INTERNAL" | null;
   imageUrl?: string | null;
   isActive?: boolean;
-  // [NEW — v4.0] Precomputed by the backend (base-unit.ts's
+  // [v4.0] Precomputed by the backend (base-unit.ts's
   // toSafeProductWithUnits(), threaded through products/route.ts's GET).
   // This is the ONLY reliable way to know which unit is the product's
   // base unit — never infer it from conversionFactor === 1 in this
@@ -87,10 +82,9 @@ export interface ProductItem {
   createdAt: string;
   units: UnitItem[];
   batches: BatchItem[];
-  // [FIX] Sent as `totalBaseStock.toString()` by the API — a decimal
-  // string, not a native number (the schema allows up to 14 integer
-  // digits, beyond safe native-number precision for very large stock
-  // counts).
+  // Sent as `totalBaseStock.toString()` by the API — a decimal string, not
+  // a native number (the schema allows up to 14 integer digits, beyond
+  // safe native-number precision for very large stock counts).
   totalStockInBase: string;
   baseUnitName: string;
   hasExpiringSoonBatch: boolean;
@@ -127,40 +121,27 @@ interface ProductTableProps {
 function ProductNameBlock({ product }: { product: ProductItem }) {
   return (
     <div>
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{product.name}</div>
-        {!product.isActive && (
-          <Badge
-            variant="destructive"
-            className="border-red-200 bg-red-100 px-1.5 py-0 text-[10px] text-red-700"
-          >
-            موقوف
-          </Badge>
-        )}
+      <div className={s.productName}>
+        <span className={s.productNameText}>{product.name}</span>
+        {!product.isActive && <span className={`${s.badge} ${s.badgeSm} ${s.badgeRed}`}>موقوف</span>}
         {product.hasDiscontinuedUnitStock && (
-          <Badge
-            variant="outline"
-            className="border-amber-300 bg-amber-50 px-1.5 py-0 text-[10px] text-amber-800"
-          >
-            مخزون على وحدة متوقفة
-          </Badge>
+          <span className={`${s.badge} ${s.badgeSm} ${s.badgeAmber}`}>مخزون على وحدة متوقفة</span>
         )}
         {product.hasNegativeStockBatch && (
-          <span title="يوجد دفعة بمخزون سالب تحتاج تسوية">
-            <Package className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
+          <span
+            className={`${s.iconFlag} ${s.iconFlagPurple}`}
+            title="يوجد دفعة بمخزون سالب تحتاج تسوية"
+          >
+            <Package size={14} aria-hidden />
           </span>
         )}
         {product.hasExpiringSoonBatch && (
-          <span title="يوجد دفعة قريبة من تاريخ الانتهاء">
-            <Clock className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+          <span className={`${s.iconFlag} ${s.iconFlagAmber}`} title="يوجد دفعة قريبة من تاريخ الانتهاء">
+            <Clock size={14} aria-hidden />
           </span>
         )}
       </div>
-      {product.category && (
-        <Badge variant="outline" className="mt-1 border-zinc-200 text-[10px] text-zinc-500">
-          {product.category}
-        </Badge>
-      )}
+      {product.category && <span className={s.categoryBadge}>{product.category}</span>}
     </div>
   );
 }
@@ -177,15 +158,14 @@ function UnitsList({
   togglingActiveId?: string | null;
 }) {
   return (
-    <div className="space-y-1.5">
+    <div className={s.unitsList}>
       {product.units.map((unit) => {
-        // [FIX — real bug] Previously `sum + b.quantity` with a native
-        // `+` on `b.quantity`, which the API sends as a decimal STRING
-        // (see BatchItem.quantity's [FIX] note above). `0 + "24"`
-        // performs STRING CONCATENATION in JS ("024"), not numeric
-        // addition, once any operand is a string — this silently
-        // produced a wrong "discontinued stock" figure for any unit
-        // with more than one matching batch. Fixed via decimal.js,
+        // Previously `sum + b.quantity` with a native `+` on `b.quantity`,
+        // which the API sends as a decimal STRING (see BatchItem.quantity's
+        // note above). `0 + "24"` performs STRING CONCATENATION in JS
+        // ("024"), not numeric addition, once any operand is a string —
+        // this silently produced a wrong "discontinued stock" figure for
+        // any unit with more than one matching batch. Fixed via decimal.js,
         // consistent with this project's quantity-arithmetic convention
         // (see lib/inventory/units.ts) — never native +/- on a
         // Decimal(18,4)-backed field.
@@ -193,11 +173,10 @@ function UnitsList({
         // [NOTE — matches backend's own v4.0 caveat] Under v4.0,
         // ProductBatch.unitId is ALWAYS the product's base unit, so
         // `b.unitId === unit.id` can only ever match for the base unit
-        // itself — a non-base deactivated unit will always compute 0
-        // here. This mirrors products/route.ts's own flagged, unresolved
-        // open question (T3a §4 under v4.0) rather than a bug introduced
-        // in this component; not changed here pending that product
-        // decision.
+        // itself — a non-base deactivated unit will always compute 0 here.
+        // This mirrors products/route.ts's own flagged, unresolved open
+        // question (T3a §4 under v4.0) rather than a bug introduced in
+        // this component; not changed here pending that product decision.
         const discontinuedStock = !unit.isActive
           ? product.batches
             .filter((b) => b.unitId === unit.id && new Decimal(b.quantity).greaterThan(0))
@@ -205,55 +184,34 @@ function UnitsList({
           : new Decimal(0);
 
         return (
-          <div key={unit.id} className="flex flex-wrap items-center gap-2 text-xs">
-            <span
-              className={`font-medium ${unit.isActive === false ? "text-zinc-400 line-through" : "text-zinc-800 dark:text-zinc-200"
-                }`}
-            >
+          <div key={unit.id} className={s.unitRow}>
+            <span className={unit.isActive === false ? s.unitNameInactive : s.unitName}>
               {unit.unitName}
             </span>
-            {/* [NEW — v4.0] Marks the product's designated base unit —
-                the only unit ProductBatch.quantity is ever counted in,
-                whose conversionFactor is permanently locked to 1 once
-                any batch exists. Read purely from `unit.isBaseUnit`
-                (precomputed server-side) — never inferred here from
-                conversionFactor === 1. */}
-            {unit.isBaseUnit && (
-              <Badge
-                variant="outline"
-                className="border-emerald-300 bg-emerald-50 px-1 py-0 text-[9px] text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300"
-              >
-                أساسية
-              </Badge>
-            )}
-            {unit.isActive === false && (
-              <Badge variant="outline" className="border-red-200 bg-red-50 px-1 py-0 text-[9px] text-red-500">
-                معطلة
-              </Badge>
-            )}
+            {/* [v4.0] Marks the product's designated base unit — the only
+                unit ProductBatch.quantity is ever counted in, whose
+                conversionFactor is permanently locked to 1 once any batch
+                exists. Read purely from `unit.isBaseUnit` (precomputed
+                server-side) — never inferred here from conversionFactor
+                === 1. */}
+            {unit.isBaseUnit && <span className={`${s.badge} ${s.badgeSm} ${s.badgeGreen}`}>أساسية</span>}
+            {unit.isActive === false && <span className={`${s.badge} ${s.badgeSm} ${s.badgeRed}`}>معطلة</span>}
             {discontinuedStock.greaterThan(0) && (
-              <Badge
-                variant="outline"
-                className="border-amber-300 bg-amber-50 px-1 py-0 text-[9px] text-amber-700"
-              >
+              <span className={`${s.badge} ${s.badgeSm} ${s.badgeAmber}`}>
                 مخزون على وحدة متوقفة ({discontinuedStock.toString()})
-              </Badge>
+              </span>
             )}
-            <span className="text-[11px] text-zinc-400">(معامل {unit.conversionFactor})</span>
-            <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
-              {formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}
-            </span>
+            <span className={s.unitFactor}>(معامل {unit.conversionFactor})</span>
+            <span className={s.unitPrice}>{formatMoney(unit.priceWholesale, unit.pricingCurrency ?? "SYP")}</span>
             {unit.priceRetail != null && (
-              <span className="text-[10px] text-zinc-400">
+              <span className={s.unitRetail}>
                 (تجزئة: {formatMoney(unit.priceRetail, unit.pricingCurrency ?? "SYP")})
               </span>
             )}
             {unit.barcode && (
-              <span className="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] text-zinc-500 dark:bg-zinc-800">
+              <span className={s.unitBarcode}>
                 {unit.barcode}
-                {unit.barcodeSource && (
-                  <span className="mr-1 font-sans text-[9px] text-zinc-400">({unit.barcodeSource})</span>
-                )}
+                {unit.barcodeSource && <span className={s.unitBarcodeSource}>({unit.barcodeSource})</span>}
               </span>
             )}
             {isAdmin && onToggleUnitActive && (
@@ -261,13 +219,13 @@ function UnitsList({
                 type="button"
                 onClick={() => onToggleUnitActive(product.id, unit.id)}
                 disabled={togglingActiveId === unit.id}
-                className="mr-1 text-[10px] text-zinc-400 underline hover:text-zinc-700"
-                // [NOTE] Deactivating the BASE unit is not blocked at the
-                // API layer today (an open, unresolved question flagged
-                // in products/route.ts's GET handler) — this tooltip is a
+                className={s.unitToggle}
+                // Deactivating the BASE unit is not blocked at the API
+                // layer today (an open, unresolved question flagged in
+                // products/route.ts's GET handler) — this tooltip is a
                 // UX-only warning, not an enforcement mechanism. It does
-                // not disable the button, since the backend itself
-                // hasn't decided this should be forbidden yet.
+                // not disable the button, since the backend itself hasn't
+                // decided this should be forbidden yet.
                 title={
                   unit.isBaseUnit && unit.isActive !== false
                     ? "تنبيه: هذه هي الوحدة الأساسية — تعطيلها يخفيها من كل الشاشات رغم أنها الوحدة التي تُحسب بها كل الدفعات."
@@ -288,9 +246,9 @@ function UnitsList({
 
 function StockValue({ product }: { product: ProductItem }) {
   return product.isOutOfStock ? (
-    <Badge className="border-red-200 bg-red-500/15 text-red-700 dark:text-red-400">نافذ من المخزون</Badge>
+    <span className={`${s.badge} ${s.badgeRed}`}>نافذ من المخزون</span>
   ) : (
-    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-100">
+    <div className={s.stockValue}>
       {product.totalStockInBase} {product.baseUnitName}
     </div>
   );
@@ -307,15 +265,21 @@ function PublicToggle({
   togglingPublicId: string | null;
   handleTogglePublic: (productId: string) => void;
 }) {
+  const disabled = togglingPublicId === product.id || !isAdmin;
   return (
-    <div className="flex items-center gap-2">
-      <Switch
-        checked={product.isPublic}
-        disabled={togglingPublicId === product.id || !isAdmin}
-        onCheckedChange={() => handleTogglePublic(product.id)}
+    <div className={s.publicToggleRow}>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={product.isPublic}
+        disabled={disabled}
+        onClick={() => handleTogglePublic(product.id)}
         title={!isAdmin ? "تعديل حالة النشر متاح لمدير المتجر فقط" : undefined}
-      />
-      <span className="text-[11px] text-zinc-500">{product.isPublic ? "معروض للجمهور" : "مخفي"}</span>
+        className={`${s.switch} ${product.isPublic ? s.switchOn : ""}`}
+      >
+        <span className={s.switchKnob} />
+      </button>
+      <span className={s.publicLabel}>{product.isPublic ? "معروض للجمهور" : "مخفي"}</span>
     </div>
   );
 }
@@ -330,16 +294,11 @@ function BatchesToggle({
   toggleExpand: (productId: string) => void;
 }) {
   return (
-    <Button
-      variant="ghost"
-      size="sm"
-      onClick={() => toggleExpand(product.id)}
-      className="gap-1 text-xs text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
-    >
-      <Layers className="h-3.5 w-3.5 text-emerald-600" />
+    <button type="button" onClick={() => toggleExpand(product.id)} className={s.batchesBtn}>
+      <Layers size={14} aria-hidden />
       <span>{product.batches.length} دفعة</span>
-      {isExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-    </Button>
+      {isExpanded ? <ChevronUp size={14} aria-hidden /> : <ChevronDown size={14} aria-hidden />}
+    </button>
   );
 }
 
@@ -363,49 +322,42 @@ function ActionButtons({
   return (
     <>
       {isAdmin && onEditProduct && (
-        <Button
-          size="sm"
-          variant="outline"
+        <button
+          type="button"
           onClick={() => onEditProduct(product)}
           title="تعديل المنتج والوحدات"
-          className="h-7 border-zinc-200 px-2 text-[11px] text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          className={`${s.btn} ${s.btnSm} ${s.btnOutlineSlate}`}
         >
           تعديل
-        </Button>
+        </button>
       )}
       {isAdmin && onToggleProductActive && (
-        <Button
-          size="sm"
-          variant="ghost"
+        <button
+          type="button"
           onClick={() => onToggleProductActive(product.id)}
           disabled={togglingActiveId === product.id}
           title={product.isActive ? "تعطيل المنتج" : "تفعيل المنتج"}
-          className={`h-7 px-2 text-[11px] ${product.isActive
-            ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
-            : "text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/20"
-            }`}
+          className={`${s.btn} ${s.btnSm} ${product.isActive ? s.btnGhostRed : s.btnGhostEmerald}`}
         >
           {product.isActive ? "تعطيل" : "تفعيل"}
-        </Button>
+        </button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
+      <button
+        type="button"
         onClick={() => onAddBatch(product.id)}
         title="إضافة دفعة لهذا المنتج"
-        className="h-7 border-emerald-200 px-2 text-[11px] text-emerald-700 hover:bg-emerald-50"
+        className={`${s.btn} ${s.btnSm} ${s.btnOutlineEmerald}`}
       >
         + دفعة
-      </Button>
-      <Button
-        size="sm"
-        variant="outline"
+      </button>
+      <button
+        type="button"
         onClick={() => onFifoPreview(product.id)}
         title="اختبار FIFO"
-        className="h-7 border-indigo-200 px-2 text-[11px] text-indigo-700 hover:bg-indigo-50"
+        className={`${s.btn} ${s.btnSm} ${s.btnOutlineIndigo}`}
       >
         FIFO
-      </Button>
+      </button>
     </>
   );
 }
@@ -442,153 +394,113 @@ function BatchCard({
 
   const adjustmentsCount = batch.adjustments?.length || 0;
 
-  // [FIX] batch.quantity is now correctly typed/treated as the decimal
-  // string the API actually sends — comparisons and display both go
-  // through Decimal, never a native `<`/`>` coercion, consistent with
-  // this project's quantity-arithmetic convention.
+  // batch.quantity is the decimal string the API actually sends —
+  // comparisons and display both go through Decimal, never a native
+  // `<`/`>` coercion, consistent with this project's quantity-arithmetic
+  // convention.
   const batchQuantity = new Decimal(batch.quantity);
   const isNegativeQty = batchQuantity.isNegative();
 
   return (
-    <div className="rounded-lg border border-zinc-200 bg-white p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900 space-y-2.5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className={s.batchCard}>
+      <div className={s.batchCardHead}>
         <div>
-          <div className="font-semibold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+          <div className={s.batchNumber}>
             <span>دفعة #{batch.batchNumber}</span>
             {adjustmentsCount > 0 && (
-              <Badge
-                variant="outline"
-                className="border-purple-200 bg-purple-50 text-[10px] text-purple-700 dark:border-purple-900 dark:bg-purple-950/30 dark:text-purple-300"
-              >
-                خضعت لتسوية ({adjustmentsCount})
-              </Badge>
+              <span className={`${s.badge} ${s.badgeSm} ${s.badgePurple}`}>خضعت لتسوية ({adjustmentsCount})</span>
             )}
           </div>
-          <div className="mt-0.5 text-zinc-500">
+          <div className={s.batchQtyLine}>
             الكمية الحالية:{" "}
-            <span
-              className={`font-bold ${isNegativeQty
-                ? "text-purple-700 dark:text-purple-400 font-mono"
-                : "text-zinc-800 dark:text-zinc-200"
-                }`}
-            >
-              {batch.quantity}
-            </span>{" "}
+            <span className={isNegativeQty ? s.batchQtyNegative : s.batchQty}>{batch.quantity}</span>{" "}
             {batch.unitName}
           </div>
         </div>
 
-        <div className="flex flex-col items-end gap-1 text-left">
-          <ExpiryBadge
-            daysToExpiry={batch.daysToExpiry}
-            expiryDate={batch.expiryDate}
-            status={batch.expiryStatus}
-          />
+        <div className={s.batchCardMeta}>
+          <ExpiryBadge daysToExpiry={batch.daysToExpiry} expiryDate={batch.expiryDate} status={batch.expiryStatus} />
           {isNegativeQty && (
-            // [FIX] NegativeStockBadge's `quantity` prop — passed as a
-            // Number here purely for DISPLAY purposes (this badge only
-            // ever renders the sign/value visually, never feeds back
-            // into any calculation), same pattern already established
-            // elsewhere in this codebase ("converting Decimal -> Number
-            // below is fine here because this is purely a display-shape
-            // transform"). The authoritative value stays the Decimal
+            // NegativeStockBadge's `quantity` prop is passed as a Number
+            // here purely for DISPLAY purposes (this badge only ever
+            // renders the sign/value visually, never feeds back into any
+            // calculation). The authoritative value stays the Decimal
             // string everywhere else in this component.
             <NegativeStockBadge quantity={batchQuantity.toNumber()} unitName={batch.unitName} />
           )}
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2 dark:border-zinc-800">
-        <div className="flex items-center gap-1.5">
+      <div className={s.batchCardFoot}>
+        <div>
           {adjustmentsCount > 0 ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={onToggleLog}
-              className="h-6 gap-1 px-1.5 text-[11px] text-purple-700 hover:bg-purple-50 dark:text-purple-400 dark:hover:bg-purple-950/30"
-            >
-              <History className="h-3 w-3" />
+            <button type="button" onClick={onToggleLog} className={s.adjLogBtn}>
+              <History size={12} aria-hidden />
               <span>سجل التسويات ({adjustmentsCount})</span>
-              {isLogExpanded ? (
-                <ChevronUp className="h-3 w-3" />
-              ) : (
-                <ChevronDown className="h-3 w-3" />
-              )}
-            </Button>
+              {isLogExpanded ? <ChevronUp size={12} aria-hidden /> : <ChevronDown size={12} aria-hidden />}
+            </button>
           ) : (
-            <span className="text-[10px] text-zinc-400">لا توجد تسويات سابقة</span>
+            <span className={s.noAdjustments}>لا توجد تسويات سابقة</span>
           )}
         </div>
 
-        <div className="flex items-center gap-1">
+        <div className={s.batchFootBtns}>
           {isAdmin && onReconcileBatch && (
-            <Button
-              size="sm"
-              variant="outline"
+            <button
+              type="button"
               onClick={() => onReconcileBatch(product, batch)}
               title="إجراء تسوية مخزنية (Stock Reconciliation)"
-              className="h-6 gap-1 border-purple-200 px-2 text-[10px] text-purple-700 hover:bg-purple-50 dark:border-purple-800 dark:text-purple-300 dark:hover:bg-purple-950/30"
+              className={`${s.btn} ${s.btnXs} ${s.chipPurple}`}
             >
-              <Scale className="h-3 w-3" />
+              <Scale size={12} aria-hidden />
               تسوية
-            </Button>
+            </button>
           )}
 
           {isAdmin && onEditBatch && (
-            <Button
-              size="sm"
-              variant="ghost"
+            <button
+              type="button"
               onClick={() => onEditBatch(product, batch)}
               title="تعديل رقم الدفعة وتاريخ الصلاحية"
-              className="h-6 gap-1 px-1.5 text-[10px] text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+              className={`${s.btn} ${s.btnXs} ${s.btnGhost}`}
             >
-              <Edit2 className="h-3 w-3" />
+              <Edit2 size={12} aria-hidden />
               تعديل
-            </Button>
+            </button>
           )}
 
           {isAdmin && onDeleteBatch && (
-            <Button
-              size="sm"
-              variant="ghost"
+            <button
+              type="button"
               onClick={() => canDelete && onDeleteBatch(product, batch)}
               disabled={!canDelete}
               title={deleteDisabledReason || "حذف الدفعة المدخلة بالخطأ"}
-              className={`h-6 gap-1 px-1.5 text-[10px] ${canDelete
-                ? "text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
-                : "cursor-not-allowed text-zinc-300 dark:text-zinc-600"
-                }`}
+              className={`${s.btn} ${s.btnXs} ${canDelete ? s.btnGhostRed : s.btnDisabledLook}`}
             >
-              <Trash2 className="h-3 w-3" />
+              <Trash2 size={12} aria-hidden />
               حذف
-            </Button>
+            </button>
           )}
         </div>
       </div>
 
       {isLogExpanded && batch.adjustments && batch.adjustments.length > 0 && (
-        <div className="rounded-md border border-purple-100 bg-purple-50/40 p-2 text-[11px] dark:border-purple-900/60 dark:bg-purple-950/20 space-y-1.5 animate-in fade-in-50">
-          <div className="font-semibold text-purple-900 dark:text-purple-200 flex items-center gap-1">
-            <History className="h-3 w-3 text-purple-600" />
+        <div className={s.adjLog}>
+          <div className={s.adjLogHead}>
+            <History size={12} aria-hidden />
             <span>تفاصيل سجل تسويات الدفعة:</span>
           </div>
-          <div className="space-y-1 divide-y divide-purple-100/60 dark:divide-purple-900/40">
+          <div className={s.adjLogList}>
             {batch.adjustments.map((adj) => {
-              // [FIX] quantityDelta is a decimal string — sign/display
-              // computed via Decimal, never a native `>` coercion on
-              // what the type system now correctly declares as `string`.
+              // quantityDelta is a decimal string — sign/display computed
+              // via Decimal, never a native `>` coercion.
               const delta = new Decimal(adj.quantityDelta);
               const isPositive = delta.greaterThan(0);
               return (
-                <div
-                  key={adj.id}
-                  className="flex flex-wrap items-center justify-between gap-2 pt-1.5 first:pt-0"
-                >
+                <div key={adj.id} className={s.adjLogItem}>
                   <div>
-                    <span className="font-medium text-zinc-800 dark:text-zinc-200">
-                      {adj.reason}
-                    </span>
-                    <div className="text-[10px] text-zinc-400">
+                    <span className={s.adjReason}>{adj.reason}</span>
+                    <div className={s.adjMeta}>
                       بواسطة: {adj.adjustedByUserName} •{" "}
                       {new Date(adj.createdAt).toLocaleString("ar-SY", {
                         dateStyle: "short",
@@ -596,14 +508,8 @@ function BatchCard({
                       })}
                     </div>
                   </div>
-                  <div
-                    className={`font-mono font-bold ${isPositive
-                      ? "text-emerald-600 dark:text-emerald-400"
-                      : "text-red-600 dark:text-red-400"
-                      }`}
-                  >
-                    {isPositive ? `+${adj.quantityDelta}` : adj.quantityDelta}{" "}
-                    {batch.unitName}
+                  <div className={`${s.adjDelta} ${isPositive ? s.adjPositive : s.adjNegative}`}>
+                    {isPositive ? `+${adj.quantityDelta}` : adj.quantityDelta} {batch.unitName}
                   </div>
                 </div>
               );
@@ -648,50 +554,47 @@ export function ProductTable({
 
   if (loading) {
     return (
-      <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-12 text-center text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">
-        <RefreshCw className="mx-auto h-6 w-6 animate-spin text-emerald-600" />
-        <p className="text-xs">جاري تحميل قائمة المنتجات والمخزون...</p>
+      <div className={s.stateBox}>
+        <RefreshCw size={24} className={`${s.stateIcon} ${s.spin}`} aria-hidden />
+        <p className={s.stateHint}>جاري تحميل قائمة المنتجات والمخزون...</p>
       </div>
     );
   }
 
   if (products.length === 0) {
     return (
-      <div className="space-y-3 rounded-xl border border-zinc-200 bg-white p-12 text-center text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">
-        <Package className="mx-auto h-10 w-10 text-zinc-300 dark:text-zinc-700" />
-        <p className="text-sm font-medium text-zinc-700 dark:text-zinc-300">لم يتم العثور على أي منتجات</p>
-        <p className="text-xs text-zinc-400">جرب تغيير كلمات البحث أو الفلاتر المحددة.</p>
+      <div className={s.stateBox}>
+        <Package size={40} className={s.stateIcon} aria-hidden />
+        <p className={s.stateTitle}>لم يتم العثور على أي منتجات</p>
+        <p className={s.stateHint}>جرب تغيير كلمات البحث أو الفلاتر المحددة.</p>
       </div>
     );
   }
 
   return (
-    <div className="space-y-4">
+    <div style={{ display: "grid", gap: 16 }}>
       {/* Desktop / tablet: real table, from md up. */}
-      <div className="hidden overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900 md:block">
-        <div className="overflow-x-auto">
-          <table className="w-full text-right text-xs">
-            <thead className="border-b border-zinc-200 bg-zinc-50 font-medium text-zinc-500 dark:border-zinc-800 dark:bg-zinc-800/60">
+      <div className={s.tableWrap}>
+        <div className={s.tableScroll}>
+          <table className={s.table}>
+            <thead>
               <tr>
-                <th className="px-4 py-3">المنتج والتصنيف</th>
-                <th className="px-4 py-3">وحدات القياس والأسعار</th>
-                <th className="px-4 py-3">المخزون المتوفر</th>
-                <th className="px-4 py-3">النشر في المتجر</th>
-                <th className="px-4 py-3 text-center">الدفعات (Batches)</th>
-                <th className="px-4 py-3 text-center">إجراءات</th>
+                <th>المنتج والتصنيف</th>
+                <th>وحدات القياس والأسعار</th>
+                <th>المخزون المتوفر</th>
+                <th>النشر في المتجر</th>
+                <th className="center">الدفعات (Batches)</th>
+                <th className="center">إجراءات</th>
               </tr>
             </thead>
             <tbody>
               {products.map((product) => (
-                <tr
-                  key={product.id}
-                  className="transition-colors hover:bg-zinc-50/50 dark:hover:bg-zinc-800/30"
-                >
-                  <td className="px-4 py-3.5 align-top">
+                <tr key={product.id}>
+                  <td>
                     <ProductNameBlock product={product} />
                   </td>
 
-                  <td className="px-4 py-3.5 align-top">
+                  <td>
                     <UnitsList
                       product={product}
                       isAdmin={isAdmin}
@@ -700,11 +603,11 @@ export function ProductTable({
                     />
                   </td>
 
-                  <td className="px-4 py-3.5 align-top">
+                  <td>
                     <StockValue product={product} />
                   </td>
 
-                  <td className="px-4 py-3.5 align-top">
+                  <td>
                     <PublicToggle
                       product={product}
                       isAdmin={isAdmin}
@@ -713,7 +616,7 @@ export function ProductTable({
                     />
                   </td>
 
-                  <td className="px-4 py-3.5 text-center align-top">
+                  <td className={s.center}>
                     <BatchesToggle
                       product={product}
                       isExpanded={expandedProductIds.has(product.id)}
@@ -721,8 +624,8 @@ export function ProductTable({
                     />
                   </td>
 
-                  <td className="px-4 py-3.5 text-center align-top">
-                    <div className="flex items-center justify-center gap-1">
+                  <td className={s.center}>
+                    <div className={s.rowActions}>
                       <ActionButtons
                         product={product}
                         isAdmin={isAdmin}
@@ -742,21 +645,20 @@ export function ProductTable({
       </div>
 
       {/* Mobile: one card per product, below md. */}
-      <div className="space-y-3 md:hidden">
+      <div className={s.cards}>
         {products.map((product) => (
-          <div
-            key={product.id}
-            className="space-y-3 rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
-          >
+          <div key={product.id} className={s.card}>
             <ProductNameBlock product={product} />
 
-            <div className="flex items-center justify-between border-t border-zinc-100 pt-2 dark:border-zinc-800/60">
-              <span className="text-[11px] text-zinc-400">المخزون المتوفر</span>
+            <div className={s.cardRow}>
+              <span className={s.cardLabel}>المخزون المتوفر</span>
               <StockValue product={product} />
             </div>
 
-            <div className="border-t border-zinc-100 pt-2 dark:border-zinc-800/60">
-              <span className="mb-1.5 block text-[11px] text-zinc-400">الوحدات والأسعار</span>
+            <div className={s.cardBlock}>
+              <span className={s.cardLabel} style={{ display: "block", marginBottom: 6 }}>
+                الوحدات والأسعار
+              </span>
               <UnitsList
                 product={product}
                 isAdmin={isAdmin}
@@ -765,7 +667,7 @@ export function ProductTable({
               />
             </div>
 
-            <div className="flex items-center justify-between border-t border-zinc-100 pt-2 dark:border-zinc-800/60">
+            <div className={s.cardRow}>
               <PublicToggle
                 product={product}
                 isAdmin={isAdmin}
@@ -779,7 +681,7 @@ export function ProductTable({
               />
             </div>
 
-            <div className="flex flex-wrap items-center gap-1.5 border-t border-zinc-100 pt-2 dark:border-zinc-800/60">
+            <div className={s.cardActions}>
               <ActionButtons
                 product={product}
                 isAdmin={isAdmin}
@@ -795,36 +697,32 @@ export function ProductTable({
       </div>
 
       {products.some((p) => expandedProductIds.has(p.id)) && (
-        <div className="space-y-4 pt-2">
-          <h2 className="flex items-center gap-2 text-base font-bold text-zinc-900 dark:text-zinc-100">
-            <Layers className="h-5 w-5 text-emerald-600" />
+        <div className={s.batchPanels}>
+          <h2 className={s.batchPanelsTitle}>
+            <Layers size={20} aria-hidden />
             <span>تفاصيل الدفعات والصلاحيات المفتوحة</span>
           </h2>
 
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className={s.batchPanelsGrid}>
             {products
               .filter((p) => expandedProductIds.has(p.id))
               .map((product) => (
-                <div
-                  key={`batch-panel-${product.id}`}
-                  className="space-y-3 rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 dark:border-zinc-800 dark:bg-zinc-900/60"
-                >
-                  <div className="flex items-center justify-between border-b border-zinc-200 pb-2 dark:border-zinc-800">
-                    <span className="text-sm font-bold text-zinc-900 dark:text-zinc-100">{product.name}</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
+                <div key={`batch-panel-${product.id}`} className={s.batchPanel}>
+                  <div className={s.batchPanelHead}>
+                    <span>{product.name}</span>
+                    <button
+                      type="button"
                       onClick={() => toggleExpand(product.id)}
-                      className="h-6 px-2 text-xs text-zinc-400"
+                      className={`${s.btn} ${s.btnXs} ${s.btnGhost}`}
                     >
                       إغلاق
-                    </Button>
+                    </button>
                   </div>
 
                   {product.batches.length === 0 ? (
-                    <p className="text-xs italic text-zinc-400">لا توجد أي دفعات مستلمة حتى الآن.</p>
+                    <p className={s.emptyBatches}>لا توجد أي دفعات مستلمة حتى الآن.</p>
                   ) : (
-                    <div className="space-y-2">
+                    <div className={s.batchList}>
                       {product.batches.map((batch) => (
                         <BatchCard
                           key={batch.id}

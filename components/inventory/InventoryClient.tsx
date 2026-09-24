@@ -3,8 +3,6 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useSessionWithOfflineFallback } from "@/lib/offline/hooks";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Package,
   Plus,
@@ -28,15 +26,17 @@ import { DeleteBatchModal } from "@/components/inventory/DeleteBatchModal";
 import { EditBatchModal } from "@/components/inventory/EditBatchModal";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ProductTable, ProductItem, BatchItem } from "@/components/inventory/ProductTable";
+import s from "./inventory.module.css";
 
-// [FIX] Added "needs_reconciliation" — the backend (/api/inventory/products
-// GET) already supports this filter value (see route.ts's
+// Added "needs_reconciliation" — the backend (/api/inventory/products GET)
+// already supports this filter value (see route.ts's
 // `hasNegativeStockBatch` branch), but no UI tab ever sent it. T3's
-// acceptance criterion ("Any batch with quantity < 0 shows the negative-
-// stock badge and appears under the 'يحتاج تسوية' filter tab") was
-// therefore only half-met. Standardized on "needs_reconciliation" only —
-// the backend's "reconcile" alias is redundant and dropped there too, so
-// there is exactly one accepted value for this filter going forward.
+// acceptance criterion ("Any batch with quantity < 0 shows the
+// negative-stock badge and appears under the 'يحتاج تسوية' filter tab")
+// was therefore only half-met. Standardized on "needs_reconciliation"
+// only — the backend's "reconcile" alias is redundant and dropped there
+// too, so there is exactly one accepted value for this filter going
+// forward.
 type FilterTab =
   | "all"
   | "public"
@@ -58,56 +58,44 @@ type FilterTabConfig = {
 };
 
 const FILTER_TABS: FilterTabConfig[] = [
-  {
-    value: "public",
-    label: "منشور بالمتجر",
-    icon: Globe,
-    activeClass: "bg-blue-600 text-white hover:bg-blue-700",
-    inactiveClass:
-      "border-blue-200 text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-400",
-  },
+  { value: "public", label: "منشور بالمتجر", icon: Globe, activeClass: s.chipBlueActive, inactiveClass: s.chipBlue },
   {
     value: "expiring",
     label: "قريب من الانتهاء",
     icon: AlertCircle,
-    activeClass: "bg-amber-600 text-white hover:bg-amber-700",
-    inactiveClass:
-      "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400",
+    activeClass: s.chipAmberActive,
+    inactiveClass: s.chipAmber,
   },
   {
-    // [FIX] New tab — was entirely missing. Color aligned with
+    // New tab — was entirely missing. Color aligned with
     // NegativeStockBadge (purple), which is the badge this filter's
     // results are meant to correspond to at the row/batch level.
     value: "needs_reconciliation",
     label: "يحتاج تسوية",
     icon: AlertCircle,
-    activeClass: "bg-purple-600 text-white hover:bg-purple-700",
-    inactiveClass:
-      "border-purple-200 text-purple-700 hover:bg-purple-50 dark:border-purple-900 dark:text-purple-400",
+    activeClass: s.chipPurpleActive,
+    inactiveClass: s.chipPurple,
   },
   {
     value: "out_of_stock",
     label: "نافذ من المخزون",
     icon: Package,
-    activeClass: "bg-red-600 text-white hover:bg-red-700",
-    inactiveClass:
-      "border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400",
+    activeClass: s.chipRedActive,
+    inactiveClass: s.chipRed,
   },
   {
     value: "discontinued_unit_stock",
     label: "مخزون على وحدة متوقفة",
     icon: AlertCircle,
-    activeClass: "bg-amber-600 text-white hover:bg-amber-700",
-    inactiveClass:
-      "border-amber-200 text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:text-amber-400",
+    activeClass: s.chipAmberActive,
+    inactiveClass: s.chipAmber,
   },
   {
     value: "inactive_products",
     label: "منتجات معطلة",
     icon: Package,
-    activeClass: "bg-zinc-700 text-white hover:bg-zinc-800",
-    inactiveClass:
-      "border-zinc-200 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-400",
+    activeClass: s.chipSlateActive,
+    inactiveClass: s.chipSlate,
   },
 ];
 
@@ -162,7 +150,7 @@ export function InventoryClient() {
         throw new Error(data.message || "فشل تعديل حالة تفعيل المنتج.");
       }
       toast.success(data.message);
-      await fetchProducts(); // ✅ بدل الـ optimistic patch
+      await fetchProducts(); // بدل الـ optimistic patch
     } catch (err: any) {
       toast.error(err.message || "حدث خطأ أثناء تعديل حالة المنتج.");
     } finally {
@@ -181,7 +169,7 @@ export function InventoryClient() {
         throw new Error(data.message || "فشل تعديل حالة الوحدة.");
       }
       toast.success(data.message);
-      await fetchProducts(); // ✅ بدل الـ optimistic patch
+      await fetchProducts(); // بدل الـ optimistic patch
     } catch (err: any) {
       toast.error(err.message || "حدث خطأ أثناء تعديل حالة الوحدة.");
     } finally {
@@ -189,8 +177,8 @@ export function InventoryClient() {
     }
   };
 
-  // [FIX] Cancels any in-flight request before starting a new one. Without
-  // this, a slow debounced search response landing after a fast filter-tab
+  // Cancels any in-flight request before starting a new one. Without this,
+  // a slow debounced search response landing after a fast filter-tab
   // response (or vice versa) could overwrite the screen with stale,
   // filter-mismatched results — a real (if rare) race, not just a style
   // nitpick, since the two triggers now fire on different timers (see the
@@ -228,7 +216,7 @@ export function InventoryClient() {
     }
   }, [searchQuery, activeFilter]);
 
-  // [FIX] The previous version decided the delay by checking whether
+  // The previous version decided the delay by checking whether
   // `searchQuery` is CURRENTLY non-empty (`searchQuery ? 300 : 0`) — not
   // whether searchQuery is what actually changed on this render. That
   // meant clicking a filter tab while text was already typed in the search
@@ -278,9 +266,7 @@ export function InventoryClient() {
       }
 
       toast.success(data.message);
-      setProducts((prev) =>
-        prev.map((p) => (p.id === productId ? { ...p, isPublic: data.isPublic } : p))
-      );
+      setProducts((prev) => prev.map((p) => (p.id === productId ? { ...p, isPublic: data.isPublic } : p)));
     } catch (err: any) {
       toast.error(err.message || "حدث خطأ أثناء تعديل حالة المتجر.");
     } finally {
@@ -328,15 +314,15 @@ export function InventoryClient() {
   };
 
   return (
-    <div className="space-y-5 sm:space-y-6" dir="rtl">
+    <div className={s.root} dir="rtl">
       {/* Action Bar Header */}
-      <div className="flex flex-col gap-4 pb-2 border-b border-zinc-200 dark:border-zinc-800 sm:flex-row sm:items-center sm:justify-between">
+      <div className={s.header}>
         <div>
-          <h1 className="flex items-center gap-2 text-xl font-bold text-zinc-900 dark:text-zinc-100 sm:text-2xl">
-            <Package className="w-6 h-6 text-emerald-600 dark:text-emerald-400 sm:w-7 sm:h-7" />
+          <h1 className={s.title}>
+            <Package size={24} className={s.titleIcon} aria-hidden />
             <span>إدارة المخزون والدفعات</span>
           </h1>
-          <p className="text-xs text-zinc-500 mt-1">
+          <p className={s.subtitle}>
             إدارة أصلية للمنتجات متعددة الوحدات والتنبيه المباشر للصلاحية مع استيراد CSV والمعاينة الحية لـ FIFO.
           </p>
         </div>
@@ -344,100 +330,96 @@ export function InventoryClient() {
         {/* 2-column grid on mobile for full-width, equal-size tap targets;
             reverts to an inline wrapping row from `sm` up where width isn't
             a constraint. */}
-        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+        <div className={s.actions}>
           {isAdmin && (
-            <Button
+            <button
+              type="button"
               onClick={() => setAddProductOpen(true)}
-              className="w-full gap-1.5 bg-emerald-600 text-xs text-white shadow-sm hover:bg-emerald-700 sm:w-auto"
+              className={`${s.btn} ${s.btnFull} ${s.btnSolidEmerald}`}
             >
-              <Plus className="w-4 h-4" />
+              <Plus size={16} aria-hidden />
               <span>منتج جديد</span>
-            </Button>
+            </button>
           )}
 
-          <Button
+          <button
+            type="button"
             onClick={() => handleOpenAddBatch()}
-            variant="outline"
-            className="w-full gap-1.5 border-emerald-300 text-xs text-emerald-800 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 sm:w-auto"
+            className={`${s.btn} ${s.btnFull} ${s.btnOutlineEmerald}`}
           >
-            <Layers className="w-4 h-4" />
+            <Layers size={16} aria-hidden />
             <span>دفعة جديدة</span>
-          </Button>
+          </button>
 
           {isAdmin && (
-            <Button
+            <button
+              type="button"
               onClick={() => setCsvImportOpen(true)}
-              variant="outline"
-              className="w-full gap-1.5 border-blue-300 text-xs text-blue-800 hover:bg-blue-50 dark:border-blue-800 dark:text-blue-300 sm:w-auto"
+              className={`${s.btn} ${s.btnFull} ${s.btnOutlineBlue}`}
             >
-              <FileUp className="w-4 h-4" />
+              <FileUp size={16} aria-hidden />
               <span>استيراد CSV</span>
-            </Button>
+            </button>
           )}
 
-          <Button
+          <button
+            type="button"
             onClick={() => handleOpenFifoPreview()}
-            variant="outline"
-            className="w-full gap-1.5 border-indigo-300 text-xs text-indigo-800 hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 sm:w-auto"
+            className={`${s.btn} ${s.btnFull} ${s.btnOutlineIndigo}`}
           >
-            <Route className="w-4 h-4" />
+            <Route size={16} aria-hidden />
             <span>معاينة FIFO</span>
-          </Button>
+          </button>
         </div>
       </div>
 
       {/* Search Bar & Filter Tabs */}
-      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div className="flex items-center gap-2 w-full md:max-w-md">
-          <div className="relative flex-1">
-            <Search className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
-            <Input
+      <div className={s.toolsRow}>
+        <div className={s.searchWrap}>
+          <div className={s.searchField}>
+            <Search size={16} className={s.searchIcon} aria-hidden />
+            <input
               type="text"
               placeholder="ابحث بالاسم أو الباركود..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full bg-white pr-9 text-xs dark:bg-zinc-900"
+              className={s.searchInput}
             />
           </div>
-          <Button
+          <button
             type="button"
-            variant="outline"
-            size="sm"
             onClick={() => setBarcodeScannerOpen(true)}
             title="مسح الباركود بالكاميرا"
-            className="h-9 gap-1 px-2.5 text-xs text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            className={`${s.btn} ${s.btnSm} ${s.btnOutlineSlate} ${s.scanBtn}`}
           >
-            <Camera className="h-4 w-4 text-emerald-600" />
-            <span className="hidden sm:inline">مسح باركود</span>
-          </Button>
+            <Camera size={16} aria-hidden />
+            <span className={s.onlyDesktop}>مسح باركود</span>
+          </button>
         </div>
 
         {/* flex-wrap instead of a horizontal scroller: on a narrow phone
-            the chips fall onto a second/third line instead of hiding behind
-            an unlabeled scroll area, so every filter stays discoverable. */}
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Button
-            variant={activeFilter === "all" ? "default" : "outline"}
-            size="sm"
+            the chips fall onto a second/third line instead of hiding
+            behind an unlabeled scroll area, so every filter stays
+            discoverable. */}
+        <div className={s.filters}>
+          <button
+            type="button"
             onClick={() => setActiveFilter("all")}
-            className={`h-8 rounded-lg text-xs ${activeFilter === "all" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : ""
-              }`}
+            className={`${s.chip} ${activeFilter === "all" ? s.chipAllActive : ""}`}
           >
             الكل
-          </Button>
+          </button>
 
           {FILTER_TABS.map(({ value, label, icon: Icon, activeClass, inactiveClass }) => (
-            <Button
+            <button
               key={value}
-              variant={activeFilter === value ? "default" : "outline"}
-              size="sm"
+              type="button"
               onClick={() => setActiveFilter(value)}
-              className={`h-8 gap-1.5 rounded-lg text-xs ${activeFilter === value ? activeClass : inactiveClass
-                }`}
+              className={`${s.chip} ${activeFilter === value ? activeClass : inactiveClass}`}
             >
-              <Icon className="h-3.5 w-3.5" />
+              <Icon size={14} aria-hidden />
               <span>{label}</span>
-            </Button>
+            </button>
           ))}
         </div>
       </div>
@@ -465,11 +447,7 @@ export function InventoryClient() {
       {/* Modals */}
       {isAdmin && (
         <>
-          <AddProductModal
-            open={addProductOpen}
-            onOpenChange={setAddProductOpen}
-            onSuccess={fetchProducts}
-          />
+          <AddProductModal open={addProductOpen} onOpenChange={setAddProductOpen} onSuccess={fetchProducts} />
           <EditProductModal
             open={editProductOpen}
             onOpenChange={setEditProductOpen}
@@ -489,11 +467,7 @@ export function InventoryClient() {
 
       {isAdmin && (
         <>
-          <CsvImportModal
-            open={csvImportOpen}
-            onOpenChange={setCsvImportOpen}
-            onSuccess={fetchProducts}
-          />
+          <CsvImportModal open={csvImportOpen} onOpenChange={setCsvImportOpen} onSuccess={fetchProducts} />
           <EditBatchModal
             open={editBatchOpen}
             onOpenChange={setEditBatchOpen}
@@ -511,14 +485,14 @@ export function InventoryClient() {
         </>
       )}
 
-      {/* [FIX] Wrapped in `isAdmin`, matching every other ADMIN-only
-          action modal in this file (AddProductModal, EditProductModal,
-          CsvImportModal, EditBatchModal, DeleteBatchModal). Stock
-          reconciliation is ADMIN-only per T2b's Role Capability Matrix —
-          this modal was previously rendered unconditionally, the only
-          ADMIN-only action in this file not hidden from a CASHIER session
-          as a UX courtesy (the server-side route still enforces the real
-          boundary either way). */}
+      {/* Wrapped in `isAdmin`, matching every other ADMIN-only action modal
+          in this file (AddProductModal, EditProductModal, CsvImportModal,
+          EditBatchModal, DeleteBatchModal). Stock reconciliation is
+          ADMIN-only per T2b's Role Capability Matrix — this modal was
+          previously rendered unconditionally, the only ADMIN-only action
+          in this file not hidden from a CASHIER session as a UX courtesy
+          (the server-side route still enforces the real boundary either
+          way). */}
       {isAdmin && (
         <ReconcileBatchModal
           open={reconcileOpen}
@@ -529,11 +503,7 @@ export function InventoryClient() {
         />
       )}
 
-      <BarcodeScannerModal
-        open={barcodeScannerOpen}
-        onOpenChange={setBarcodeScannerOpen}
-        onScan={handleBarcodeScanned}
-      />
+      <BarcodeScannerModal open={barcodeScannerOpen} onOpenChange={setBarcodeScannerOpen} onScan={handleBarcodeScanned} />
 
       <FifoPreviewModal
         open={fifoPreviewOpen}
