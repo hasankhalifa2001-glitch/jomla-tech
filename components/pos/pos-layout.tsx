@@ -14,6 +14,11 @@ import {
   resolveCartLinePrices,
   cartNeedsExchangeRate,
   useSyncWorker,
+  // [ADDED — camera + hardware barcode scanning] Re-exported via
+  // lib/offline/index.ts's `export * from "./barcode-lookup"` — imported
+  // from the barrel like everything else in this block, not a separate
+  // direct file import.
+  findProductUnitByBarcode,
   type PosProductItem,
   type CachedProductUnit,
   type CartLineItem,
@@ -21,6 +26,7 @@ import {
   type OfflineInvoice,
   type PaymentMethod,
 } from "@/lib/offline";
+import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ProductCatalog } from "./product-catalog";
 import { CartPanel } from "./cart-panel";
 import { WalkInCustomerModal } from "./walk-in-customer-modal";
@@ -50,6 +56,7 @@ import {
   AlertTriangle,
   ShoppingCart,
   ChevronUp,
+  ScanLine,
 } from "lucide-react";
 import { toast } from "sonner";
 import { serializeMoney, formatMoney, compareMoney } from "@/lib/utils/money";
@@ -97,6 +104,8 @@ export function PosLayout() {
   const [completedItems, setCompletedItems] = useState<CartLineItem[]>([]);
   const [allowSystemCustomer, setAllowSystemCustomer] = useState(true);
   const [reopenPaymentAfterCustomer, setReopenPaymentAfterCustomer] = useState(false);
+  // [ADDED] Camera barcode scanner modal open/close state.
+  const [barcodeScannerOpen, setBarcodeScannerOpen] = useState(false);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -388,6 +397,71 @@ export function PosLayout() {
     });
   }
 
+  // [ADDED — barcode -> cart bridge]
+  // The SINGLE resolution path shared by BOTH scan surfaces:
+  //   1. The camera scanner (BarcodeScannerModal, mode="continuous" below)
+  //   2. The hardware keyboard-wedge scanner (ProductCatalog's search-input
+  //      Enter handler, wired via the onBarcodeEnter prop)
+  // Offline-first: tries the full local cache first (findProductUnitByBarcode
+  // — NOT the debounced/filtered `products` state) and only reaches for the
+  // network as a last resort, and only when actually online. Never blocks or
+  // throws while offline.
+  //
+  // Returns a boolean so ProductCatalog's Enter handler can distinguish
+  // "this was recognized as a barcode" (found, or found-but-rejected) from
+  // "this wasn't a barcode at all" (falls through to plain text-search
+  // behavior there).
+  const handleBarcodeScan = useCallback(
+    async (barcode: string): Promise<boolean> => {
+      if (!tenantId) return false;
+
+      let result = await findProductUnitByBarcode(tenantId, barcode);
+
+      // Fallback: barcode not found locally AND we're online — the product
+      // may be genuinely new (created/edited after this device's last
+      // sync). One retry after a fresh pull, never more than one, so a
+      // legitimately nonexistent barcode still fails fast instead of
+      // looping.
+      if (
+        result.status === "not_found" &&
+        typeof navigator !== "undefined" &&
+        navigator.onLine
+      ) {
+        const syncResult = await syncProductsFromServer(tenantId);
+        if (syncResult.success) {
+          result = await findProductUnitByBarcode(tenantId, barcode);
+          // Keep the visible catalog in sync with what was just pulled.
+          const prods = await getOfflineProducts(tenantId, searchQuery);
+          setProducts(prods);
+        }
+      }
+
+      if (result.status === "found") {
+        handleAddToCart(result.product, result.unit);
+        return true;
+      }
+
+      if (result.status === "unit_inactive") {
+        // [FIX — previously silent when matched via the hardware-scanner
+        // Enter path] Now a clear Arabic toast on every entry point.
+        toast.error(
+          `الصنف "${result.product.name}" (${result.unit.unitName}) غير نشط ولا يمكن بيعه.`
+        );
+        return true; // recognized as a real barcode — rejected, not "unmatched text"
+      }
+
+      // not_found — offline with no local match, or genuinely nonexistent.
+      toast.error(
+        typeof navigator !== "undefined" && navigator.onLine
+          ? "لم يتم العثور على منتج مرتبط بهذا الباركود."
+          : "لم يتم العثور على هذا الباركود محلياً — تحقق من الاتصال بالإنترنت والمزامنة."
+      );
+      return false;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tenantId, searchQuery, dailyExchangeRate]
+  );
+
   function handleUpdateQuantity(cartId: string, delta: number) {
     setCartItems((prev) =>
       prev
@@ -666,6 +740,9 @@ export function PosLayout() {
            as "this is the important/primary action" (exchange-rate
            badge, sync spinner icon, mobile checkout bar) rather than
            being sprinkled across every interactive element.
+        6. [ADDED] A "مسح باركود" scan button, styled and placed identically
+           to the sync/seed buttons — icon-only under lg, labeled on lg+.
+           Opens the camera scanner in continuous mode.
       */}
       <div className="flex items-center justify-between gap-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 sm:p-3 dark:border-zinc-800 dark:bg-zinc-900 shadow-xs shrink-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -733,6 +810,30 @@ export function PosLayout() {
               <span className="sm:hidden">لا يوجد سعر صرف</span>
             </Badge>
           )}
+
+          {/* [ADDED] Camera barcode scan — icon-only under lg, labeled on lg+,
+              same pattern as the sync/seed buttons beside it. */}
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={() => setBarcodeScannerOpen(true)}
+            className="h-8 w-8 lg:hidden text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
+            title="مسح باركود بالكاميرا"
+          >
+            <ScanLine className="h-3.5 w-3.5 text-emerald-600" />
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setBarcodeScannerOpen(true)}
+            className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
+            title="مسح باركود بالكاميرا وإضافة للسلة مباشرة"
+          >
+            <ScanLine className="h-3.5 w-3.5 text-emerald-600" />
+            <span>مسح باركود</span>
+          </Button>
 
           {/* Sync products — icon-only under lg, labeled button on lg+ */}
           <Button
@@ -833,6 +934,9 @@ export function PosLayout() {
             onAddToCart={handleAddToCart}
             onSeedDemoData={handleSeedDemoData}
             searchInputRef={searchInputRef}
+            // [ADDED] Hardware keyboard-wedge scanner support — see
+            // handleBarcodeScan above and product-catalog.tsx's prop doc.
+            onBarcodeEnter={handleBarcodeScan}
           />
         </div>
 
@@ -1027,6 +1131,24 @@ export function PosLayout() {
         customer={completedCustomer}
         items={completedItems}
         onStartNewSale={handleStartNewSale}
+      />
+
+      {/*
+        [ADDED] Camera barcode scanner — continuous mode so the cashier can
+        scan multiple items back-to-back without reopening this dialog per
+        item. feedback="silent" because handleBarcodeScan / handleAddToCart
+        already produce their own contextual toasts (item added / inactive /
+        not found) — showing this modal's own generic "تم مسح الباركود
+        بنجاح" toast on top would double up during rapid scanning.
+      */}
+      <BarcodeScannerModal
+        open={barcodeScannerOpen}
+        onOpenChange={setBarcodeScannerOpen}
+        onScan={(barcode) => {
+          void handleBarcodeScan(barcode);
+        }}
+        mode="continuous"
+        feedback="silent"
       />
     </div>
   );

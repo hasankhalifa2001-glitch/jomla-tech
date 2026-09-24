@@ -33,6 +33,25 @@ interface ProductCatalogProps {
   onAddToCart: (product: PosProductItem, unit: CachedProductUnit) => void;
   onSeedDemoData: () => void;
   searchInputRef: React.RefObject<HTMLInputElement | null>;
+  /**
+   * [ADDED — hardware keyboard-wedge scanner support]
+   * Delegates exact-barcode resolution to the SAME full-local-cache lookup
+   * the camera scanner uses (findProductUnitByBarcode via PosLayout's
+   * handleBarcodeScan) — instead of this component searching its own
+   * `products` prop, which is a debounced, potentially-stale, text-filtered
+   * SUBSET of the catalog, not the full local cache. A physical USB/
+   * Bluetooth scanner types a barcode into this input and fires Enter
+   * within milliseconds — often faster than the 300ms search debounce in
+   * PosLayout can resolve — so matching against `products` alone could
+   * silently miss a real, in-stock item.
+   *
+   * Returns true if the string was recognized and handled as a barcode
+   * (found-and-added, OR found-but-rejected e.g. inactive unit) — false
+   * only when nothing matched at all, so the caller knows to fall through
+   * to the plain "single filtered text result" convenience below rather
+   * than treating an unrelated free-text search as a failed barcode scan.
+   */
+  onBarcodeEnter: (raw: string) => Promise<boolean>;
 }
 
 // [v3.6] FIX — this used to resolve and display USD as the primary price
@@ -67,32 +86,47 @@ export function ProductCatalog({
   onAddToCart,
   onSeedDemoData,
   searchInputRef,
+  onBarcodeEnter,
 }: ProductCatalogProps) {
-  // Handle Barcode Scan / Enter key press on search input
-  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === "Enter" && searchQuery.trim()) {
-      e.preventDefault();
-      const clean = searchQuery.trim().toLowerCase();
+  // Handle Barcode Scan (hardware keyboard-wedge scanner) / Enter key press
+  // on the search input.
+  //
+  // [CHANGED] Was: a `for (const prod of products)` loop matching against
+  // this component's OWN `products` prop — the currently-displayed,
+  // debounced, text-filtered subset. That had two real bugs:
+  //   1. A hardware scanner's Enter often arrives before the 300ms search
+  //      debounce in PosLayout resolves, so `products` could still reflect
+  //      a PREVIOUS, unrelated search — a genuine in-stock barcode could
+  //      silently fail to match anything in the stale list.
+  //   2. A barcode that matched but only on a deactivated unit produced NO
+  //      feedback at all (the `u.isActive !== false` filter excluded it
+  //      from the `.find()`, and there was no toast/message for this case)
+  //      — the cashier had zero indication of why nothing happened.
+  // Now delegates entirely to `onBarcodeEnter`, which searches the FULL
+  // local cache (via findProductUnitByBarcode in PosLayout) and returns a
+  // definite recognized/not-recognized signal, including a proper Arabic
+  // toast for the inactive-unit case. See product-catalog's prop doc above.
+  async function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== "Enter" || !searchQuery.trim()) return;
+    e.preventDefault();
 
-      // Check if there is an exact barcode match among active units
-      for (const prod of products) {
-        const matchingUnit = prod.units?.find(
-          (u) => u.isActive !== false && u.barcode && u.barcode.toLowerCase() === clean
-        );
-        if (matchingUnit) {
-          onAddToCart(prod, matchingUnit);
-          onSearchChange("");
-          return;
-        }
-      }
+    const clean = searchQuery.trim();
 
-      // If only 1 product matches in the current filtered list, add its default active unit
-      if (products.length === 1 && products[0].units && products[0].units.length > 0) {
-        const defaultActiveUnit = products[0].units.find((u) => u.isActive !== false);
-        if (defaultActiveUnit) {
-          onAddToCart(products[0], defaultActiveUnit);
-          onSearchChange("");
-        }
+    const matchedAsBarcode = await onBarcodeEnter(clean);
+    if (matchedAsBarcode) {
+      onSearchChange("");
+      return;
+    }
+
+    // Unrelated to barcode matching: a plain text-search convenience —
+    // if free-text typing has narrowed the currently-displayed list to
+    // exactly one product, Enter adds its default active unit. Unchanged
+    // from the original behavior.
+    if (products.length === 1 && products[0].units && products[0].units.length > 0) {
+      const defaultActiveUnit = products[0].units.find((u) => u.isActive !== false);
+      if (defaultActiveUnit) {
+        onAddToCart(products[0], defaultActiveUnit);
+        onSearchChange("");
       }
     }
   }
@@ -109,7 +143,7 @@ export function ProductCatalog({
             placeholder="ابحث بالاسم، الباركود، أو الوحدة... (F2 للتركيز، Enter للإضافة السريعة)"
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
-            onKeyDown={handleKeyDown}
+            onKeyDown={(e) => void handleKeyDown(e)}
             className="pr-9 pl-16 text-xs h-10 rounded-xl bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 shadow-xs"
           />
           <div className="absolute left-2.5 top-2.5 flex items-center gap-1">

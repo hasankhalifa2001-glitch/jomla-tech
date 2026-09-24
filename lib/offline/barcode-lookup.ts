@@ -1,33 +1,42 @@
 // lib/offline/barcode-lookup.ts
 //
 // [NEW — T4b camera + hardware scanner integration]
-// [CORRECTED] The first draft of this file imported a non-existent named
-// export `db` from "./db" (the actual module only exports `getOfflineDb()`
-// and the `OfflineDatabase` class) and read raw `CachedProduct` rows
-// straight off the `cachedProducts` Dexie table. `CachedProduct` (db.ts) is
-// NOT the same shape as `PosProductItem` (pos-service.ts) — PosProductItem
-// is a derived shape computed BY getOfflineProducts(), adding fields like
-// `totalCachedStock` (multi-batch, base-unit stock breakdown) that do not
-// exist on the raw cached row at all. Returning a raw CachedProduct where a
-// PosProductItem is expected (handleAddToCart's signature) would either
-// fail to compile or silently hand downstream code an object missing
-// fields it relies on.
+// Offline-first barcode -> cart-line resolution, shared by BOTH scan
+// surfaces added to the POS screen:
+//   1. The camera scanner (BarcodeScannerModal, mode="continuous")
+//   2. The hardware keyboard-wedge scanner (ProductCatalog's search-input
+//      Enter handler, via PosLayout's onBarcodeEnter prop)
 //
-// Fixed by reusing getOfflineProducts() itself — the exact same function
-// that already populates the POS screen's visible catalog — instead of
-// re-implementing raw Dexie access here. This guarantees:
-//   1. The returned `product` is a genuine, fully-computed PosProductItem,
-//      identical in shape to every other product object already flowing
-//      through the POS screen (cart, catalog cards, etc).
+// [CORRECTED, final] Verified against the real lib/offline/db.ts,
+// pos-service.ts, and index.ts barrel:
+//   - CachedProductUnit is declared and exported from ./db — imported
+//     from there directly, not from ./pos-service (which only imports it
+//     for internal use and never re-exports it under its own name).
+//   - PosProductItem and getOfflineProducts() are both declared and
+//     exported from ./pos-service.
+//   - Both are re-exported through lib/offline/index.ts's
+//     `export * from "./db"` / `export * from "./pos-service"`, so
+//     everywhere else in the app that already does
+//     `import { type CachedProductUnit, type PosProductItem, getOfflineProducts } from "@/lib/offline"`
+//     resolves to exactly these same declarations — this file's return
+//     shape is identical to what the rest of the POS screen already
+//     works with, not a parallel/incompatible shape.
+//
+// Deliberately calls getOfflineProducts() rather than reading raw
+// CachedProduct rows off db.cachedProducts directly — getOfflineProducts()
+// is the SAME function that already populates the POS screen's visible
+// catalog, so reusing it here guarantees:
+//   1. The returned `product` is a genuine PosProductItem (has
+//      totalCachedStock etc.), not a raw CachedProduct missing fields
+//      handleAddToCart and other POS code expect.
 //   2. Any product-level exclusion getOfflineProducts() already applies
-//      (e.g. a deactivated Product being absent from the POS catalog
-//      entirely, per T3a) is automatically honored here too — there is no
-//      second, separately-maintained inclusion/exclusion rule to keep in
-//      sync with the catalog's own.
-//   3. No duplicated base-unit/multi-batch stock math — getOfflineProducts
-//      is the single place that logic lives.
+//      is automatically honored here too (no second, separately
+//      maintained inclusion rule to keep in sync with the catalog's own).
+//   3. No duplicated base-unit/multi-batch/pending-offline-sale stock
+//      math — getOfflineProducts() is the single place that logic lives.
 
-import { getOfflineProducts, type PosProductItem, type CachedProductUnit } from "./pos-service";
+import { getOfflineProducts, type PosProductItem } from "./pos-service";
+import type { CachedProductUnit } from "./db";
 
 export type BarcodeLookupResult =
     | { status: "found"; product: PosProductItem; unit: CachedProductUnit }
@@ -50,8 +59,9 @@ export type BarcodeLookupResult =
  * against a partially-filtered `products` state (as the original
  * ProductCatalog implementation did) could miss a real, in-stock item.
  *
- * Not indexed at the Dexie level — getOfflineProducts does an in-memory
- * pass over the tenant's cached catalog either way, and this adds one more
+ * Not indexed at the Dexie level — getOfflineProducts already does an
+ * in-memory pass over the tenant's cached catalog either way (including
+ * its own pending-offline-sale stock adjustment); this adds one more
  * in-memory `.find()` per product on top of work already being done. Fine
  * at the catalog sizes this app targets; revisit only if ever measured to
  * be a real bottleneck.
