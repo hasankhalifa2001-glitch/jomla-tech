@@ -209,7 +209,20 @@ export async function POST(req: Request) {
           // Decimal(18,4) precision. The sync engine's void path negates the
           // same way.
           userId: adminUserId,
-          // [v4.2] Auto-Redirect on Write: resolve active customer in case of merge
+          // [v4.2] Auto-Redirect on Write: resolve active customer in case of merge.
+          // [v4.4 §1] Resolved FRESH here, inside this transaction, from the
+          // original invoice's customerId — never copied verbatim from the
+          // stored value, and never read from a value cached before the
+          // transaction opened. A customer merged away between the sale and
+          // this void must receive the reversal on the CURRENT survivor
+          // (matching wherever the original invoice itself resolves), or that
+          // customer's ledger would silently split across two accounts.
+          //
+          // [v4.4 §3.1] This resolution is the ONLY customer-related decision
+          // this route makes. A void writes an Invoice (+ its items + restored
+          // inventory) and never reads or writes any Customer field — so a
+          // prior merge's contact-field state (v4.3 §4) and T4e's WhatsApp
+          // statement feature are entirely unaffected by a later void.
           customerId: await resolveActiveCustomerId(tx, tenantId, originalInvoice.customerId),
           totalSYP: subtractMoney("0", originalInvoice.totalSYP.toString()),
           totalUSD: subtractMoney("0", originalInvoice.totalUSD.toString()),

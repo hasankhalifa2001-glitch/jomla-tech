@@ -27,6 +27,39 @@
  * before persisting a financial record — mirroring T1's "one sanctioned path"
  * pattern for raw queries and base-unit access.
  *
+ * [v4.4 — WHICH write paths must resolve, and HOW]
+ * Two revisions clarified this list and the exact rule each member follows:
+ *
+ *   1. T4d's void writers are members — both the online route
+ *      (app/api/ledger/voids) and the sync engine's void sub-pass. A void
+ *      resolves originalInvoice.customerId FRESH, at the moment its own
+ *      transaction executes: never copied verbatim from the original invoice's
+ *      stored customerId, and never read from a value cached earlier. A
+ *      customer merged away between a sale and its later void must receive the
+ *      reversal on the CURRENT survivor — the same row the original invoice
+ *      itself resolves to — or that customer's ledger silently splits in two,
+ *      with part of the reversal sitting on a customer who, from the
+ *      merchant's point of view, no longer exists.
+ *
+ *   2. T4c's sync engine splits PASS 2 into two ORDERED sub-phases (non-void
+ *      invoices, then voids). BOTH call this helper independently, each
+ *      resolved fresh: the void pass never reuses whatever the non-void pass
+ *      resolved earlier in the same batch, because a merge can complete in the
+ *      gap between the two sub-phases of one batch.
+ *
+ * [v4.4 — NO LOCK IS REQUIRED BETWEEN A MERGE AND A CONCURRENT WRITE]
+ * When a write and a merge race for the same customer, the outcome depends
+ * only on which transaction commits first, and both outcomes are correct:
+ *   - write commits first → it lands on the pre-merge customer (true at that
+ *     instant), and the merge that runs afterwards re-points that newly
+ *     written row along with everything else, per the merge transaction's
+ *     existing scope;
+ *   - merge commits first → the write's in-transaction resolution returns the
+ *     survivor immediately.
+ * Correctness comes from calling this helper INSIDE the same transaction as
+ * the write it resolves for — not from any ordering guarantee between the two
+ * transactions.
+ *
  * [DOCUMENTED KNOWN LIMITATION — Concurrency & Row Locks]
  * Customer merge does not place a database-level row lock on the Customer table
  * (to avoid distributed lock contention with offline writers). While

@@ -54,6 +54,8 @@ const {
   fakeInvoiceItem,
   fakeProductBatch,
   fakeProductUnit,
+  fakeCustomer,
+  fakeCustomerMergeLog,
 } = vi.hoisted(() => {
   const callLog: string[] = [];
   const lockCalls: Array<{
@@ -77,11 +79,39 @@ const {
   };
   const fakeProductUnit: any = { findUniqueOrThrow: vi.fn() };
 
+  // [T4e v4.4 §1 / §3.1] The void route now resolves the written customerId
+  // through resolveActiveCustomerId(tx, ...) — which reads CustomerMergeLog
+  // ONLY, never Customer. Both models are modelled here so (a) the unmerged
+  // default keeps every pre-existing assertion byte-identical, and (b) the
+  // "zero writes to Customer" invariant can be asserted dynamically.
+  const fakeCustomerMergeLog: any = { findFirst: vi.fn() };
+
+  // Every Customer surface the route *could* reach — reads included, because
+  // §3.1 states a void "never reads or writes any field on Customer".
+  const customerCall = (method: string) =>
+    vi.fn(async () => {
+      callLog.push(`customer:${method}`);
+      return undefined;
+    });
+  const fakeCustomer: any = {
+    findFirst: customerCall("findFirst"),
+    findUnique: customerCall("findUnique"),
+    findMany: customerCall("findMany"),
+    create: customerCall("create"),
+    update: customerCall("update"),
+    updateMany: customerCall("updateMany"),
+    upsert: customerCall("upsert"),
+    delete: customerCall("delete"),
+    deleteMany: customerCall("deleteMany"),
+  };
+
   const fakeTx = {
     invoice: fakeInvoice,
     invoiceItem: fakeInvoiceItem,
     productBatch: fakeProductBatch,
     productUnit: fakeProductUnit,
+    customer: fakeCustomer,
+    customerMergeLog: fakeCustomerMergeLog,
   };
 
   const fakeDb: any = {
@@ -89,6 +119,8 @@ const {
     invoiceItem: fakeInvoiceItem,
     productBatch: fakeProductBatch,
     productUnit: fakeProductUnit,
+    customer: fakeCustomer,
+    customerMergeLog: fakeCustomerMergeLog,
     $transaction: vi.fn(async (cb: any) => {
       callLog.push("transaction");
       return cb(fakeTx);
@@ -119,6 +151,8 @@ const {
     fakeInvoiceItem,
     fakeProductBatch,
     fakeProductUnit,
+    fakeCustomer,
+    fakeCustomerMergeLog,
   };
 });
 
@@ -235,12 +269,30 @@ function referenceBaseQty(soldQty: string, factor: string): string {
   return new Decimal(soldQty).times(new Decimal(factor)).toString();
 }
 
+/**
+ * [T4e v4.4 §1] Switches the harness into "this customer was merged away"
+ * state — the exact shape a CustomerMergeLog row has, chased one hop (a chain
+ * back to an already-seen id terminates the recursion, same as production).
+ * Every resolution is recorded in the shared callLog so a test can prove the
+ * lookup happened INSIDE the void transaction, not from a cached value.
+ */
+function arrangeMergedCustomer(survivorByMergedId: Record<string, string>) {
+  fakeCustomerMergeLog.findFirst.mockImplementation(async ({ where }: any) => {
+    callLog.push(`resolve-customer:${where.mergedCustomerId}`);
+    const survivor = survivorByMergedId[where.mergedCustomerId];
+    return survivor ? { survivingCustomerId: survivor } : null;
+  });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   callLog.length = 0;
   lockCalls.length = 0;
   mockSessionState.session = null;
   mockAssertTenantWritable.mockResolvedValue("ACTIVE");
+  // Default: this customer was never merged, so resolveActiveCustomerId() is a
+  // pure pass-through and every pre-T4e assertion below is unchanged.
+  fakeCustomerMergeLog.findFirst.mockResolvedValue(null);
 });
 
 describe("T4d v4.1 — inventory restoration uses unit conversion, never inversion", () => {
@@ -769,3 +821,174 @@ describe("T4d v4.1 — single entry point for the online void action (static sca
     expect(modal).toContain("/api/ledger/voids");
   });
 });
+
+// ============================================================================
+// T4e Addendum v4.4 §3.1 — a void never touches Customer fields.
+//
+// A void writes exactly one thing: a new Invoice row (+ its items + inventory
+// restored). It never reads or writes name / phone / shopName / isActive, so a
+// prior merge's contact-field state (v4.3 §4) and T4e's WhatsApp statement
+// feature are entirely unaffected by any later void of that customer's
+// invoices. Stated explicitly so it is never mistaken for a bug and "fixed".
+// ============================================================================
+describe("T4e v4.4 §3.1 — a void performs zero reads and zero writes on Customer", () => {
+  it("never touches the Customer table (dynamic)", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess();
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    // No Customer method — read or write — was invoked at any point.
+    expect(callLog.filter((e) => e.startsWith("customer:"))).toEqual([]);
+    for (const method of [
+      "findFirst",
+      "findUnique",
+      "findMany",
+      "create",
+      "update",
+      "updateMany",
+      "upsert",
+      "delete",
+      "deleteMany",
+    ]) {
+      expect(
+        fakeCustomer[method],
+        `Customer.${method} must never be called by the void writer`
+      ).not.toHaveBeenCalled();
+    }
+
+    // The only customer-adjacent read the writer performs is the merge log —
+    // i.e. it resolves WHERE the row belongs without ever touching Customer.
+    expect(fakeCustomerMergeLog.findFirst).toHaveBeenCalled();
+  });
+
+  it("contains no Customer read or write of any kind (static)", () => {
+    const routeSource = fs.readFileSync(
+      path.resolve(process.cwd(), "app/api/ledger/voids/route.ts"),
+      "utf-8"
+    );
+
+    // No Customer model access on either the tenant-scoped handle or the
+    // transaction client. (A bare "Customer" substring check is impossible
+    // here: resolveActiveCustomerId and originalInvoice.customerId both
+    // legitimately contain it — hence the anchored patterns.)
+    expect(routeSource).not.toMatch(/\b(?:tx|db)\.customer\b/);
+    expect(routeSource).not.toMatch(
+      /\bcustomer\s*\.\s*(create|update|updateMany|upsert|delete|deleteMany)\b/
+    );
+
+    // It does write the void invoice, with the customer resolved through the
+    // one sanctioned path — the exact call §1 requires.
+    expect(routeSource).toContain(
+      "resolveActiveCustomerId(tx, tenantId, originalInvoice.customerId)"
+    );
+  });
+});
+
+// ============================================================================
+// T4e Addendum v4.4 §1 — Void customerId resolution.
+//
+// The void writer is one of the write paths required to resolve its target
+// customer through resolveActiveCustomerId() INSIDE the transaction that
+// performs the write — never copied verbatim from the original invoice's
+// stored customerId, never read from an earlier cached value.
+//
+// THE DISCRIMINATING SETUP: the original invoice is read (before the
+// transaction) still carrying the PRE-merge customerId. That is the only
+// arrangement that can fail — if the route copied `originalInvoice.customerId`
+// straight into the void row, the assertions below would see
+// "cust-merged-away" instead of the survivor. A setup in which the merged-away
+// invoice had already been re-pointed by the merge would let a copy-verbatim
+// implementation pass, so it proves nothing and is deliberately not used.
+// ============================================================================
+describe("T4e v4.4 §1 — the void row lands on the customer's CURRENT survivor", () => {
+  const MERGED_AWAY = "cust-merged-away";
+  const SURVIVOR = "cust-survivor";
+
+  it("resolves to the surviving customer when the original customer was merged away after the sale", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({ invoice: { customerId: MERGED_AWAY } });
+    arrangeMergedCustomer({ [MERGED_AWAY]: SURVIVOR });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    const data = createData();
+    expect(data.customerId).toBe(SURVIVOR);
+    expect(data.customerId).not.toBe(MERGED_AWAY);
+
+    // Resolution ran INSIDE the void transaction — after the batch lock and
+    // before Invoice.create() — reading the merge state as of that instant,
+    // never a value cached before the transaction opened.
+    const resolveIndex = callLog.indexOf(`resolve-customer:${MERGED_AWAY}`);
+    expect(resolveIndex).toBeGreaterThan(callLog.indexOf("transaction"));
+    expect(resolveIndex).toBeGreaterThan(callLog.indexOf("lock"));
+
+    // The lookup was tenant-scoped and asked the one question the helper asks.
+    expect(fakeCustomerMergeLog.findFirst.mock.calls[0][0]).toEqual({
+      where: { tenantId: TENANT_ID, mergedCustomerId: MERGED_AWAY },
+      select: { survivingCustomerId: true },
+    });
+  });
+
+  it("zero-sums the survivor's ledger — the regression case beside T4d's own monetary zero-sum test", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({ invoice: { customerId: MERGED_AWAY } });
+    arrangeMergedCustomer({ [MERGED_AWAY]: SURVIVOR });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    const data = createData();
+
+    // The ledger equation is computed PER CUSTOMER, so the zero-sum property
+    // only holds because the original (already re-pointed by the merge, per
+    // T4e Scope item 6) and the new void row sit on the SAME customer.
+    expect(data.customerId).toBe(SURVIVOR);
+    expect(sumMoney([original.totalSYP, data.totalSYP])).toBe("0.0000");
+    expect(sumMoney([original.paidAmountSYP, data.paidAmountSYP])).toBe("0.0000");
+    expect(sumMoney([original.debtAmountSYP, data.debtAmountSYP])).toBe("0.0000");
+    expect(data.debtAmountSYP).toBe("-100000.0000");
+  });
+
+  it("creates no balance on the deactivated, merged-away customer", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({ invoice: { customerId: MERGED_AWAY } });
+    arrangeMergedCustomer({ [MERGED_AWAY]: SURVIVOR });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+    const data = createData();
+
+    // Miniature per-customer ledger: SUM(Invoice.debtAmountSYP) over the rows
+    // that now carry each customerId. The merge already zeroed the merged-away
+    // customer by re-pointing the original off it; the void must not put
+    // anything back on it.
+    const ledger = [
+      // The original sale, as re-pointed by the merge (T4e Scope item 6).
+      { customerId: SURVIVOR, debtAmountSYP: original.debtAmountSYP },
+      // Wherever the void row actually went.
+      { customerId: data.customerId, debtAmountSYP: data.debtAmountSYP },
+    ];
+    const balanceOf = (customerId: string) =>
+      // The "0.0000" seed stands in for SQL's SUM over zero rows: this
+      // codebase's normalized zero at the schema's Decimal(18,4) precision.
+      sumMoney([
+        "0.0000",
+        ...ledger.filter((r) => r.customerId === customerId).map((r) => r.debtAmountSYP),
+      ]);
+
+    expect(balanceOf(MERGED_AWAY)).toBe("0.0000");
+    expect(balanceOf(SURVIVOR)).toBe("0.0000");
+  });
+});
+

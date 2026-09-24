@@ -466,6 +466,16 @@ export async function POST(req: NextRequest) {
   // ==========================================================================
   // PASS 2 — Invoices (sale or void). Idempotent via Invoice.offlineId.
   // Split into two ORDERED SUB-PHASES (v4.1) — sales first, then voids.
+  //
+  // [v4.4] BOTH sub-phases independently call resolveActiveCustomerId():
+  //   - the non-void pass resolves through resolveTargetCustomerId() below,
+  //     whose three mapped/matched branches each route through the helper;
+  //   - the void pass resolves its own originalInvoice.customerId directly.
+  // Neither reuses a value the other resolved — each resolves FRESH inside its
+  // own transaction, because a customer merge can complete in the narrow gap
+  // between the two sub-phases of a single batch. Carrying a value over would
+  // land the void on a deactivated, merged-away customer and split that
+  // customer's ledger in two.
   // ==========================================================================
   async function processInvoiceSyncItem(inv: InvoicePayload): Promise<void> {
     if (inv.voidsOfflineInvoiceId && userRole !== "ADMIN") {

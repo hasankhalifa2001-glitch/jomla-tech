@@ -31,6 +31,13 @@ const mergeCustomersSchema = z.object({
  *   3. Deactivates the duplicate customer (isActive: false)
  *   4. Writes summary CustomerMergeLog
  *   5. Refreshes B2BOrderRequest.matchedCustomerId for PENDING_REVIEW orders
+ *      ONLY — deliberately. An order that has already moved to APPROVED keeps
+ *      whatever matchedCustomerId it had at approval time, unrefreshed,
+ *      indefinitely. The field's only documented purpose (per T1) is a
+ *      pre-approval hint shown to the reviewing admin; once approval has
+ *      happened it is inert and feeds no downstream calculation, so leaving it
+ *      stale after a merge is a display-only historical artifact, not a
+ *      correctness gap. The `status` filter below is load-bearing.
  *   6. Writes CustomerMergeLogItem append-only audit trail rows for every re-pointed record
  *
  * Scoping Guarantee (Prevent Audit Desync):
@@ -157,7 +164,11 @@ export async function POST(req: Request) {
         },
       });
 
-      // 8. Fifth top-level write: Refresh matchedCustomerId on PENDING_REVIEW B2BOrderRequests
+      // 8. Fifth top-level write: Refresh matchedCustomerId on PENDING_REVIEW
+      // B2BOrderRequests ONLY. The status filter is load-bearing, not
+      // incidental — see item 5 of this route's header: an APPROVED order's
+      // matchedCustomerId is historical/display-only and is intentionally left
+      // untouched by a later merge.
       await tx.b2BOrderRequest.updateMany({
         where: {
           tenantId,

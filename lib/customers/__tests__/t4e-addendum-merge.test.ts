@@ -10,12 +10,18 @@ const {
   mockSessionState,
   mockGetTenantDb,
   mockAssertTenantWritable,
+  mockPrisma,
   fakeCustomer,
   fakeInvoice,
+  fakeInvoiceItem,
+  fakeProductBatch,
+  fakeProductUnit,
+  fakeTenant,
   fakeCustomerPayment,
   fakeCustomerMergeLog,
   fakeCustomerMergeLogItem,
   fakeB2BOrderRequest,
+  fakeB2BOrderRequestItem,
 } = vi.hoisted(() => {
   const fakeCustomer: any = {
     findFirst: vi.fn(),
@@ -25,11 +31,22 @@ const {
   const fakeInvoice: any = {
     findMany: vi.fn(),
     updateMany: vi.fn(),
+    // [T5] the approval path now creates the real Invoice
+    create: vi.fn(),
   };
+
+  // [T5] Everything the approval path needs beyond the status flip.
+  const fakeInvoiceItem: any = { create: vi.fn() };
+  const fakeProductBatch: any = { update: vi.fn() };
+  const fakeProductUnit: any = { findUniqueOrThrow: vi.fn() };
+  const fakeTenant: any = { findUnique: vi.fn() };
+  const fakeB2BOrderRequestItem: any = { findMany: vi.fn() };
 
   const fakeCustomerPayment: any = {
     findMany: vi.fn(),
     updateMany: vi.fn(),
+    // [T5] written only when an approval captures a payment
+    create: vi.fn(),
   };
 
   const fakeCustomerMergeLog: any = {
@@ -61,10 +78,25 @@ const {
   const txMock: any = {
     customer: fakeCustomer,
     invoice: fakeInvoice,
+    invoiceItem: fakeInvoiceItem,
+    productBatch: fakeProductBatch,
+    productUnit: fakeProductUnit,
+    tenant: fakeTenant,
     customerPayment: fakeCustomerPayment,
     customerMergeLog: fakeCustomerMergeLog,
     customerMergeLogItem: fakeCustomerMergeLogItem,
     b2BOrderRequest: fakeB2BOrderRequest,
+    b2BOrderRequestItem: fakeB2BOrderRequestItem,
+  };
+
+  // [T5] The approval route is a category-5 RAW-client call site — it must call
+  // lockBatchesForFifoAllocations(), which is typed to accept exactly
+  // Prisma.TransactionClient, so it reaches the store through `prisma` from
+  // "@/lib/db" instead of getTenantDb(). Both entry points resolve to this same
+  // fake transaction client.
+  const mockPrisma = {
+    ...txMock,
+    $transaction: vi.fn(async (cb: any) => cb(txMock)),
   };
 
   const mockGetTenantDb = vi.fn(() => ({
@@ -78,12 +110,18 @@ const {
     mockSessionState,
     mockGetTenantDb,
     mockAssertTenantWritable,
+    mockPrisma,
     fakeCustomer,
     fakeInvoice,
+    fakeInvoiceItem,
+    fakeProductBatch,
+    fakeProductUnit,
+    fakeTenant,
     fakeCustomerPayment,
     fakeCustomerMergeLog,
     fakeCustomerMergeLogItem,
     fakeB2BOrderRequest,
+    fakeB2BOrderRequestItem,
   };
 });
 
@@ -104,6 +142,35 @@ vi.mock("@/lib/db/tenant-scope", async () => {
   return {
     ...actual,
     getTenantDb: mockGetTenantDb,
+  };
+});
+
+// [T5] The approval route reaches the store through the RAW client (category-5
+// call site), so `prisma` must resolve to the same fake transaction client.
+vi.mock("@/lib/db", async (importOriginal) => {
+  const actual = await importOriginal<any>();
+  return { ...actual, prisma: mockPrisma };
+});
+
+// [T5] Inventory helpers that would otherwise need real ProductBatch rows
+// through the fake tx. lib/inventory/units.ts stays REAL.
+vi.mock("@/lib/inventory/fifo", () => ({
+  commitFifoAllocation: vi.fn(async (_tx: any, args: any) => ({
+    allocations: [{ batchId: "batch-1", allocatedQty: args.requestedQty }],
+    isSufficient: true,
+    remainingQty: "0",
+  })),
+}));
+
+vi.mock("@/lib/inventory/batch-locking", () => ({
+  lockBatchesForFifoAllocations: vi.fn(async () => new Map()),
+}));
+
+vi.mock("@/lib/inventory/base-unit", async (importOriginal) => {
+  const actual = await importOriginal<any>();
+  return {
+    ...actual,
+    requireBaseUnit: vi.fn(async () => ({ id: "unit-base", conversionFactor: "1" })),
   };
 });
 
@@ -386,10 +453,29 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
         survivingCustomerId: "cust-survivor",
       });
 
+      // [T5] The approval path is now the FULL flow (claim → FIFO → invoice →
+      // stock → link), so every dependency it touches must be arranged.
+      fakeB2BOrderRequest.updateMany.mockResolvedValueOnce({ count: 1 });
+      fakeB2BOrderRequestItem.findMany.mockResolvedValueOnce([
+        {
+          productId: "prod-1",
+          unitId: "unit-carton",
+          quantity: "3",
+          priceWholesaleSnapshot: "50000.0000",
+          pricingCurrencySnapshot: "SYP",
+        },
+      ]);
+      fakeTenant.findUnique.mockResolvedValueOnce({ dailyExchangeRate: "15000.0000" });
+      fakeCustomer.findFirst.mockResolvedValueOnce({ isSystemGenerated: false });
+      fakeProductUnit.findUniqueOrThrow.mockResolvedValueOnce({ conversionFactor: "24" });
+      fakeInvoice.create.mockResolvedValueOnce({ id: "inv-1" });
+      fakeInvoiceItem.create.mockResolvedValue({});
+      fakeProductBatch.update.mockResolvedValue({});
       fakeB2BOrderRequest.update.mockResolvedValueOnce({
         id: "order-1",
         status: "APPROVED",
         matchedCustomerId: "cust-survivor",
+        resultingInvoiceId: "inv-1",
       });
 
       const req = new Request("http://localhost/api/orders/order-1/status", {
@@ -402,16 +488,23 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
       const res = await orderStatusPatch(req, { params });
       expect(res.status).toBe(200);
 
-      // Verify status update used the resolved active customer ID
-      expect(fakeB2BOrderRequest.update).toHaveBeenCalledWith(
+      // The status CLAIM (race-safe conditional update) froze the resolved
+      // active customer ID onto the row.
+      expect(fakeB2BOrderRequest.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: "order-1", tenantId: "tenant-1" },
+          where: { id: "order-1", tenantId: "tenant-1", status: "PENDING_REVIEW" },
           data: expect.objectContaining({
             status: "APPROVED",
             matchedCustomerId: "cust-survivor",
           }),
         })
       );
+
+      // ...and the invoice is linked back to the request.
+      expect(fakeB2BOrderRequest.update).toHaveBeenCalledWith({
+        where: { id: "order-1", tenantId: "tenant-1" },
+        data: { resultingInvoiceId: "inv-1" },
+      });
     });
 
     it("rejects approval if order is not in PENDING_REVIEW before customer resolution", async () => {
@@ -427,8 +520,10 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
       const res = await orderStatusPatch(req, { params });
       expect(res.status).toBe(400);
 
-      // Customer resolution must not have run
+      // Customer resolution must not have run, and no invoice may be created
+      // for an order that never existed in a reviewable state.
       expect(fakeCustomerMergeLog.findFirst).not.toHaveBeenCalled();
+      expect(fakeInvoice.create).not.toHaveBeenCalled();
     });
   });
 

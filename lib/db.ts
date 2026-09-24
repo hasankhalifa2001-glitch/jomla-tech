@@ -48,6 +48,12 @@
 //          - app/api/sync/route.ts (T4c) — see that route's own header
 //            comment for the full reasoning and the manual-tenantId
 //            discipline it requires on every query/write in the file.
+//          - app/api/orders/[id]/status/route.ts (T5) — the B2B order
+//            approval path, which must lock batches via
+//            lockBatchesForFifoAllocations() and allocate via
+//            commitFifoAllocation() inside the same transaction that claims
+//            the order row. Same manual-tenantId discipline: every query in
+//            that file carries tenantId explicitly in its own `where`.
 //          - lib/inventory/fifo.ts — commitFifoAllocation() accepts
 //            exactly Prisma.TransactionClient as its required first
 //            parameter, shared with app/api/sync/route.ts's (T4c) and

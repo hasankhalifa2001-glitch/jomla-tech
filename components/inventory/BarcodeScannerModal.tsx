@@ -50,7 +50,16 @@ export function BarcodeScannerModal({
   feedback = "toast",
   continuousCooldownMs = 1200,
 }: BarcodeScannerModalProps) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  // [FIXED] Was `useRef<HTMLVideoElement | null>(null)` read as
+  // `videoRef.current!` inside the effect. DialogContent (Radix) mounts its
+  // children in a Portal AFTER the first render, so when the effect ran the
+  // ref was still null. @zxing/library then silently created a detached,
+  // off-screen <video> element for the stream: the camera light turned on
+  // and the decoder kept running (hence the NotFoundException spam in the
+  // console), but the visible <video> in the modal never got a stream and
+  // stayed black. Storing the element in STATE via a callback ref makes the
+  // effect wait until the element really exists, and re-run when it changes.
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
 
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -97,7 +106,9 @@ export function BarcodeScannerModal({
   }, []);
 
   useEffect(() => {
-    if (!open) {
+    // [FIXED] Do not start until the modal is open AND the <video> element
+    // has actually been mounted (videoEl is non-null).
+    if (!open || !videoEl) {
       if (readerRef.current) {
         readerRef.current.reset();
         readerRef.current = null;
@@ -119,13 +130,28 @@ export function BarcodeScannerModal({
     // the first hit.
     let locked = false;
     let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+    // Guards against state updates / retries after this effect was cleaned up
+    // (StrictMode double-invoke, modal closed mid-startup, etc.).
+    let cancelled = false;
 
-    codeReader
-      .decodeFromConstraints(
-        { video: { facingMode: "environment" } },
-        videoRef.current!,
+    // [ADDED — laptop / no-rear-camera fallback] A bare `facingMode:
+    // "environment"` string is spec'd as an IDEAL preference, not a hard
+    // requirement — a device with only a front-facing camera (any
+    // laptop) is expected to receive that camera as a fallback per the
+    // W3C mediacapture spec, with no error at all. `attemptDecode` is a
+    // small wrapper solely so a strict/non-standard browser or driver
+    // that throws OverconstrainedError on the first attempt (rejecting
+    // the constraint outright instead of falling back) gets one retry
+    // with a plain `{ video: true }` — "any camera, no preference" —
+    // before this is treated as a genuine camera-access failure. On a
+    // spec-compliant browser this retry path is never reached at all;
+    // the first call already succeeds with whatever camera is available.
+    const attemptDecode = (constraints: MediaStreamConstraints) =>
+      codeReader.decodeFromConstraints(
+        constraints,
+        videoEl, // [FIXED] real, mounted element instead of videoRef.current!
         (result) => {
-          if (!result || locked) return;
+          if (!result || locked || cancelled) return;
           locked = true;
 
           const currentMode = modeRef.current;
@@ -175,22 +201,43 @@ export function BarcodeScannerModal({
             handleOpenChange(false);
           }
         }
-      )
-      .catch((err) => {
-        console.error("Barcode scanner camera error:", err);
-        setCameraError(
-          "تعذّر الوصول إلى الكاميرا. يرجى التأكد من السماح باستخدام الكاميرا."
-        );
-      });
+      );
+
+    attemptDecode({ video: { facingMode: "environment" } }).catch((err) => {
+      if (cancelled) return;
+
+      const isOverconstrained =
+        err && (err.name === "OverconstrainedError" || err.name === "ConstraintNotSatisfiedError");
+
+      if (isOverconstrained) {
+        // The device (a laptop with only a front camera, most commonly)
+        // rejected the facingMode preference outright instead of falling
+        // back on its own — retry with no camera preference at all.
+        attemptDecode({ video: true }).catch((fallbackErr) => {
+          if (cancelled) return;
+          console.error("Barcode scanner camera error (fallback attempt):", fallbackErr);
+          setCameraError(
+            "تعذّر الوصول إلى الكاميرا. يرجى التأكد من السماح باستخدام الكاميرا."
+          );
+        });
+        return;
+      }
+
+      console.error("Barcode scanner camera error:", err);
+      setCameraError(
+        "تعذّر الوصول إلى الكاميرا. يرجى التأكد من السماح باستخدام الكاميرا."
+      );
+    });
 
     return () => {
+      cancelled = true;
       if (cooldownTimer) clearTimeout(cooldownTimer);
       if (readerRef.current) {
         readerRef.current.reset();
         readerRef.current = null;
       }
     };
-  }, [open, retryToken, handleOpenChange, continuousCooldownMs]);
+  }, [open, videoEl, retryToken, handleOpenChange, continuousCooldownMs]);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -208,7 +255,13 @@ export function BarcodeScannerModal({
         </DialogHeader>
 
         <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black flex items-center justify-center border border-zinc-800">
-          <video ref={videoRef} className="w-full h-full object-cover" />
+          <video
+            ref={setVideoEl} // [FIXED] callback ref -> state, so the effect re-runs once mounted
+            className="w-full h-full object-cover"
+            autoPlay
+            muted
+            playsInline
+          />
 
           {isScanning && !awaitingCooldown && (
             <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center">

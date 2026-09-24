@@ -332,6 +332,12 @@ const eslintConfig = defineConfig([
       "app/(dashboard)/admin/**",
       "app/api/admin/**",
       "app/api/sync/**",
+      // [T5] The B2B order approval route is a category-5 raw-client call
+      // site: it must call lockBatchesForFifoAllocations(), which is typed to
+      // accept exactly Prisma.TransactionClient — a shape getTenantDb()'s
+      // extended client is deliberately NOT assignable to. See lib/db.ts's
+      // category-5 rationale and that route's own header comment.
+      "app/api/orders/**",
       "app/api/inventory/fifo-preview/**",
       "lib/inventory/fifo.ts",
       "app/(store)/**",
