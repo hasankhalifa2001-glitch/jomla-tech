@@ -66,6 +66,7 @@ export interface InvoiceDetail {
     paidAmountUSD: string;
     debtAmountSYP: string;
     debtAmountUSD: string;
+    receiptPdfUrl: string | null;
     voidReason: string | null;
     voidsInvoiceId: string | null;
     voidedByInvoiceId: string | null;

@@ -49,6 +49,7 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { formatMoney, multiplyMoney } from "@/lib/utils/money";
+import { ReceiptActions } from "@/components/receipts/receipt-actions";
 import type { InvoiceDetail } from "./types";
 import { INVOICE_STATUS_CLASSES, INVOICE_STATUS_LABELS, formatRowTimestamp, invoiceReference } from "./sales-log-utils";
 
@@ -343,6 +344,30 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                                 </span>
                             </div>
                         </div>
+
+                        {/*
+                            [T4f] Print / share for a SERVER-sourced invoice.
+
+                            Rule 1 says thermal printing reads whichever
+                            representation is authoritative right now — and for a
+                            row in the sales log that is the server Invoice with
+                            its InvoiceItems, which is exactly what `detail` is.
+                            So the print path here carries server numbers, not a
+                            local row's view of them.
+
+                            Share is NOT gated by the local sync state on this
+                            surface: this invoice arrived over
+                            GET /api/invoices/[id], so it is on the server by
+                            construction (see share-gate.ts). When
+                            detail.receiptPdfUrl is already set, the share action
+                            simply opens that cached file — no raster is rendered
+                            and no POST is issued (share-flow.ts's STEP 3).
+                        */}
+                        <ReceiptActions
+                            source={{ source: "server", detail }}
+                            serverInvoiceId={detail.id}
+                            className="pt-1"
+                        />
                     </div>
                 )}
             </DialogContent>

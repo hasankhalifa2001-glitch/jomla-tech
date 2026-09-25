@@ -9,6 +9,8 @@ import {
   type PendingOfflineInvoiceRow,
 } from "@/lib/offline/pos-service";
 import { formatMoney } from "@/lib/utils/money";
+import { ReceiptActions } from "@/components/receipts/receipt-actions";
+import { buildLocalReceiptSource } from "@/lib/receipts/local-receipt-source";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -166,6 +168,35 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
                     إلغاء الفاتورة
                   </Button>
                 )}
+
+                {/*
+                  [T4f — Rule 2] Thermal printing of a DEVICE-LOCAL record — the
+                  only print path that must work with zero server involvement.
+
+                  It covers a locally-queued VOID (row.isLocalVoid) exactly as it
+                  covers a pending sale: the void is just an OfflineInvoice whose
+                  voidsOfflineInvoiceId is set, so receipt-model.ts reaches the
+                  same VOID branch — same void notice, same "مرتجع: N" restored
+                  units, same SYP/USD totals at the ORIGINAL sale's
+                  exchangeRateUsed (which the void row itself carries). No
+                  special-casing for the offline path exists anywhere.
+
+                  The source is a thunk because an offlineInvoices row stores only
+                  productId/unitId: names are read from the local catalog cache at
+                  click time, never on every render.
+                */}
+                <ReceiptActions
+                  source={() =>
+                    buildLocalReceiptSource({
+                      tenantId,
+                      invoice: row.invoice,
+                      customerName: row.customerName,
+                    })
+                  }
+                  offlineId={row.invoice.offlineId}
+                  serverInvoiceId={row.invoice.serverId ?? null}
+                  size="sm"
+                />
               </div>
             </div>
           );

@@ -3,7 +3,9 @@
  *
  * Responsibilities:
  * 1. Pushes pending offline data (offlineCustomers, offlineInvoices, offlinePayments)
- *    to /api/sync sorted by local `createdAt` ascending.
+ *    to /api/sync IN CHUNKED BATCHES, in a fixed dependency-respecting order — see
+ *    the [FIX — CHUNKED SYNC] note below for the full design and the exact bug
+ *    this closes.
  * 2. Processes per-item responses from the server, updating local record status
  *    to "SYNCED" or "FAILED" with explicit failure reasons. A third server
  *    status, "RETRY_LATER", leaves the local record untouched (still PENDING)
@@ -14,54 +16,104 @@
  *    the FAILED state until manual reconciliation / T4e ledger resolution).
  *    RETRY_LATER items ARE automatically retried — see triggers 1-3 below.
  * 4. Listens for network reconnection (`online` event) and triggers sync within 5 seconds.
- * 5. Runs a periodic 45s safety-net check while online with pending work — see
- *    the [FIX — PERIODIC INTERVAL STABILITY] note below for why this needed a
- *    second look in this revision.
+ * 5. Runs a periodic 45s safety-net check while online with pending work.
  *
  * [... prior header documentation on SYP/USD payload shape, post-sync
- * cache-refresh logic, and the original RETRY_LATER handling (false-success
- * bug + orphaned-retry bug) — unchanged and still in effect, see earlier
- * revisions of this file for the full text ...]
+ * cache-refresh logic, the original RETRY_LATER handling (false-success bug
+ * + orphaned-retry bug), and the periodic-interval-stability fix — unchanged
+ * and still in effect, see earlier revisions of this file for the full text
+ * of each ...]
  *
- * [FIX — PERIODIC INTERVAL STABILITY, this revision — closes a real
- * "safety net that resets itself before it ever fires" bug]
+ * [FIX — CHUNKED SYNC, this revision — closes two real bugs that only
+ * surface after a long offline period with a large backlog]
  *
- * The periodic 45s safety-net `useEffect` previously listed `pendingCount`
- * in its dependency array:
+ * BUG 1 — Timeout / oversized-payload risk. The previous version of this
+ * file collected EVERY pending customer/invoice/payment into ONE payload and
+ * sent it in a SINGLE /api/sync request. The server processes each invoice
+ * inside its own sequential `await` loop (app/api/sync/route.ts), so a
+ * backlog of, say, 300 invoices accumulated over a multi-day offline period
+ * could take tens of seconds to process in one request — a real risk of
+ * hitting a serverless function's execution-time limit (common limits are
+ * 10-60s) mid-request, with the client left holding a hung/failed fetch and
+ * NO local status updates at all (the whole response never arrived), even
+ * though every invoice processed before the cutoff had already committed
+ * successfully server-side.
  *
- *   useEffect(() => {
- *     periodicIntervalRef.current = setInterval(() => { ... }, 45_000);
- *     return () => clearInterval(periodicIntervalRef.current);
- *   }, [tenantId, pendingCount, triggerSync]);
+ * BUG 2 — Cross-CHUNK dependency violations. Splitting into chunks
+ * introduces a NEW failure mode that does not exist with a single request:
+ * app/api/sync/route.ts's dependency-aware logic (retryableCustomerOfflineIds,
+ * TransientDependencyError, and the sale-before-void sub-phase ordering) is
+ * only aware of items within ONE request. A naive chunking scheme that
+ * simply slices arrays into fixed-size pieces WITHOUT respecting dependency
+ * order across chunks could send:
+ *   - an invoice referencing a walk-in customer BEFORE that customer's own
+ *     chunk has been confirmed SYNCED — the server has no record of a
+ *     RETRY_LATER customer from a PRIOR request, so this invoice fails with
+ *     the generic "customer not found" error and is marked permanently
+ *     FAILED, not RETRY_LATER;
+ *   - a void invoice in an EARLIER chunk than the original sale it reverses
+ *     (possible if local creation order differs from the chunking split) —
+ *     the void fails with "original not synced yet," which is NOT a
+ *     retryable-pattern error server-side and is marked permanently FAILED.
  *
- * `pendingCount` is a live, reactive value (useLiveQuery) that changes on
- * EVERY write to offlineInvoices/offlinePayments/offlineCustomers — a new
- * sale, a new walk-in customer, a new offline void, and every status
- * transition a sync pass itself writes. Each such change re-runs this
- * effect: React tears down the existing interval (clearInterval in the
- * cleanup function) and starts a brand-new 45s countdown from zero.
+ * FIX — a fixed, dependency-respecting client-side stage order, each stage
+ * chunked and sent as its own sequence of requests, with local Dexie state
+ * updated after EVERY chunk (not only at the very end):
  *
- * On a device with steady activity (a cashier ringing up sale after sale
- * more often than once every 45 seconds), the interval could be reset
- * indefinitely and NEVER actually fire — defeating the entire purpose of
- * the safety net, which exists specifically to catch a RETRY_LATER item
- * that triggers 1 and 2 (the 0->positive pendingCount transition and the
- * browser `online` event) cannot reach.
+ *   STAGE 1 — customers, chunked at CUSTOMER_CHUNK_SIZE. All customer
+ *     chunks complete (success, retry, or failure recorded) before stage 2
+ *     begins.
+ *   STAGE 2 — sale invoices (no voidsOfflineInvoiceId), chunked at
+ *     INVOICE_CHUNK_SIZE. Any sale invoice whose offlineCustomerId belongs
+ *     to a customer left RETRY_LATER anywhere in stage 1 is EXCLUDED from
+ *     this sync pass entirely (never sent — stays PENDING locally, picked
+ *     up automatically on the next pass once its customer has synced).
+ *     This is the client-side mirror of the server's own
+ *     TransientDependencyError, extended across chunk/request boundaries
+ *     where the server-side mechanism (scoped to one request) cannot reach.
+ *   STAGE 3 — void invoices, chunked at INVOICE_CHUNK_SIZE, sent ONLY after
+ *     every stage-2 chunk has been attempted. Any void whose
+ *     voidsOfflineInvoiceId belongs to an original invoice that is NOT
+ *     already SYNCED (from an earlier pass) AND was not marked SYNCED
+ *     during stage 2 of *this* pass is EXCLUDED from this pass — covers an
+ *     original that came back RETRY_LATER, FAILED, or was itself excluded
+ *     for its own customer dependency in stage 2.
+ *   STAGE 4 — payments, chunked at PAYMENT_CHUNK_SIZE. Same
+ *     customer-dependency exclusion as stage 2.
  *
- * Fixed: `pendingCount` is read from a ref (`pendingCountRef`, kept in
- * sync by a separate, cheap effect) INSIDE the interval callback instead
- * of being a dependency of the effect that creates the interval. The
- * interval-creating effect now depends only on `[tenantId, triggerSync]`
- * — both stable across ordinary pending-count churn — so the interval is
- * created once per mount (and once per tenant/triggerSync identity
- * change) and ticks reliably every 45s regardless of how often
- * `pendingCount` itself changes in between ticks.
+ * Every chunk is its own independent /api/sync request/response cycle:
+ * Dexie is updated immediately after each chunk's response arrives (SYNCED/
+ * FAILED writes, RETRY_LATER left untouched), rather than batching every
+ * update until the entire multi-chunk pass finishes. This means a
+ * connection drop or a function timeout partway through a large backlog
+ * loses NOTHING already confirmed — every chunk that got a response before
+ * the interruption is already reflected in Dexie, and the remaining
+ * un-sent chunks simply stay PENDING for the next pass (triggered
+ * automatically by the existing periodic-interval / reconnect / new-work
+ * triggers, unchanged from the prior revision).
+ *
+ * A record excluded from a pass for a dependency reason is NEVER written to
+ * Dexie with any status change — it is simply left out of that pass's
+ * payload entirely, exactly like a RETRY_LATER server response, so it's
+ * naturally reconsidered on the next pass with zero extra bookkeeping.
+ *
+ * Chunk sizes are deliberately conservative (customers/payments are
+ * cheaper per-item than invoices, hence the larger size) and are exported
+ * constants so they can be tuned without hunting through the function body.
  */
 
-import { getOfflineDb, isOfflineDbSupported } from "./db";
+import { getOfflineDb, isOfflineDbSupported, type OfflineInvoice } from "./db";
 import { refreshProductCache, refreshCustomerCache } from "./cache-refresh";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
+
+// [FIX — CHUNKED SYNC] Conservative defaults — tunable without touching
+// the sync logic itself. Invoices are the most expensive per-item
+// (FIFO/base-unit resolution, batch locking, multiple child-row writes),
+// so they get the smallest chunk size.
+export const CUSTOMER_CHUNK_SIZE = 50;
+export const INVOICE_CHUNK_SIZE = 25;
+export const PAYMENT_CHUNK_SIZE = 50;
 
 export interface SyncSummary {
   success: boolean;
@@ -79,9 +131,18 @@ export interface SyncSummary {
   retryLaterCustomers: number;
   retryLaterInvoices: number;
   retryLaterPayments: number;
-  // True whenever this pass ended with at least one RETRY_LATER item —
-  // lets a UI show a calm "still syncing" state instead of conflating
-  // this with a genuine, manual-intervention-needed failure.
+  // [FIX — CHUNKED SYNC] Counts of items this pass never even SENT,
+  // because a dependency of theirs (their customer, or — for a void —
+  // their original sale) was not confirmed SYNCED anywhere in this same
+  // pass. Distinct from retryLaterX (which reflects a server response)
+  // — these never reached the server at all this pass. Also left
+  // untouched in Dexie (still PENDING), for the exact same reason.
+  deferredInvoices: number;
+  deferredPayments: number;
+  // True whenever this pass ended with at least one RETRY_LATER or
+  // locally-deferred item — lets a UI show a calm "still syncing" state
+  // instead of conflating this with a genuine, manual-intervention-needed
+  // failure.
   hasPendingRetries: boolean;
   errors: string[];
 }
@@ -102,8 +163,137 @@ export interface SyncApiResponse {
   message?: string;
 }
 
+function chunk<T>(items: T[], size: number): T[][] {
+  if (size <= 0) return [items];
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
 /**
- * Executes a sync pass for all PENDING offline records belonging to the given tenant.
+ * Posts a single chunk-shaped payload to /api/sync. Never throws on a
+ * non-2xx HTTP response — returns a shaped failure result instead, so the
+ * caller can decide how to record it against the specific items in this
+ * chunk without needing its own try/catch around every call site.
+ */
+async function postSyncChunk(payload: {
+  customers: ReturnType<typeof buildCustomerPayload>[];
+  invoices: ReturnType<typeof buildInvoicePayload>[];
+  payments: ReturnType<typeof buildPaymentPayload>[];
+}): Promise<{ ok: true; data: SyncApiResponse } | { ok: false; error: string }> {
+  try {
+    const response = await fetch("/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errJson = await response.json().catch(() => ({}));
+      const errorMsg =
+        errJson.message || `Sync request failed with HTTP ${response.status}`;
+      return { ok: false, error: errorMsg };
+    }
+
+    const data: SyncApiResponse = await response.json();
+    return { ok: true, data };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Network error during sync.";
+    return { ok: false, error: message };
+  }
+}
+
+// ============================================================================
+// Payload shape builders — unchanged field-for-field from the prior
+// revision's single-payload construction, just factored out so both the
+// chunked stages below and any future caller build identically-shaped
+// per-record payloads.
+// ============================================================================
+
+function buildCustomerPayload(c: {
+  offlineId: string;
+  name: string;
+  phone?: string;
+  shopName?: string;
+  createdAt: Date | string;
+}) {
+  return {
+    offlineId: c.offlineId,
+    name: c.name,
+    phone: c.phone,
+    shopName: c.shopName,
+    createdAt: c.createdAt,
+  };
+}
+
+function buildInvoicePayload(inv: OfflineInvoice) {
+  return {
+    offlineId: inv.offlineId,
+    customerId: inv.customerId,
+    offlineCustomerId: inv.offlineCustomerId,
+    items: inv.items.map((it) => ({
+      productId: it.productId,
+      unitId: it.unitId,
+      quantity: it.quantity,
+      unitPriceSYP: it.unitPriceSYP,
+      unitPriceUSD: it.unitPriceUSD,
+    })),
+    totalSYP: inv.totalSYP,
+    totalUSD: inv.totalUSD,
+    exchangeRateUsed: inv.exchangeRateUsed,
+    paidAmountSYP: inv.paidAmountSYP,
+    paidAmountUSD: inv.paidAmountUSD,
+    debtAmountSYP: inv.debtAmountSYP,
+    debtAmountUSD: inv.debtAmountUSD,
+    paymentMethod: inv.paymentMethod,
+    voidsOfflineInvoiceId: inv.voidsOfflineInvoiceId,
+    voidReason: inv.voidReason,
+    createdAt: inv.createdAt,
+  };
+}
+
+function buildPaymentPayload(p: {
+  offlineId: string;
+  customerId?: string;
+  offlineCustomerId?: string;
+  invoiceId?: string;
+  offlineInvoiceId?: string;
+  amountSYP: string;
+  amountUSD: string;
+  exchangeRate: string;
+  paymentMethod: string;
+  receiptNo?: string;
+  notes?: string;
+  createdAt: Date | string;
+}) {
+  return {
+    offlineId: p.offlineId,
+    customerId: p.customerId,
+    offlineCustomerId: p.offlineCustomerId,
+    invoiceId: p.invoiceId,
+    offlineInvoiceId: p.offlineInvoiceId,
+    amountSYP: p.amountSYP,
+    amountUSD: p.amountUSD,
+    exchangeRate: p.exchangeRate,
+    paymentMethod: p.paymentMethod,
+    receiptNo: p.receiptNo,
+    notes: p.notes,
+    createdAt: p.createdAt,
+  };
+}
+
+/**
+ * Executes a full, dependency-respecting, CHUNKED sync pass for all PENDING
+ * offline records belonging to the given tenant.
+ *
+ * See the file-header [FIX — CHUNKED SYNC] note for the full stage design.
+ * Local Dexie state is updated progressively, after every individual
+ * chunk's response — never batched until the whole pass finishes — so an
+ * interruption partway through a large backlog loses nothing already
+ * confirmed by the server.
  */
 export async function syncPendingRecords(tenantId: string): Promise<SyncSummary> {
   if (!tenantId || !tenantId.trim()) {
@@ -122,6 +312,8 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
     retryLaterCustomers: 0,
     retryLaterInvoices: 0,
     retryLaterPayments: 0,
+    deferredInvoices: 0,
+    deferredPayments: 0,
     hasPendingRetries: false,
     errors: [],
   };
@@ -168,91 +360,56 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
   );
 
-  const payload = {
-    customers: pendingCustomers.map((c) => ({
-      offlineId: c.offlineId,
-      name: c.name,
-      phone: c.phone,
-      shopName: c.shopName,
-      createdAt: c.createdAt,
-    })),
-    invoices: pendingInvoices.map((inv) => ({
-      offlineId: inv.offlineId,
-      customerId: inv.customerId,
-      offlineCustomerId: inv.offlineCustomerId,
-      items: inv.items.map((it) => ({
-        productId: it.productId,
-        unitId: it.unitId,
-        quantity: it.quantity,
-        unitPriceSYP: it.unitPriceSYP,
-        unitPriceUSD: it.unitPriceUSD,
-      })),
-      totalSYP: inv.totalSYP,
-      totalUSD: inv.totalUSD,
-      exchangeRateUsed: inv.exchangeRateUsed,
-      paidAmountSYP: inv.paidAmountSYP,
-      paidAmountUSD: inv.paidAmountUSD,
-      debtAmountSYP: inv.debtAmountSYP,
-      debtAmountUSD: inv.debtAmountUSD,
-      paymentMethod: inv.paymentMethod,
-      voidsOfflineInvoiceId: inv.voidsOfflineInvoiceId,
-      voidReason: inv.voidReason,
-      createdAt: inv.createdAt,
-    })),
-    payments: pendingPayments.map((p) => ({
-      offlineId: p.offlineId,
-      customerId: p.customerId,
-      offlineCustomerId: p.offlineCustomerId,
-      invoiceId: p.invoiceId,
-      offlineInvoiceId: p.offlineInvoiceId,
-      amountSYP: p.amountSYP,
-      amountUSD: p.amountUSD,
-      exchangeRate: p.exchangeRate,
-      paymentMethod: p.paymentMethod,
-      receiptNo: p.receiptNo,
-      notes: p.notes,
-      createdAt: p.createdAt,
-    })),
-  };
+  // ==========================================================================
+  // Cross-stage dependency tracking — populated as each stage runs, consumed
+  // by later stages to decide what's safe to SEND at all this pass. See the
+  // file-header FIX note, BUG 2, for why this must exist client-side in
+  // addition to (never instead of) the server's own per-request
+  // TransientDependencyError mechanism.
+  // ==========================================================================
 
-  try {
-    const response = await fetch("/api/sync", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
+  // offlineCustomerId -> true once a chunk response confirms SYNCED this pass.
+  const customerSyncedThisPass = new Set<string>();
+  // offlineCustomerId -> true if left RETRY_LATER (or never attempted due to
+  // an earlier chunk-level network failure) anywhere in stage 1 this pass.
+  // A customer NOT in this set and NOT in customerSyncedThisPass either was
+  // FAILED outright — those invoices/payments are still sent (see the
+  // file-header FIX note and t4c's own TransientDependencyError doc: a
+  // genuinely-failed dependency should surface its OWN clear "customer not
+  // found"-class error for manual review, not be silently withheld forever).
+  const customerBlockedThisPass = new Set<string>();
+  // offlineId (of a SALE invoice) -> true once confirmed SYNCED this pass,
+  // OR already known SYNCED from a prior pass (i.e. not in pendingInvoices
+  // at all, since only PENDING rows were fetched above). Used to gate
+  // stage-3 (voids).
+  const saleConfirmedThisPassOrEarlier = new Set<string>();
+  // offlineId (of a SALE invoice) -> true if left RETRY_LATER, or excluded
+  // for its own customer dependency, in stage 2 this pass. Gates stage 3.
+  const saleBlockedThisPass = new Set<string>();
 
-    if (!response.ok) {
-      const errJson = await response.json().catch(() => ({}));
-      const errorMsg =
-        errJson.message || `Sync request failed with HTTP ${response.status}`;
-      summary.success = false;
-      summary.errors.push(errorMsg);
-      return summary;
-    }
+  async function processChunkResults(
+    kind: "customers" | "invoices" | "payments",
+    data: SyncApiResponse
+  ): Promise<void> {
+    if (kind === "customers") {
+      for (const res of data.customers || []) {
+        const local = pendingCustomers.find((c) => c.offlineId === res.offlineId);
+        if (!local || local.id === undefined) continue;
 
-    const data: SyncApiResponse = await response.json();
-
-    // 1. Process Customers
-    for (const res of data.customers || []) {
-      const localCustomer = pendingCustomers.find((c) => c.offlineId === res.offlineId);
-      if (localCustomer && localCustomer.id !== undefined) {
         if (res.status === "SYNCED") {
           summary.syncedCustomers++;
-          await db.offlineCustomers.update(localCustomer.id, {
+          customerSyncedThisPass.add(res.offlineId);
+          await db.offlineCustomers.update(local.id, {
             status: "SYNCED",
             failureReason: undefined,
           });
-
           if (res.realId) {
             await db.cachedCustomers.put({
               id: res.realId,
               tenantId: scopedTenantId,
-              name: localCustomer.name,
-              phone: localCustomer.phone,
-              shopName: localCustomer.shopName,
+              name: local.name,
+              phone: local.phone,
+              shopName: local.shopName,
               cachedBalanceDebtSYP: "0.0000",
               cachedBalanceDebtUSD: "0.0000",
               isSystemGenerated: false,
@@ -260,128 +417,250 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
             });
           }
         } else if (res.status === "RETRY_LATER") {
-          // Deliberately no Dexie write at all — the local record stays
-          // exactly as it was (status: "PENDING"), so it's naturally
-          // re-included in the next sync pass's own PENDING query above,
-          // with zero extra bookkeeping needed here.
           summary.retryLaterCustomers++;
           summary.hasPendingRetries = true;
+          customerBlockedThisPass.add(res.offlineId);
         } else {
           summary.failedCustomers++;
           summary.errors.push(res.error || `Customer ${res.offlineId} failed`);
-          await db.offlineCustomers.update(localCustomer.id, {
+          await db.offlineCustomers.update(local.id, {
             status: "FAILED",
             failureReason: res.error || "فشل المزامنة",
           });
         }
       }
+      return;
     }
 
-    // 2. Process Invoices
-    for (const res of data.invoices || []) {
-      const localInvoice = pendingInvoices.find((i) => i.offlineId === res.offlineId);
-      if (localInvoice && localInvoice.id !== undefined) {
+    if (kind === "invoices") {
+      for (const res of data.invoices || []) {
+        const local = pendingInvoices.find((i) => i.offlineId === res.offlineId);
+        if (!local || local.id === undefined) continue;
+
+        const isSale = !local.voidsOfflineInvoiceId;
+
         if (res.status === "SYNCED") {
           summary.syncedInvoices++;
-          await db.offlineInvoices.update(localInvoice.id, {
+          if (isSale) saleConfirmedThisPassOrEarlier.add(res.offlineId);
+          await db.offlineInvoices.update(local.id, {
             status: "SYNCED",
             failureReason: undefined,
+            serverId: res.realId ?? undefined,
           });
         } else if (res.status === "RETRY_LATER") {
-          // Same as above — no Dexie write, stays PENDING. Covers both a
-          // raw transient DB conflict AND a customer dependency still
-          // mid-retry (server-side TransientDependencyError) — this file
-          // does not need to distinguish the two cases, only the server
-          // does, via res.error's wording.
           summary.retryLaterInvoices++;
           summary.hasPendingRetries = true;
+          if (isSale) saleBlockedThisPass.add(res.offlineId);
         } else {
           summary.failedInvoices++;
           summary.errors.push(res.error || `Invoice ${res.offlineId} failed`);
-          await db.offlineInvoices.update(localInvoice.id, {
+          if (isSale) saleBlockedThisPass.add(res.offlineId);
+          await db.offlineInvoices.update(local.id, {
             status: "FAILED",
             failureReason: res.error || "فشل المزامنة",
           });
         }
       }
+      return;
     }
 
-    // 3. Process Payments
+    // payments
     for (const res of data.payments || []) {
-      const localPayment = pendingPayments.find((p) => p.offlineId === res.offlineId);
-      if (localPayment && localPayment.id !== undefined) {
-        if (res.status === "SYNCED") {
-          summary.syncedPayments++;
-          await db.offlinePayments.update(localPayment.id, {
-            status: "SYNCED",
-            failureReason: undefined,
-          });
-        } else if (res.status === "RETRY_LATER") {
-          // Same as above — no Dexie write, stays PENDING.
-          summary.retryLaterPayments++;
-          summary.hasPendingRetries = true;
-        } else {
-          summary.failedPayments++;
-          summary.errors.push(res.error || `Payment ${res.offlineId} failed`);
-          await db.offlinePayments.update(localPayment.id, {
-            status: "FAILED",
-            failureReason: res.error || "فشل المزامنة",
-          });
-        }
+      const local = pendingPayments.find((p) => p.offlineId === res.offlineId);
+      if (!local || local.id === undefined) continue;
+
+      if (res.status === "SYNCED") {
+        summary.syncedPayments++;
+        await db.offlinePayments.update(local.id, {
+          status: "SYNCED",
+          failureReason: undefined,
+        });
+      } else if (res.status === "RETRY_LATER") {
+        summary.retryLaterPayments++;
+        summary.hasPendingRetries = true;
+      } else {
+        summary.failedPayments++;
+        summary.errors.push(res.error || `Payment ${res.offlineId} failed`);
+        await db.offlinePayments.update(local.id, {
+          status: "FAILED",
+          failureReason: res.error || "فشل المزامنة",
+        });
       }
     }
-
-    // success is also false whenever anything is still RETRY_LATER —
-    // this pass did not fully complete, even though nothing failed
-    // terminally. hasPendingRetries (set above) lets a UI distinguish
-    // this calmly from a genuine failure requiring intervention.
-    summary.success =
-      summary.failedCustomers === 0 &&
-      summary.failedInvoices === 0 &&
-      summary.failedPayments === 0 &&
-      summary.retryLaterCustomers === 0 &&
-      summary.retryLaterInvoices === 0 &&
-      summary.retryLaterPayments === 0;
-
-    // Post-sync cache refresh — only triggered by genuinely SYNCED
-    // invoices/payments (RETRY_LATER items changed nothing server-side
-    // yet, so there's nothing new to refresh for them).
-    if (summary.syncedInvoices > 0) {
-      try {
-        const productResult = await refreshProductCache(scopedTenantId);
-        if (!productResult.ok && productResult.reason !== "offline") {
-          console.error(
-            "syncPendingRecords: post-sync refreshProductCache failed:",
-            productResult.reason
-          );
-        }
-      } catch (err) {
-        console.error("syncPendingRecords: post-sync refreshProductCache threw:", err);
-      }
-    }
-
-    if (summary.syncedInvoices > 0 || summary.syncedPayments > 0) {
-      try {
-        const customerResult = await refreshCustomerCache(scopedTenantId);
-        if (!customerResult.ok && customerResult.reason !== "offline") {
-          console.error(
-            "syncPendingRecords: post-sync refreshCustomerCache failed:",
-            customerResult.reason
-          );
-        }
-      } catch (err) {
-        console.error("syncPendingRecords: post-sync refreshCustomerCache threw:", err);
-      }
-    }
-
-    return summary;
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Network error during sync.";
-    summary.success = false;
-    summary.errors.push(message);
-    return summary;
   }
+
+  // ==========================================================================
+  // STAGE 1 — Customers, chunked. Every chunk attempted before stage 2 opens.
+  // ==========================================================================
+  for (const customerChunk of chunk(pendingCustomers, CUSTOMER_CHUNK_SIZE)) {
+    const result = await postSyncChunk({
+      customers: customerChunk.map(buildCustomerPayload),
+      invoices: [],
+      payments: [],
+    });
+
+    if (!result.ok) {
+      // A chunk-level network/HTTP failure — none of this chunk's items got
+      // any server response at all, so none of them are added to either
+      // customerSyncedThisPass or customerBlockedThisPass. They simply stay
+      // PENDING in Dexie (untouched), exactly like a single RETRY_LATER
+      // item would — no status write, naturally retried next pass. Every
+      // invoice/payment depending on one of these customers is therefore
+      // ALSO deferred below (via the "not synced AND not blocked" check,
+      // which still correctly withholds them — see the invoice/payment
+      // filtering logic in stages 2-4).
+      summary.success = false;
+      summary.errors.push(result.error);
+      continue;
+    }
+
+    await processChunkResults("customers", result.data);
+  }
+
+  // ==========================================================================
+  // STAGE 2 — Sale invoices, chunked, filtered by customer dependency.
+  // ==========================================================================
+  const saleInvoices = pendingInvoices.filter((inv) => !inv.voidsOfflineInvoiceId);
+
+  const sendableSaleInvoices = saleInvoices.filter((inv) => {
+    if (!inv.offlineCustomerId) return true; // customerId (real) or system customer — no dependency
+    if (customerBlockedThisPass.has(inv.offlineCustomerId)) return false; // known-blocked this pass
+    return true; // synced this pass, synced earlier, or failed outright — see note below
+  });
+  summary.deferredInvoices += saleInvoices.length - sendableSaleInvoices.length;
+
+  for (const invoiceChunk of chunk(sendableSaleInvoices, INVOICE_CHUNK_SIZE)) {
+    const result = await postSyncChunk({
+      customers: [],
+      invoices: invoiceChunk.map(buildInvoicePayload),
+      payments: [],
+    });
+
+    if (!result.ok) {
+      summary.success = false;
+      summary.errors.push(result.error);
+      continue;
+    }
+
+    await processChunkResults("invoices", result.data);
+  }
+
+  // ==========================================================================
+  // STAGE 3 — Void invoices, chunked, sent only after ALL stage-2 chunks have
+  // been attempted. Filtered by original-sale dependency.
+  // ==========================================================================
+  const voidInvoices = pendingInvoices.filter((inv) => inv.voidsOfflineInvoiceId);
+
+  const sendableVoidInvoices = voidInvoices.filter((inv) => {
+    const originalOfflineId = inv.voidsOfflineInvoiceId!;
+    // The original might belong to an EARLIER, already-synced pass (not in
+    // pendingInvoices at all, since only PENDING rows were fetched) — that
+    // case is legitimate and must be sendable. Only exclude when the
+    // original is a member of THIS pass's pending set AND did not confirm
+    // SYNCED during stage 2 above.
+    const originalIsPartOfThisPendingSet = saleInvoices.some(
+      (s) => s.offlineId === originalOfflineId
+    );
+    if (!originalIsPartOfThisPendingSet) return true; // synced in an earlier pass
+    return saleConfirmedThisPassOrEarlier.has(originalOfflineId);
+  });
+  summary.deferredInvoices += voidInvoices.length - sendableVoidInvoices.length;
+
+  for (const invoiceChunk of chunk(sendableVoidInvoices, INVOICE_CHUNK_SIZE)) {
+    const result = await postSyncChunk({
+      customers: [],
+      invoices: invoiceChunk.map(buildInvoicePayload),
+      payments: [],
+    });
+
+    if (!result.ok) {
+      summary.success = false;
+      summary.errors.push(result.error);
+      continue;
+    }
+
+    await processChunkResults("invoices", result.data);
+  }
+
+  // ==========================================================================
+  // STAGE 4 — Payments, chunked, filtered by customer dependency (same rule
+  // as stage 2).
+  // ==========================================================================
+  const sendablePayments = pendingPayments.filter((p) => {
+    if (!p.offlineCustomerId) return true;
+    if (customerBlockedThisPass.has(p.offlineCustomerId)) return false;
+    return true;
+  });
+  summary.deferredPayments = pendingPayments.length - sendablePayments.length;
+
+  for (const paymentChunk of chunk(sendablePayments, PAYMENT_CHUNK_SIZE)) {
+    const result = await postSyncChunk({
+      customers: [],
+      invoices: [],
+      payments: paymentChunk.map(buildPaymentPayload),
+    });
+
+    if (!result.ok) {
+      summary.success = false;
+      summary.errors.push(result.error);
+      continue;
+    }
+
+    await processChunkResults("payments", result.data);
+  }
+
+  // success is false whenever anything failed terminally, was left
+  // RETRY_LATER by the server, OR was locally deferred for a dependency
+  // reason this pass — none of these mean data loss (everything stays
+  // correctly queued), but none of them mean "this pass fully completed"
+  // either.
+  summary.success =
+    summary.success &&
+    summary.failedCustomers === 0 &&
+    summary.failedInvoices === 0 &&
+    summary.failedPayments === 0 &&
+    summary.retryLaterCustomers === 0 &&
+    summary.retryLaterInvoices === 0 &&
+    summary.retryLaterPayments === 0 &&
+    summary.deferredInvoices === 0 &&
+    summary.deferredPayments === 0;
+
+  if (summary.deferredInvoices > 0 || summary.deferredPayments > 0) {
+    summary.hasPendingRetries = true;
+  }
+
+  // Post-sync cache refresh — unchanged in spirit from the prior revision,
+  // now simply keyed off the pass-wide totals accumulated across every
+  // chunk/stage rather than a single request's counts.
+  if (summary.syncedInvoices > 0) {
+    try {
+      const productResult = await refreshProductCache(scopedTenantId);
+      if (!productResult.ok && productResult.reason !== "offline") {
+        console.error(
+          "syncPendingRecords: post-sync refreshProductCache failed:",
+          productResult.reason
+        );
+      }
+    } catch (err) {
+      console.error("syncPendingRecords: post-sync refreshProductCache threw:", err);
+    }
+  }
+
+  if (summary.syncedInvoices > 0 || summary.syncedPayments > 0) {
+    try {
+      const customerResult = await refreshCustomerCache(scopedTenantId);
+      if (!customerResult.ok && customerResult.reason !== "offline") {
+        console.error(
+          "syncPendingRecords: post-sync refreshCustomerCache failed:",
+          customerResult.reason
+        );
+      }
+    } catch (err) {
+      console.error("syncPendingRecords: post-sync refreshCustomerCache threw:", err);
+    }
+  }
+
+  return summary;
 }
 
 /**
@@ -420,9 +699,19 @@ export async function getPendingRecordsCount(tenantId?: string): Promise<number>
  *   1. pendingCount transitioning from 0 to positive (a genuinely NEW
  *      pending item appearing — e.g. right after submitOfflineSale()).
  *   2. A real browser `online` reconnect event.
- *   3. A periodic 45s safety-net check — see file-header
- *      [FIX — PERIODIC INTERVAL STABILITY] note for why this now reads
- *      pendingCount from a ref instead of depending on it directly.
+ *   3. A periodic 45s safety-net check — reads pendingCount from a ref
+ *      instead of depending on it directly, so the interval itself is
+ *      created once per mount/tenant and ticks reliably.
+ *
+ * [NOTE — chunked sync interaction] A single triggerSync() call now
+ * internally performs a full, potentially multi-request chunked pass (see
+ * syncPendingRecords' file-header FIX note) rather than one HTTP call.
+ * isSyncingRef correctly covers the ENTIRE multi-chunk pass (it's held for
+ * the duration of the syncPendingRecords() await, not per-request), so a
+ * new trigger firing mid-pass (e.g. the 45s interval ticking while a large
+ * backlog is still being chunked through) is still correctly suppressed by
+ * the existing `if (!tenantId || isSyncingRef.current) return;` guard in
+ * triggerSync() below — no changes needed there.
  */
 export function useSyncWorker(tenantId?: string) {
   const [isSyncing, setIsSyncing] = useState(false);
@@ -457,11 +746,6 @@ export function useSyncWorker(tenantId?: string) {
     0
   ) ?? 0;
 
-  // [FIX — PERIODIC INTERVAL STABILITY] Mirrors the live pendingCount into
-  // a ref on every render, so the periodic-interval effect below can read
-  // the CURRENT value inside its callback without needing pendingCount in
-  // its own dependency array (which would tear down and recreate the
-  // interval on every pendingCount change — see the file-header FIX note).
   const pendingCountRef = useRef(pendingCount);
   useEffect(() => {
     pendingCountRef.current = pendingCount;
@@ -476,7 +760,6 @@ export function useSyncWorker(tenantId?: string) {
     }, 2000);
   }, [triggerSync]);
 
-  // Trigger 1 — 0 -> positive pendingCount transition (new local work).
   const prevPendingCountRef = useRef<number | null>(null);
   useEffect(() => {
     if (!tenantId) return;
@@ -494,7 +777,6 @@ export function useSyncWorker(tenantId?: string) {
     prevPendingCountRef.current = pendingCount;
   }, [tenantId, pendingCount, scheduleSync]);
 
-  // Trigger 2 — real browser online reconnect event.
   useEffect(() => {
     if (!tenantId || typeof window === "undefined") return;
 
@@ -509,24 +791,8 @@ export function useSyncWorker(tenantId?: string) {
         clearTimeout(debounceTimerRef.current);
       }
     };
-    // [FIX — PERIODIC INTERVAL STABILITY] pendingCount removed from this
-    // effect's dependency array too, for the same reason as trigger 3
-    // below — handleOnline reads the live value via pendingCountRef
-    // instead, so the listener no longer needs to be torn down and
-    // re-added on every pendingCount change.
   }, [tenantId, scheduleSync]);
 
-  // Trigger 3 — periodic 45s safety net. Covers the case where a
-  // RETRY_LATER item is stuck PENDING on a device that never actually
-  // loses connectivity (so trigger 2 never fires) and where no new local
-  // work is created afterward (so trigger 1 never fires either).
-  //
-  // [FIX — PERIODIC INTERVAL STABILITY] This effect now depends only on
-  // [tenantId, triggerSync] — NOT on pendingCount — so the interval is
-  // created once per mount/tenant and ticks reliably every 45s. The
-  // callback reads the CURRENT pending count via pendingCountRef.current
-  // at fire time, so it still behaves correctly (a no-op when nothing is
-  // pending) without needing pendingCount as a dependency.
   useEffect(() => {
     if (!tenantId) return;
 

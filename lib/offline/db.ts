@@ -72,6 +72,13 @@ export interface OfflineInvoice {
   id?: number;
   tenantId: string;
   offlineId: string;
+  /**
+   * [T4f] Persisted upon successful sync from the server's SyncItemResult.realId.
+   * Allows local client surfaces (e.g. CheckoutSuccessModal or OfflineVoidPanel)
+   * to immediately know the server-side Invoice.id when status === "SYNCED" without
+   * requiring an extra network lookup.
+   */
+  serverId?: string | null;
   customerId?: string;
   offlineCustomerId?: string;
   items: OfflineInvoiceItem[];
@@ -134,6 +141,43 @@ export interface CachedTenantSettings {
   tenantId: string;
   dailyExchangeRate: string;
   cachedAt: Date;
+}
+
+/**
+ * [T4f — Rule 4] A DEVICE-scoped setting row, keyed by a stable setting name.
+ *
+ * Deliberately carries NO `tenantId` and NO `userId`: Rule 4 requires the
+ * thermal printer's width to persist on THIS DEVICE and "not follow the user
+ * or tenant to a different device" — and the same tenant's cashiers may use
+ * different physical printers on different devices, so a tenant-level field
+ * would be wrong even if it were convenient. The absence of both fields is
+ * asserted mechanically (lib/receipts/__tests__/t4f-printer-config.test.ts),
+ * not merely intended.
+ *
+ * Fields are printer-specific rather than a generic JSON blob so that a
+ * half-written or hand-edited row cannot be silently interpreted as "some
+ * other shape": an unknown `key` is ignored by the reader, and a row whose
+ * `printerIsConfirmed` is not an explicit `true` is treated as UNCONFIRMED —
+ * never as "close enough".
+ */
+export interface DeviceSetting {
+  /** Primary key — e.g. lib/receipts/printer-config.ts's "thermal-printer". */
+  key: string;
+  /** The paper width the human selected (80mm / 58mm). */
+  printerPaperWidth?: "80mm" | "58mm";
+  /**
+   * The dots-per-line value in force. Only ever written together with
+   * `printerIsConfirmed: true` — see printer-config.ts's confirmPrinterConfig().
+   */
+  printerDotsPerLine?: number;
+  /**
+   * Explicit human confirmation that this is the printer's real print-head
+   * width. Mirrors T3a's BarcodeSource rule: an unconfirmed value is its own
+   * distinct state and is NEVER silently coerced into a usable one.
+   */
+  printerIsConfirmed?: boolean;
+  printerConfirmedAt?: Date;
+  updatedAt: Date;
 }
 
 export interface CachedProductUnit {
@@ -242,6 +286,8 @@ export class OfflineDatabase extends Dexie {
   cachedProducts!: Table<CachedProduct, string>;
   cachedCustomers!: Table<CachedCustomer, string>;
   cachedSession!: Table<CachedSession, string>;
+  /** [T4f — Rule 4] Device-scoped settings (currently: the thermal printer). */
+  deviceSettings!: Table<DeviceSetting, string>;
 
   constructor() {
     super("JomlaTechOffline");
@@ -257,6 +303,38 @@ export class OfflineDatabase extends Dexie {
       cachedCustomers: "id, tenantId, phone, isSystemGenerated, [tenantId+phone]",
       cachedSession: "userId, tenantId, cachedAt",
     });
+
+    // [T4f — Rule 4] version(2): the device-scoped settings table.
+    //
+    // Restates all seven v1 schemas verbatim alongside the new one, so the
+    // complete shape of version 2 is readable in a single place rather than
+    // having to be mentally merged from two deltas (Dexie merges version
+    // blocks either way; restating just removes the ambiguity).
+    //
+    // `deviceSettings` is keyed by a plain setting name ("thermal-printer") and
+    // is intentionally NOT tenant- or user-scoped — see the DeviceSetting
+    // interface above and lib/receipts/printer-config.ts.
+    this.version(2)
+      .stores({
+        offlineInvoices:
+          "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+        offlinePayments:
+          "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+        offlineCustomers: "++id, &offlineId, tenantId, status, createdAt",
+        cachedTenantSettings: "tenantId, cachedAt",
+        cachedProducts: "id, tenantId, isActive, [tenantId+isActive]",
+        cachedCustomers: "id, tenantId, phone, isSystemGenerated, [tenantId+phone]",
+        cachedSession: "userId, tenantId, cachedAt",
+        deviceSettings: "key",
+      })
+      .upgrade(async () => {
+        // Intentional no-op. `deviceSettings` is a brand-new table with no
+        // predecessor, so there is no existing row to backfill or rewrite —
+        // Dexie creates it empty on open. The callback exists because this
+        // file's own rule below requires a matching .upgrade() for every new
+        // version block: an explicit "nothing to migrate" is a statement that
+        // the upgrade path was considered, not an omission.
+      });
 
     // Any future table/field addition must land as a NEW
     // version(N).stores({...}) block with a matching .upgrade()

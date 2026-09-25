@@ -19,6 +19,9 @@ import {
 } from "lucide-react";
 import type { OfflineInvoice, SelectedCustomer, CartLineItem } from "@/lib/offline";
 import { formatMoney, compareMoney, multiplyMoney } from "@/lib/utils/money";
+import { ReceiptActions } from "@/components/receipts/receipt-actions";
+import { itemNamesFromCartLines } from "@/lib/receipts/local-receipt-source";
+import type { LocalReceiptSource } from "@/lib/receipts/receipt-model";
 
 interface CheckoutSuccessModalProps {
   open: boolean;
@@ -27,6 +30,12 @@ interface CheckoutSuccessModalProps {
   customer: SelectedCustomer | null;
   items: CartLineItem[];
   onStartNewSale: () => void;
+  /**
+   * [T4f] Opens pos-layout's printer settings popover when a thermal print fails
+   * because this device has no confirmed printer width yet — so a first-time
+   * printer setup is one click away from the receipt the cashier was printing.
+   */
+  onPrinterSetupRequired?: () => void;
 }
 
 export function CheckoutSuccessModal({
@@ -36,6 +45,7 @@ export function CheckoutSuccessModal({
   customer,
   items,
   onStartNewSale,
+  onPrinterSetupRequired,
 }: CheckoutSuccessModalProps) {
   if (!invoice) return null;
 
@@ -55,6 +65,27 @@ export function CheckoutSuccessModal({
   const paymentLabel = currentMethod
     ? paymentMethodLabels[currentMethod] || currentMethod
     : "على الحساب بالكامل (دين)";
+
+  /**
+   * [T4f — Rule 1's "local fast path"] The cart's own line items still carry the
+   * product and unit NAMES, so the receipt source is assembled here with no Dexie
+   * read at all: the thermal print of this brand-new, still-PENDING invoice
+   * touches the catalog cache zero times. (Anywhere the names are NOT in hand,
+   * buildLocalReceiptSource() reads them from cachedProducts instead.)
+   */
+  const receiptSource: LocalReceiptSource = {
+    source: "local",
+    invoice,
+    customerName: customer ? customer.name : "",
+    itemNames: itemNamesFromCartLines(
+      items.map((line) => ({
+        productId: line.product.id,
+        productName: line.product.name,
+        unitId: line.unitId,
+        unitName: line.unitName,
+      }))
+    ),
+  };
 
   // [v3.6] FIX — was checking debtAmountUSD (derived/informational).
   // debtAmountSYP is the authoritative field on OfflineInvoice
@@ -272,30 +303,51 @@ export function CheckoutSuccessModal({
         </div>
 
         {/* Action Buttons */}
-        <div className="flex items-center justify-between gap-3 pt-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handlePrint}
-            className="text-xs gap-1.5"
-          >
-            <Printer className="h-4 w-4" />
-            طباعة إيصال الفاتورة
-          </Button>
+        <div className="space-y-2 pt-2">
+          {/*
+            [T4f] Thermal ESC/POS printing (Web Bluetooth) + the gated PDF share.
 
-          <Button
-            type="button"
+            The thermal button reads ONLY this device's Dexie row and the local
+            catalog names — no request, no server row, no receiptPdfUrl — so it
+            works on this still-PENDING invoice. The share button is DISABLED
+            (not hidden) with "شارك بعد اكتمال المزامنة" until the background sync
+            gives the invoice a server-side row, and enables itself the moment
+            that happens (a live Dexie query, no reload).
+          */}
+          <ReceiptActions
+            source={receiptSource}
+            offlineId={invoice.offlineId}
+            serverInvoiceId={invoice.serverId ?? null}
             size="sm"
-            onClick={() => {
-              onOpenChange(false);
-              onStartNewSale();
-            }}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold gap-1.5 px-6"
-          >
-            <PlusCircle className="h-4 w-4" />
-            فاتورة جديدة (جديد)
-          </Button>
+            onPrinterSetupRequired={onPrinterSetupRequired}
+          />
+
+          <div className="flex items-center justify-between gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handlePrint}
+              className="text-xs gap-1.5"
+              title="طباعة الإيصال عبر نافذة المتصفح — بديل عند عدم دعم Web Bluetooth (مثل iOS)"
+            >
+              <Printer className="h-4 w-4" />
+              طباعة من المتصفح
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => {
+                onOpenChange(false);
+                onStartNewSale();
+              }}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold gap-1.5 px-6"
+            >
+              <PlusCircle className="h-4 w-4" />
+              فاتورة جديدة (جديد)
+            </Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

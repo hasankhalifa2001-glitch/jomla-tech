@@ -253,6 +253,14 @@ export interface InvoiceDetail {
     paidAmountUSD: string;
     debtAmountSYP: string;
     debtAmountUSD: string;
+    /**
+     * [T4f] The cached, server-generated receipt PDF for this invoice, if one
+     * has ever been generated. Null until the FIRST share (see
+     * lib/data/receipts.ts's cacheReceiptPdfOnce()) — so this field answers
+     * "can I share an already-cached file without rendering anything?" and
+     * never "may I share at all" (that is the sync-state gate, Rule 1).
+     */
+    receiptPdfUrl: string | null;
     voidReason: string | null;
     voidsInvoiceId: string | null;
     voidedByInvoiceId: string | null;
@@ -283,6 +291,9 @@ export async function findInvoiceDetail(
             id: true, createdAt: true, status: true, totalSYP: true, totalUSD: true,
             exchangeRateUsed: true, paidAmountSYP: true, paidAmountUSD: true,
             debtAmountSYP: true, debtAmountUSD: true, voidReason: true, voidsInvoiceId: true,
+            // [T4f] The cached receipt PDF URL, so the detail view can share an
+            // already-generated file without rendering one again.
+            receiptPdfUrl: true,
             // Only its userId is ever needed — see originalInvoiceUserId on
             // InvoiceDetail for why this relation is resolved at all.
             voidsInvoice: { select: { userId: true } },
@@ -316,6 +327,8 @@ export async function findInvoiceDetail(
         paidAmountUSD: invoice.paidAmountUSD.toString(),
         debtAmountSYP: invoice.debtAmountSYP.toString(),
         debtAmountUSD: invoice.debtAmountUSD.toString(),
+        // [T4f]
+        receiptPdfUrl: invoice.receiptPdfUrl,
         voidReason: invoice.voidReason,
         voidsInvoiceId: invoice.voidsInvoiceId,
         voidedByInvoiceId: invoice.voidedBy?.id ?? null,
@@ -335,5 +348,65 @@ export async function findInvoiceDetail(
             unitPriceSYP: item.unitPriceSYP.toString(),
             unitPriceUSD: item.unitPriceUSD.toString(),
         })),
+    };
+}
+
+/**
+ * [T4f / T4c2] Shared ownership check for viewing / printing / sharing an invoice.
+ *
+ * Rules:
+ * - ADMIN: unrestricted access across the tenant.
+ * - CASHIER: allowed if they created the invoice (invoice.userId === sessionUser.id),
+ *   OR if this invoice is a VOID that reverses their own original sale
+ *   (invoice.originalInvoiceUserId === sessionUser.id).
+ * - Any other case is forbidden (403).
+ */
+export function canSessionUserAccessInvoice(
+    sessionUser: { id: string; role: string },
+    invoice: { userId: string; originalInvoiceUserId: string | null }
+): boolean {
+    if (sessionUser.role !== "CASHIER") return true;
+    return (
+        invoice.userId === sessionUser.id ||
+        invoice.originalInvoiceUserId === sessionUser.id
+    );
+}
+
+export interface InvoiceAccessRow {
+    id: string;
+    userId: string;
+    originalInvoiceUserId: string | null;
+    status: InvoiceStatus;
+    receiptPdfUrl: string | null;
+}
+
+/**
+ * Lightweight access check query used by receipt generation / status check routes
+ * that do not require loading all InvoiceItems.
+ */
+export async function findInvoiceAccessRow(
+    db: TxOrClient,
+    tenantId: string,
+    invoiceId: string
+): Promise<InvoiceAccessRow | null> {
+    const invoice = await db.invoice.findUnique({
+        where: { id: invoiceId, tenantId },
+        select: {
+            id: true,
+            userId: true,
+            status: true,
+            receiptPdfUrl: true,
+            voidsInvoice: { select: { userId: true } },
+        },
+    });
+
+    if (!invoice) return null;
+
+    return {
+        id: invoice.id,
+        userId: invoice.userId,
+        status: invoice.status,
+        receiptPdfUrl: invoice.receiptPdfUrl,
+        originalInvoiceUserId: invoice.voidsInvoice?.userId ?? null,
     };
 }

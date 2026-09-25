@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { getTenantDb } from "@/lib/db/tenant-scope";
-import { findInvoiceDetail } from "@/lib/data/invoices";
+import { findInvoiceDetail, canSessionUserAccessInvoice } from "@/lib/data/invoices";
 
 /**
  * T4c2 — GET /api/invoices/[id]
@@ -63,14 +63,9 @@ export async function GET(
         // voiding ADMIN (T4d), never the original seller — so checking
         // only `invoice.userId` here made a void unreachable for the
         // very cashier whose own sale it reverses, breaking T4c2's
-        // "navigable from either side" cross-link guarantee. Now also
-        // allows access when the cashier owns the ORIGINAL invoice this
-        // row voids (see lib/data/invoices.ts's originalInvoiceUserId).
-        if (
-            session.user.role === "CASHIER" &&
-            invoice.userId !== session.user.id &&
-            invoice.originalInvoiceUserId !== session.user.id
-        ) {
+        // "navigable from either side" cross-link guarantee.
+        // Uses shared canSessionUserAccessInvoice helper.
+        if (!canSessionUserAccessInvoice(session.user, invoice)) {
             return NextResponse.json(
                 { error: "FORBIDDEN", message: "لا يمكنك عرض فاتورة موظف آخر." },
                 { status: 403 }

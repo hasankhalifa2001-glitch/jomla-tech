@@ -124,6 +124,63 @@ const NESTED_WRITE_RULE = {
     "Nested create/update/upsert/set/disconnect on tenant-scoped models is forbidden because it bypasses tenant isolation. Perform separate top-level model operations inside a $transaction instead.",
 };
 
+// ============================================================================
+// [T4f — Rule 4] WEB BLUETOOTH CONFINEMENT (the static-analysis criterion).
+//
+// Rule 4's first acceptance criterion asks for a static check that no code path
+// can infer a printer's dots-per-line from Bluetooth device metadata:
+//
+//   "No code path infers dots-per-line from Bluetooth device metadata or from
+//    paper-width selection alone without an explicit, confirmable value — a
+//    static-analysis check mirroring T3a's 'no inference from digit pattern'
+//    verification."
+//
+// The decisive half of that is structural rather than semantic: if exactly ONE
+// file in the codebase can reach Web Bluetooth at all, then no other file can
+// infer a width from a device, because no other file can reach a device. So
+// these three selectors ban every route to the API everywhere except
+// lib/receipts/bluetooth-printer.ts:
+//
+//   navigator.bluetooth      — the only entry point to a device
+//   <anything>.gatt          — service discovery, where a model/resolution
+//                              could be snooped out of the device
+//   <anything>.requestDevice — the pairing call
+//
+// WHY A SEPARATE RULE KEY RATHER THAN MORE no-restricted-syntax SELECTORS:
+// ESLint flat config REPLACES a rule's entire configuration at the last
+// matching entry, so appending these selectors to the untargeted
+// `no-restricted-syntax` array would mean every per-file override in this file
+// (lib/offline/**, lib/data/invoices.ts, units.ts, base-unit.ts, the inventory
+// route DTO files, seed.ts, tenant-scope.ts) silently DROPPED the ban for
+// itself — lib/offline/** included, which is exactly where a stray Bluetooth
+// call would be most plausible. `no-restricted-properties` is a DISTINCT rule
+// key, so it composes additively with every existing block instead of
+// competing with them, and it is the idiomatic ESLint construct for "ban this
+// member access".
+//
+// The independent, source-level counterpart of this check lives in
+// lib/receipts/__tests__/t4f-printer-config.test.ts, which scans
+// printer-config.ts's own source for these identifiers — following the
+// precedent of lib/offline/__tests__/t4d-offline-void.test.ts's source scans, so
+// the guarantee survives someone deleting the lint rule.
+// ============================================================================
+
+const T4F_BLUETOOTH_ONLY_FILE = "lib/receipts/bluetooth-printer.ts";
+
+const T4F_BLUETOOTH_CONFINEMENT_MESSAGE =
+  "Web Bluetooth is confined to lib/receipts/bluetooth-printer.ts. Rule 4 requires the printer's dots-per-line to be an explicit, per-device, human-confirmed setting — it is never inferred from device metadata (name / GATT / model), and a second call site is exactly how that inference would creep in.";
+
+const T4F_NO_RESTRICTED_PROPERTIES = [
+  "error",
+  {
+    object: "navigator",
+    property: "bluetooth",
+    message: T4F_BLUETOOTH_CONFINEMENT_MESSAGE,
+  },
+  { property: "gatt", message: T4F_BLUETOOTH_CONFINEMENT_MESSAGE },
+  { property: "requestDevice", message: T4F_BLUETOOTH_CONFINEMENT_MESSAGE },
+];
+
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
@@ -144,6 +201,10 @@ const eslintConfig = defineConfig([
         QUERY_RAW_RULE,
         NESTED_WRITE_RULE,
       ],
+      // [T4f — Rule 4] Active for EVERY file; the single sanctioned transport
+      // re-enables it via its own override at the end of this config. See the
+      // T4F block above for why this is not inside no-restricted-syntax.
+      "no-restricted-properties": T4F_NO_RESTRICTED_PROPERTIES,
       "no-restricted-imports": [
         "error",
         {
@@ -346,6 +407,24 @@ const eslintConfig = defineConfig([
     ],
     rules: {
       "no-restricted-imports": "off",
+    },
+  },
+  {
+    // [T4f — Rule 4] The ONE sanctioned Web Bluetooth call site: the ESC/POS
+    // transport itself (requestThermalPrinter / printEscPosBytes /
+    // isPrinterConnected / disconnectThermalPrinter). Every other file in the
+    // project is covered by the untargeted `no-restricted-properties` rule added
+    // to the global block above — see the T4F block's comment for why the ban
+    // is a separate rule key.
+    //
+    // Note what this override deliberately does NOT do: it replaces only
+    // `no-restricted-properties`. This file is still inside lib/**, so
+    // QUERY_RAW_RULE, NESTED_WRITE_RULE and BASE_UNIT_ID_RULES /
+    // CONVERSION_FACTOR_RULES / PRODUCT_MODEL_RULES all remain in force here —
+    // a whole-rule-family "off" would have silently loosened them.
+    files: [T4F_BLUETOOTH_ONLY_FILE],
+    rules: {
+      "no-restricted-properties": "off",
     },
   },
 ]);
