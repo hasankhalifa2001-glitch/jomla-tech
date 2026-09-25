@@ -412,7 +412,7 @@ describe("Rule 1(b,c,d) — share is gated on sync state, and only then touches 
     expect(result).toEqual({ kind: "generated", url: "https://cdn.example/receipt.pdf" });
     expect(renderRaster).toHaveBeenCalledTimes(1);
     expect(cacheRaster).toHaveBeenCalledTimes(1);
-    expect(cacheRaster.mock.calls[0][0]).toBe("invoice-1");
+    expect(cacheRaster).toHaveBeenCalledWith("invoice-1", expect.any(Blob));
     expect(deliverPdf).toHaveBeenCalledWith("https://cdn.example/receipt.pdf");
   });
 
