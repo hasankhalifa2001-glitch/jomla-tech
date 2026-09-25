@@ -65,19 +65,36 @@ export default auth((req) => {
         resolveTenantSlugFromStorePath(pathname) || resolveTenantSlugFromHost(host);
 
     // ── 1a. Explicit sub-link rewrite: /store/tenantSlug/... -> /tenantSlug/...
+    //
+    // [FIX — DNS_HOSTNAME_RESOLVED_PRIVATE] Previously built the rewrite target
+    // via `new URL(targetPath, req.url)`. On Vercel, `req.url` inside a
+    // NextAuth-wrapped Edge middleware is not guaranteed to carry the public
+    // request origin — it can resolve to an internal/private host, which then
+    // makes Vercel treat NextResponse.rewrite(...) as a rewrite to an EXTERNAL
+    // target and reject it with 404 DNS_HOSTNAME_RESOLVED_PRIVATE before the
+    // request ever reaches application code. `req.nextUrl` (NextURL) is the
+    // platform-correct source of truth for the current request's public
+    // origin/pathname inside middleware — cloning it and only mutating
+    // `pathname` guarantees the rewrite target always shares the exact same,
+    // correct origin as the incoming request, on every environment
+    // (localhost, preview, and production alike).
     if (pathname.startsWith("/store/")) {
         const segments = pathname.split("/").filter(Boolean);
         if (segments.length >= 2) {
             const slug = segments[1];
             const rest = segments.slice(2).join("/");
             const targetPath = `/${slug}${rest ? `/${rest}` : ""}`;
-            const rewritten = NextResponse.rewrite(new URL(targetPath, req.url));
+            const rewrittenUrl = req.nextUrl.clone();
+            rewrittenUrl.pathname = targetPath;
+            const rewritten = NextResponse.rewrite(rewrittenUrl);
             rewritten.headers.set("x-tenant-slug", slug);
             return rewritten;
         }
     }
 
     // ── 1b. Subdomain rewrite: tenant.domain.com -> /tenantSlug
+    // [FIX — same DNS_HOSTNAME_RESOLVED_PRIVATE issue as 1a] Same
+    // req.nextUrl.clone() + pathname-only mutation fix applied here.
     const subdomainSlug = resolveTenantSlugFromHost(host);
 
     if (subdomainSlug) {
@@ -90,9 +107,9 @@ export default auth((req) => {
             pathname.startsWith("/account-locked");
 
         if (!isReservedPath && !pathname.startsWith(`/${subdomainSlug}`)) {
-            const rewritten = NextResponse.rewrite(
-                new URL(`/${subdomainSlug}${pathname}`, req.url)
-            );
+            const rewrittenUrl = req.nextUrl.clone();
+            rewrittenUrl.pathname = `/${subdomainSlug}${pathname}`;
+            const rewritten = NextResponse.rewrite(rewrittenUrl);
             rewritten.headers.set("x-tenant-slug", subdomainSlug);
             return rewritten;
         }
