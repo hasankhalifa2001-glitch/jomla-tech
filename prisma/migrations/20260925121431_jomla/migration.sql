@@ -25,6 +25,9 @@ CREATE TYPE "ReportStatus" AS ENUM ('PENDING', 'RESOLVED', 'DISMISSED');
 -- CreateEnum
 CREATE TYPE "B2BOrderStatus" AS ENUM ('PENDING_REVIEW', 'APPROVED', 'REJECTED');
 
+-- CreateEnum
+CREATE TYPE "CustomerMergeRecordType" AS ENUM ('INVOICE', 'PAYMENT');
+
 -- CreateTable
 CREATE TABLE "Tenant" (
     "id" TEXT NOT NULL,
@@ -286,6 +289,18 @@ CREATE TABLE "CustomerMergeLog" (
 );
 
 -- CreateTable
+CREATE TABLE "CustomerMergeLogItem" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "mergeLogId" TEXT NOT NULL,
+    "recordType" "CustomerMergeRecordType" NOT NULL,
+    "recordId" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "CustomerMergeLogItem_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "StockAdjustment" (
     "id" TEXT NOT NULL,
     "tenantId" TEXT NOT NULL,
@@ -491,6 +506,18 @@ CREATE INDEX "CustomerMergeLog_tenantId_idx" ON "CustomerMergeLog"("tenantId");
 CREATE INDEX "CustomerMergeLog_survivingCustomerId_idx" ON "CustomerMergeLog"("survivingCustomerId");
 
 -- CreateIndex
+CREATE INDEX "CustomerMergeLogItem_tenantId_idx" ON "CustomerMergeLogItem"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "CustomerMergeLogItem_mergeLogId_idx" ON "CustomerMergeLogItem"("mergeLogId");
+
+-- CreateIndex
+CREATE INDEX "CustomerMergeLogItem_recordId_idx" ON "CustomerMergeLogItem"("recordId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "CustomerMergeLogItem_mergeLogId_recordType_recordId_key" ON "CustomerMergeLogItem"("mergeLogId", "recordType", "recordId");
+
+-- CreateIndex
 CREATE INDEX "StockAdjustment_tenantId_idx" ON "StockAdjustment"("tenantId");
 
 -- CreateIndex
@@ -615,6 +642,12 @@ ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_mergedCustomerId
 
 -- AddForeignKey
 ALTER TABLE "CustomerMergeLog" ADD CONSTRAINT "CustomerMergeLog_performedByUserId_fkey" FOREIGN KEY ("performedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerMergeLogItem" ADD CONSTRAINT "CustomerMergeLogItem_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerMergeLogItem" ADD CONSTRAINT "CustomerMergeLogItem_mergeLogId_fkey" FOREIGN KEY ("mergeLogId") REFERENCES "CustomerMergeLog"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;

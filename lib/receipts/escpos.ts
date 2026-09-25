@@ -34,7 +34,15 @@ import { RASTER_PIXEL_ALIGNMENT } from "./constraints";
 export const ESC_POS_INIT = 0x1b; // ESC
 export const ESC_POS_GS = 0x1d; // GS
 
-/** GS v 0 accepts at most 255 rows per band (yL/yH is a byte pair). */
+/**
+ * Per-band row cap actually enforced by this encoder. The GS v 0 protocol
+ * itself allows up to 65535 rows per band (yL/yH is a 16-bit little-endian
+ * pair, not a single byte) — 255 here is a deliberately conservative safety
+ * margin against cheap 58/80mm printers' small raster input buffers, not a
+ * protocol limit. Splitting into more, smaller bands than the protocol
+ * strictly requires costs a little header overhead; it never risks a
+ * malformed or truncated raster.
+ */
 export const ESC_POS_MAX_BAND_ROWS = 255;
 
 /** Conservative BLE ATT payload: the default 23-byte MTU minus 3 bytes of
@@ -229,10 +237,19 @@ export function buildRasterCommands(
   const maxBandRows = options.maxBandRows ?? ESC_POS_MAX_BAND_ROWS;
   const feedLines = options.feedLines ?? 4;
 
+  // ESC d n's n is a single byte (0-255). A value outside that range would
+  // previously be silently truncated by the `& 0xff` mask below (e.g. 260
+  // would become 4) — now it fails loudly instead, consistent with every
+  // other width/size validation in this file.
+  if (!Number.isInteger(feedLines) || feedLines < 0 || feedLines > 0xff) {
+    throw new Error(
+      `ESC/POS: feedLines must be an integer between 0 and 255, received ${feedLines}.`
+    );
+  }
+
   if (raster.data.length !== bytesPerRow * raster.heightDots) {
     throw new Error(
-      `ESC/POS: raster buffer is ${raster.data.length} bytes but ${bytesPerRow} bytes/row × ${raster.heightDots} rows = ${
-        bytesPerRow * raster.heightDots
+      `ESC/POS: raster buffer is ${raster.data.length} bytes but ${bytesPerRow} bytes/row × ${raster.heightDots} rows = ${bytesPerRow * raster.heightDots
       } was expected.`
     );
   }
@@ -274,8 +291,7 @@ export function assertRasterMatchesConfiguredWidth(
   const expectedBytes = bytesPerRowForWidth(configuredDotsPerLine) * raster.heightDots;
   if (raster.data.length !== expectedBytes) {
     throw new Error(
-      `ESC/POS: raster payload is ${raster.data.length} bytes, expected ${expectedBytes} for ${
-        configuredDotsPerLine
+      `ESC/POS: raster payload is ${raster.data.length} bytes, expected ${expectedBytes} for ${configuredDotsPerLine
       } dots × ${raster.heightDots} rows.`
     );
   }

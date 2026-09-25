@@ -32,7 +32,7 @@ import {
   PNG_IHDR_TYPE_OFFSET,
   PNG_MAGIC_BYTES,
   PNG_WIDTH_OFFSET,
-  RECEIPT_PDF_MIME,
+  RECEIPT_RASTER_MIME,
   RECEIPT_PDF_RASTER_WIDTH,
 } from "./constraints";
 
@@ -82,7 +82,10 @@ export function validateReceiptRasterPng(
 
   // 1. Declared content type — checked first because it is the cheapest, and
   //    because a browser sending this is a bug worth naming precisely.
-  if (declaredContentType !== RECEIPT_PDF_MIME) {
+  //    Compared against RECEIPT_RASTER_MIME (the uploaded PNG's type), never
+  //    RECEIPT_PDF_MIME (the final cached artifact's type) — the two are
+  //    deliberately distinct constants in constraints.ts.
+  if (declaredContentType !== RECEIPT_RASTER_MIME) {
     throw new ReceiptRasterValidationError(
       "CONTENT_TYPE",
       `صيغة الإيصال غير مدعومة (${declaredContentType ?? "غير محددة"}) — الصيغة المطلوبة PNG فقط.`

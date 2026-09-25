@@ -36,9 +36,16 @@
  * contains no navigator.bluetooth / gatt / requestDevice reference at all, so
  * "width could be inferred from the device" stays mechanically false rather
  * than merely reviewed.
+ *
+ * [FIX] validateDotsPerLine() previously hardcoded the literal `8` for the
+ * "must be a byte-aligned width" rule, duplicating constraints.ts's
+ * RASTER_PIXEL_ALIGNMENT (the same constant escpos.ts's
+ * bytesPerRowForWidth() already enforces this rule against). Now imported
+ * and referenced directly, so the two checks can never drift apart.
  */
 
 import { getOfflineDb, isOfflineDbSupported, type DeviceSetting } from "@/lib/offline/db";
+import { RASTER_PIXEL_ALIGNMENT } from "./constraints";
 
 export type PaperWidth = "80mm" | "58mm";
 
@@ -117,8 +124,9 @@ export function createUnconfirmedPrinterConfig(
 
 /**
  * Validates a human-entered dots-per-line value. Must be a positive integer, a
- * multiple of 8 (thermal heads address whole bytes per line — see escpos.ts's
- * bytesPerRowForWidth), and within MAX_DOTS_PER_LINE.
+ * multiple of RASTER_PIXEL_ALIGNMENT (thermal heads address whole bytes per
+ * line — see escpos.ts's bytesPerRowForWidth(), which enforces the identical
+ * rule from the same constant), and within MAX_DOTS_PER_LINE.
  */
 export function validateDotsPerLine(value: number): number {
   if (!Number.isInteger(value)) {
@@ -128,12 +136,12 @@ export function validateDotsPerLine(value: number): number {
   }
   if (value <= 0 || value > MAX_DOTS_PER_LINE) {
     throw new InvalidPrinterWidthError(
-      `عدد النقاط في السطر يجب أن يكون بين 8 و ${MAX_DOTS_PER_LINE} (تم إدخال ${value}).`
+      `عدد النقاط في السطر يجب أن يكون بين ${RASTER_PIXEL_ALIGNMENT} و ${MAX_DOTS_PER_LINE} (تم إدخال ${value}).`
     );
   }
-  if (value % 8 !== 0) {
+  if (value % RASTER_PIXEL_ALIGNMENT !== 0) {
     throw new InvalidPrinterWidthError(
-      `عدد النقاط في السطر يجب أن يكون من مضاعفات 8 لأن الطابعة الحرارية تعنون الخط بالبايت (تم إدخال ${value}).`
+      `عدد النقاط في السطر يجب أن يكون من مضاعفات ${RASTER_PIXEL_ALIGNMENT} لأن الطابعة الحرارية تعنون الخط بالبايت (تم إدخال ${value}).`
     );
   }
   return value;

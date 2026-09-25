@@ -38,6 +38,28 @@
  * works for status PENDING, FAILED and SYNCED, and for a local void record
  * alike. Do not add a fetch here — Rule 1's first acceptance criterion is
  * precisely that there is none.
+ *
+ * [FIX — serverInvoiceId now actually used] `share-gate.ts`'s own header
+ * documents the intent explicitly: "[serverInvoiceId] is carried here only so
+ * the caller can decide whether it must resolve the id before acting". Before
+ * this fix, the device-local branch of `resolveTarget` ignored the prop
+ * entirely and always issued a GET /api/invoices/by-offline-id — even when the
+ * caller (e.g. pos-layout, once OfflineInvoice.serverId is known post-sync)
+ * already had the id in hand. Now, when `serverInvoiceId` is supplied, we skip
+ * that round-trip and build the ShareTarget directly.
+ *
+ * We deliberately do NOT also fetch a cached receiptPdfUrl for this fast path.
+ * We pass `receiptPdfUrl: null`, which tells share-flow.ts "treat this as if no
+ * PDF is cached yet". This is SAFE, not merely convenient: the server-side
+ * write in lib/data/receipts.ts's cacheReceiptPdfOnce() is a conditional
+ * UPDATE ... WHERE receiptPdfUrl IS NULL — if a PDF was in fact already cached
+ * (e.g. shared earlier from another device/tab), that UPDATE simply loses the
+ * race (count === 0), and cacheReceiptPdfOnce() re-reads and returns the
+ * existing URL instead. So the worst case here is one redundant raster
+ * render + upload attempt on an already-shared invoice, never a wrong or
+ * duplicated artifact. This keeps the fast path to zero extra requests instead
+ * of adding a second lightweight "does this invoice already have a PDF"
+ * lookup, at the cost of that rare redundant upload.
  */
 
 import { useState } from "react";
@@ -83,7 +105,12 @@ export interface ReceiptActionsProps {
    * the instant its background sync lands.
    */
   offlineId?: string | null;
-  /** The server Invoice id when already known (OfflineInvoice.serverId, or detail.id). */
+  /**
+   * The server Invoice id when already known (OfflineInvoice.serverId, or
+   * detail.id). When set, the share flow's `resolveTarget` uses it directly
+   * instead of issuing a GET /api/invoices/by-offline-id lookup — see the
+   * [FIX] note above.
+   */
   serverInvoiceId?: string | null;
   /** "default" on a modal's action row, "sm" in a dense list row. */
   size?: "sm" | "default";
@@ -186,8 +213,17 @@ export function ReceiptActions({
             };
           }
 
-          // Device-local: ONE request resolves both the server id and whether a
-          // PDF was already cached for it.
+          // Device-local, but the caller already told us the server id (e.g.
+          // this invoice has already synced and the caller carries
+          // OfflineInvoice.serverId). Skip the network round-trip entirely —
+          // see the [FIX] note in this file's header for why passing
+          // receiptPdfUrl: null here is safe, not merely convenient.
+          if (serverInvoiceId) {
+            return { serverInvoiceId, receiptPdfUrl: null };
+          }
+
+          // Device-local, id unknown: the one remaining case that actually
+          // needs the by-offline-id lookup.
           const res = await fetch(
             `/api/invoices/by-offline-id?offlineId=${encodeURIComponent(activeSource.invoice.offlineId)}`,
             { cache: "no-store" }
@@ -314,4 +350,3 @@ export function ReceiptActions({
     </div>
   );
 }
-

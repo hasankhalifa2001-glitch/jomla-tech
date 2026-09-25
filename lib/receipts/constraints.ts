@@ -35,6 +35,13 @@
  * print head so a PDF and a thermal print of the same invoice read the same
  * way — but pinned here as a CONSTANT precisely so no device's configured
  * dots-per-line can ever change it.
+ *
+ * NOTE: 576px at 203dpi is ~72mm — the printable area of an 80mm thermal
+ * head, not the full 80mm paper width (a thermal head cannot print to the
+ * physical edge of the paper). RECEIPT_PDF_PAGE_WIDTH_PT below is
+ * deliberately based on the full 80mm instead: see pdf.ts for why the two
+ * numbers differ on purpose and how that's reconciled when the raster is
+ * placed on the page.
  */
 export const RECEIPT_PDF_RASTER_WIDTH = 576;
 
@@ -53,7 +60,21 @@ export const MAX_RECEIPT_RASTER_HEIGHT = 12_000;
 /** 1 MB — a 576 × 4000 grayscale PNG of pure text is ~100 KB. */
 export const MAX_RECEIPT_RASTER_BYTES = 1_048_576;
 
-export const RECEIPT_PDF_MIME = "image/png";
+/**
+ * MIME type of the intermediate client-rendered raster (the file uploaded
+ * to POST /api/invoices/[id]/receipt as the `raster` field) — NOT the MIME
+ * type of the final cached PDF artifact. Named RECEIPT_RASTER_MIME
+ * (previously, incorrectly, RECEIPT_PDF_MIME) specifically so nothing
+ * mistakes this for the Content-Type of Invoice.receiptPdfUrl.
+ */
+export const RECEIPT_RASTER_MIME = "image/png";
+
+/**
+ * MIME type of the final, cached PDF artifact — Invoice.receiptPdfUrl.
+ * Distinct from RECEIPT_RASTER_MIME above; do not conflate the two when
+ * setting a Content-Type header or storing/serving the cached file.
+ */
+export const RECEIPT_PDF_MIME = "application/pdf";
 
 /** The 8-byte PNG signature (RFC 2083 §3.1), as a plain number array so this
  * module stays usable from both the browser and the Node runtime. */
@@ -66,5 +87,11 @@ export const PNG_IHDR_TYPE_OFFSET = 12; // "IHDR" chunk type
 export const PNG_WIDTH_OFFSET = 16; // IHDR width,  big-endian uint32
 export const PNG_HEIGHT_OFFSET = 20; // IHDR height, big-endian uint32
 
-/** 80 mm page width in PDF points (80 mm / 25.4 × 72). */
+/**
+ * 80 mm page width in PDF points (80 mm / 25.4 × 72) — the FULL paper width,
+ * deliberately larger than RECEIPT_PDF_RASTER_WIDTH's ~72mm printable area.
+ * See pdf.ts: the raster is scaled uniformly (aspect ratio preserved) to
+ * fill this page edge-to-edge, since a PDF viewed on screen has no
+ * thermal-head mechanical margin to reproduce.
+ */
 export const RECEIPT_PDF_PAGE_WIDTH_PT = (80 / 25.4) * 72;

@@ -29,6 +29,18 @@
  * kilobytes, so it is written in small sequential chunks — sequential, not
  * parallel, because most thermal printers have a small input buffer that
  * overflows (garble, dropped bands) if it is flooded.
+ *
+ * [FIX — write-characteristic discovery] findWriteCharacteristic() previously
+ * had two lookup paths: the known-UUID fast path returned whatever
+ * characteristic matched the UUID with NO check that it was actually
+ * writable, while the fallback getCharacteristics() scan correctly checked
+ * `properties.write || properties.writeWithoutResponse`. A device exposing a
+ * non-writable characteristic under one of our known UUIDs (a lookalike/clone
+ * device, or UUID reuse under a different spec) would pass discovery
+ * silently and only fail deep inside the print loop with a NotSupportedError
+ * from writeValue() mid-job. Both paths now apply the same properties check,
+ * so an unwritable characteristic is rejected at discovery time, with the
+ * existing clear Arabic error, instead of mid-print.
  */
 
 import { BLE_DEFAULT_CHUNK_BYTES, chunkBytes } from "./escpos";
@@ -94,6 +106,19 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** True when a characteristic can actually be written to — either write
+ * request or write-without-response. Applied identically on both the
+ * known-UUID fast path and the property-scan fallback below, so a
+ * same-UUID-but-unwritable characteristic is rejected at discovery time,
+ * not mid-print. */
+function isWritableCharacteristic(
+  characteristic: BluetoothRemoteGATTCharacteristic
+): boolean {
+  return Boolean(
+    characteristic.properties?.write || characteristic.properties?.writeWithoutResponse
+  );
+}
+
 async function findWriteCharacteristic(
   gatt: BluetoothRemoteGATTServer
 ): Promise<BluetoothRemoteGATTCharacteristic> {
@@ -108,7 +133,9 @@ async function findWriteCharacteristic(
     for (const characteristicUuid of ESC_POS_WRITE_CHARACTERISTIC_UUIDS) {
       try {
         const characteristic = await service.getCharacteristic(characteristicUuid);
-        if (characteristic) return characteristic;
+        if (characteristic && isWritableCharacteristic(characteristic)) {
+          return characteristic;
+        }
       } catch {
         // Fall through to the property-based search below.
       }
@@ -116,10 +143,7 @@ async function findWriteCharacteristic(
 
     try {
       const characteristics = await service.getCharacteristics();
-      const writable = characteristics.find(
-        (candidate) =>
-          candidate.properties?.write || candidate.properties?.writeWithoutResponse
-      );
+      const writable = characteristics.find(isWritableCharacteristic);
       if (writable) return writable;
     } catch {
       // Service has no usable characteristic list; try the next service.

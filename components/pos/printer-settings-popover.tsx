@@ -14,17 +14,34 @@
  * [EVERY DECISION HERE IS A HUMAN ONE] Nothing in this file infers a
  * dots-per-line value:
  *   - Choosing a paper width PREFILLS the suggested number
- *     (suggestedDotsPerLine) and writes an UNCONFIRMED config. It cannot become
- *     usable by itself.
- *   - The value only becomes usable via «تأكيد» (confirmPrinterConfig), which is
- *     an explicit, timestamped human confirmation. This is T3a's BarcodeSource
- *     precedent applied to hardware: an unconfirmed value is its own state,
- *     never coerced into a usable one.
+ *     (suggestedDotsPerLine) as LOCAL, UNSAVED UI state only — see the [FIX]
+ *     note below. It cannot become usable by itself, and it cannot silently
+ *     overwrite whatever is currently confirmed on this device either.
+ *   - The value only becomes usable, and only gets persisted, via «تأكيد»
+ *     (confirmPrinterConfig), which is an explicit, timestamped human
+ *     confirmation. This is T3a's BarcodeSource precedent applied to
+ *     hardware: an unconfirmed value is its own state, never coerced into a
+ *     usable one.
  *   - The override field lets the user enter what the printer's manual (or a
  *     test print) actually says, validated only for shape by
  *     validateDotsPerLine (positive integer, multiple of 8).
  *   - The test print exists so "verify against physical output" (Rule 4's second
  *     acceptance criterion) has a button, not a wiki page.
+ *
+ * [FIX — paper-width selection no longer clobbers a confirmed config]
+ * `handleSelectWidth` previously called `savePrinterConfig(unconfirmed)`
+ * immediately on tap — writing straight to the SAME Dexie row the real print
+ * path (`printer-config.ts`'s `readPrinterConfig`) reads from. That meant an
+ * accidental or exploratory tap on "58 مم" instantly demoted an already
+ * CONFIRMED, working config (e.g. 80mm/576) back to `isConfirmed: false`,
+ * breaking real thermal printing for this device until someone noticed and
+ * re-confirmed — a one-tap outage with no undo, in a cashier-facing control
+ * used under time pressure. Selecting a width is now purely local component
+ * state (`setConfig`/`setDotsDraft`); Dexie is only written from
+ * `handleConfirm`, i.e. only on the explicit "تأكيد" press. This keeps the
+ * "nothing becomes usable without explicit confirmation" rule consistent in
+ * BOTH directions: an unconfirmed value can't become usable on its own, AND
+ * it can't erase something that already was usable.
  *
  * [THE PAIRED DEVICE IS NEVER ASKED FOR A WIDTH] `handle.name` is displayed for
  * identification only. bluetooth-printer.ts is the only module that touches
@@ -106,7 +123,10 @@ export function PrinterSettingsPopover({
     [onOpenChange]
   );
 
-  // Read this device's persisted config whenever the popover opens.
+  // Read this device's persisted config whenever the popover opens. This is
+  // ALSO what discards any unsaved local width selection from a previous
+  // open-without-confirming — reopening always reflects what is actually
+  // persisted, never a half-picked draft.
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
@@ -131,16 +151,18 @@ export function PrinterSettingsPopover({
     };
   }, [isOpen]);
 
-  async function handleSelectWidth(width: PaperWidth) {
-    // A selection is ONLY a prefilled, UNCONFIRMED config — see the file header.
+  /**
+   * [FIX] Local UI state ONLY — see this file's header. Picking a paper width
+   * prefills the suggested dots-per-line and marks the in-memory draft as
+   * unconfirmed, but does NOT touch Dexie. Whatever this device already has
+   * confirmed (if anything) keeps working for real printing until the user
+   * explicitly presses «تأكيد» — an exploratory or mistaken tap here can no
+   * longer take the printer offline.
+   */
+  function handleSelectWidth(width: PaperWidth) {
     const unconfirmed = createUnconfirmedPrinterConfig(width);
     setConfig(unconfirmed);
     setDotsDraft(String(suggestedDotsPerLine(width)));
-    try {
-      await savePrinterConfig(unconfirmed);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "تعذّر حفظ إعدادات الطابعة.");
-    }
   }
 
   async function handlePair() {
@@ -160,9 +182,11 @@ export function PrinterSettingsPopover({
     try {
       const base = config ?? createUnconfirmedPrinterConfig();
       // confirmPrinterConfig validates the entry and stamps `confirmedAt` — this
-      // call IS the explicit human decision Rule 4 requires. Nothing else in the
-      // codebase can set isConfirmed, so an unfinished setup can never become a
-      // usable width on its own.
+      // call IS the explicit human decision Rule 4 requires, and — per the
+      // [FIX] above — it is now also the ONLY place this component ever
+      // writes to Dexie. Nothing else in the codebase can set isConfirmed or
+      // persist a width, so an unfinished/exploratory setup can never become,
+      // or overwrite, a usable width on its own.
       const confirmed = confirmPrinterConfig(base, Number(dotsDraft));
       const persisted = await savePrinterConfig(confirmed);
       setConfig(persisted);
@@ -183,7 +207,12 @@ export function PrinterSettingsPopover({
 
     setIsBusy(true);
     try {
-      const stored = config ?? (await readPrinterConfig());
+      // Deliberately re-read from Dexie rather than trusting local `config`
+      // state: `config` may currently hold an UNCONFIRMED draft width the
+      // user picked but never pressed «تأكيد» on (see [FIX] above), and a
+      // test print must reflect what is actually persisted/usable, not an
+      // in-progress selection.
+      const stored = await readPrinterConfig();
       if (!stored || !stored.isConfirmed) {
         toast.error("أكّد عرض رأس الطابعة أولاً، ثم اطبع نموذجاً تجريبياً.");
         return;
@@ -266,7 +295,8 @@ export function PrinterSettingsPopover({
         <p className="text-[11px] leading-relaxed text-zinc-500">
           هذا الإعداد خاص بهذا الجهاز فقط — لا ينتقل مع المستخدم أو المتجر. اختر مقاس الورق،
           ثم أدخل عدد النقاط في السطر من دليل طابعتك (أو من نتيجة الطباعة التجريبية) واضغط
-          «تأكيد».
+          «تأكيد». اختيار المقاس وحده لا يغيّر أي إعداد محفوظ فعلياً — التغيير يُحفظ فقط عند
+          الضغط على «تأكيد».
         </p>
 
         <div className="space-y-1.5">
