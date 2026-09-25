@@ -37,6 +37,11 @@ import { CheckoutSuccessModal } from "./checkout-success-modal";
 // only the local submitOfflineVoid() service — never the server-side ledger
 // void endpoint T4c2 itself uses.
 import { OfflineVoidPanel } from "./offline-void-panel";
+// [T4f — Rule 4] The per-DEVICE thermal printer settings control. On the POS
+// screen rather than under /settings/**, which is ADMIN-gated — printing is a
+// CASHIER activity, so a cashier on a fresh device must be able to configure
+// its printer without an admin present.
+import { PrinterSettingsPopover } from "./printer-settings-popover";
 import { useCustomerCacheSync } from "@/lib/offline/customer-sync";
 import {
   Drawer,
@@ -99,6 +104,12 @@ export function PosLayout() {
   const [isCustomerModalOpen, setIsCustomerModalOpen] = useState(false);
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
   const [isSuccessModalOpen, setIsSuccessModalOpen] = useState(false);
+  /**
+   * [T4f] Printer-settings popover visibility, owned here because BOTH the top
+   * bar's trigger and a failed thermal print (from any ReceiptActions on this
+   * screen) need to open it — see onPrinterSetupRequired below.
+   */
+  const [printerSettingsOpen, setPrinterSettingsOpen] = useState(false);
   const [completedInvoice, setCompletedInvoice] = useState<OfflineInvoice | null>(null);
   const [completedCustomer, setCompletedCustomer] = useState<SelectedCustomer | null>(null);
   const [completedItems, setCompletedItems] = useState<CartLineItem[]>([]);
@@ -886,6 +897,21 @@ export function PosLayout() {
             <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
             <span>تهيئة بيانات تجريبية</span>
           </Button>
+
+          {/*
+            [T4f — Rule 4] The printer settings control. Deliberately NOT
+            role-gated: the printer's dots-per-line is a property of THIS device
+            (Dexie's `deviceSettings` table, which stores no tenantId and no
+            userId), and a cashier is the person who actually prints.
+
+            Its controlled `open` state lives in this component so a failed
+            thermal print can route the user straight here instead of leaving
+            them with a toast and no way forward.
+          */}
+          <PrinterSettingsPopover
+            open={printerSettingsOpen}
+            onOpenChange={setPrinterSettingsOpen}
+          />
         </div>
       </div>
 
@@ -1131,6 +1157,19 @@ export function PosLayout() {
         customer={completedCustomer}
         items={completedItems}
         onStartNewSale={handleStartNewSale}
+        /*
+          [T4f] A thermal print with no confirmed printer width on this device
+          lands here. The success dialog is CLOSED first, deliberately: the
+          printer popover lives in the top bar, and a modal Radix dialog makes
+          everything behind it inert — so opening the popover without closing
+          this dialog would render it unreachable. Closing the dialog reveals
+          the popover (and the receipt is already saved locally, so nothing is
+          lost by dismissing it).
+        */
+        onPrinterSetupRequired={() => {
+          setIsSuccessModalOpen(false);
+          setPrinterSettingsOpen(true);
+        }}
       />
 
       {/*
