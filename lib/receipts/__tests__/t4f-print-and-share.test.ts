@@ -139,7 +139,7 @@ function localVoid(): OfflineInvoice {
 }
 
 function localSource(invoice: OfflineInvoice): LocalReceiptSource {
-  return { source: "local", invoice, customerName: CUSTOMER_NAME, itemNames: ITEM_NAMES };
+  return { source: "local", invoice, customerName: CUSTOMER_NAME, itemNames: ITEM_NAMES, businessName: "سوبرماركت الأمانة", };
 }
 
 const STUB_MEASURE = (text: string) => text.length * 8;
@@ -338,11 +338,17 @@ describe("Rules 2 + 5 — void receipts, local and server, at both widths", () =
 
 describe("Rule 1(b,c,d) — share is gated on sync state, and only then touches anything", () => {
   function makePorts(params: { status: unknown; target: ShareTarget | null }) {
-    const getSyncStatus = vi.fn(() => params.status as never);
-    const resolveTarget = vi.fn(async () => params.target);
-    const renderRaster = vi.fn(async () => new Blob([new Uint8Array([1, 2, 3])]));
-    const cacheRaster = vi.fn(async () => "https://cdn.example/receipt.pdf");
-    const deliverPdf = vi.fn();
+    const getSyncStatus = vi.fn<ShareFlowPorts["getSyncStatus"]>(() => params.status as never);
+    const resolveTarget = vi.fn<ShareFlowPorts["resolveTarget"]>(async () => params.target);
+    const renderRaster = vi.fn<ShareFlowPorts["renderRaster"]>(
+      async () => new Blob([new Uint8Array([1, 2, 3])])
+    );
+    // Typed with the port signature so `mock.calls` is a real tuple and
+    // `mock.calls[0][0]` is a `string` — an untyped vi.fn() would infer `[]`.
+    const cacheRaster = vi.fn<ShareFlowPorts["cacheRaster"]>(
+      async () => "https://cdn.example/receipt.pdf"
+    );
+    const deliverPdf = vi.fn<ShareFlowPorts["deliverPdf"]>();
 
     const ports: ShareFlowPorts = {
       getSyncStatus,

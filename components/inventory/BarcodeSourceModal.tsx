@@ -33,8 +33,8 @@ import {
     DialogDescription,
     DialogFooter,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { Barcode, Factory, PenLine, CheckCircle2, ShieldQuestion } from "lucide-react";
+import m from "./modals.module.css";
 
 export type BarcodeSourceChoice = "GS1" | "INTERNAL";
 
@@ -55,8 +55,8 @@ interface BarcodeSourceModalProps {
      */
     onDismiss: () => void;
     /**
-     * [ADDED] Present ONLY when this exact barcode value was just found in
-     * the platform-wide shared catalog (ProductCatalogEntry). This is
+     * Present ONLY when this exact barcode value was just found in the
+     * platform-wide shared catalog (ProductCatalogEntry). This is
      * fundamentally different information from "inferring GS1 from the
      * barcode's digit pattern," which remains permanently forbidden (see
      * the BarcodeSource enum note in schema.prisma). A catalog match is not
@@ -88,25 +88,24 @@ export function BarcodeSourceModal({
     // literal acceptance criterion here, not a UX nicety. Do not change this
     // to default to either option.
     //
-    // [FIX] There is deliberately NO effect here re-resetting `selected`
-    // when `open`/`barcode` change. Calling setState synchronously inside a
+    // There is deliberately NO effect here re-resetting `selected` when
+    // `open`/`barcode` change. Calling setState synchronously inside a
     // useEffect body to sync internal state with a prop is exactly the
-    // anti-pattern React's own docs warn against (it forces an extra,
-    // avoidable render pass every time this modal opens). Instead, the
-    // PARENT (AddProductModal) is responsible for mounting this component
-    // with a `key` derived from the specific barcode-classification request
-    // — e.g. `key={`${unitIndex}-${barcode}`}` — every time a genuinely new
-    // value needs classifying. A changing `key` makes React unmount the old
+    // anti-pattern React's own docs warn against. Instead, the PARENT
+    // (AddProductModal) mounts this component with a `key` derived from the
+    // specific barcode-classification request — e.g.
+    // `key={`${unitIndex}-${barcode}`}` — every time a genuinely new value
+    // needs classifying. A changing `key` makes React unmount the old
     // instance and mount a brand-new one, so `useState(null)` below starts
     // fresh purely through normal initialization — no effect, no extra
     // render, and the same "never carries over the previous selection"
-    // guarantee the old effect existed to provide.
+    // guarantee.
     const [selected, setSelected] = useState<BarcodeSourceChoice | null>(null);
 
-    // [ADDED] Lets the merchant override the simplified catalog-match view
-    // and drop down into the full manual radio choice — the barcode-
-    // collision escape hatch. Once toggled, behaves identically to a
-    // no-catalog-match classification for the rest of this session.
+    // Lets the merchant override the simplified catalog-match view and drop
+    // down into the full manual radio choice — the barcode-collision escape
+    // hatch. Once toggled, behaves identically to a no-catalog-match
+    // classification for the rest of this session.
     const [manualOverride, setManualOverride] = useState(false);
 
     const showSimplifiedView = !!catalogMatch && !manualOverride;
@@ -126,9 +125,9 @@ export function BarcodeSourceModal({
         onConfirm(selected);
     };
 
-    // [ADDED] The simplified path's own explicit confirmation — still a
-    // deliberate human click, just a single one instead of a two-option
-    // radio choice, since only one answer is structurally possible here.
+    // The simplified path's own explicit confirmation — still a deliberate
+    // human click, just a single one instead of a two-option radio choice,
+    // since only one answer is structurally possible here.
     const handleConfirmCatalogGs1 = () => {
         onConfirm("GS1");
     };
@@ -144,159 +143,123 @@ export function BarcodeSourceModal({
                 // than an ambiguous "did they mean to cancel or not" state.
                 className="sm:max-w-md"
             >
-                <DialogHeader>
-                    <DialogTitle className="flex items-center gap-2 text-base font-bold">
-                        <Barcode className="w-5 h-5 text-emerald-600" />
-                        <span>تصنيف مصدر الباركود</span>
-                    </DialogTitle>
-                    {!showSimplifiedView && (
-                        <DialogDescription className="text-xs text-zinc-500 leading-relaxed">
-                            هذا التصنيف إجباري ولا يمكن تخمينه تلقائياً — الرجاء تحديد مصدر
-                            هذا الباركود بدقة قبل حفظه.
-                        </DialogDescription>
-                    )}
-                </DialogHeader>
+                <div className={m.m}>
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2 text-base font-bold">
+                            <Barcode className={`w-5 h-5 ${m.titleIcon}`} aria-hidden />
+                            <span>تصنيف مصدر الباركود</span>
+                        </DialogTitle>
+                        {!showSimplifiedView && (
+                            <DialogDescription className="text-xs text-zinc-500 leading-relaxed">
+                                هذا التصنيف إجباري ولا يمكن تخمينه تلقائياً — الرجاء تحديد مصدر هذا الباركود بدقة قبل حفظه.
+                            </DialogDescription>
+                        )}
+                    </DialogHeader>
 
-                <div className="py-2 space-y-3">
-                    <div className="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200 dark:border-zinc-800">
-                        <span className="text-[11px] text-zinc-500">الباركود المدخل:</span>
-                        <p className="font-mono font-bold text-sm text-zinc-800 dark:text-zinc-200 mt-0.5">
-                            {barcode || "—"}
-                        </p>
+                    <div className={m.stack} style={{ paddingBlock: 8 }}>
+                        <div className={m.box}>
+                            <span className={m.label}>الباركود المدخل:</span>
+                            <p className={`${m.inputMono} ${m.summaryName}`} style={{ marginTop: 2 }}>
+                                {barcode || "—"}
+                            </p>
+                        </div>
+
+                        {showSimplifiedView ? (
+                            // Simplified confirmation view — shown only when this exact
+                            // barcode was just found in the shared catalog. Asking "GS1
+                            // or internal?" here would be asking a question the system
+                            // already knows the answer to with certainty (see the
+                            // prop-level comment above). Still requires an explicit
+                            // click before anything is saved.
+                            <div className={m.stack}>
+                                <div className={`${m.radioCard} ${m.radioCardActive}`} style={{ cursor: "default" }}>
+                                    <CheckCircle2 className={`w-5 h-5 ${m.radioIconEmerald}`} style={{ marginTop: 1 }} aria-hidden />
+                                    <div>
+                                        <p className={m.radioTitle}>هذا الباركود مؤكَّد مسبقاً كـ GS1 في الكتالوج المشترك</p>
+                                        <p className={m.radioBody}>
+                                            تاجر آخر على المنصّة صنّف هذا الباركود بنفسه كـ GS1 عند ربطه بالمنتج &quot;{catalogMatch?.name}&quot;.
+                                            بما أن الكتالوج المشترك لا يقبل إلا الباركودات المصنّفة GS1 صراحةً، هذا التصنيف مؤكد وليس تخميناً.
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <button
+                                    type="button"
+                                    onClick={() => setManualOverride(true)}
+                                    className={m.statusRow}
+                                    style={{ border: 0, background: "transparent", cursor: "pointer", textDecoration: "underline" }}
+                                >
+                                    <ShieldQuestion size={14} aria-hidden />
+                                    <span>هذا غير صحيح، أريد تصنيفه يدوياً بنفسي</span>
+                                </button>
+                            </div>
+                        ) : (
+                            <div className={m.stack}>
+                                {/* GS1 option */}
+                                <label className={`${m.radioCard} ${selected === "GS1" ? m.radioCardActive : ""}`}>
+                                    <input
+                                        type="radio"
+                                        name="barcode-source"
+                                        value="GS1"
+                                        checked={selected === "GS1"}
+                                        onChange={() => setSelected("GS1")}
+                                        className={m.radioInput}
+                                    />
+                                    <Factory className={`w-4 h-4 ${m.radioIconEmerald}`} style={{ marginTop: 2 }} aria-hidden />
+                                    <div>
+                                        <p className={m.radioTitle}>باركود قياسي مطبوع من المصنّع (GS1)</p>
+                                        <p className={m.radioBody}>
+                                            باركود دولي حقيقي مطبوع على المنتج من الشركة المصنّعة — يؤهّل هذا المنتج للاستفادة من الكتالوج المشترك بين التجّار على المنصّة.
+                                        </p>
+                                    </div>
+                                </label>
+
+                                {/* INTERNAL option */}
+                                <label className={`${m.radioCard} ${selected === "INTERNAL" ? m.radioCardActive : ""}`}>
+                                    <input
+                                        type="radio"
+                                        name="barcode-source"
+                                        value="INTERNAL"
+                                        checked={selected === "INTERNAL"}
+                                        onChange={() => setSelected("INTERNAL")}
+                                        className={m.radioInput}
+                                    />
+                                    <PenLine className={`w-4 h-4 ${m.radioIconBlue}`} style={{ marginTop: 2 }} aria-hidden />
+                                    <div>
+                                        <p className={m.radioTitle}>باركود داخلي أنشأته بنفسي لهذا المنتج</p>
+                                        <p className={m.radioBody}>
+                                            رقم أو ملصق داخلي خاص بمتجرك فقط — لن يُستخدم للمساهمة في الكتالوج المشترك بين التجّار.
+                                        </p>
+                                    </div>
+                                </label>
+
+                                {catalogMatch && manualOverride && (
+                                    <p className={m.pendingNote}>
+                                        <ShieldQuestion size={12} aria-hidden />
+                                        <span>تنبيه: هذا الباركود موجود في الكتالوج المشترك كـ GS1 — اخترت تصنيفه يدوياً مع ذلك، سيُعتمد اختيارك.</span>
+                                    </p>
+                                )}
+                            </div>
+                        )}
                     </div>
 
-                    {showSimplifiedView ? (
-                        // [ADDED] Simplified confirmation view — shown only when this
-                        // exact barcode was just found in the shared catalog. Asking
-                        // "GS1 or internal?" here would be asking a question the
-                        // system already knows the answer to with certainty (see the
-                        // prop-level comment above for why this is a known fact, not
-                        // a guess). Still requires an explicit click before anything
-                        // is saved.
-                        <div className="space-y-3">
-                            <div className="p-3 rounded-lg border-2 border-emerald-400 bg-emerald-50 dark:bg-emerald-950/30 dark:border-emerald-700">
-                                <div className="flex items-start gap-2.5">
-                                    <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-                                    <div>
-                                        <p className="text-xs font-bold text-emerald-800 dark:text-emerald-300">
-                                            هذا الباركود مؤكَّد مسبقاً كـ GS1 في الكتالوج المشترك
-                                        </p>
-                                        <p className="text-[11px] text-emerald-700/90 dark:text-emerald-400/90 mt-1 leading-relaxed">
-                                            تاجر آخر على المنصّة صنّف هذا الباركود بنفسه كـ GS1 عند
-                                            ربطه بالمنتج &quot;{catalogMatch?.name}&quot;. بما أن
-                                            الكتالوج المشترك لا يقبل إلا الباركودات المصنّفة GS1
-                                            صراحةً، هذا التصنيف مؤكد وليس تخميناً.
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <button
-                                type="button"
-                                onClick={() => setManualOverride(true)}
-                                className="flex items-center gap-1.5 text-[11px] text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 underline underline-offset-2"
-                            >
-                                <ShieldQuestion className="w-3.5 h-3.5" />
-                                <span>هذا غير صحيح، أريد تصنيفه يدوياً بنفسي</span>
+                    <DialogFooter>
+                        <div className={m.footerRow} style={{ width: "100%" }}>
+                            <button type="button" onClick={onDismiss} className={`${m.btn} ${m.btnOutline}`}>
+                                إلغاء (لن يُحفظ الباركود)
                             </button>
-                        </div>
-                    ) : (
-                        <div className="space-y-2">
-                            {/* GS1 option */}
-                            <label
-                                className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-colors ${selected === "GS1"
-                                    ? "border-emerald-500 bg-emerald-50/60 dark:bg-emerald-950/20"
-                                    : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700"
-                                    }`}
-                            >
-                                <input
-                                    type="radio"
-                                    name="barcode-source"
-                                    value="GS1"
-                                    checked={selected === "GS1"}
-                                    onChange={() => setSelected("GS1")}
-                                    className="mt-1 w-4 h-4 accent-emerald-600"
-                                />
-                                <div className="flex items-start gap-2">
-                                    <Factory className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
-                                    <div>
-                                        <p className="text-xs font-bold text-zinc-800 dark:text-zinc-200">
-                                            باركود قياسي مطبوع من المصنّع (GS1)
-                                        </p>
-                                        <p className="text-[11px] text-zinc-500 mt-0.5 leading-relaxed">
-                                            باركود دولي حقيقي مطبوع على المنتج من الشركة المصنّعة —
-                                            يؤهّل هذا المنتج للاستفادة من الكتالوج المشترك بين
-                                            التجّار على المنصّة.
-                                        </p>
-                                    </div>
-                                </div>
-                            </label>
-
-                            {/* INTERNAL option */}
-                            <label
-                                className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-colors ${selected === "INTERNAL"
-                                    ? "border-emerald-500 bg-emerald-50/60 dark:bg-emerald-950/20"
-                                    : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700"
-                                    }`}
-                            >
-                                <input
-                                    type="radio"
-                                    name="barcode-source"
-                                    value="INTERNAL"
-                                    checked={selected === "INTERNAL"}
-                                    onChange={() => setSelected("INTERNAL")}
-                                    className="mt-1 w-4 h-4 accent-emerald-600"
-                                />
-                                <div className="flex items-start gap-2">
-                                    <PenLine className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
-                                    <div>
-                                        <p className="text-xs font-bold text-zinc-800 dark:text-zinc-200">
-                                            باركود داخلي أنشأته بنفسي لهذا المنتج
-                                        </p>
-                                        <p className="text-[11px] text-zinc-500 mt-0.5 leading-relaxed">
-                                            رقم أو ملصق داخلي خاص بمتجرك فقط — لن يُستخدم للمساهمة
-                                            في الكتالوج المشترك بين التجّار.
-                                        </p>
-                                    </div>
-                                </div>
-                            </label>
-
-                            {catalogMatch && manualOverride && (
-                                <p className="text-[10px] text-amber-600 dark:text-amber-400 flex items-center gap-1 px-1">
-                                    <ShieldQuestion className="w-3 h-3 shrink-0" />
-                                    <span>
-                                        تنبيه: هذا الباركود موجود في الكتالوج المشترك كـ GS1 —
-                                        اخترت تصنيفه يدوياً مع ذلك، سيُعتمد اختيارك.
-                                    </span>
-                                </p>
+                            {showSimplifiedView ? (
+                                <button type="button" onClick={handleConfirmCatalogGs1} className={`${m.btn} ${m.btnSolid}`}>
+                                    تأكيد كـ GS1
+                                </button>
+                            ) : (
+                                <button type="button" onClick={handleSave} disabled={!selected} className={`${m.btn} ${m.btnSolid}`}>
+                                    تأكيد وحفظ
+                                </button>
                             )}
                         </div>
-                    )}
+                    </DialogFooter>
                 </div>
-
-                <DialogFooter className="flex-row justify-between sm:justify-between gap-2">
-                    <Button type="button" variant="outline" onClick={onDismiss} className="h-10 sm:h-9">
-                        إلغاء (لن يُحفظ الباركود)
-                    </Button>
-                    {showSimplifiedView ? (
-                        <Button
-                            type="button"
-                            onClick={handleConfirmCatalogGs1}
-                            className="h-10 sm:h-9 bg-emerald-600 hover:bg-emerald-700 text-white"
-                        >
-                            تأكيد كـ GS1
-                        </Button>
-                    ) : (
-                        <Button
-                            type="button"
-                            onClick={handleSave}
-                            disabled={!selected}
-                            className="h-10 sm:h-9 bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-40"
-                        >
-                            تأكيد وحفظ
-                        </Button>
-                    )}
-                </DialogFooter>
             </DialogContent>
         </Dialog>
     );

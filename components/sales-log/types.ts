@@ -78,6 +78,7 @@ export interface InvoiceDetail {
      * lets the detail view say who made the original sale.
      */
     originalInvoiceUserId: string | null;
+    businessName: string | null;
     user: { id: string; name: string };
     customer: { id: string; name: string; phone: string | null };
     items: InvoiceDetailItem[];

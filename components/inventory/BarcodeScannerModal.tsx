@@ -10,16 +10,15 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { Camera, RefreshCw, ScanLine } from "lucide-react";
 import { toast } from "sonner";
+import m from "./modals.module.css";
 
 interface BarcodeScannerModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onScan: (barcode: string) => void;
   /**
-   * [ADDED — POS integration]
    * "single" (default, unchanged behavior from the original Inventory-only
    * version): scan once, close automatically. Matches "find one product"
    * use cases (Inventory's search-by-barcode).
@@ -31,11 +30,11 @@ interface BarcodeScannerModalProps {
    */
   mode?: "single" | "continuous";
   /**
-   * [ADDED] "toast" (default): show this modal's own generic
-   * "تم مسح الباركود بنجاح: X" confirmation. "silent": suppress it and let
-   * the caller show its own, more contextual feedback (e.g. POS's
-   * "تمت إضافة X إلى السلة" from handleAddToCart) — avoids two stacked
-   * toasts per scan during rapid continuous scanning.
+   * "toast" (default): show this modal's own generic "تم مسح الباركود
+   * بنجاح: X" confirmation. "silent": suppress it and let the caller show
+   * its own, more contextual feedback (e.g. POS's "تمت إضافة X إلى
+   * السلة" from handleAddToCart) — avoids two stacked toasts per scan
+   * during rapid continuous scanning.
    */
   feedback?: "toast" | "silent";
   /** Cooldown between accepted scans in continuous mode, ms. */
@@ -50,7 +49,7 @@ export function BarcodeScannerModal({
   feedback = "toast",
   continuousCooldownMs = 1200,
 }: BarcodeScannerModalProps) {
-  // [FIXED] Was `useRef<HTMLVideoElement | null>(null)` read as
+  // Was `useRef<HTMLVideoElement | null>(null)` read as
   // `videoRef.current!` inside the effect. DialogContent (Radix) mounts its
   // children in a Portal AFTER the first render, so when the effect ran the
   // ref was still null. @zxing/library then silently created a detached,
@@ -64,9 +63,9 @@ export function BarcodeScannerModal({
 
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [retryToken, setRetryToken] = useState(0);
-  // [ADDED] Visual "ready to scan next item" indicator for continuous mode
-  // — lets the cashier see the cooldown window instead of wondering why a
-  // scan didn't seem to register.
+  // Visual "ready to scan next item" indicator for continuous mode — lets
+  // the cashier see the cooldown window instead of wondering why a scan
+  // didn't seem to register.
   const [awaitingCooldown, setAwaitingCooldown] = useState(false);
 
   const isScanning = open && !cameraError;
@@ -106,8 +105,8 @@ export function BarcodeScannerModal({
   }, []);
 
   useEffect(() => {
-    // [FIXED] Do not start until the modal is open AND the <video> element
-    // has actually been mounted (videoEl is non-null).
+    // Do not start until the modal is open AND the <video> element has
+    // actually been mounted (videoEl is non-null).
     if (!open || !videoEl) {
       if (readerRef.current) {
         readerRef.current.reset();
@@ -119,37 +118,37 @@ export function BarcodeScannerModal({
     const codeReader = new BrowserMultiFormatReader();
     readerRef.current = codeReader;
 
-    // [CHANGED] Was a permanent one-shot `hasScannedRef.current = true`
-    // that never reset for the lifetime of a scan session — meaning a
-    // "continuous" mode built on top of the old version would have gone
-    // dead after exactly one successful scan (the camera keeps running
-    // visually, but the callback becomes a permanent no-op). Replaced
-    // with a `locked` flag that DOES reset after `continuousCooldownMs` —
-    // but only when mode === "continuous". In "single" mode the behavior
-    // is byte-for-byte identical to before: lock forever, reset+close on
-    // the first hit.
+    // Was a permanent one-shot `hasScannedRef.current = true` that never
+    // reset for the lifetime of a scan session — meaning a "continuous"
+    // mode built on top of the old version would have gone dead after
+    // exactly one successful scan (the camera keeps running visually, but
+    // the callback becomes a permanent no-op). Replaced with a `locked`
+    // flag that DOES reset after `continuousCooldownMs` — but only when
+    // mode === "continuous". In "single" mode the behavior is
+    // byte-for-byte identical to before: lock forever, reset+close on the
+    // first hit.
     let locked = false;
     let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
     // Guards against state updates / retries after this effect was cleaned up
     // (StrictMode double-invoke, modal closed mid-startup, etc.).
     let cancelled = false;
 
-    // [ADDED — laptop / no-rear-camera fallback] A bare `facingMode:
-    // "environment"` string is spec'd as an IDEAL preference, not a hard
-    // requirement — a device with only a front-facing camera (any
-    // laptop) is expected to receive that camera as a fallback per the
-    // W3C mediacapture spec, with no error at all. `attemptDecode` is a
-    // small wrapper solely so a strict/non-standard browser or driver
-    // that throws OverconstrainedError on the first attempt (rejecting
-    // the constraint outright instead of falling back) gets one retry
-    // with a plain `{ video: true }` — "any camera, no preference" —
-    // before this is treated as a genuine camera-access failure. On a
-    // spec-compliant browser this retry path is never reached at all;
-    // the first call already succeeds with whatever camera is available.
+    // Laptop / no-rear-camera fallback: a bare `facingMode: "environment"`
+    // string is spec'd as an IDEAL preference, not a hard requirement — a
+    // device with only a front-facing camera (any laptop) is expected to
+    // receive that camera as a fallback per the W3C mediacapture spec, with
+    // no error at all. `attemptDecode` is a small wrapper solely so a
+    // strict/non-standard browser or driver that throws
+    // OverconstrainedError on the first attempt (rejecting the constraint
+    // outright instead of falling back) gets one retry with a plain
+    // `{ video: true }` — "any camera, no preference" — before this is
+    // treated as a genuine camera-access failure. On a spec-compliant
+    // browser this retry path is never reached at all; the first call
+    // already succeeds with whatever camera is available.
     const attemptDecode = (constraints: MediaStreamConstraints) =>
       codeReader.decodeFromConstraints(
         constraints,
-        videoEl, // [FIXED] real, mounted element instead of videoRef.current!
+        videoEl, // real, mounted element instead of videoRef.current!
         (result) => {
           if (!result || locked || cancelled) return;
           locked = true;
@@ -242,76 +241,57 @@ export function BarcodeScannerModal({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-md p-6 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl">
-        <DialogHeader>
-          <DialogTitle className="text-base font-bold flex items-center gap-2">
-            <Camera className="w-5 h-5 text-emerald-600" />
-            <span>{mode === "continuous" ? "مسح مستمر للأصناف" : "مسح الباركود بالكاميرا"}</span>
-          </DialogTitle>
-          <DialogDescription className="text-xs text-zinc-500">
-            {mode === "continuous"
-              ? "وجّه الكاميرا نحو كل صنف بالتتابع — سيُضاف تلقائياً إلى السلة عند كل مسح ناجح."
-              : "وجه كاميرا الجهاز نحو الباركود المطبوع على المنتج للمسح التلقائي."}
-          </DialogDescription>
-        </DialogHeader>
+        <div className={m.m}>
+          <DialogHeader>
+            <DialogTitle className="text-base font-bold flex items-center gap-2">
+              <Camera className={`w-5 h-5 ${m.titleIcon}`} aria-hidden />
+              <span>{mode === "continuous" ? "مسح مستمر للأصناف" : "مسح الباركود بالكاميرا"}</span>
+            </DialogTitle>
+            <DialogDescription className="text-xs text-zinc-500">
+              {mode === "continuous"
+                ? "وجّه الكاميرا نحو كل صنف بالتتابع — سيُضاف تلقائياً إلى السلة عند كل مسح ناجح."
+                : "وجه كاميرا الجهاز نحو الباركود المطبوع على المنتج للمسح التلقائي."}
+            </DialogDescription>
+          </DialogHeader>
 
-        <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black flex items-center justify-center border border-zinc-800">
-          <video
-            ref={setVideoEl} // [FIXED] callback ref -> state, so the effect re-runs once mounted
-            className="w-full h-full object-cover"
-            autoPlay
-            muted
-            playsInline
-          />
+          <div className={m.videoFrame} style={{ marginBlock: 8 }}>
+            <video ref={setVideoEl} className={m.video} autoPlay muted playsInline />
 
-          {isScanning && !awaitingCooldown && (
-            <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center">
-              <div className="w-48 h-32 border-2 border-dashed border-emerald-500 rounded-lg animate-pulse" />
-              <span className="text-[11px] text-emerald-400 bg-black/60 px-2 py-0.5 rounded mt-2 font-mono">
-                جاري البحث عن باركود...
-              </span>
-            </div>
-          )}
+            {isScanning && !awaitingCooldown && (
+              <div className={m.scanOverlay}>
+                <div className={m.scanFrame} />
+                <span className={m.scanCaption}>جاري البحث عن باركود...</span>
+              </div>
+            )}
 
-          {/* [ADDED] Continuous-mode cooldown indicator — tells the cashier
-              the last item registered and the camera will accept the next
-              one in a moment, instead of leaving them guessing whether the
-              scan worked. */}
-          {isScanning && awaitingCooldown && (
-            <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center bg-emerald-950/40">
-              <ScanLine className="w-10 h-10 text-emerald-400 animate-pulse" />
-              <span className="text-[11px] text-emerald-300 bg-black/60 px-2 py-0.5 rounded mt-2 font-mono">
-                تمت الإضافة — جاهز للصنف التالي...
-              </span>
-            </div>
-          )}
+            {/* Continuous-mode cooldown indicator — tells the cashier the
+                last item registered and the camera will accept the next
+                one in a moment, instead of leaving them guessing whether
+                the scan worked. */}
+            {isScanning && awaitingCooldown && (
+              <div className={m.cooldownOverlay}>
+                <ScanLine size={40} color="#6ee7b7" aria-hidden />
+                <span className={m.cooldownCaption}>تمت الإضافة — جاهز للصنف التالي...</span>
+              </div>
+            )}
 
-          {cameraError && (
-            <div className="p-4 text-center text-xs text-red-400 space-y-3">
-              <p>{cameraError}</p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={handleRetry}
-                className="gap-1.5 text-[11px] h-7 border-red-400 text-red-300 hover:bg-red-950/40"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>إعادة المحاولة</span>
-              </Button>
-            </div>
-          )}
+            {cameraError && (
+              <div className={m.cameraErrorBox}>
+                <p>{cameraError}</p>
+                <button type="button" onClick={handleRetry} className={`${m.btn} ${m.btnXs} ${m.btnOutlineRed}`}>
+                  <RefreshCw size={14} aria-hidden />
+                  <span>إعادة المحاولة</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <button type="button" onClick={() => handleOpenChange(false)} className={`${m.btn} ${m.btnOutline} ${m.btnFull}`}>
+              {mode === "continuous" ? "إنهاء المسح" : "إغلاق"}
+            </button>
+          </DialogFooter>
         </div>
-
-        <DialogFooter className="gap-2 sm:gap-0">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => handleOpenChange(false)}
-            className="w-full"
-          >
-            {mode === "continuous" ? "إنهاء المسح" : "إغلاق"}
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
