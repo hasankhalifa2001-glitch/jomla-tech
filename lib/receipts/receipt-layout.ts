@@ -23,6 +23,21 @@
  * text op is re-measured against the content width and layout THROWS if one
  * exceeds it. Long unbreakable tokens are hard-split inside wrapText(), so
  * this assertion is reachable only by a genuine bug.
+ *
+ * [DESIGN FIX — visual density pass] The original constants produced a
+ * cramped receipt: 12px page padding, a single reused 6px gap regardless of
+ * whether it separated two lines of the same block or two whole sections, and
+ * the total row was only marginally bigger than everything else. This pass:
+ *   - widens the page margin (12 → 22px) so nothing sits flush against the
+ *     physical/PDF edge;
+ *   - introduces distinct named gaps for a section boundary (SECTION_GAP_PX,
+ *     used after the title and around dividers) versus an in-item gap
+ *     (ITEM_GAP_PX, used after each item block) instead of one magic "6"
+ *     reused everywhere;
+ *   - gives the primary total row its own top gap plus a further-enlarged
+ *     font, so "إجمالي الفاتورة" reads as the one clear focal point.
+ * No block ordering or business logic changed — only WHERE and HOW MUCH
+ * vertical space each op gets.
  */
 
 import type { ReceiptBlock, ReceiptModel } from "./receipt-model";
@@ -41,10 +56,13 @@ export interface ReceiptFontSet {
 }
 
 /** Sized for a 576-dot (80 mm @ 203 dpi) canvas; scaled by the caller if a
- * narrower head is configured — see receipt-canvas.ts. */
+ * narrower head is configured — see receipt-canvas.ts.
+ * [DESIGN FIX] title bumped 34→38 (more presence as the one centered line),
+ * subtitle trimmed 22→20 (more contrast against title/body — meta info now
+ * reads clearly as secondary), body/small unchanged. */
 export const DEFAULT_RECEIPT_FONTS: ReceiptFontSet = {
-  title: 34,
-  subtitle: 22,
+  title: 38,
+  subtitle: 20,
   body: 26,
   small: 22,
 };
@@ -96,7 +114,17 @@ export interface ReceiptLayout {
   ops: ReceiptOp[];
 }
 
-const DEFAULT_PADDING_PX = 12;
+// [DESIGN FIX] 12 → 22. The old margin left almost no breathing room on
+// either physical (thermal) or digital (PDF) edge of the receipt.
+const DEFAULT_PADDING_PX = 22;
+
+// [DESIGN FIX] Named gaps instead of one reused magic "6" everywhere. A
+// section boundary (after the title, around a divider) now reads as visually
+// distinct from a tight in-block line gap, and each item block gets its own
+// breathing room before the next one starts.
+const SECTION_GAP_PX = 14;
+const ITEM_GAP_PX = 12;
+const DIVIDER_MARGIN_PX = 10;
 
 function fontFor(block: ReceiptBlock, fonts: ReceiptFontSet): { px: number; bold: boolean } {
   switch (block.type) {
@@ -187,9 +215,16 @@ class LayoutCursor {
     this.y += heightPx;
   }
 
+  /**
+   * [DESIGN FIX] Gap BEFORE the divider line too (previously the divider sat
+   * flush against whatever came before it — only a post-gap existed), and the
+   * post-gap widened from 6 to DIVIDER_MARGIN_PX, so a divider reads as an
+   * actual section break rather than a thin rule wedged between two lines.
+   */
   pushDivider(): void {
+    this.y += DIVIDER_MARGIN_PX;
     this.ops.push({ kind: "divider", y: this.y, heightPx: 2 });
-    this.y += 6;
+    this.y += DIVIDER_MARGIN_PX;
   }
 }
 
@@ -212,6 +247,11 @@ function lineHeightFor(fontPx: number): number {
  * together (a long label on 58 mm paper), the label wraps onto its own
  * line(s) and the value follows, end-aligned. Neither branch is allowed to
  * exceed the content width: that is the Rule 4 invariant this module guards.
+ *
+ * [DESIGN FIX] A primary-emphasis row (the invoice total) now gets its own
+ * top gap (SECTION_GAP_PX) and a further-enlarged value font (body × 1.15)
+ * instead of just reusing fonts.body, so it reads as the one clear focal
+ * point on the receipt rather than merely "a bit bigger than the rest".
  */
 function layoutRowBlock(
   cursor: LayoutCursor,
@@ -220,11 +260,17 @@ function layoutRowBlock(
   fonts: ReceiptFontSet,
   contentWidth: number
 ): void {
+  const isPrimary = block.emphasis === "primary";
+
+  if (isPrimary) {
+    cursor.pushSpacer(SECTION_GAP_PX);
+  }
+
   const labelFont = fonts.small;
-  const valueFont = block.emphasis === "primary" ? fonts.body : fonts.small;
-  const valueBold = block.emphasis === "primary";
+  const valueFont = isPrimary ? Math.round(fonts.body * 1.15) : fonts.small;
+  const valueBold = isPrimary;
   const tone: ReceiptTone =
-    block.emphasis === "primary" ? "primary" : block.emphasis === "danger" ? "danger" : "normal";
+    isPrimary ? "primary" : block.emphasis === "danger" ? "danger" : "normal";
   const gap = 8;
   const singleLineHeight = Math.max(lineHeightFor(labelFont), lineHeightFor(valueFont));
 
@@ -299,12 +345,16 @@ function layoutRowBlock(
 /**
  * Lays out an `item` block: the product name, then "<qty> × <unit price>" with
  * the line total pushed to the opposite edge (or onto its own line when the
- * two would collide on narrow paper), then the optional USD "≈" line.
+ * two would collide on narrow paper), then the optional USD "≈" line (unused
+ * post SYP-only fix, but the rendering path is kept for a future opt-in).
  *
  * `block.isReturn` drives the tone only — the RULE 5 text itself ("مرتجع: 3
  * طرد") was already produced by lib/receipts/receipt-lines.ts, so there is
  * exactly one place in this feature where the negative sign is turned into a
  * labelled absolute value.
+ *
+ * [DESIGN FIX] Trailing gap after the whole item block widened 6 → ITEM_GAP_PX
+ * so consecutive items no longer read as visually glued together.
  */
 function layoutItemBlock(
   cursor: LayoutCursor,
@@ -423,7 +473,7 @@ function layoutItemBlock(
     }
   }
 
-  cursor.pushSpacer(6);
+  cursor.pushSpacer(ITEM_GAP_PX);
 }
 
 /**
@@ -491,7 +541,11 @@ export function layoutReceipt(
           cursor.pushSpacer(lineHeightFor(px));
         }
 
-        if (block.type !== "subtitle") cursor.pushSpacer(6);
+        // [DESIGN FIX] Section gap after the title (was a flat 6px reused for
+        // both title and notice). A notice block also gets the fuller
+        // section gap now, since it functionally closes a distinct block
+        // (the sync warning, a void reason) rather than continuing one.
+        if (block.type !== "subtitle") cursor.pushSpacer(SECTION_GAP_PX);
         break;
       }
       case "row":

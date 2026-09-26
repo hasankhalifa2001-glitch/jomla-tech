@@ -17,10 +17,15 @@ import {
   User,
   Calendar,
 } from "lucide-react";
+import { getOfflineDb } from "@/lib/offline/db";
+import { useLocalInvoiceSyncStatus } from "@/lib/receipts/use-local-invoice-status";
 import type { OfflineInvoice, SelectedCustomer, CartLineItem } from "@/lib/offline";
 import { formatMoney, compareMoney, multiplyMoney } from "@/lib/utils/money";
 import { ReceiptActions } from "@/components/receipts/receipt-actions";
-import { itemNamesFromCartLines } from "@/lib/receipts/local-receipt-source";
+import {
+  buildLocalReceiptSource,
+  itemNamesFromCartLines,
+} from "@/lib/receipts/local-receipt-source";
 import type { LocalReceiptSource } from "@/lib/receipts/receipt-model";
 
 interface CheckoutSuccessModalProps {
@@ -47,6 +52,18 @@ export function CheckoutSuccessModal({
   onStartNewSale,
   onPrinterSetupRequired,
 }: CheckoutSuccessModalProps) {
+  /**
+   * [FIX] Same live sync-status source of truth as ReceiptActions' own
+   * share-gate — not a second, independent Dexie subscription. The banner
+   * below and the share button inside <ReceiptActions> now react to the
+   * exact same status value at the exact same moment sync-worker.ts flips
+   * this row to SYNCED. Called unconditionally, before the `!invoice`
+   * early return below, because hooks cannot be conditional (same rule
+   * receipt-actions.tsx's own header comment calls out).
+   */
+  const localStatus = useLocalInvoiceSyncStatus(invoice?.offlineId ?? null);
+  const isSynced = localStatus.status === "SYNCED";
+
   if (!invoice) return null;
 
   function handlePrint() {
@@ -67,25 +84,47 @@ export function CheckoutSuccessModal({
     : "على الحساب بالكامل (دين)";
 
   /**
-   * [T4f — Rule 1's "local fast path"] The cart's own line items still carry the
-   * product and unit NAMES, so the receipt source is assembled here with no Dexie
-   * read at all: the thermal print of this brand-new, still-PENDING invoice
-   * touches the catalog cache zero times. (Anywhere the names are NOT in hand,
-   * buildLocalReceiptSource() reads them from cachedProducts instead.)
+   * [FIX — real bug, confirmed via screenshot] `invoice` prop is a snapshot
+   * from the moment this modal opened and never updates its own `status`
+   * field. A static LocalReceiptSource therefore kept reporting the invoice
+   * as PENDING to buildReceiptModel() forever — even after
+   * useLocalInvoiceSyncStatus (the same live query the share button's gate
+   * uses) correctly reported SYNCED and unlocked the button. This thunk
+   * re-reads the live Dexie row and delegates to buildLocalReceiptSource()
+   * — the single shared builder that also resolves the tenant's business
+   * name from CachedSession, so print/share always reflects the invoice's
+   * TRUE current state, not the state at modal-open time.
+   *
+   * [FIX] `db` was never an export of "@/lib/offline/db" — that module only
+   * exports the singleton accessor `getOfflineDb()`. Also corrected the table
+   * name (`offlineInvoices`, not `invoices`) and the lookup itself: the
+   * table's primary key is the numeric auto-increment `id`
+   * (`++id, &offlineId, ...`), not the string `offlineId`, so a plain
+   * `.get(offlineIdString)` would look up the wrong key. `offlineId` is only
+   * a unique secondary index, so it must be queried via `.where(...).equals(...)`.
    */
-  const receiptSource: LocalReceiptSource = {
-    source: "local",
-    invoice,
-    customerName: customer ? customer.name : "",
-    itemNames: itemNamesFromCartLines(
-      items.map((line) => ({
-        productId: line.product.id,
-        productName: line.product.name,
-        unitId: line.unitId,
-        unitName: line.unitName,
-      }))
-    ),
-  };
+  async function buildCurrentReceiptSource(): Promise<LocalReceiptSource> {
+    const dbInstance = getOfflineDb();
+    const liveInvoice =
+      (await dbInstance.offlineInvoices
+        .where("offlineId")
+        .equals(invoice!.offlineId)
+        .first()) ?? invoice!;
+
+    return buildLocalReceiptSource({
+      tenantId: liveInvoice.tenantId,
+      invoice: liveInvoice,
+      customerName: customer ? customer.name : "",
+      knownItemNames: itemNamesFromCartLines(
+        items.map((line) => ({
+          productId: line.product.id,
+          productName: line.product.name,
+          unitId: line.unitId,
+          unitName: line.unitName,
+        }))
+      ),
+    });
+  }
 
   // [v3.6] FIX — was checking debtAmountUSD (derived/informational).
   // debtAmountSYP is the authoritative field on OfflineInvoice
@@ -95,7 +134,10 @@ export function CheckoutSuccessModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl" dir="rtl">
+      <DialogContent
+        className="sm:max-w-xl max-h-[90vh] overflow-y-auto"
+        dir="rtl"
+      >
         <DialogHeader>
           <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-600 mb-2">
             <CheckCircle2 className="h-6 w-6" />
@@ -109,18 +151,37 @@ export function CheckoutSuccessModal({
           </DialogDescription>
         </DialogHeader>
 
-        {/* Clear Local Save vs Synced Status Distinction Alert */}
-        <div className="rounded-xl border border-amber-300 bg-amber-50/80 p-3 dark:border-amber-900 dark:bg-amber-950/40 space-y-1.5">
-          <div className="flex items-center gap-2 text-amber-800 dark:text-amber-300 font-bold text-xs">
-            <CloudOff className="h-4 w-4 shrink-0 text-amber-600" />
-            <span>حالة الفاتورة: محفوظة محلياً — بانتظار المزامنة (PENDING)</span>
+        {/*
+          [FIX] Sync-status banner driven by the same
+          useLocalInvoiceSyncStatus(offlineId) hook ReceiptActions uses for its
+          share-button gate. Once the row flips to SYNCED, this switches to the
+          emerald "synced" state at the exact same moment the share button
+          unlocks itself — no reload, no second source of truth.
+        */}
+        {isSynced ? (
+          <div className="rounded-xl border border-emerald-300 bg-emerald-50/80 p-3 dark:border-emerald-900 dark:bg-emerald-950/40 space-y-1.5">
+            <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-bold text-xs">
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+              <span>تمت مزامنة الفاتورة مع السيرفر بنجاح</span>
+            </div>
+            <p className="text-[11px] text-emerald-700 dark:text-emerald-400 leading-relaxed">
+              الفاتورة أصبحت مسجّلة على السيرفر المركزي، وزر مشاركة الإيصال
+              (PDF) متاح الآن.
+            </p>
           </div>
-          <p className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed">
-            ⚠️ تنبيه للكاشير: هذه الفاتورة{" "}
-            <strong>مخزنة على هذا الجهاز فقط</strong> حالياً. ستتم المزامنة
-            التلقائية مع السيرفر المركزي فور توفر اتصال بالإنترنت (T4c).
-          </p>
-        </div>
+        ) : (
+          <div className="rounded-xl border border-amber-300 bg-amber-50/80 p-3 dark:border-amber-900 dark:bg-amber-950/40 space-y-1.5">
+            <div className="flex items-center gap-2 text-amber-800 dark:text-amber-300 font-bold text-xs">
+              <CloudOff className="h-4 w-4 shrink-0 text-amber-600" />
+              <span>حالة الفاتورة: محفوظة محلياً — بانتظار المزامنة (PENDING)</span>
+            </div>
+            <p className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed">
+              ⚠️ تنبيه للكاشير: هذه الفاتورة{" "}
+              <strong>مخزنة على هذا الجهاز فقط</strong> حالياً. ستتم المزامنة
+              التلقائية مع السيرفر المركزي فور توفر اتصال بالإنترنت (T4c).
+            </p>
+          </div>
+        )}
 
         {/* Invoice Summary Printable Card */}
         <div
@@ -186,13 +247,13 @@ export function CheckoutSuccessModal({
               // money.ts's toDecimal(), which would have crashed this
               // entire modal the moment such an item appeared in a
               // completed sale. item.unitPriceSYP is the always-present,
-              // authoritative field and is used for the actual line total;
-              // the USD figure is now a guarded, optional secondary value.
+              // authoritative field and is used for the actual line total.
+              //
+              // [FIX — SYP-only] The USD line total (lineUSD) is no longer
+              // computed at all — per product decision, no "≈ $X" appears
+              // anywhere in this modal (matches receipt-model.ts's own fix
+              // for the printed/shared receipt).
               const lineSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
-              const lineUSD =
-                item.unitPriceUSD !== null
-                  ? multiplyMoney(item.unitPriceUSD, item.quantity)
-                  : null;
               return (
                 <div
                   key={idx}
@@ -211,11 +272,6 @@ export function CheckoutSuccessModal({
                     <p className="font-bold text-zinc-800 dark:text-zinc-200">
                       {formatMoney(lineSYP, "SYP")} ل.س
                     </p>
-                    {lineUSD !== null && (
-                      <p className="text-[10px] text-purple-600 dark:text-purple-400 font-semibold">
-                        ≈ ${formatMoney(lineUSD, "USD")}
-                      </p>
-                    )}
                   </div>
                 </div>
               );
@@ -224,41 +280,19 @@ export function CheckoutSuccessModal({
 
           {/*
             Financial Totals.
-            [v3.6] FIX — every row below used to show the USD figure as
-            the large/primary value (totalUSD, paidAmountUSD,
-            debtAmountUSD), with SYP either absent or a small secondary
-            note. All persisted OfflineInvoice fields' SYP counterparts
-            are authoritative and always present (db.ts derives USD from
-            them, never the reverse) — SYP is now the primary figure on
-            every row, USD the secondary "≈" one.
-
-            [FIX — build] totalUSD/paidAmountUSD/debtAmountUSD/
-            exchangeRateUsed are all typed `string | null` on
-            OfflineInvoice (db.ts's review-pass-6 nullability change: a
-            SYP-only sale that never needed an exchange rate stores every
-            USD-derived field, and the rate itself, as `null` rather than
-            a fabricated placeholder). Each is now guarded with the same
-            `!== null` pattern already used above for
-            item.unitPriceUSD, instead of being passed to formatMoney()
-            unguarded — that previously threw a MoneyError the first time
-            a genuinely SYP-only invoice reached this modal, and failed
-            the TypeScript build regardless.
+            [FIX — SYP-only] Per product decision, the "(≈ $X)" secondary
+            USD figure is removed entirely from every row below (total,
+            paid, debt). The exchange-rate row is kept — it is a reference
+            rate, not a converted amount.
           */}
           <div className="space-y-1 pt-2 border-t border-zinc-200 dark:border-zinc-800">
             <div className="flex justify-between text-xs font-bold">
               <span className="text-zinc-600 dark:text-zinc-400">
                 إجمالي الفاتورة:
               </span>
-              <div className="text-left">
-                <span className="text-emerald-700 dark:text-emerald-400 font-extrabold ml-2 font-mono">
-                  {formatMoney(invoice.totalSYP, "SYP")} ل.س
-                </span>
-                {invoice.totalUSD !== null && (
-                  <span className="text-purple-600 dark:text-purple-400 text-[11px]">
-                    (≈ ${formatMoney(invoice.totalUSD, "USD")})
-                  </span>
-                )}
-              </div>
+              <span className="text-emerald-700 dark:text-emerald-400 font-extrabold font-mono">
+                {formatMoney(invoice.totalSYP, "SYP")} ل.س
+              </span>
             </div>
 
             <div className="flex justify-between text-xs">
@@ -272,31 +306,17 @@ export function CheckoutSuccessModal({
 
             <div className="flex justify-between text-xs">
               <span className="text-zinc-500">المبلغ المدفوع:</span>
-              <div className="text-left">
-                <span className="font-bold text-emerald-600 font-mono">
-                  {formatMoney(invoice.paidAmountSYP, "SYP")} ل.س
-                </span>
-                {invoice.paidAmountUSD !== null && (
-                  <span className="text-purple-600 dark:text-purple-400 text-[10px] mr-1">
-                    (≈ ${formatMoney(invoice.paidAmountUSD, "USD")})
-                  </span>
-                )}
-              </div>
+              <span className="font-bold text-emerald-600 font-mono">
+                {formatMoney(invoice.paidAmountSYP, "SYP")} ل.س
+              </span>
             </div>
 
             {isDebtPresent && (
               <div className="flex justify-between text-xs font-bold text-red-600 dark:text-red-400">
                 <span>المتبقي على الحساب (دين):</span>
-                <div className="text-left">
-                  <span className="font-mono">
-                    {formatMoney(invoice.debtAmountSYP, "SYP")} ل.س
-                  </span>
-                  {invoice.debtAmountUSD !== null && (
-                    <span className="text-[10px] font-semibold mr-1 opacity-80">
-                      (≈ ${formatMoney(invoice.debtAmountUSD, "USD")})
-                    </span>
-                  )}
-                </div>
+                <span className="font-mono">
+                  {formatMoney(invoice.debtAmountSYP, "SYP")} ل.س
+                </span>
               </div>
             )}
           </div>
@@ -307,28 +327,32 @@ export function CheckoutSuccessModal({
           {/*
             [T4f] Thermal ESC/POS printing (Web Bluetooth) + the gated PDF share.
 
-            The thermal button reads ONLY this device's Dexie row and the local
-            catalog names — no request, no server row, no receiptPdfUrl — so it
-            works on this still-PENDING invoice. The share button is DISABLED
-            (not hidden) with "شارك بعد اكتمال المزامنة" until the background sync
-            gives the invoice a server-side row, and enables itself the moment
-            that happens (a live Dexie query, no reload).
+            [FIX] `source` is now a THUNK (buildCurrentReceiptSource), not a
+            static object — see that function's own comment above for why a
+            static object silently baked in a stale PENDING status even
+            after sync completed. receipt-actions.tsx already supports and
+            calls a thunk-shaped `source` at print/share TIME.
           */}
           <ReceiptActions
-            source={receiptSource}
+            source={buildCurrentReceiptSource}
             offlineId={invoice.offlineId}
             serverInvoiceId={invoice.serverId ?? null}
             size="sm"
             onPrinterSetupRequired={onPrinterSetupRequired}
           />
 
-          <div className="flex items-center justify-between gap-3">
+          {/*
+            [FIX] Responsive — was a fixed flex-row that squeezed both
+            buttons onto one cramped line at 375px width (iPhone SE). Now
+            stacks vertically on narrow screens, back to a row from sm: up.
+          */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <Button
               type="button"
               variant="outline"
               size="sm"
               onClick={handlePrint}
-              className="text-xs gap-1.5"
+              className="text-xs gap-1.5 w-full sm:w-auto"
               title="طباعة الإيصال عبر نافذة المتصفح — بديل عند عدم دعم Web Bluetooth (مثل iOS)"
             >
               <Printer className="h-4 w-4" />
@@ -342,7 +366,7 @@ export function CheckoutSuccessModal({
                 onOpenChange(false);
                 onStartNewSale();
               }}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold gap-1.5 px-6"
+              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold gap-1.5 px-6 w-full sm:w-auto"
             >
               <PlusCircle className="h-4 w-4" />
               فاتورة جديدة (جديد)

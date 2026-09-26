@@ -229,6 +229,10 @@ export async function listInvoicesForTenant(
 // their OWN sale would be rejected by GET /api/invoices/[id]'s ownership
 // check — making T4c2's "navigable from either side" guarantee false for
 // exactly the user most likely to need it.
+//
+// [FIX — business name] `businessName` (Tenant.name) is now resolved in the
+// same query, for receipt-model.ts's headerBlocks() — see that file's own
+// [FIX — business name] note.
 // ---------------------------------------------------------------------
 export interface InvoiceDetailItem {
     id: string;
@@ -278,6 +282,12 @@ export interface InvoiceDetail {
     user: { id: string; name: string };
     customer: { id: string; name: string; phone: string | null };
     items: InvoiceDetailItem[];
+    /**
+     * [FIX — business name] Tenant.name, resolved in this same query.
+     * Feeds receipt-model.ts's headerBlocks() for a server-sourced receipt
+     * (a synced invoice's thermal print, or the shared PDF raster).
+     */
+    businessName: string | null;
 }
 
 export async function findInvoiceDetail(
@@ -304,6 +314,8 @@ export async function findInvoiceDetail(
             userId: true,
             user: { select: { id: true, name: true } },
             customer: { select: { id: true, name: true, phone: true } },
+            // [FIX — business name]
+            tenant: { select: { name: true } },
             items: {
                 select: {
                     id: true, productId: true, product: { select: { name: true } },
@@ -337,6 +349,8 @@ export async function findInvoiceDetail(
         userId: invoice.userId,
         user: invoice.user,
         customer: invoice.customer,
+        // [FIX — business name]
+        businessName: invoice.tenant.name,
         items: invoice.items.map((item) => ({
             id: item.id,
             productId: item.productId,

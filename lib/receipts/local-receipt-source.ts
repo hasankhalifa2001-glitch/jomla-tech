@@ -11,6 +11,13 @@
  * resolves display names from `cachedProducts` — the local catalog cache
  * T4a/T4b already maintain — and nothing else.
  *
+ * [FIX — business name] The receipt header also needs the tenant's display
+ * name (Tenant.name server-side). That is already cached offline, with zero
+ * new storage: db.ts's CachedSession row carries `tenantName`, written at
+ * login by createCachedSessionRecord() and readable by tenantId alone. So
+ * resolving it here is the same "narrow, explicit local read" as the item
+ * names above — no fetch, no new Dexie table.
+ *
  * [WHY cachedProducts IS READ DIRECTLY HERE, NOT getOfflineProducts()]
  * lib/offline/pos-service.ts's getOfflineProducts() is the POS *search/
  * browse* reader: it decorates every product with a freshly computed
@@ -68,12 +75,37 @@ export async function resolveLocalReceiptItemNames(
 }
 
 /**
+ * [FIX — business name] Resolves Tenant.name for the receipt header from
+ * the device-local CachedSession row — no network call, same "already
+ * cached at login" guarantee the printer/catalog data relies on. Returns
+ * null (never throws) when unsupported/missing, so a receipt can still be
+ * built and printed without a business name rather than failing outright —
+ * headerBlocks() in receipt-model.ts falls back to the plain document title
+ * in that case.
+ */
+export async function resolveLocalBusinessName(
+  tenantId: string | undefined
+): Promise<string | null> {
+  if (!tenantId || !isOfflineDbSupported()) return null;
+
+  const session = await getOfflineDb()
+    .cachedSession.where("tenantId")
+    .equals(tenantId)
+    .first();
+
+  return session?.tenantName ?? null;
+}
+
+/**
  * The local-source builder every print path uses.
  *
  * `knownItemNames` is the post-checkout fast path: components/pos/pos-layout.tsx
  * still holds the cart's CartLineItem[] (which carries `product.name` and
  * `unitName`), so a receipt printed straight after a sale touches Dexie not at
- * all. Anywhere else, names are resolved from the local catalog.
+ * all for item names. `businessName` is still resolved here even on that fast
+ * path — it is one small indexed lookup against an already-cached session
+ * row, not a scan, so the cost is negligible next to the correctness gained
+ * from having exactly one place that knows how to find it.
  */
 export async function buildLocalReceiptSource(params: {
   tenantId?: string;
@@ -85,11 +117,14 @@ export async function buildLocalReceiptSource(params: {
     params.knownItemNames ??
     (await resolveLocalReceiptItemNames(params.tenantId, params.invoice.items));
 
+  const businessName = await resolveLocalBusinessName(params.tenantId);
+
   return {
     source: "local",
     invoice: params.invoice,
     customerName: params.customerName,
     itemNames,
+    businessName,
   };
 }
 

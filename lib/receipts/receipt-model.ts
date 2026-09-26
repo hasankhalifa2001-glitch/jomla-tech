@@ -27,6 +27,22 @@
  * lib/receipts/receipt-layout.ts, which is fed by an injected
  * width-measuring function so the whole pipeline stays unit-testable with no
  * canvas, no DOM, and no Bluetooth.
+ *
+ * [FIX — SYP-only receipt] Per product decision: the printed/shared receipt
+ * never shows a USD "≈" approximation — not on the total/paid/debt rows, not
+ * per line item. Every money row below is built from `sypLabel()` alone.
+ * The exchange-rate reference row is kept (it is a rate, not a converted
+ * amount). USD fields still exist on OfflineInvoice / ServerReceiptDetail for
+ * other parts of the app (e.g. the on-screen checkout modal) — they are just
+ * never read by this file anymore.
+ *
+ * [FIX — business name] The receipt header now shows the tenant's business
+ * name as the prominent title, with the SALE/VOID document label demoted to
+ * a subtitle beneath it. Sourced offline-safe: LocalReceiptSource.businessName
+ * comes from CachedSession.tenantName (see local-receipt-source.ts), never a
+ * network call; ServerReceiptDetail.businessName comes from Tenant.name,
+ * resolved server-side (see lib/data/invoices.ts). Falls back to the plain
+ * document title when null, so a missing name never breaks receipt building.
  */
 
 import type { OfflineInvoice, OfflineInvoiceItem } from "@/lib/offline/db";
@@ -37,12 +53,10 @@ import {
   VOID_DOCUMENT_LABEL,
   VOID_TOTAL_LABEL,
   absoluteMoney,
-  dualMoneyLabel,
   formatQuantityLabel,
   formatReceiptTimestamp,
   paymentMethodLabel,
   sypLabel,
-  usdLabel,
 } from "./receipt-lines";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +87,13 @@ export interface LocalReceiptSource {
   invoice: OfflineInvoice;
   customerName: string;
   itemNames: LocalReceiptItemNames;
+  /**
+   * [FIX — business name] Tenant.name, sourced from CachedSession.tenantName
+   * offline (see resolveLocalBusinessName in local-receipt-source.ts) — no
+   * network call. Null when unavailable; headerBlocks() falls back to the
+   * plain document title in that case.
+   */
+  businessName: string | null;
 }
 
 /**
@@ -112,6 +133,8 @@ export interface ServerReceiptDetail {
   receiptPdfUrl?: string | null;
   customer: { name: string };
   items: ServerReceiptDetailItem[];
+  /** [FIX — business name] Tenant.name, resolved server-side. */
+  businessName: string | null;
 }
 
 export interface ServerReceiptSource {
@@ -133,14 +156,16 @@ export type ReceiptBlock =
   | { type: "notice"; text: string; tone: "warn" | "danger" }
   | { type: "row"; label: string; value: string; emphasis?: "primary" | "danger" }
   | {
-      type: "item";
-      name: string;
-      detail: string;
-      total: string;
-      /** Secondary/derived line (the USD "≈" figure), when there is one. */
-      sub?: string;
-      isReturn: boolean;
-    }
+    type: "item";
+    name: string;
+    detail: string;
+    total: string;
+    /** Secondary/derived line. Unused since the SYP-only fix — kept optional
+     * on the type so a future need (e.g. a per-tenant re-opt-in) does not
+     * require touching receipt-layout.ts / receipt-canvas.ts again. */
+    sub?: string;
+    isReturn: boolean;
+  }
   | { type: "divider" }
   | { type: "spacer" };
 
@@ -172,17 +197,36 @@ function localItemName(
   };
 }
 
+/**
+ * [FIX — business name] `businessName` (when present and non-blank) becomes
+ * the prominent receipt title, and the SALE/VOID document label is demoted
+ * to a subtitle beneath it. With no business name, behavior is unchanged
+ * from before this fix: the document label alone is the title.
+ */
 function headerBlocks(
   kind: ReceiptDocumentKind,
   reference: string,
   createdAt: string | Date,
-  originalReference: string | null
+  originalReference: string | null,
+  businessName: string | null
 ): ReceiptBlock[] {
-  const blocks: ReceiptBlock[] = [
-    { type: "title", text: kind === "VOID" ? VOID_DOCUMENT_LABEL : SALE_DOCUMENT_LABEL },
-    { type: "subtitle", text: `المرجع: ${reference}` },
-    { type: "subtitle", text: `التاريخ: ${formatReceiptTimestamp(createdAt)}` },
-  ];
+  const blocks: ReceiptBlock[] = [];
+
+  if (businessName && businessName.trim()) {
+    blocks.push({ type: "title", text: businessName.trim() });
+    blocks.push({
+      type: "subtitle",
+      text: kind === "VOID" ? VOID_DOCUMENT_LABEL : SALE_DOCUMENT_LABEL,
+    });
+  } else {
+    blocks.push({
+      type: "title",
+      text: kind === "VOID" ? VOID_DOCUMENT_LABEL : SALE_DOCUMENT_LABEL,
+    });
+  }
+
+  blocks.push({ type: "subtitle", text: `المرجع: ${reference}` });
+  blocks.push({ type: "subtitle", text: `التاريخ: ${formatReceiptTimestamp(createdAt)}` });
 
   if (kind === "VOID" && originalReference) {
     blocks.push({ type: "subtitle", text: `الفاتورة الملغاة: ${originalReference}` });
@@ -196,14 +240,14 @@ function headerBlocks(
  * invariant (db.ts's createOfflineInvoiceRecord enforces paidAmountSYP >= 0 and
  * debtAmountSYP >= 0 on a plain sale), so no sign normalization is needed — and
  * applying one would silently hide a real invariant violation.
+ *
+ * [FIX — SYP-only] No longer takes or reads any USD figure. Every value is
+ * `sypLabel()` alone — no "(≈ $X)" suffix anywhere on this block.
  */
 function saleTotalBlocks(
   totalSYP: MoneyInput,
-  totalUSD: MoneyInput | null,
   paidSYP: MoneyInput,
-  paidUSD: MoneyInput | null,
   debtSYP: MoneyInput,
-  debtUSD: MoneyInput | null,
   exchangeRateUsed: MoneyInput | null
 ): ReceiptBlock[] {
   const blocks: ReceiptBlock[] = [
@@ -211,13 +255,13 @@ function saleTotalBlocks(
     {
       type: "row",
       label: "إجمالي الفاتورة",
-      value: dualMoneyLabel(totalSYP, totalUSD),
+      value: sypLabel(totalSYP),
       emphasis: "primary",
     },
     {
       type: "row",
       label: "المبلغ المدفوع",
-      value: dualMoneyLabel(paidSYP, paidUSD),
+      value: sypLabel(paidSYP),
     },
   ];
 
@@ -225,7 +269,7 @@ function saleTotalBlocks(
     blocks.push({
       type: "row",
       label: "المتبقي على الحساب (دين)",
-      value: dualMoneyLabel(debtSYP, debtUSD),
+      value: sypLabel(debtSYP),
       emphasis: "danger",
     });
   }
@@ -245,14 +289,14 @@ function saleTotalBlocks(
  * stored money is negative by design (the same "negative for display
  * purposes" convention Rule 5 describes for quantities) and a customer-facing
  * receipt must never show a bare minus sign.
+ *
+ * [FIX — SYP-only] Same change as saleTotalBlocks: no USD parameters, no
+ * "(≈ $X)" suffix.
  */
 function voidTotalBlocks(
   totalSYP: MoneyInput,
-  totalUSD: MoneyInput | null,
   paidSYP: MoneyInput,
-  paidUSD: MoneyInput | null,
   debtSYP: MoneyInput,
-  debtUSD: MoneyInput | null,
   exchangeRateUsed: MoneyInput | null
 ): ReceiptBlock[] {
   const blocks: ReceiptBlock[] = [
@@ -260,19 +304,13 @@ function voidTotalBlocks(
     {
       type: "row",
       label: VOID_TOTAL_LABEL,
-      value: dualMoneyLabel(
-        absoluteMoney(totalSYP),
-        totalUSD === null ? null : absoluteMoney(totalUSD)
-      ),
+      value: sypLabel(absoluteMoney(totalSYP)),
       emphasis: "primary",
     },
     {
       type: "row",
       label: "المبلغ المُعاد للزبون",
-      value: dualMoneyLabel(
-        absoluteMoney(paidSYP),
-        paidUSD === null ? null : absoluteMoney(paidUSD)
-      ),
+      value: sypLabel(absoluteMoney(paidSYP)),
     },
   ];
 
@@ -280,10 +318,7 @@ function voidTotalBlocks(
     blocks.push({
       type: "row",
       label: "تسوية الدين (إلغاء)",
-      value: dualMoneyLabel(
-        absoluteMoney(debtSYP),
-        debtUSD === null ? null : absoluteMoney(debtUSD)
-      ),
+      value: sypLabel(absoluteMoney(debtSYP)),
       emphasis: "danger",
     });
   }
@@ -303,6 +338,10 @@ function syncNoticeBlocks(isSynced: boolean): ReceiptBlock[] {
   return [{ type: "notice", text: LOCAL_ONLY_NOTICE, tone: "warn" }];
 }
 
+/**
+ * [FIX — SYP-only] No longer computes or attaches `sub` (the "≈ $X" line per
+ * item). Only the SYP line total is produced.
+ */
 function localItemsToBlocks(
   items: OfflineInvoiceItem[],
   resolveName: (item: OfflineInvoiceItem) => { productName: string; unitName: string }
@@ -312,10 +351,6 @@ function localItemsToBlocks(
   for (const item of items) {
     const { productName, unitName } = resolveName(item);
     const lineTotalSYP = absoluteMoney(multiplyMoney(item.quantity, item.unitPriceSYP));
-    const lineTotalUSD =
-      item.unitPriceUSD === null
-        ? null
-        : absoluteMoney(multiplyMoney(item.quantity, item.unitPriceUSD));
 
     blocks.push({
       type: "item",
@@ -325,7 +360,6 @@ function localItemsToBlocks(
         absoluteMoney(item.unitPriceSYP)
       )}`,
       total: sypLabel(lineTotalSYP),
-      sub: lineTotalUSD === null ? undefined : `≈ ${usdLabel(lineTotalUSD)}`,
       isReturn: compareMoney(item.quantity, "0") < 0,
     });
   }
@@ -333,15 +367,12 @@ function localItemsToBlocks(
   return blocks;
 }
 
+/** [FIX — SYP-only] Same change as localItemsToBlocks. */
 function serverItemsToBlocks(items: ServerReceiptDetailItem[]): ReceiptBlock[] {
   const blocks: ReceiptBlock[] = [];
 
   for (const item of items) {
     const lineTotalSYP = absoluteMoney(multiplyMoney(item.quantity, item.unitPriceSYP));
-    const lineTotalUSD =
-      item.unitPriceUSD === null
-        ? null
-        : absoluteMoney(multiplyMoney(item.quantity, item.unitPriceUSD));
 
     blocks.push({
       type: "item",
@@ -350,7 +381,6 @@ function serverItemsToBlocks(items: ServerReceiptDetailItem[]): ReceiptBlock[] {
         absoluteMoney(item.unitPriceSYP)
       )}`,
       total: sypLabel(lineTotalSYP),
-      sub: lineTotalUSD === null ? undefined : `≈ ${usdLabel(lineTotalUSD)}`,
       isReturn: compareMoney(item.quantity, "0") < 0,
     });
   }
@@ -367,7 +397,8 @@ function buildLocalModel(source: LocalReceiptSource): ReceiptModel {
     kind,
     invoice.offlineId,
     invoice.createdAt,
-    invoice.voidsOfflineInvoiceId ?? null
+    invoice.voidsOfflineInvoiceId ?? null,
+    source.businessName
   );
 
   blocks.push({ type: "row", label: "الزبون", value: source.customerName || "زبون نقدي" });
@@ -393,23 +424,17 @@ function buildLocalModel(source: LocalReceiptSource): ReceiptModel {
   blocks.push(
     ...(kind === "VOID"
       ? voidTotalBlocks(
-          invoice.totalSYP,
-          invoice.totalUSD,
-          invoice.paidAmountSYP,
-          invoice.paidAmountUSD,
-          invoice.debtAmountSYP,
-          invoice.debtAmountUSD,
-          invoice.exchangeRateUsed
-        )
+        invoice.totalSYP,
+        invoice.paidAmountSYP,
+        invoice.debtAmountSYP,
+        invoice.exchangeRateUsed
+      )
       : saleTotalBlocks(
-          invoice.totalSYP,
-          invoice.totalUSD,
-          invoice.paidAmountSYP,
-          invoice.paidAmountUSD,
-          invoice.debtAmountSYP,
-          invoice.debtAmountUSD,
-          invoice.exchangeRateUsed
-        )),
+        invoice.totalSYP,
+        invoice.paidAmountSYP,
+        invoice.debtAmountSYP,
+        invoice.exchangeRateUsed
+      )),
     ...syncNoticeBlocks(isSynced)
   );
 
@@ -432,7 +457,8 @@ function buildServerModel(source: ServerReceiptSource): ReceiptModel {
     kind,
     detail.id,
     detail.createdAt,
-    detail.voidsInvoiceId
+    detail.voidsInvoiceId,
+    detail.businessName
   );
 
   blocks.push({ type: "row", label: "الزبون", value: customerName });
@@ -451,23 +477,17 @@ function buildServerModel(source: ServerReceiptSource): ReceiptModel {
   blocks.push(
     ...(kind === "VOID"
       ? voidTotalBlocks(
-          detail.totalSYP,
-          detail.totalUSD,
-          detail.paidAmountSYP,
-          detail.paidAmountUSD,
-          detail.debtAmountSYP,
-          detail.debtAmountUSD,
-          detail.exchangeRateUsed
-        )
+        detail.totalSYP,
+        detail.paidAmountSYP,
+        detail.debtAmountSYP,
+        detail.exchangeRateUsed
+      )
       : saleTotalBlocks(
-          detail.totalSYP,
-          detail.totalUSD,
-          detail.paidAmountSYP,
-          detail.paidAmountUSD,
-          detail.debtAmountSYP,
-          detail.debtAmountUSD,
-          detail.exchangeRateUsed
-        ))
+        detail.totalSYP,
+        detail.paidAmountSYP,
+        detail.debtAmountSYP,
+        detail.exchangeRateUsed
+      ))
     // A server-sourced invoice is on the server by definition: no sync notice.
   );
 
