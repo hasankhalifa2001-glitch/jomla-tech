@@ -188,7 +188,7 @@ export default function BillingSettingsPage() {
                 <Wallet className="h-3.5 w-3.5" />
                 سعر الاشتراك الشهري
               </dt>
-              <dd className="font-bold text-emerald-600">$25.00</dd>
+              <dd className="font-bold text-emerald-600">$10.00</dd>
             </div>
           </dl>
 

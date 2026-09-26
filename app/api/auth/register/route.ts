@@ -135,7 +135,7 @@ export async function POST(req: Request) {
                     name: tenantName.trim(),
                     slug: cleanSlug,
                     phone: phone ? phone.trim() : null,
-                    subscriptionStatus: "PENDING",
+                    subscriptionStatus: "ACTIVE",
                 },
             });
 
