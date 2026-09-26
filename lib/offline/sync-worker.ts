@@ -13,8 +13,9 @@
  *    DB conflict on the item's own transaction AND a customer dependency
  *    still mid-retry (see app/api/sync/route.ts's TransientDependencyError).
  * 3. Enforces that FAILED items are NEVER automatically retried (they remain in
- *    the FAILED state until manual reconciliation / T4e ledger resolution).
- *    RETRY_LATER items ARE automatically retried — see triggers 1-3 below.
+ *    the FAILED state until manual reconciliation / T4e ledger resolution) —
+ *    see retryFailedInvoice() below for the one explicit, manual exception to
+ *    this rule.
  * 4. Listens for network reconnection (`online` event) and triggers sync within 5 seconds.
  * 5. Runs a periodic 45s safety-net check while online with pending work.
  *
@@ -24,7 +25,7 @@
  * and still in effect, see earlier revisions of this file for the full text
  * of each ...]
  *
- * [FIX — CHUNKED SYNC, this revision — closes two real bugs that only
+ * [FIX — CHUNKED SYNC, prior revision — closes two real bugs that only
  * surface after a long offline period with a large backlog]
  *
  * BUG 1 — Timeout / oversized-payload risk. The previous version of this
@@ -100,6 +101,23 @@
  * Chunk sizes are deliberately conservative (customers/payments are
  * cheaper per-item than invoices, hence the larger size) and are exported
  * constants so they can be tuned without hunting through the function body.
+ *
+ * [FIX — CONNECTION-LEVEL ERRORS, this revision] Closes a real
+ * misclassification bug on the SERVER side (app/api/sync/route.ts's
+ * isRetryableTxError()) that this file's own status handling below simply
+ * trusted: a raw database CONNECTION failure (e.g. Postgres or the
+ * connection pool closing an established connection mid-request — "Server
+ * has closed the connection") was previously NOT recognized as retryable
+ * there, so it fell through to a permanent FAILED result after a single
+ * attempt instead of the correct RETRY_LATER. Per this file's OWN
+ * documented policy (point 3 above), FAILED is never auto-retried — so a
+ * perfectly valid invoice could get stuck forever over a passing network
+ * hiccup with zero data problem. That server-side classification is now
+ * fixed to recognize Prisma connection-error codes (P1001/P1002/P1008/
+ * P1017), PrismaClientInitializationError, and matching raw driver
+ * messages as retryable, exactly like the existing deadlock/serialization
+ * handling. See retryFailedInvoice() below for the client-side manual
+ * safety net for any invoice already stuck FAILED from before that fix.
  */
 
 import { getOfflineDb, isOfflineDbSupported, type OfflineInvoice } from "./db";
@@ -690,6 +708,51 @@ export async function getPendingRecordsCount(tenantId?: string): Promise<number>
   ]);
 
   return cCount + iCount + pCount;
+}
+
+/**
+ * [ADDED — manual retry escape hatch for a FAILED invoice]
+ *
+ * Resets a single FAILED offline invoice back to PENDING (clearing its
+ * failureReason) so the next sync pass — the caller is expected to call
+ * triggerSync() immediately after this, as offline-void-panel.tsx does —
+ * attempts it again from scratch.
+ *
+ * This exists as a safety net ALONGSIDE the /api/sync/route.ts fix that
+ * now correctly classifies transient database CONNECTION errors (e.g.
+ * "Server has closed the connection") as RETRY_LATER instead of FAILED
+ * going forward — see this file's header [FIX — CONNECTION-LEVEL ERRORS]
+ * note. That server-side fix is what stops NEW invoices from getting
+ * stuck this way. This function is for any invoice that was ALREADY
+ * marked FAILED (from before that fix, or any future misclassification
+ * neither of us anticipated) — per this file's own documented policy,
+ * FAILED is never auto-retried, so without an explicit escape hatch such
+ * an invoice would otherwise require a direct database edit to recover.
+ *
+ * Deliberately scoped to exactly ONE invoice (by offlineId) — never
+ * touches any other pending/failed record. Safe to call from a UI button
+ * with no extra guards at the call site: it quietly does nothing if the
+ * invoice doesn't exist locally, belongs to a different tenant, or isn't
+ * currently FAILED (e.g. a second click while a retry is already
+ * in flight and has already resolved it).
+ */
+export async function retryFailedInvoice(
+  tenantId: string,
+  offlineId: string
+): Promise<void> {
+  if (!tenantId || !offlineId || !isOfflineDbSupported()) return;
+
+  const db = getOfflineDb();
+  const local = await db.offlineInvoices.where("offlineId").equals(offlineId).first();
+
+  if (!local || local.id === undefined) return;
+  if (local.tenantId !== tenantId) return;
+  if (local.status !== "FAILED") return;
+
+  await db.offlineInvoices.update(local.id, {
+    status: "PENDING",
+    failureReason: undefined,
+  });
 }
 
 /**

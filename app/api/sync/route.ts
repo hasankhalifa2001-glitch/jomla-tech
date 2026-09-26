@@ -58,7 +58,7 @@ export const dynamic = "force-dynamic";
  * still-PENDING (eligible for automatic retry on the next sync pass, with
  * no local status change at all).
  *
- * [FIX — TRANSIENT CUSTOMER DEPENDENCY, this revision — restores a
+ * [FIX — TRANSIENT CUSTOMER DEPENDENCY, prior revision — restores a
  * regression] A single sync request can contain a brand-new walk-in
  * customer AND a sale/void/payment that references that same customer,
  * created moments apart on the same device (T4b's ordinary "create
@@ -91,6 +91,42 @@ export const dynamic = "force-dynamic";
  * still falls through to the original generic error and is still marked
  * FAILED as before — this only changes behavior for the specific "my own
  * dependency is still mid-retry" case.
+ *
+ * [FIX — CONNECTION-LEVEL ERRORS, this revision — closes a real
+ * misclassification bug] isRetryableTxError() previously recognized ONLY
+ * transaction write-conflict errors (Prisma code P2034, and
+ * deadlock/serialization messages) as retryable. It had NO awareness of a
+ * raw database CONNECTION failure — the connection pool losing its link to
+ * Postgres mid-request, a brief network blip between this server and the
+ * database, or Postgres itself closing an established/idle connection
+ * ("Server has closed the connection", observed in production; see the
+ * accompanying client-side sync-worker.ts fix note for the exact symptom).
+ *
+ * That is an INFRASTRUCTURE problem, not a problem with the invoice/
+ * customer/payment DATA being synced — yet it fell through to the generic
+ * branch in every catch block below and was recorded as a permanent
+ * "FAILED" after a single attempt (withTxRetries only retries when this
+ * function returns true). Per this route's own documented per-item
+ * semantics (see the client's sync-worker.ts header), FAILED is NEVER
+ * automatically retried — so a perfectly valid invoice with zero actual
+ * data problem could get stuck FAILED forever purely because of a passing
+ * network hiccup.
+ *
+ * FIX: isRetryableTxError() now ALSO recognizes:
+ *   - Prisma error codes P1001 (can't reach database server), P1002 (the
+ *     database server was reached but timed out), P1008 (operation
+ *     timed out), and P1017 (server has closed the connection) — all
+ *     surfaced as Prisma.PrismaClientKnownRequestError.
+ *   - Prisma.PrismaClientInitializationError — the client couldn't even
+ *     (re-)establish a connection to the database at all.
+ *   - A message-based fallback covering P2024 (connection-pool timeout,
+ *     which doesn't always surface as a typed error depending on engine
+ *     version) and common raw driver-level connection-loss phrases.
+ *
+ * Any of these now correctly triggers a retry inside withTxRetries() (up
+ * to MAX_TX_ATTEMPTS) and, if still failing after that, is recorded as
+ * RETRY_LATER instead of FAILED — exactly the same treatment as the
+ * existing deadlock/serialization case, with no other behavior change.
  */
 
 // ============================================================================
@@ -215,12 +251,34 @@ function isUniqueConflict(err: unknown): boolean {
   return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
 }
 
+// [FIX — CONNECTION-LEVEL ERRORS] See the file-header FIX note for the
+// full rationale. Recognizes both transaction write-conflicts (the
+// original P2034/deadlock/serialization case) AND raw database
+// connection failures (new) as retryable — the latter being an
+// infrastructure hiccup, never a data problem with the item being synced.
 function isRetryableTxError(err: unknown): boolean {
-  if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2034") {
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    // P2034: write conflict / deadlock, reported by the query engine's own
+    //        "please retry this transaction" mechanism.
+    // P1001: the database server could not be reached at all.
+    // P1002: the database server was reached but the connection timed out.
+    // P1008: an operation on the database timed out.
+    // P1017: the server closed an established connection
+    //        ("Server has closed the connection").
+    if (["P2034", "P1001", "P1002", "P1008", "P1017"].includes(err.code)) {
+      return true;
+    }
+  }
+  // The Prisma client failed to even establish/re-establish a connection
+  // to the database at all — always transient from this route's
+  // perspective, never a reason to burn the item into permanent FAILED.
+  if (err instanceof Prisma.PrismaClientInitializationError) {
     return true;
   }
   const message = err instanceof Error ? err.message : String(err);
-  return /deadlock detected|could not serialize|40001|40P01/i.test(message);
+  return /deadlock detected|could not serialize|40001|40P01|P2024|server has closed the connection|connection terminated|connection reset|econnreset|etimedout|timed out fetching a new connection|can't reach database server/i.test(
+    message
+  );
 }
 
 function errorMessage(err: unknown, fallback: string): string {
