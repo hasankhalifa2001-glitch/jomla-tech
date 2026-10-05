@@ -15,7 +15,7 @@ export function SublinkLauncher() {
             <button
                 type="button"
                 disabled
-                className={`${s.chip} ${s.linkChip} ${s.linkChipOff}`}
+                className={`${s.chip} ${s.linkChip} ${s.linkChipOff} max-md:!shrink-0`}
                 aria-label="المتجر الإلكتروني"
             >
                 <Store size={18} aria-hidden />
@@ -36,7 +36,7 @@ export function SublinkLauncher() {
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label="المتجر الإلكتروني"
-                        className={`${s.chip} ${s.linkChip} ${s.linkChipOn}`}
+                        className={`${s.chip} ${s.linkChip} ${s.linkChipOn} max-md:!shrink-0`}
                     >
                         <Store size={18} aria-hidden />
                         <span className={s.onlyDesktop}>المتجر الإلكتروني</span>

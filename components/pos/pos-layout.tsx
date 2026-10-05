@@ -62,6 +62,7 @@ import {
   ShoppingCart,
   ChevronUp,
   ScanLine,
+  PackageSearch,
 } from "lucide-react";
 import { toast } from "sonner";
 import { serializeMoney, formatMoney, compareMoney } from "@/lib/utils/money";
@@ -70,7 +71,17 @@ export function PosLayout() {
   const { data: session } = useSessionWithOfflineFallback();
   const tenantId = session?.tenantId;
 
-  const { isReady: isDbReady, status: dbStatus } = useOfflineDbReady(tenantId);
+  // [FIX — empty-cache deadlock] `isReady` requires products AND customers
+  // AND an exchange rate to ALL be cached (lib/offline/hooks.ts), which is
+  // deliberately strict (T4a's contract) and must not change. A brand-new
+  // tenant has none of the three, so `isReady` is false until after the
+  // very first sync — but every data-loading effect below used to be
+  // gated on `isReady`, so the catalog spun forever and the effect that
+  // performs that first sync (1d) could never run: the cache could never
+  // populate itself. The effects below are therefore gated on `isDbOpen`
+  // ("Dexie is open and queryable", true even when every table is empty)
+  // instead. `isDbReady` is kept ONLY for the status dot's colour.
+  const { isReady: isDbReady, isDbOpen, status: dbStatus } = useOfflineDbReady(tenantId);
   const dailyExchangeRate = useExchangeRateStore((state) => state.dailyExchangeRate);
   const hydrateExchangeRate = useExchangeRateStore((state) => state.hydrateFromCache);
 
@@ -78,13 +89,8 @@ export function PosLayout() {
   // screen at all — sync-worker.ts's reactive auto-sync logic (fires a
   // debounced sync attempt whenever a Dexie write moves pendingCount from
   // 0 to a positive number) therefore never actually ran during a normal
-  // POS session; it only ever fired incidentally when some OTHER
-  // component holding this hook happened to mount/remount (e.g. a full
-  // page reload). `pendingCount` below is now the single, live source of
-  // truth for the "بانتظار المزامنة" badge — no more separately-tracked,
-  // stale local state that only updated on a handful of manual call
-  // sites (loadData, effect "1a", handleConfirmCheckout) and had no way
-  // to reflect a sync that succeeded elsewhere.
+  // POS session. `pendingCount` below is the single, live source of
+  // truth for the "بانتظار المزامنة" badge.
   const { pendingCount: pendingInvoicesCount, triggerSync } = useSyncWorker(tenantId);
   // [v4.2] T4e Addendum: Evicts merged duplicate customers from cachedCustomers across tabs
   useCustomerCacheSync(tenantId);
@@ -122,28 +128,26 @@ export function PosLayout() {
 
   // [FIX — race condition] Monotonically increasing request id, checked
   // against the id captured at request time before writing a product-search
-  // response into state. Previously, two overlapping effects both called
-  // getOfflineProducts on every searchQuery keystroke (see below), and
-  // neither guarded against out-of-order resolution — a slower response
-  // for an earlier keystroke could resolve AFTER a faster response for a
-  // later keystroke and silently overwrite it, showing products that don't
-  // match what's currently typed in the search box. This ref is the single
-  // source of truth for "is this response still the one we care about."
+  // response into state. A slower response for an earlier keystroke could
+  // otherwise resolve AFTER a faster response for a later keystroke and
+  // silently overwrite it.
   const productsRequestIdRef = useRef(0);
 
   // Full reload of products (exchange rate + product catalog) — intentionally
   // used ONLY after an action that can invalidate all of it at once
   // (seeding demo data). Everyday product search and the exchange-rate
-  // refresh are each handled by their own narrower effect below, so this
-  // is not on the render path.
+  // refresh are each handled by their own narrower effect below.
   //
-  // [FIX] No longer reads/sets pendingInvoicesCount — that value now comes
-  // live from useSyncWorker(tenantId) above, which reacts to Dexie writes
-  // on its own; there is nothing left here for this function to refresh.
+  // [FIX] The exchange-rate hydrate is wrapped in its OWN try/catch so a
+  // missing/failed rate can never prevent the product catalog from loading.
   const loadData = useCallback(async () => {
-    if (!isDbReady) return;
+    if (!isDbOpen) return;
     try {
-      await hydrateExchangeRate(tenantId);
+      try {
+        await hydrateExchangeRate(tenantId);
+      } catch (err) {
+        console.error("Failed to hydrate exchange rate (non-fatal):", err);
+      }
       const prods = await getOfflineProducts(tenantId, searchQuery);
       setProducts(prods);
     } catch (err) {
@@ -151,24 +155,12 @@ export function PosLayout() {
     } finally {
       setIsLoadingProducts(false);
     }
-  }, [isDbReady, hydrateExchangeRate, tenantId, searchQuery]);
+  }, [isDbOpen, hydrateExchangeRate, tenantId, searchQuery]);
 
-  // 1a. Exchange rate — loads once per tenant/DB readiness change.
-  // Deliberately does NOT depend on searchQuery: it has nothing to do with
-  // what's typed in the product search box, so re-running this on every
-  // keystroke (as an old merged effect once did) was pure wasted work, not
-  // a correctness requirement.
-  //
-  // [FIX] Previously also fetched offlineInvoices here to compute
-  // pendingInvoicesCount manually. That entire branch is removed — the
-  // pending count is now sourced live from useSyncWorker(tenantId) above,
-  // which updates automatically on any Dexie write to
-  // offlineInvoices/offlinePayments/offlineCustomers, from any code path,
-  // including a sync pass completing on a totally different mounted
-  // component. Manually re-deriving the same count here would just be a
-  // second, out-of-sync source of truth for the exact bug this fix closes.
+  // 1a. Exchange rate — loads once per tenant/DB-open change.
+  // Deliberately does NOT depend on searchQuery.
   useEffect(() => {
-    if (!isDbReady) return;
+    if (!isDbOpen) return;
     let isMounted = true;
 
     hydrateExchangeRate(tenantId).catch((err) => {
@@ -180,14 +172,14 @@ export function PosLayout() {
     return () => {
       isMounted = false;
     };
-  }, [isDbReady, hydrateExchangeRate, tenantId]);
+  }, [isDbOpen, hydrateExchangeRate, tenantId]);
 
   // 1b. Default system cash customer — also independent of searchQuery.
   // `prev ?? system` preserves whatever the cashier has already actively
   // selected (including mid-search) instead of clobbering it every time
   // this effect re-runs.
   useEffect(() => {
-    if (!isDbReady) return;
+    if (!isDbOpen) return;
     let isMounted = true;
 
     getSystemCashCustomer(tenantId).then((system) => {
@@ -199,31 +191,21 @@ export function PosLayout() {
     return () => {
       isMounted = false;
     };
-  }, [isDbReady, tenantId]);
+  }, [isDbOpen, tenantId]);
 
   // 1c. Product catalog / search — the SINGLE source of truth for
-  // `products` and `isLoadingProducts`. Previously this logic was
-  // duplicated across two separate effects (the merged "initial load"
-  // effect and a second "dynamic search filtering" effect) that both fired
-  // on every searchQuery change, double-calling getOfflineProducts per
-  // keystroke with no ordering guarantee between the two calls or between
-  // successive keystrokes — see the productsRequestIdRef comment above for
-  // why that was a real bug, not just redundant work.
+  // `products` and `isLoadingProducts`. Runs as soon as Dexie is open, so
+  // an EMPTY cache resolves to "loaded, zero products" (clearing the
+  // spinner) rather than waiting for a full cache that can only be filled
+  // by the sync in effect 1d.
   useEffect(() => {
-    if (!isDbReady) return;
+    if (!isDbOpen) return;
 
     const requestId = ++productsRequestIdRef.current;
 
     // [FIX — React "setState synchronously within an effect" warning]
-    // Wrapped in an inner async function instead of calling
-    // setIsLoadingProducts(true) directly as the first statement of the
-    // effect body. React (and the Next.js dev overlay) flags a setState
-    // call that runs synchronously in an effect's body as a potential
-    // cascading-render risk — not a bug, but a best-practice nudge.
-    // Moving the setState calls inside `run()` doesn't change the
-    // request-id race-guard logic at all (see productsRequestIdRef
-    // comment above); it only changes WHEN, relative to React's own
-    // render/commit cycle, the state updates are scheduled.
+    // setState calls live inside an inner async function instead of the
+    // effect body's first statement.
     async function run() {
       setIsLoadingProducts(true);
       try {
@@ -246,22 +228,21 @@ export function PosLayout() {
     }
 
     void run();
-  }, [isDbReady, searchQuery, tenantId]);
+  }, [isDbOpen, searchQuery, tenantId]);
 
   // 1d. Opportunistic initial product sync from the server (Postgres ->
-  // Dexie). Fires once per tenant/DB-ready change, independent of
-  // searchQuery. This closes the gap where `cachedProducts` previously had
-  // no path to ever receive a tenant's REAL catalog — only
-  // `seedSampleOfflineData`'s hardcoded demo products ever wrote to it.
+  // Dexie). Fires once per tenant/DB-open change, independent of
+  // searchQuery. [FIX] Now gated on `isDbOpen`, NOT `isDbReady`: on a
+  // brand-new tenant the cache is empty so `isDbReady` is false — gating
+  // this on it meant an empty cache could never populate itself.
   //
   // Deliberately silent on failure (offline, fetch error): this must never
   // block or interrupt a cashier who may be legitimately offline and
-  // relying on whatever was cached during the last successful sync. See
-  // lib/offline/product-sync.ts for the "OFFLINE"/"FETCH_FAILED" reasons
-  // this swallows here — the manual "مزامنة المنتجات" button below is the
-  // path that surfaces those to the user instead.
+  // relying on whatever was cached during the last successful sync. The
+  // manual "مزامنة الأصناف" button / empty-state banner below is the path
+  // that surfaces those to the user instead.
   useEffect(() => {
-    if (!isDbReady || !tenantId) return;
+    if (!isDbOpen || !tenantId) return;
     let isMounted = true;
 
     syncProductsFromServer(tenantId).then((result) => {
@@ -278,7 +259,7 @@ export function PosLayout() {
       isMounted = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDbReady, tenantId]);
+  }, [isDbOpen, tenantId]);
 
   // Cart Totals calculation strictly through decimal.js
   const cartTotals = useMemo(() => {
@@ -292,6 +273,18 @@ export function PosLayout() {
     () => cartNeedsExchangeRate(cartItems),
     [cartItems]
   );
+
+  const isRateMissing =
+    !dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0;
+
+  // [FIX] Explicit "nothing cached yet" state: Dexie is open, the first
+  // read finished, no search is active, and there are zero products. This
+  // replaces the endless spinner with an actionable message.
+  const showEmptyCacheBanner =
+    isDbOpen &&
+    !isLoadingProducts &&
+    products.length === 0 &&
+    searchQuery.trim() === "";
 
   // 2. Keyboard Shortcuts (F2: Search, F4: Customer, F9: Checkout, Esc: Close)
   useEffect(() => {
@@ -339,13 +332,9 @@ export function PosLayout() {
   // [v3.6] FIX — this handler previously only captured `unitPriceUSD` from
   // resolveCartLinePrices() and never stored `unitPriceSYP` on the cart
   // line at all, even though CartLineItem (pos-service.ts) has required
-  // `unitPriceSYP: string` since the v3.6 re-anchoring. That omission
-  // meant every cart line was missing the ONE field calculateCartTotals()
-  // actually multiplies by quantity — adding anything to the cart would
-  // have thrown inside money.ts's toDecimal() the moment totals were
-  // computed. Both prices (SYP authoritative, USD derived/nullable) are
-  // now captured and stored, matching resolveCartLinePrices()'s real
-  // return shape.
+  // `unitPriceSYP: string` since the v3.6 re-anchoring. Both prices (SYP
+  // authoritative, USD derived/nullable) are now captured and stored,
+  // matching resolveCartLinePrices()'s real return shape.
   function handleAddToCart(product: PosProductItem, unit: CachedProductUnit) {
     if (unit.isActive === false) {
       toast.error("لا يمكن بيع وحدة غير نشطة.");
@@ -356,15 +345,11 @@ export function PosLayout() {
     let unitPriceSYP: string;
     let unitPriceUSD: string | null;
     let pricingCurrency: "USD" | "SYP";
-    let priceRetailSYP: string | undefined;
-    let priceRetailUSD: string | null | undefined;
     try {
       const prices = resolveCartLinePrices(unit, product, dailyExchangeRate);
       unitPriceSYP = prices.unitPriceSYP;
       unitPriceUSD = prices.unitPriceUSD;
       pricingCurrency = prices.pricingCurrency;
-      priceRetailSYP = prices.priceRetailSYP;
-      priceRetailUSD = prices.priceRetailUSD;
     } catch (err) {
       toast.error(
         err instanceof Error
@@ -397,8 +382,6 @@ export function PosLayout() {
         // [T4b] Preserved from resolveCartLinePrices so cartNeedsExchangeRate
         // can inspect items without re-reading the unit from the catalog.
         pricingCurrency,
-        priceRetailSYP,
-        priceRetailUSD,
       };
       return [...prev, newItem];
     });
@@ -493,11 +476,9 @@ export function PosLayout() {
     );
   }
 
-  // [v3.6] FIX — same omission as handleAddToCart above: this rebuilt the
-  // cart line's price fields on a unit change but only ever wrote
-  // `unitPriceUSD`, silently dropping `unitPriceSYP` on the item that
-  // changed. Now updates all four price fields returned by
-  // resolveCartLinePrices().
+  // [v3.6] FIX — rebuilds ALL price fields returned by
+  // resolveCartLinePrices() on a unit change (previously only
+  // `unitPriceUSD` was written, silently dropping `unitPriceSYP`).
   function handleChangeUnit(cartId: string, newUnitId: string) {
     setCartItems((prev) =>
       prev.map((item) => {
@@ -521,8 +502,6 @@ export function PosLayout() {
                 // [T4b] Keep pricingCurrency up to date when the cashier
                 // switches a line item to a different unit mid-sale.
                 pricingCurrency: prices.pricingCurrency,
-                priceRetailSYP: prices.priceRetailSYP,
-                priceRetailUSD: prices.priceRetailUSD,
               };
             } catch (err) {
               toast.error(
@@ -550,31 +529,13 @@ export function PosLayout() {
 
   // 4. Offline Checkout Submission
   //
-  // [v3.6] FIX — this previously took `paidAmountUSD`/`debtAmountUSD` from
-  // the payment step and forwarded `totalUSD`/`paidAmountUSD`/
-  // `debtAmountUSD` straight into submitOfflineSale()'s payload. None of
-  // those fields exist on OfflineSalePayload anymore (pos-service.ts):
-  // the payload now only accepts the SYP-authoritative fields
-  // (totalSYP/paidAmountSYP/debtAmountSYP) and derives USD itself inside
-  // createOfflineInvoiceRecord. This now takes paidAmountSYP/debtAmountSYP
-  // from the payment step and forwards only the SYP fields.
+  // [v3.6] Takes paidAmountSYP/debtAmountSYP from the payment step and
+  // forwards only the SYP-authoritative fields to submitOfflineSale();
+  // USD is derived inside createOfflineInvoiceRecord.
   //
-  // [FIX — real bug: pending badge and sync never reacted to a completed
-  // sale] This handler previously re-fetched getOfflineInvoicesList()
-  // manually at the end just to recompute pendingInvoicesCount by hand —
-  // a separate, disconnected source of truth from any actual sync attempt
-  // happening elsewhere in the app. Now that useSyncWorker(tenantId) is
-  // mounted at the top of this component, pendingInvoicesCount updates
-  // itself the instant saveOfflineInvoiceWithBalance() (inside
-  // submitOfflineSale) writes the new PENDING row to Dexie — there is
-  // nothing left to manually recompute here. What WAS still missing
-  // entirely is actually asking for a sync attempt: this component never
-  // called triggerSync() anywhere, so the very first sync after any sale
-  // only ever happened if some OTHER mounted component's useSyncWorker
-  // instance (or its own debounced reactive effect) happened to run. An
-  // explicit triggerSync() call right after a successful checkout gives
-  // the cashier fast, deterministic feedback instead of depending solely
-  // on the hook's own 2-second debounce.
+  // [FIX] An explicit triggerSync() right after a successful checkout
+  // gives the cashier fast, deterministic feedback instead of depending
+  // solely on the hook's own 2-second debounce.
   async function handleConfirmCheckout(paymentData: {
     paidAmountSYP: string;
     debtAmountSYP: string;
@@ -583,6 +544,11 @@ export function PosLayout() {
     // [T4b] If any cart item is priced in USD, a valid dailyExchangeRate is mandatory.
     // For SYP-only carts, an exchange rate is optional; if none is cached, fallback to "1.0000"
     // so the Dexie offline invoice record can be durably saved.
+    //
+    // KNOWN CONCERN (reported to the maintainer, intentionally NOT changed
+    // here): with the "1.0000" fallback the persisted invoice freezes
+    // exchangeRateUsed = 1, so its derived USD figures equal the SYP
+    // figures. See the review notes accompanying this file.
     const effectiveRate =
       dailyExchangeRate && compareMoney(dailyExchangeRate, 0) > 0
         ? dailyExchangeRate
@@ -631,20 +597,12 @@ export function PosLayout() {
     setIsPaymentModalOpen(false);
     setIsSuccessModalOpen(true);
 
-    // [FIX] Products still need a manual refresh here (stock display is
-    // not covered by any live query) — the pending-invoice COUNT no
-    // longer does, since useSyncWorker's pendingCount already updated
-    // itself reactively the instant the Dexie write above completed.
+    // Products still need a manual refresh here (stock display is not
+    // covered by any live query) — the pending-invoice COUNT does not,
+    // since useSyncWorker's pendingCount updates itself reactively.
     const prods = await getOfflineProducts(tenantId, searchQuery);
     setProducts(prods);
 
-    // [FIX] Explicit, immediate sync attempt right after a successful
-    // checkout — see the function-level FIX note above for why this was
-    // the actual missing piece (this screen never called triggerSync()
-    // anywhere before). useSyncWorker's own reactive 0->positive
-    // detection + 2s debounce would eventually fire this on its own now
-    // that the hook is mounted here, but an explicit call gives faster,
-    // more deterministic feedback instead of waiting out the debounce.
     void triggerSync();
 
     toast.success("تم حفظ الفاتورة محلياً بنجاح في قاعدة البيانات (Dexie)!");
@@ -665,20 +623,10 @@ export function PosLayout() {
 
   async function handleSeedDemoData() {
     // [FIX — TS2345] `seedSampleOfflineData` deliberately requires a
-    // strict `tenantId: string` (not `string | undefined`) — see its
-    // definition in pos-service.ts: unlike the read paths and the other
-    // write paths in that file, it performs bulk durable writes
-    // (cachedProducts / cachedCustomers / cachedTenantSettings) and the
-    // whole point of that stricter signature is to make "no tenant
-    // context" a compile-time error here rather than a runtime one. This
-    // call site previously passed `tenantId` (typed `string | undefined`
-    // from `session?.user?.tenantId`) straight through without narrowing
-    // it first, which is exactly what TypeScript was correctly rejecting.
-    // The guard below both fixes the compile error (TS narrows `tenantId`
-    // to `string` for the rest of this function after the early return)
-    // and gives the cashier/admin a clear Arabic explanation instead of
-    // letting the click silently do nothing or fall through to the
-    // generic catch-block error message below.
+    // strict `tenantId: string` (it performs bulk durable writes), so
+    // "no tenant context" is made a compile-time error here. The guard
+    // below narrows `tenantId` to `string` for the rest of this function
+    // and gives the user a clear Arabic explanation.
     if (!tenantId) {
       toast.error("لا يمكن تحميل بيانات تجريبية دون تحديد هوية المتجر (تسجيل الدخول مطلوب).");
       return;
@@ -715,6 +663,7 @@ export function PosLayout() {
       if (result.success) {
         const prods = await getOfflineProducts(tenantId, searchQuery);
         setProducts(prods);
+        setIsLoadingProducts(false);
         toast.success(`تمت مزامنة ${result.count} صنف من السيرفر بنجاح.`);
       } else if (result.reason === "OFFLINE") {
         toast.error("لا يوجد اتصال بالإنترنت — تعذّرت مزامنة الأصناف.");
@@ -731,29 +680,16 @@ export function PosLayout() {
       {/*
         Top POS Action & Status Bar — reworked for density on mobile.
 
-        Design changes vs. the previous version:
-        1. "قاعدة Dexie: جاهزة" is no longer a permanent text badge — it's
-           a small status dot with a tooltip. It rarely changes state
-           during a shift, so it doesn't deserve constant label-width.
+        1. "قاعدة Dexie: جاهزة" is a small status dot with a tooltip.
         2. The "فواتير بانتظار المزامنة" badge only renders when the count
-           is > 0. A "0" badge told the cashier nothing and cost a full
-           badge's width on every screen size.
-        3. The exchange-rate badge drops its "سعر الصرف:" label below the
-           sm breakpoint — the number + icon is enough once you already
-           know what the badge is for.
-        4. "مزامنة الأصناف" and "تهيئة بيانات تجريبية" collapse to
-           icon-only buttons below lg (with a title tooltip) and expand to
-           full labeled buttons on lg+, where there's room. These are
-           secondary/admin actions — they shouldn't compete with the
-           primary search-and-sell flow for mobile width.
-        5. Hover states on secondary buttons switched from
-           emerald-tinted to neutral zinc, so emerald reads consistently
-           as "this is the important/primary action" (exchange-rate
-           badge, sync spinner icon, mobile checkout bar) rather than
-           being sprinkled across every interactive element.
-        6. [ADDED] A "مسح باركود" scan button, styled and placed identically
-           to the sync/seed buttons — icon-only under lg, labeled on lg+.
-           Opens the camera scanner in continuous mode.
+           is > 0.
+        3. The exchange-rate badge drops its label below the sm breakpoint.
+           [FIX] When the rate is missing it is now a non-blocking AMBER
+           warning (SYP sales never need a rate), not a red alarm.
+        4. Secondary buttons collapse to icon-only below lg.
+        5. Hover states on secondary buttons are neutral zinc so emerald
+           reads consistently as "primary".
+        6. A "مسح باركود" scan button, same pattern as sync/seed.
       */}
       <div className="flex items-center justify-between gap-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 sm:p-3 dark:border-zinc-800 dark:bg-zinc-900 shadow-xs shrink-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -761,7 +697,7 @@ export function PosLayout() {
             <span
               className={`inline-block h-2 w-2 rounded-full ${isDbReady
                 ? "bg-emerald-500"
-                : dbStatus === "NO_CACHED_DATA"
+                : dbStatus === "NO_CACHED_DATA" || dbStatus === "PARTIAL"
                   ? "bg-amber-500"
                   : "bg-zinc-300 animate-pulse"
                 }`}
@@ -770,7 +706,9 @@ export function PosLayout() {
                   ? "قاعدة البيانات المحلية جاهزة"
                   : dbStatus === "NO_CACHED_DATA"
                     ? "لا توجد بيانات مخزنة محلياً بعد — يرجى الاتصال بالإنترنت للمزامنة"
-                    : "جاري تهيئة قاعدة البيانات..."
+                    : dbStatus === "PARTIAL"
+                      ? "بعض البيانات المحلية غير مكتملة بعد (مثل سعر الصرف أو الزبائن)"
+                      : "جاري تهيئة قاعدة البيانات..."
               }
             />
             {pendingInvoicesCount > 0 && (
@@ -805,7 +743,7 @@ export function PosLayout() {
         </div>
 
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {dailyExchangeRate && compareMoney(dailyExchangeRate, 0) > 0 ? (
+          {!isRateMissing ? (
             <Badge className="bg-emerald-600 text-white gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap">
               <DollarSign className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">سعر الصرف: </span>
@@ -813,12 +751,13 @@ export function PosLayout() {
             </Badge>
           ) : (
             <Badge
-              variant="destructive"
-              className="gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap"
+              variant="outline"
+              className="gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800"
+              title="البيع بالليرة السورية متاح بدون سعر صرف. السعر مطلوب فقط للأصناف المسعّرة بالدولار."
             >
-              <AlertTriangle className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">سعر الصرف غير محدد!</span>
-              <span className="sm:hidden">لا يوجد سعر صرف</span>
+              <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
+              <span className="hidden sm:inline">سعر الصرف غير محدد</span>
+              <span className="sm:hidden">بدون سعر صرف</span>
             </Badge>
           )}
 
@@ -935,18 +874,46 @@ export function PosLayout() {
       />
 
       {/*
+        [FIX] Explicit "no local data yet" state, replacing the old endless
+        "جاري قراءة الأصناف من الذاكرة المحلية" spinner. Shown when Dexie is
+        open, the first read has finished, no search is active and there are
+        zero cached products — i.e. a brand-new tenant (or a device that has
+        never synced). It tells the user exactly what to do and offers the
+        sync action directly.
+      */}
+      {showEmptyCacheBanner && (
+        <div className="flex items-center justify-between gap-3 rounded-2xl border border-amber-300 bg-amber-50 px-3.5 py-3 text-amber-900 dark:border-amber-900 dark:bg-amber-950/50 dark:text-amber-200 shrink-0">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <PackageSearch className="h-5 w-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5 min-w-0">
+              <p className="text-xs font-bold">لا توجد أصناف محلية بعد</p>
+              <p className="text-[11px] leading-relaxed text-amber-800 dark:text-amber-300">
+                {typeof navigator !== "undefined" && !navigator.onLine
+                  ? "لا يوجد اتصال بالإنترنت. اتصل بالإنترنت ثم اضغط مزامنة الأصناف."
+                  : "اضغط مزامنة الأصناف لتحميل أصناف متجرك. إذا لم تضف أصنافاً بعد، أضفها من صفحة المخزون أولاً."}
+              </p>
+            </div>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleSyncProducts}
+            disabled={isSyncingProducts}
+            className="h-8 gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white shrink-0"
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 ${isSyncingProducts ? "animate-spin" : ""}`}
+            />
+            <span>{isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}</span>
+          </Button>
+        </div>
+      )}
+
+      {/*
         Main Split Layout: Desktop 2-column, Mobile 1-column.
 
-        [FIX — bottom-nav clearance] `pb-16` (64px) matched the OLD
-        floating cart bar's footprint (bottom-3 + h-13 ≈ 64px). Now that
-        the bar sits higher (see below, to clear the app shell's bottom
-        tab bar), the scrollable content needs more bottom clearance too
-        — otherwise the catalog's last row of products would still sit
-        directly under the floating bar even though the bar itself moved.
-        Bumped to `pb-36` (144px), sized to the new bar position
-        (bottom-20 ≈ 80px) + its own height (h-13 ≈ 52px) + a small
-        margin. Re-check this alongside the bottom-nav height once you
-        can give me the exact value (see note below).
+        [FIX — bottom-nav clearance] `pb-36` (144px) clears the floating
+        mobile cart bar, which sits above the app shell's bottom tab bar.
       */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 flex-1 overflow-hidden pb-36 lg:pb-0">
         {/* RIGHT SIDE (60%-65% width on desktop, 100% on mobile): Product Catalog */}
@@ -986,24 +953,11 @@ export function PosLayout() {
       {/*
         Mobile Floating Bottom Bar (Trigger for Cart Drawer).
 
-        [FIX — hidden behind app shell bottom nav] This was previously
-        `bottom-3` — the same fixed viewport-bottom zone the app shell's
-        own bottom tab bar (سلة/مخزون/دفتر الديون/نقطة البيع/الرئيسية)
-        occupies. Both are independently `fixed`, so they overlapped: the
-        tab bar rendered on top, making this button invisible and
-        unreachable on mobile even though it was present in the DOM.
-
-        Moved to `bottom-20` (80px) so it sits ABOVE the tab bar instead
-        of raising z-index — raising z-index alone would still visually
-        stack this bar on top of the tab bar rather than clearing it.
-
-        NOTE: `bottom-20` is an estimate based on the tab bar's visible
-        height in the screenshot, not a measured constant. Once you can
-        give me the tab bar component (or just its rendered height from
-        DevTools → Computed), I'll replace this with an exact value —
-        ideally read from a shared constant/CSS variable the tab bar
-        itself exports, so the two can never drift out of sync again if
-        the tab bar's height ever changes.
+        [FIX — hidden behind app shell bottom nav] Moved to `bottom-20`
+        (80px) so it sits ABOVE the app shell's own bottom tab bar instead
+        of overlapping it. NOTE: `bottom-20` is an estimate of the tab
+        bar's height, not a measured constant — ideally replace it with a
+        shared constant/CSS variable exported by the tab bar component.
       */}
       <div className="lg:hidden fixed bottom-20 inset-x-3 z-30">
         <Button
@@ -1029,13 +983,9 @@ export function PosLayout() {
           </div>
 
           {/*
-            [v3.6] FIX — SYP is now the primary/large figure and USD the
-            secondary/derived one, matching the schema's re-anchoring
-            (previously this was inverted: USD large/primary, SYP small).
-            Also guards against `cartTotals.totalUSD` being `null` (no
-            exchange rate cached yet) — the old code called
-            formatMoney(cartTotals.totalUSD, "USD") unconditionally, which
-            throws a MoneyError on null instead of just hiding the USD line.
+            [v3.6] SYP is the primary/large figure and USD the
+            secondary/derived one. Guards against `cartTotals.totalUSD`
+            being `null` (no exchange rate cached yet).
           */}
           <div className="flex items-center gap-2">
             <div className="text-left">
@@ -1100,13 +1050,9 @@ export function PosLayout() {
 
       {/*
         Checkout & Payment Rail Selection Modal.
-        [v3.6] Now passes `totalSYP` (authoritative) alongside `totalUSD`
-        (derived, may be null) so payment-modal.tsx can lead its own UI
-        with SYP the same way the rest of the app does. That file isn't
-        shown here, so its `totalSYP`/`totalUSD` props and its
-        onConfirmCheckout payload shape (paidAmountSYP/debtAmountSYP,
-        matching handleConfirmCheckout below) need the corresponding
-        update on its side.
+        [v3.6] Passes `totalSYP` (authoritative) alongside `totalUSD`
+        (derived, may be null) so payment-modal.tsx leads its own UI with
+        SYP the same way the rest of the app does.
       */}
       <PaymentModal
         open={isPaymentModalOpen}

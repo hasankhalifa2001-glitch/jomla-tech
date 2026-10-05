@@ -39,6 +39,23 @@ interface BarcodeScannerModalProps {
   feedback?: "toast" | "silent";
   /** Cooldown between accepted scans in continuous mode, ms. */
   continuousCooldownMs?: number;
+  /**
+   * Optional heading override. Defaults to the generic per-mode title, so
+   * existing callers (POS, Inventory search) are unchanged.
+   */
+  title?: string;
+  /**
+   * Optional description override. The built-in continuous-mode text talks
+   * about adding items to the CART (POS-specific); a caller using continuous
+   * mode for something else (e.g. collecting several barcodes for one unit)
+   * passes its own wording here.
+   */
+  description?: string;
+  /**
+   * Optional caller content rendered directly under the video frame — e.g. a
+   * live list of what has been scanned so far in this session.
+   */
+  children?: React.ReactNode;
 }
 
 export function BarcodeScannerModal({
@@ -48,6 +65,9 @@ export function BarcodeScannerModal({
   mode = "single",
   feedback = "toast",
   continuousCooldownMs = 1200,
+  title,
+  description,
+  children,
 }: BarcodeScannerModalProps) {
   // Was `useRef<HTMLVideoElement | null>(null)` read as
   // `videoRef.current!` inside the effect. DialogContent (Radix) mounts its
@@ -238,6 +258,15 @@ export function BarcodeScannerModal({
     };
   }, [open, videoEl, retryToken, handleOpenChange, continuousCooldownMs]);
 
+  const resolvedTitle =
+    title ?? (mode === "continuous" ? "مسح مستمر للأصناف" : "مسح الباركود بالكاميرا");
+
+  const resolvedDescription =
+    description ??
+    (mode === "continuous"
+      ? "وجّه الكاميرا نحو كل صنف بالتتابع — سيُضاف تلقائياً إلى السلة عند كل مسح ناجح."
+      : "وجه كاميرا الجهاز نحو الباركود المطبوع على المنتج للمسح التلقائي.");
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-md p-6 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl">
@@ -245,12 +274,10 @@ export function BarcodeScannerModal({
           <DialogHeader>
             <DialogTitle className="text-base font-bold flex items-center gap-2">
               <Camera className={`w-5 h-5 ${m.titleIcon}`} aria-hidden />
-              <span>{mode === "continuous" ? "مسح مستمر للأصناف" : "مسح الباركود بالكاميرا"}</span>
+              <span>{resolvedTitle}</span>
             </DialogTitle>
             <DialogDescription className="text-xs text-zinc-500">
-              {mode === "continuous"
-                ? "وجّه الكاميرا نحو كل صنف بالتتابع — سيُضاف تلقائياً إلى السلة عند كل مسح ناجح."
-                : "وجه كاميرا الجهاز نحو الباركود المطبوع على المنتج للمسح التلقائي."}
+              {resolvedDescription}
             </DialogDescription>
           </DialogHeader>
 
@@ -285,6 +312,9 @@ export function BarcodeScannerModal({
               </div>
             )}
           </div>
+
+          {/* Caller-supplied content (e.g. the list scanned so far). */}
+          {children}
 
           <DialogFooter>
             <button type="button" onClick={() => handleOpenChange(false)} className={`${m.btn} ${m.btnOutline} ${m.btnFull}`}>

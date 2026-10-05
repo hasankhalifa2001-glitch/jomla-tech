@@ -1,62 +1,105 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @next/next/no-img-element */
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
-import { Plus, Trash2, PackagePlus, Camera, Crop, AlertTriangle, CheckCircle2, Check, ScanBarcode, ShieldAlert, Search, Info, RefreshCw } from "lucide-react";
+import {
+  Plus,
+  Trash2,
+  PackagePlus,
+  Camera,
+  Crop,
+  AlertTriangle,
+  CheckCircle2,
+  ScanBarcode,
+  ShieldAlert,
+  Search,
+  Info,
+  RefreshCw,
+  ImagePlus,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
-import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
+import {
+  BarcodeSourceModal,
+  type BarcodeSourceChoice,
+  type BarcodeSourceCandidate,
+  type BarcodeSourceSelection,
+} from "@/components/inventory/BarcodeSourceModal";
+import { ModalShell, ModalStepper, Field, NativeSelect, Segmented } from "@/components/inventory/modal-ui";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-// lib/inventory/packaging-unit-validation.ts was deleted when
-// validatePackagingUnits() was merged into lib/inventory/units.ts (see
-// that file's header FIX #3 note) — every former importer, including this
-// component, now imports it from there instead. The old path no longer
-// resolves to anything and previously broke the build/dev server on this
-// file ("Module not found").
+// validatePackagingUnits() lives in lib/inventory/units.ts (the old
+// packaging-unit-validation.ts was deleted when it was merged in).
 import { validatePackagingUnits } from "@/lib/inventory/units";
-import m from "./modals.module.css";
+// [Batch cost entry — UNIFIED] The ONE shared derivation the server also runs
+// (costFromTotal() underneath), so the figure shown live in this form can never
+// diverge from what gets stored for the initial batch.
+import { costBreakdownForDisplay } from "@/lib/inventory/units";
 
-// products/route.ts's POST now requires conversionFactor/priceWholesale/
-// priceRetail/initialBatch.quantity as validated DECIMAL STRINGS
-// (regex-checked, max 4 decimal places) rather than JSON numbers — see
-// that file's DECIMAL_STRING_REGEX note. This component's internal state
-// stays `number` (simplest for <input type="number"> controls), but every
-// value crossing into the API payload must go through this helper rather
-// than a raw `Number(...)`/`String(...)` cast:
-//   - `String(0.1 + 0.2)` can produce floating-point noise like
-//     "0.30000000000000004", which has more than 4 decimal digits and
-//     would fail the backend's regex outright.
-//   - `toFixed(4)` both rounds to the column's actual precision
-//     (Decimal(18,4)) and guarantees a plain, non-exponential decimal
-//     string, matching the regex `^-?\d{1,14}(\.\d{1,4})?$` in every case.
-// Non-finite input (a NaN slipping through a bad parseFloat) is coerced to
-// "0" rather than emitting an invalid string like "NaN".
+// [Batch cost entry] Mirrors the server's own quantity/totalCost rule
+// (batches/route.ts's AMOUNT_REGEX + isPositiveAmount): strictly positive,
+// max 14 integer / 4 decimal digits, validated on the raw typed string so no
+// precision is lost through parseFloat().
+const AMOUNT_REGEX = /^\d{1,14}(\.\d{1,4})?$/;
+function isPositiveAmount(value: string): boolean {
+  const v = value.trim();
+  if (!AMOUNT_REGEX.test(v)) return false;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0;
+}
+
+// products/route.ts's POST requires conversionFactor/priceWholesale as
+// validated DECIMAL STRINGS (regex-checked, max 4 decimal places) rather than
+// JSON numbers. Every value crossing into the API payload must go through this
+// helper rather than a raw `Number(...)`/`String(...)` cast. Non-finite input
+// becomes "0".
 const toDecimalString = (value: number): string => {
   if (!Number.isFinite(value)) return "0";
   return value.toFixed(4);
 };
+
+// [v4.4, Spec Addendum Section 10] Today's date, DISPLAY ONLY — a cosmetic
+// preview of the date prefix the server prepends to the batchNumber at save
+// time. NEVER sent to the server; the real prefix is generated server-side by
+// lib/inventory/batch-number.ts's buildServerDatePrefix().
+function todaysDatePrefix(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+}
+
+/** One CONFIRMED barcode on a unit — `barcodeSource` is never empty here. */
+interface UnitBarcodeForm {
+  barcode: string;
+  // Only "GS1" | "INTERNAL" exist in this list. The UNCONFIRMED state is not
+  // representable here at all: an as-yet-unclassified value lives in
+  // `UnitForm.barcodeDraft` / the confirmation modal, and a value that the
+  // merchant abandoned is simply never added to `barcodes`.
+  barcodeSource: BarcodeSourceChoice;
+}
 
 interface UnitForm {
   unitName: string;
   conversionFactor: number;
   pricingCurrency: "SYP" | "USD";
   priceWholesale: number;
-  priceRetail: number | "";
-  barcode: string;
-  // "" is the UNCONFIRMED state, distinct from both "GS1" and "INTERNAL".
-  // "" is NEVER silently coerced into "INTERNAL" anywhere downstream —
-  // see handleSubmit and the barcode-commit flow below. A unit may
-  // legally reach submit time with barcode: "" AND barcodeSource: ""
-  // together (no barcode at all — fine); it may NEVER reach submit time
-  // with a non-empty barcode paired with barcodeSource: "" (an
-  // unconfirmed classification) — that combination is actively prevented
-  // at every point a barcode value can be set, not just checked-for at
-  // the end.
-  barcodeSource: "GS1" | "INTERNAL" | "";
-  imageUrl: string;
+  // [v4.5] Zero, one, or many barcodes per unit, each already classified.
+  barcodes: UnitBarcodeForm[];
+  // [v4.5] The transient text in this unit's barcode input — what the
+  // merchant is typing or just scanned, before it has been classified.
+  // NEVER submitted; Enter / the Add button / a delimited paste / the next
+  // step all route it through the confirmation modal, and only a confirmed
+  // entry is appended to `barcodes` above. A dismiss discards the draft.
+  barcodeDraft: string;
+  // [v4.6] imageUrl removed — the image now lives on the Product.
 }
 
 interface AddProductModalProps {
@@ -70,10 +113,8 @@ const DEFAULT_BASE_UNIT: UnitForm = {
   conversionFactor: 1,
   pricingCurrency: "SYP",
   priceWholesale: 1000,
-  priceRetail: "",
-  barcode: "",
-  barcodeSource: "",
-  imageUrl: "",
+  barcodes: [],
+  barcodeDraft: "",
 };
 
 interface CatalogEntryInfo {
@@ -91,13 +132,22 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [isPublic, setIsPublic] = useState(false);
+  // [v4.6] The ONE product-level image (moved here from per-unit UnitForm).
+  const [imageUrl, setImageUrl] = useState("");
 
   const [units, setUnits] = useState<UnitForm[]>([{ ...DEFAULT_BASE_UNIT }]);
 
   const [hasInitialBatch, setHasInitialBatch] = useState(false);
   const [batchUnitIndex, setBatchUnitIndex] = useState(0);
-  const [batchNumber, setBatchNumber] = useState("");
-  const [batchQuantity, setBatchQuantity] = useState<number>(0);
+  // [v4.4, Spec Addendum Section 10] Only the merchant-supplied SUFFIX is
+  // collected here. The stored value is always "{server-date}-{suffix}", built
+  // server-side — this component never builds that concatenation itself.
+  const [batchNumberSuffix, setBatchNumberSuffix] = useState("");
+  // [Batch cost entry — UNIFIED] QUANTITY received in the picked unit plus the
+  // TOTAL paid for it. The server derives the stored per-base-unit cost. Both
+  // stay raw strings — never round-tripped through parseFloat().
+  const [batchQuantity, setBatchQuantity] = useState<string>("");
+  const [totalCost, setTotalCost] = useState<string>("");
   const [expiryDate, setExpiryDate] = useState("");
 
   const [loading, setLoading] = useState(false);
@@ -106,9 +156,14 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
   const [scannerModalOpen, setScannerModalOpen] = useState(false);
   const [activeUnitForScan, setActiveUnitForScan] = useState<number>(0);
+  // [v4.5 UX] Barcodes collected by the camera in continuous mode. They are
+  // classified together, in ONE confirmation modal, when the scanner closes.
+  // The ref mirrors the state so the scanner's (ref-held) onScan callback never
+  // reads a stale list while scans arrive quickly.
+  const [scanBuffer, setScanBuffer] = useState<string[]>([]);
+  const scanBufferRef = useRef<string[]>([]);
 
   const [cropModalOpen, setCropModalOpen] = useState(false);
-  const [activeUnitForCrop, setActiveUnitForCrop] = useState<number>(0);
 
   const [catalogInfo, setCatalogInfo] = useState<CatalogEntryInfo | null>(null);
   const [reportModalOpen, setReportModalOpen] = useState(false);
@@ -120,11 +175,16 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
   const [barcodeGate, setBarcodeGate] = useState<{
     unitIndex: number | null;
-    barcode: string;
-  }>({ unitIndex: null, barcode: "" });
+    // [v4.5] The NEW barcodes awaiting classification in this one action —
+    // exactly the set the modal shows, one row each. Empty while closed.
+    candidates: BarcodeSourceCandidate[];
+  }>({ unitIndex: null, candidates: [] });
 
   const lookupAbortRef = useRef<AbortController | null>(null);
   const lookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // [v4.5 UX] Per-unit barcode inputs, so focus can return to the field after
+  // a confirmation (back-to-back hardware scanning without re-clicking).
+  const barcodeInputRefs = useRef<Record<number, HTMLInputElement | null>>({});
 
   useEffect(() => {
     return () => {
@@ -137,17 +197,21 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setName("");
     setCategory("");
     setIsPublic(false);
+    setImageUrl(""); // [v4.6]
     setUnits([{ ...DEFAULT_BASE_UNIT }]);
     setHasInitialBatch(false);
     setBatchUnitIndex(0);
-    setBatchNumber("");
-    setBatchQuantity(0);
+    setBatchNumberSuffix("");
+    setBatchQuantity("");
+    setTotalCost("");
     setExpiryDate("");
     setCatalogInfo(null);
     setStep(1);
     setPendingQuickScanBarcode("");
     setQuickScanConsumed(false);
-    setBarcodeGate({ unitIndex: null, barcode: "" });
+    setBarcodeGate({ unitIndex: null, candidates: [] });
+    scanBufferRef.current = [];
+    setScanBuffer([]);
   };
 
   const handleOpenChange = (isOpen: boolean) => {
@@ -170,10 +234,9 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         conversionFactor: highestFactor * 6,
         pricingCurrency: units[0]?.pricingCurrency || "SYP",
         priceWholesale: 0,
-        priceRetail: "",
-        barcode: "",
-        barcodeSource: "",
-        imageUrl: "",
+        barcodes: [],
+        barcodeDraft: "",
+        // [v4.6] No imageUrl on units anymore — image is on the product.
       },
     ]);
   };
@@ -181,18 +244,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const handleRemoveUnit = (index: number) => {
     // Unit 0 is always the product's base unit (T3a §0: the first unit
     // entered at creation automatically becomes Product.baseUnitId, with
-    // conversionFactor locked to 1). Previously only `units.length <= 1`
-    // was guarded against — nothing stopped removing index 0 specifically
-    // when 2+ units existed. Doing so left the array's NEW index 0 (the
-    // old index 1) displayed as "الوحدة الأساسية" with its
-    // conversionFactor field forced to show "1" and disabled (`idx === 0`
-    // in the JSX below) — while the underlying state for that unit still
-    // held its real, original factor (e.g. 6). The user could never fix
-    // this (the field is disabled), and validatePackagingUnits() would
-    // then fail with "يجب تحديد وحدة أساسية واحدة بمعامل تحويل يساوي 1"
-    // even though the screen showed a "1". This guard makes index-0
-    // removal impossible regardless of caller, as defense in depth
-    // alongside hiding the delete button for idx === 0 in the JSX below.
+    // conversionFactor locked to 1). Removing it would leave the NEW index 0
+    // displayed as the base unit while its state still held its real factor,
+    // and the field is locked so the user could never fix it. Defense in depth
+    // alongside hiding the delete button for idx === 0 in the JSX.
     if (index === 0) {
       toast.error("لا يمكن حذف الوحدة الأساسية — هي المرجع الذي تُحسب عليه كل الوحدات الأخرى.");
       return;
@@ -209,17 +264,11 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       setBatchUnitIndex(0);
     }
 
-    // Previously only cleared the gate when `barcodeGate.unitIndex ===
-    // index` (an exact match). If the gate was open for a LATER unit
-    // (e.g. unitIndex: 2) and an EARLIER unit was removed (index: 1),
-    // every index after the removed one shifts down by one in the new
-    // array — but the gate's stored unitIndex was left unchanged,
-    // pointing at the wrong unit (or, if it was the last one, out of
-    // bounds). Fixed to shift the index down when it's past the removed
-    // position, and only clear it on an exact match.
+    // Shift the gate's unit index down when an EARLIER unit was removed, and
+    // clear it only on an exact match.
     setBarcodeGate((prev) => {
       if (prev.unitIndex === null) return prev;
-      if (prev.unitIndex === index) return { unitIndex: null, barcode: "" };
+      if (prev.unitIndex === index) return { unitIndex: null, candidates: [] };
       if (prev.unitIndex > index) return { ...prev, unitIndex: prev.unitIndex - 1 };
       return prev;
     });
@@ -231,123 +280,251 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setUnits(updated);
   };
 
-  const requestBarcodeClassification = (unitIndex: number, rawBarcode: string) => {
-    const cleaned = rawBarcode.trim();
+  /** Every barcode already CONFIRMED on any unit of this form. */
+  const confirmedBarcodes = (source: UnitForm[]) =>
+    source.flatMap((u) => u.barcodes.map((b) => b.barcode));
 
-    if (!cleaned) {
-      const updated = [...units];
-      updated[unitIndex] = { ...updated[unitIndex], barcode: "", barcodeSource: "" };
-      setUnits(updated);
-      setCatalogInfo(null);
-      // Also close the classification gate if it was open for this exact
-      // unit — previously only the unit's own barcode/barcodeSource
-      // fields were cleared, but a still-open BarcodeSourceModal (opened
-      // for the barcode value that just got erased) could be left
-      // pointing at a barcode that no longer exists on this unit.
-      if (barcodeGate.unitIndex === unitIndex) {
-        setBarcodeGate({ unitIndex: null, barcode: "" });
+  /**
+   * [v4.5] Splits one input/paste into individual barcode values. `;`, tab and
+   * newline are the separators, mirroring the CSV import's rule; a single
+   * value (the overwhelmingly common case) behaves exactly as before.
+   */
+  const splitBarcodeInput = (raw: string): string[] =>
+    raw
+      .split(/[;\n\t]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+  const clearUnitBarcodeDraft = (unitIndex: number) => {
+    setUnits((prev) => {
+      const updated = [...prev];
+      if (updated[unitIndex]) {
+        updated[unitIndex] = { ...updated[unitIndex], barcodeDraft: "" };
       }
-      return;
-    }
-
-    const currentUnit = units[unitIndex];
-    if (currentUnit && currentUnit.barcode === cleaned && currentUnit.barcodeSource) {
-      return;
-    }
-
-    const updated = [...units];
-    updated[unitIndex] = { ...updated[unitIndex], barcodeSource: "" };
-    setUnits(updated);
-
-    setBarcodeGate({ unitIndex, barcode: cleaned });
-    lookupBarcodeInCatalog(cleaned, unitIndex);
+      return updated;
+    });
+    // A still-open gate for this unit would be pointing at a draft that no
+    // longer exists — close it.
+    setBarcodeGate((prev) =>
+      prev.unitIndex === unitIndex ? { unitIndex: null, candidates: [] } : prev
+    );
   };
 
-  const handleBarcodeSourceConfirm = (source: BarcodeSourceChoice) => {
-    const { unitIndex, barcode } = barcodeGate;
+  const focusBarcodeInput = (unitIndex: number) => {
+    // Next tick: the confirmation dialog has to finish closing (and release
+    // its focus trap) before focus can land back on the input.
+    setTimeout(() => barcodeInputRefs.current[unitIndex]?.focus(), 60);
+  };
+
+  /**
+   * Opens the mandatory confirmation gate for EVERY new barcode found in what
+   * the merchant entered (one row per barcode), and loads the shared-catalog
+   * match for each so a known GS1 barcode can use the simplified confirmation
+   * view. The gate is always (re)opened from scratch, so no previous
+   * classification can carry over.
+   */
+  const requestBarcodeClassification = (unitIndex: number, rawValue: string) => {
+    // [UX] A classification session is already open — never re-open or replace
+    // it (Enter followed by a stray second event would otherwise remount the
+    // modal and wipe the merchant's clicks).
+    if (barcodeGate.unitIndex !== null) return;
+
+    // De-duplicate WITHIN this single input/paste itself, before comparing
+    // against what's already confirmed elsewhere ("123;123" must never produce
+    // two rows for one physical barcode).
+    const parsed = Array.from(new Set(splitBarcodeInput(rawValue)));
+
+    if (parsed.length === 0) {
+      // [UX] Deliberately does NOT clear catalogInfo: an empty field firing
+      // this (e.g. tabbing through it) used to wipe the shared-catalog banner
+      // the merchant had just earned from the step-1 scan.
+      clearUnitBarcodeDraft(unitIndex);
+      return;
+    }
+
+    // A barcode resolves to exactly one unit tenant-wide, so it can never
+    // belong to two units of the same product. Caught here with a friendly
+    // message instead of a 400 after the whole form has been filled in; the
+    // backend re-checks independently.
+    const used = new Set(confirmedBarcodes(units));
+    const fresh = parsed.filter((b) => !used.has(b));
+    const clashes = parsed.filter((b) => used.has(b));
+    if (clashes.length > 0) {
+      toast.error(
+        clashes.length === 1
+          ? `الباركود ${clashes[0]} مضاف مسبقاً لهذا المنتج.`
+          : `${clashes.length} باركودات مضافة مسبقاً لهذا المنتج وتم تجاهلها.`
+      );
+    }
+    if (fresh.length === 0) {
+      clearUnitBarcodeDraft(unitIndex);
+      return;
+    }
+
+    setBarcodeGate({ unitIndex, candidates: fresh.map((barcode) => ({ barcode })) });
+    lookupCatalogMatches(fresh, unitIndex);
+  };
+
+  const handleBarcodeSourceConfirm = (selections: BarcodeSourceSelection[]) => {
+    const { unitIndex } = barcodeGate;
     if (unitIndex === null) return;
 
     setUnits((prev) => {
       const updated = [...prev];
-      updated[unitIndex] = { ...updated[unitIndex], barcode, barcodeSource: source };
+      const unit = updated[unitIndex];
+      if (!unit) return prev;
+      const existing = new Set(unit.barcodes.map((b) => b.barcode));
+      const added = selections.filter((s) => !existing.has(s.barcode));
+      updated[unitIndex] = {
+        ...unit,
+        barcodes: [
+          ...unit.barcodes,
+          ...added.map((s) => ({ barcode: s.barcode, barcodeSource: s.barcodeSource })),
+        ],
+        // The draft has been consumed — it is a confirmed chip now.
+        barcodeDraft: "",
+      };
       return updated;
     });
 
-    setBarcodeGate({ unitIndex: null, barcode: "" });
+    setBarcodeGate({ unitIndex: null, candidates: [] });
+    // [UX] Ready for the next scan/typed barcode with no extra click.
+    focusBarcodeInput(unitIndex);
   };
 
   const handleBarcodeSourceDismiss = () => {
     const { unitIndex } = barcodeGate;
     if (unitIndex !== null) {
-      setUnits((prev) => {
-        const updated = [...prev];
-        updated[unitIndex] = { ...updated[unitIndex], barcode: "", barcodeSource: "" };
-        return updated;
-      });
+      // Spec: dismissing the gate means the barcode VALUE is not saved either —
+      // which is exactly why the draft (not just a "source" field) is cleared.
+      clearUnitBarcodeDraft(unitIndex);
     }
-    setBarcodeGate({ unitIndex: null, barcode: "" });
+    setBarcodeGate({ unitIndex: null, candidates: [] });
   };
 
-  const lookupBarcodeInCatalog = (barcodeVal: string, targetUnitIndex: number) => {
-    if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
+  /** Removes a barcode chip that has not been saved yet (create screen). */
+  const handleRemoveUnitBarcode = (unitIndex: number, barcode: string) => {
+    setUnits((prev) => {
+      const updated = [...prev];
+      const unit = updated[unitIndex];
+      if (!unit) return prev;
+      updated[unitIndex] = {
+        ...unit,
+        barcodes: unit.barcodes.filter((b) => b.barcode !== barcode),
+      };
+      return updated;
+    });
+  };
 
-    const cleanBarcode = barcodeVal.trim();
-    if (!cleanBarcode) {
-      setCatalogInfo(null);
-      return;
-    }
+  /**
+   * [v4.5] Looks up EVERY freshly entered barcode in the shared catalog in one
+   * pass. Two things come out of it:
+   *   1. per-barcode matches, folded back into the open confirmation gate, so a
+   *      barcode the platform already knows gets the simplified one-click GS1
+   *      view while every other row gets the full GS1/INTERNAL choice;
+   *   2. the FIRST match also drives the one-time name/category/image
+   *      suggestion banner.
+   * A miss is NOT an error and never blocks classification.
+   */
+  const lookupCatalogMatches = (barcodesList: string[], targetUnitIndex: number) => {
+    if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
 
     lookupTimerRef.current = setTimeout(async () => {
       lookupAbortRef.current?.abort();
       const controller = new AbortController();
       lookupAbortRef.current = controller;
 
-      try {
-        const res = await fetch(`/api/catalog/lookup?barcode=${encodeURIComponent(cleanBarcode)}`, {
-          signal: controller.signal,
-        });
-        const data = await res.json();
-        if (res.ok && data.success && data.entry) {
-          setCatalogInfo(data.entry);
-          if (data.entry.name) {
-            setName((prev) => prev || data.entry.name);
-          }
-          if (data.entry.category) {
-            setCategory((prev) => prev || data.entry.category);
-          }
-          if (data.entry.imageUrl) {
-            setUnits((prevUnits) => {
-              const updated = [...prevUnits];
-              if (updated[targetUnitIndex] && !updated[targetUnitIndex].imageUrl) {
-                updated[targetUnitIndex] = {
-                  ...updated[targetUnitIndex],
-                  imageUrl: data.entry.imageUrl,
-                };
-              }
-              return updated;
+      const matches: Record<string, { name: string } | null> = {};
+      const foundEntries: CatalogEntryInfo[] = [];
+
+      await Promise.all(
+        barcodesList.map(async (value) => {
+          try {
+            const res = await fetch(`/api/catalog/lookup?barcode=${encodeURIComponent(value)}`, {
+              signal: controller.signal,
             });
+            const data = await res.json();
+            if (res.ok && data.success && data.entry) {
+              matches[value] = { name: data.entry.name };
+              foundEntries.push(data.entry as CatalogEntryInfo);
+            } else {
+              matches[value] = null;
+            }
+          } catch (err: any) {
+            if (err?.name === "AbortError") return;
           }
-          toast.success(`تم العثور على المنتج في الكتالوج المشترك: "${data.entry.name}"`);
-        } else {
-          setCatalogInfo(null);
-        }
-      } catch (err: any) {
-        if (err?.name === "AbortError") return;
+        })
+      );
+
+      // Fold the matches into the gate — only rows still present there are
+      // updated (the merchant may have confirmed or dismissed meanwhile).
+      setBarcodeGate((prev) =>
+        prev.unitIndex === null
+          ? prev
+          : {
+            ...prev,
+            candidates: prev.candidates.map((c) => ({
+              ...c,
+              catalogMatch: matches[c.barcode] ?? c.catalogMatch ?? null,
+            })),
+          }
+      );
+
+      const firstEntry = foundEntries[0];
+      if (!firstEntry) {
+        setCatalogInfo(null);
+        return;
       }
+
+      setCatalogInfo(firstEntry);
+      if (firstEntry.name) setName((prev) => prev || firstEntry.name);
+
+      const suggestedCategory = firstEntry.category;
+      if (suggestedCategory) setCategory((prev) => prev || suggestedCategory);
+
+      const suggestedImage = firstEntry.imageUrl;
+      // [v4.6] Catalog image is now suggested at the product level.
+      if (suggestedImage && !imageUrl) {
+        setImageUrl(suggestedImage);
+      }
+
+      toast.success(`تم العثور على المنتج في الكتالوج المشترك: "${firstEntry.name}"`);
     }, 300);
   };
 
+  // [v4.5 UX] The unit scanner runs in CONTINUOUS mode: each accepted scan only
+  // lands in the buffer (a barcode still sitting in front of the camera is
+  // ignored); the whole batch is classified once, when the scanner closes.
   const handleBarcodeScanResult = (scannedBarcode: string) => {
-    requestBarcodeClassification(activeUnitForScan, scannedBarcode);
+    const value = scannedBarcode.trim();
+    if (!value || scanBufferRef.current.includes(value)) return;
+    scanBufferRef.current = [...scanBufferRef.current, value];
+    setScanBuffer(scanBufferRef.current);
+  };
+
+  const handleScannerOpenChange = (isOpen: boolean) => {
+    setScannerModalOpen(isOpen);
+    if (isOpen) return;
+
+    const collected = scanBufferRef.current;
+    scanBufferRef.current = [];
+    setScanBuffer([]);
+
+    if (collected.length > 0) {
+      requestBarcodeClassification(activeUnitForScan, collected.join(";"));
+    }
+  };
+
+  const openUnitScanner = (unitIndex: number) => {
+    scanBufferRef.current = [];
+    setScanBuffer([]);
+    setActiveUnitForScan(unitIndex);
+    setScannerModalOpen(true);
   };
 
   const handleCropResult = (croppedDataUrl: string) => {
-    const updated = [...units];
-    updated[activeUnitForCrop] = {
-      ...updated[activeUnitForCrop],
-      imageUrl: croppedDataUrl,
-    };
-    setUnits(updated);
+    // [v4.6] Crop result now goes to the product-level imageUrl, not a unit.
+    setImageUrl(croppedDataUrl);
   };
 
   const runQuickCatalogCheck = async (barcodeOverride?: string) => {
@@ -372,6 +549,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         setCatalogInfo(data.entry);
         if (data.entry.name) setName((prev) => prev || data.entry.name);
         if (data.entry.category) setCategory((prev) => prev || data.entry.category);
+        if (data.entry.imageUrl) setImageUrl((prev) => prev || data.entry.imageUrl);
         setQuickLookupState("found");
       } else {
         setCatalogInfo(null);
@@ -394,15 +572,11 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
 
   const handleTogglePublic = (checked: boolean) => {
     if (checked) {
-      const candidateUnits = units.map((u) => ({
-        isActive: true,
-        priceRetail: u.priceRetail === "" ? null : Number(u.priceRetail),
-        imageUrl: u.imageUrl || null,
-      }));
-
+      // [v4.6] Image lives on the product, not on individual units.
       const gate = checkProductPublishable({
         isActive: true,
-        units: candidateUnits,
+        imageUrl: imageUrl.trim() || null,
+        units: units.map(() => ({ isActive: true })),
       });
 
       if (!gate.publishable) {
@@ -420,9 +594,24 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         return;
       }
 
-      if (pendingQuickScanBarcode && !quickScanConsumed) {
+      // [v4.5 UX] The barcode from the quick scan is handed to the BASE unit's
+      // draft field instead of popping the confirmation modal mid-navigation.
+      // The merchant sees it sitting in the barcode field on the next step (and
+      // can move it/remove it, e.g. when it actually belongs to a carton), and
+      // the step-2 "next" check refuses to continue until it is classified —
+      // so nothing is silently lost if the modal is later dismissed.
+      const quick = pendingQuickScanBarcode.trim();
+      if (quick && !quickScanConsumed) {
         setQuickScanConsumed(true);
-        requestBarcodeClassification(0, pendingQuickScanBarcode);
+        setUnits((prev) => {
+          const updated = [...prev];
+          const current = updated[0].barcodeDraft.trim();
+          updated[0] = {
+            ...updated[0],
+            barcodeDraft: current ? `${current};${quick}` : quick,
+          };
+          return updated;
+        });
       }
     }
 
@@ -432,29 +621,22 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
         return;
       }
 
-      const packagingCheck = validatePackagingUnits(
-        units.map((u) => ({
-          ...u,
-          priceRetail: u.priceRetail === "" ? null : u.priceRetail,
-        }))
-      );
+      const packagingCheck = validatePackagingUnits(units);
       if (!packagingCheck.valid) {
         toast.error(packagingCheck.error);
         return;
       }
 
-      const enteredBarcodes = units.map((u) => u.barcode.trim()).filter(Boolean);
-      if (new Set(enteredBarcodes).size !== enteredBarcodes.length) {
-        toast.error("لا يمكن استخدام نفس الباركود لأكثر من وحدة قياس ضمن المنتج نفسه.");
-        return;
-      }
+      // [v4.5] Barcodes. The two real failure modes are a gate left open
+      // mid-classification, and a value typed/scanned but never classified.
       if (barcodeGate.unitIndex !== null) {
         toast.error("يرجى إكمال تصنيف مصدر الباركود المعلّق قبل المتابعة.");
         return;
       }
-      const hasUnclassified = units.some((u) => u.barcode.trim() && !u.barcodeSource);
-      if (hasUnclassified) {
-        toast.error("يوجد باركود بدون تصنيف مصدر — يرجى إعادة إدخاله لتصنيفه.");
+      const pendingDraftIndex = units.findIndex((u) => u.barcodeDraft.trim().length > 0);
+      if (pendingDraftIndex !== -1) {
+        toast.error("يوجد باركود لم يكتمل تصنيفه — يرجى تأكيد مصدره قبل المتابعة.");
+        requestBarcodeClassification(pendingDraftIndex, units[pendingDraftIndex].barcodeDraft);
         return;
       }
     }
@@ -482,43 +664,57 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
-    const packagingCheck = validatePackagingUnits(
-      units.map((u) => ({
-        ...u,
-        priceRetail: u.priceRetail === "" ? null : u.priceRetail,
-      }))
-    );
+    const packagingCheck = validatePackagingUnits(units);
     if (!packagingCheck.valid) {
       toast.error(packagingCheck.error);
       setStep(2);
       return;
     }
 
-    const enteredBarcodes = units.map((u) => u.barcode.trim()).filter(Boolean);
-    if (new Set(enteredBarcodes).size !== enteredBarcodes.length) {
-      toast.error("لا يمكن استخدام نفس الباركود لأكثر من وحدة قياس ضمن المنتج نفسه.");
-      return;
-    }
-
-    const hasUnclassifiedBarcode = units.some((u) => u.barcode.trim() && !u.barcodeSource);
-    if (hasUnclassifiedBarcode) {
-      toast.error("يوجد باركود واحد أو أكثر بدون تصنيف مصدر (GS1/داخلي) مؤكد. يرجى إعادة إدخاله لإكمال التصنيف.");
+    // [v4.5] Submitting with a draft still present would silently discard what
+    // the merchant typed, so the gate is opened for that unit and this submit
+    // is aborted — press submit again once resolved.
+    if (barcodeGate.unitIndex !== null) {
+      toast.error("يرجى إكمال تصنيف مصدر الباركود المعلّق قبل الحفظ.");
       setStep(2);
       return;
     }
 
-    if (hasInitialBatch && (!batchQuantity || batchQuantity <= 0)) {
+    const pendingDraftIndex = units.findIndex((u) => u.barcodeDraft.trim().length > 0);
+    if (pendingDraftIndex !== -1) {
+      toast.error("يوجد باركود لم يكتمل تصنيفه — يرجى تأكيد مصدره قبل الحفظ.");
+      setStep(2);
+      requestBarcodeClassification(pendingDraftIndex, units[pendingDraftIndex].barcodeDraft);
+      return;
+    }
+
+    if (hasInitialBatch && !isPositiveAmount(batchQuantity)) {
       toast.error("يرجى إدخال كمية أكبر من الصفر للدفعة المخزونية الأولية، أو إلغاء تفعيلها.");
       return;
     }
 
+    if (hasInitialBatch && !batchNumberSuffix.trim()) {
+      // [v4.4, Section 10] An empty merchant part would collapse every batch
+      // created on the same day down to an identical batchNumber. Rejected here
+      // for a friendly message; the backend rejects it independently.
+      toast.error("يرجى إدخال رقم الدفعة (الجزء الخاص بك) — لا يمكن تركه فارغاً.");
+      return;
+    }
+
+    if (hasInitialBatch && !isPositiveAmount(totalCost)) {
+      // [Batch cost entry] Same positive-decimal rule the backend applies to
+      // initialBatch.totalCost.
+      toast.error("يرجى إدخال إجمالي التكلفة المدفوعة (رقم أكبر من صفر، بالليرة السورية).");
+      return;
+    }
+
     if (isPublic) {
-      const candidateUnits = units.map((u) => ({
+      // [v4.6] Image is at the product level.
+      const gate = checkProductPublishable({
         isActive: true,
-        priceRetail: u.priceRetail === "" ? null : Number(u.priceRetail),
-        imageUrl: u.imageUrl || null,
-      }));
-      const gate = checkProductPublishable({ isActive: true, units: candidateUnits });
+        imageUrl: imageUrl.trim() || null,
+        units: units.map(() => ({ isActive: true })),
+      });
       if (!gate.publishable) {
         toast.error(`لا يمكن نشر المنتج: ${gate.reason}`);
         return;
@@ -531,31 +727,36 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       const payload = {
         name: name.trim(),
         category: category.trim() || null,
+        // [v4.6] Product-level image — sent at top level, not per unit.
+        imageUrl: imageUrl.trim() || null,
         isPublic,
-        // Every field the backend validates as a decimal string
-        // (conversionFactor, priceWholesale, priceRetail) now goes
-        // through `toDecimalString` instead of `Number(...)` — see the
-        // helper's comment above for why a plain String()/Number() cast
-        // is unsafe here. `pricingCurrency`/`barcode`/`barcodeSource`/
-        // `imageUrl` are untouched — none of those are Decimal-backed
-        // columns.
+        // Every Decimal-backed field goes through `toDecimalString`.
+        // [v4.5] `barcodes` is the unit's FULL confirmed list, each entry
+        // carrying its own human-confirmed source; the route issues one
+        // createUnitBarcode() per element inside its own transaction (T1's
+        // nested-write rule).
         units: units.map((u) => ({
           unitName: u.unitName.trim(),
           conversionFactor: toDecimalString(Number(u.conversionFactor)),
           pricingCurrency: u.pricingCurrency,
           priceWholesale: toDecimalString(Number(u.priceWholesale)),
-          priceRetail: u.priceRetail !== "" ? toDecimalString(Number(u.priceRetail)) : null,
-          barcode: u.barcode.trim() || null,
-          barcodeSource: u.barcode.trim() ? (u.barcodeSource as "GS1" | "INTERNAL") : null,
-          imageUrl: u.imageUrl.trim() || null,
+          barcodes: u.barcodes.map((b) => ({
+            barcode: b.barcode,
+            barcodeSource: b.barcodeSource,
+          })),
         })),
         initialBatch: hasInitialBatch
           ? {
             unitIndex: batchUnitIndex,
-            batchNumber: batchNumber.trim() || `BATCH-${Date.now().toString().slice(-6)}`,
-            // Same reasoning — initialBatch.quantity is validated as a
-            // nonNegativeDecimalString on the backend now too.
-            quantity: toDecimalString(Number(batchQuantity)),
+            // [v4.4, Section 10] The merchant-supplied SUFFIX only — the
+            // date prefix is added server-side at creation time.
+            batchNumberSuffix: batchNumberSuffix.trim(),
+            // [Batch cost entry — UNIFIED] Both sent exactly as typed:
+            // `quantity` is in the SELECTED unit and `totalCost` is what was
+            // paid for that whole quantity; the server derives the stored
+            // per-base-unit cost.
+            quantity: batchQuantity.trim(),
+            totalCost: totalCost.trim(),
             expiryDate: expiryDate || null,
           }
           : null,
@@ -583,553 +784,753 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     }
   };
 
+  // [Batch cost entry] Live derivation for the initial-batch section — built on
+  // the SAME function the server runs, so the figure shown here is exactly what
+  // gets stored. Null until both values are derivable.
+  const selectedBatchUnit = units[batchUnitIndex];
+  const initialBatchCostBreakdown = costBreakdownForDisplay(
+    totalCost.trim(),
+    batchQuantity.trim(),
+    selectedBatchUnit?.conversionFactor ?? 0
+  );
+
+  const baseUnitName = units[0]?.unitName.trim() || "الوحدة الأساسية";
+  const imageIsUploaded = imageUrl.startsWith("data:");
+
   return (
     <>
-      <Dialog open={open} onOpenChange={handleOpenChange}>
-        <DialogContent
-          className="
-            fixed inset-x-0 bottom-0 top-auto left-0 right-0
-            translate-x-0 translate-y-0
-            w-full sm:w-auto
-            max-w-full sm:max-w-3xl
-            max-h-[92vh] sm:max-h-[90vh]
-            rounded-t-2xl rounded-b-none sm:rounded-xl
-            overflow-y-auto
-            p-4 sm:p-6
-            bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800
-            sm:left-[50%] sm:right-auto sm:top-[50%]
-            sm:-translate-x-1/2 sm:-translate-y-1/2
-          "
-          dir="rtl"
-        >
-          <div className={m.m}>
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2 text-lg font-bold">
-                <PackagePlus className={`w-5 h-5 ${m.titleIcon}`} aria-hidden />
-                <span>إضافة منتج جديد متعدد الوحدات</span>
-              </DialogTitle>
-              <DialogDescription className="text-xs text-zinc-500">
-                أدخل بيانات المنتج، وحدات التعبئة (طرد / كرتونة / قطعة)، أسعار الجملة والتجزئة، وتصنيف الباركود.
-              </DialogDescription>
-            </DialogHeader>
+      <ModalShell
+        open={open}
+        onOpenChange={handleOpenChange}
+        title="إضافة منتج جديد"
+        icon={PackagePlus}
+        description="بيانات المنتج، ووحداته وأسعاره، وباركوداته."
+        header={<ModalStepper steps={STEP_LABELS} current={step} />}
+        onSubmit={handleSubmit}
+        onKeyDown={handleFormKeyDown}
+        footer={
+          <>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => handleOpenChange(false)}
+              disabled={loading}
+              className="text-slate-600"
+            >
+              إلغاء
+            </Button>
+            <div className="flex flex-1 items-center justify-end gap-2 sm:flex-none">
+              {step > 1 && (
+                <Button
+                  key="back-btn"
+                  type="button"
+                  variant="outline"
+                  onClick={goBack}
+                  disabled={loading}
+                  className="flex-1 sm:flex-none"
+                >
+                  رجوع
+                </Button>
+              )}
+              {/* Distinct keys keep React from reusing ONE <button> element when
+                  it flips from type="button" to type="submit" — which used to
+                  fire a submit from the very click that advanced the step. */}
+              {step < 3 ? (
+                <Button
+                  key="next-btn"
+                  type="button"
+                  onClick={goNext}
+                  className="flex-[2] bg-emerald-600 hover:bg-emerald-700 sm:min-w-28 sm:flex-none"
+                >
+                  التالي
+                </Button>
+              ) : (
+                <Button
+                  key="submit-btn"
+                  type="submit"
+                  disabled={loading}
+                  className="flex-[2] bg-emerald-600 hover:bg-emerald-700 sm:min-w-28 sm:flex-none"
+                >
+                  {loading ? "جاري الحفظ..." : "حفظ المنتج"}
+                </Button>
+              )}
+            </div>
+          </>
+        }
+      >
+        {catalogInfo && (
+          <div className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-sky-200 bg-sky-50 p-3">
+            <div className="flex items-start gap-2">
+              <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-sky-600" aria-hidden />
+              <div>
+                <p className="text-sm font-bold text-sky-900">تم جلب البيانات من الكتالوج المشترك (GS1)</p>
+                <p className="text-xs text-sky-700">
+                  {catalogInfo.name}
+                  {catalogInfo.category ? ` (${catalogInfo.category})` : ""}
+                </p>
+              </div>
+            </div>
+            {!catalogInfo.isOwner && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setReportModalOpen(true)}
+                className="h-8 gap-1 border-sky-200 bg-white text-xs"
+              >
+                <AlertTriangle className="size-3.5 text-amber-500" aria-hidden />
+                اقتراح تصحيح
+              </Button>
+            )}
+          </div>
+        )}
 
-            <div className={m.steps}>
-              {STEP_LABELS.map((label, i) => {
-                const stepNum = (i + 1) as 1 | 2 | 3;
-                const isActive = stepNum === step;
-                const isDone = stepNum < step;
-                return (
-                  <div key={stepNum} className={m.stepItem}>
-                    <div className={`${m.stepDot} ${isActive ? m.stepDotActive : isDone ? m.stepDotDone : ""}`}>
-                      {isDone ? <Check size={14} aria-hidden /> : stepNum}
-                    </div>
-                    <span className={`${m.stepLabel} ${isActive ? m.stepLabelActive : ""}`}>{label}</span>
-                    {stepNum < 3 && <div className={`${m.stepBar} ${isDone ? m.stepBarDone : ""}`} />}
-                  </div>
-                );
-              })}
+        {/* ------------------------------------------------------------ step 1 */}
+        {step === 1 && (
+          <>
+            <section className="space-y-3 rounded-lg border border-dashed border-emerald-300 bg-emerald-50/50 p-4">
+              <div className="flex items-start gap-3">
+                <ScanBarcode className="mt-0.5 size-5 shrink-0 text-emerald-600" aria-hidden />
+                <div>
+                  <p className="text-sm font-bold text-emerald-900">عندك المنتج قدّامك؟ امسح الباركود أولاً</p>
+                  <p className="text-xs text-emerald-800/80">
+                    إذا كان مسجّلاً بالكتالوج المشترك، منعبّي الاسم والتصنيف تلقائياً.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <Input
+                  type="text"
+                  dir="ltr"
+                  inputMode="numeric"
+                  placeholder="الباركود"
+                  aria-label="الباركود للبحث في الكتالوج"
+                  value={pendingQuickScanBarcode}
+                  onChange={(e) => {
+                    setPendingQuickScanBarcode(e.target.value);
+                    setQuickScanConsumed(false);
+                    setQuickLookupState("idle");
+                  }}
+                  onKeyDown={(e) => {
+                    // A keyboard-wedge scanner ends every scan with Enter: run
+                    // the lookup right away instead of swallowing it.
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      if (pendingQuickScanBarcode.trim()) runQuickCatalogCheck();
+                    }
+                  }}
+                  className="h-10 flex-1 bg-white font-mono"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => runQuickCatalogCheck()}
+                  disabled={!pendingQuickScanBarcode.trim() || quickLookupState === "loading"}
+                  className="h-10 shrink-0 gap-1.5 bg-white"
+                >
+                  <Search className="size-4" aria-hidden />
+                  <span className="hidden sm:inline">{quickLookupState === "loading" ? "جارِ التحقق..." : "تحقق"}</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setQuickScanModalOpen(true)}
+                  aria-label="مسح بالكاميرا"
+                  className="size-10 shrink-0 bg-white text-emerald-600"
+                >
+                  <Camera className="size-5" aria-hidden />
+                </Button>
+              </div>
+
+              {quickLookupState === "loading" && (
+                <p className="flex items-center gap-1.5 text-xs text-slate-600">
+                  <RefreshCw className="size-3.5 animate-spin" aria-hidden />
+                  جارِ البحث في الكتالوج المشترك...
+                </p>
+              )}
+              {quickLookupState === "found" && catalogInfo && (
+                <p className="flex items-start gap-1.5 text-xs text-emerald-700">
+                  <CheckCircle2 className="mt-0.5 size-4 shrink-0" aria-hidden />
+                  <span>
+                    لقينا هالباركود بالكتالوج المشترك: &quot;{catalogInfo.name}&quot; — تعبّى الاسم والتصنيف تلقائياً.
+                  </span>
+                </p>
+              )}
+              {quickLookupState === "not_found" && (
+                <p className="flex items-start gap-1.5 text-xs text-slate-600">
+                  <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
+                  <span>هالباركود غير مسجّل بالكتالوج المشترك — بيُعتبر منتج جديد، كمّل الإدخال يدوياً.</span>
+                </p>
+              )}
+              {pendingQuickScanBarcode.trim() && (
+                <p className="flex items-start gap-1.5 text-xs text-slate-500">
+                  <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
+                  <span>رح يُضاف هالباركود للوحدة الأساسية بالخطوة الجاية، وبتقدر تنقله أو تحذفه هناك.</span>
+                </p>
+              )}
+            </section>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="اسم المنتج الرئيسي" htmlFor="product-name" required>
+                <Input
+                  id="product-name"
+                  type="text"
+                  placeholder="مثال: زيت زيتون ممتاز 1 ليتر"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="h-11 text-base font-semibold"
+                  autoFocus
+                  required
+                />
+              </Field>
+
+              <Field label="التصنيف / الفئة" htmlFor="product-category">
+                <Input
+                  id="product-category"
+                  type="text"
+                  placeholder="مثال: زيوت ومواد غذائية"
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value)}
+                  className="h-11 text-base"
+                />
+              </Field>
             </div>
 
-            <form onSubmit={handleSubmit} onKeyDown={handleFormKeyDown} className={m.form}>
-              {catalogInfo && (
-                <div className={m.boxBlue}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <CheckCircle2 size={16} color="#2563eb" aria-hidden style={{ flexShrink: 0 }} />
-                    <div>
-                      <p style={{ fontWeight: 800, color: "#1e3a8a" }}>تم جلب البيانات من الكتالوج المشترك (GS1)</p>
-                      <p style={{ fontSize: "0.6875rem", color: "#1d4ed8" }}>
-                        المنتج: {catalogInfo.name} {catalogInfo.category ? `(${catalogInfo.category})` : ""}
-                      </p>
-                    </div>
-                  </div>
-                  {!catalogInfo.isOwner && (
-                    <button
-                      type="button"
-                      onClick={() => setReportModalOpen(true)}
-                      className={`${m.btn} ${m.btnSm} ${m.btnOutlineBlue} ${m.btnFull}`}
-                    >
-                      <AlertTriangle size={12} color="#f59e0b" aria-hidden />
-                      <span>تقديم اقتراح تصحيح</span>
-                    </button>
+            <Field label="صورة المنتج">
+              <div className="flex items-start gap-3">
+                <div className="flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 text-slate-300">
+                  {imageUrl ? (
+                    <img src={imageUrl} alt="معاينة الصورة" className="size-full object-cover" />
+                  ) : (
+                    <ImagePlus className="size-6" aria-hidden />
                   )}
                 </div>
-              )}
 
-              {step === 1 && (
-                <div className={m.stack}>
-                  <div className={m.boxDashedEmerald}>
-                    <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                      <ScanBarcode size={20} className={m.titleIcon} style={{ marginTop: 2 }} aria-hidden />
-                      <div>
-                        <p style={{ fontWeight: 800, color: "#065f46" }}>عندك المنتج قدّامك؟ اكتب أو امسح الباركود أولاً</p>
-                        <p style={{ fontSize: "0.6875rem", color: "#047857cc" }}>
-                          إذا كان مسجّلاً في الكتالوج المشترك، سيتم تعبئة الاسم والتصنيف تلقائياً
-                        </p>
-                      </div>
-                    </div>
+                <div className="min-w-0 flex-1 space-y-2">
+                  {imageIsUploaded ? (
+                    // A cropped upload is a multi-kilobyte data URL — printing
+                    // it into a text field made the input unreadable.
+                    <p className="flex h-10 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm text-slate-600">
+                      صورة مرفوعة من الجهاز
+                    </p>
+                  ) : (
+                    <Input
+                      type="text"
+                      dir="ltr"
+                      placeholder="رابط الصورة (اختياري)"
+                      aria-label="رابط صورة المنتج"
+                      value={imageUrl}
+                      onChange={(e) => {
+                        const newVal = e.target.value;
+                        if (isPublic && !newVal.trim() && imageUrl.trim()) {
+                          toast.error("ألغِ النشر أولاً");
+                          return;
+                        }
+                        setImageUrl(newVal);
+                      }}
+                      className="h-10"
+                    />
+                  )}
 
-                    <div className={m.inputRow}>
-                      <input
-                        type="text"
-                        placeholder="اكتب الباركود هنا يدوياً..."
-                        value={pendingQuickScanBarcode}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setPendingQuickScanBarcode(val);
-                          setQuickScanConsumed(false);
-                          setQuickLookupState("idle");
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setCropModalOpen(true)}
+                      className="h-9 gap-1.5"
+                    >
+                      <Crop className="size-4 text-sky-600" aria-hidden />
+                      {imageUrl ? "تغيير الصورة" : "رفع وقص"}
+                    </Button>
+                    {imageUrl && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          if (isPublic) {
+                            toast.error("ألغِ النشر أولاً");
+                            return;
+                          }
+                          setImageUrl("");
                         }}
-                        className={`${m.input} ${m.inputMono}`}
+                        className="h-9 gap-1.5 text-red-600 hover:bg-red-50 hover:text-red-700"
+                      >
+                        <Trash2 className="size-4" aria-hidden />
+                        إزالة
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </Field>
+          </>
+        )}
+
+        {/* ------------------------------------------------------------ step 2 */}
+        {step === 2 && (
+          <>
+            {units.map((unit, idx) => {
+              const isPendingClassification = barcodeGate.unitIndex === idx;
+              const unitLabel = unit.unitName.trim() || "الوحدة";
+              return (
+                <section key={idx} className="space-y-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900">
+                        {idx === 0 ? "الوحدة الأساسية" : `وحدة تجميعية #${idx + 1}`}
+                      </h3>
+                      {idx === 0 && (
+                        <p className="mt-0.5 text-xs text-slate-500">
+                          هي الوحدة اللي بينحسب فيها المخزون، وكل الوحدات التانية بتُقاس عليها.
+                        </p>
+                      )}
+                    </div>
+                    {/* The base unit (idx 0) can never be removed (T3a §0) —
+                        see handleRemoveUnit()'s matching guard above. */}
+                    {idx !== 0 && units.length > 1 && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => handleRemoveUnit(idx)}
+                        aria-label="حذف الوحدة"
+                        className="size-9 shrink-0 text-red-600 hover:bg-red-50 hover:text-red-700"
+                      >
+                        <Trash2 className="size-4" aria-hidden />
+                      </Button>
+                    )}
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <Field label="اسم الوحدة" htmlFor={`unit-name-${idx}`} required>
+                      <Input
+                        id={`unit-name-${idx}`}
+                        type="text"
+                        placeholder="مثال: قطعة / كرتونة / طرد"
+                        value={unit.unitName}
+                        onChange={(e) => handleUnitChange(idx, "unitName", e.target.value)}
+                        required
                       />
-                      <button
-                        type="button"
-                        onClick={() => runQuickCatalogCheck()}
-                        disabled={!pendingQuickScanBarcode.trim() || quickLookupState === "loading"}
-                        className={`${m.btn} ${m.btnSm} ${m.btnOutlineEmerald}`}
+                    </Field>
+
+                    {/* T3a §0: the base unit's factor is locked to 1 and is not
+                        even shown. Every other unit states its factor
+                        RELATIVE to the base unit, in words. */}
+                    {idx !== 0 && (
+                      <Field
+                        label={`${unitLabel} الواحدة تساوي كم ${baseUnitName}؟`}
+                        htmlFor={`unit-factor-${idx}`}
+                        required
+                        hint={`مثال: الكرتونة = 24 ${baseUnitName}`}
                       >
-                        <Search size={14} aria-hidden />
-                        <span>{quickLookupState === "loading" ? "جارِ التحقق..." : "تحقق"}</span>
-                      </button>
-                      <button
+                        <Input
+                          id={`unit-factor-${idx}`}
+                          type="number"
+                          step="any"
+                          min="0.0001"
+                          inputMode="decimal"
+                          value={unit.conversionFactor}
+                          onChange={(e) => {
+                            // Only fall back when the parsed value isn't a real
+                            // number at all (an empty string); `|| 1` used to
+                            // snap a typed "0" (on the way to "0.25") back to 1.
+                            // validatePackagingUnits() rejects a submitted
+                            // value <= 0 anyway.
+                            const parsed = parseFloat(e.target.value);
+                            handleUnitChange(idx, "conversionFactor", Number.isFinite(parsed) ? parsed : 0);
+                          }}
+                          required
+                        />
+                      </Field>
+                    )}
+
+                    <Field label="العملة" className={idx === 0 ? "" : undefined}>
+                      <Segmented
+                        ariaLabel="عملة التسعير"
+                        value={unit.pricingCurrency}
+                        onChange={(v) => handleUnitChange(idx, "pricingCurrency", v)}
+                        options={[
+                          { value: "SYP", label: "ليرة سورية" },
+                          { value: "USD", label: "دولار" },
+                        ]}
+                      />
+                    </Field>
+
+                    <Field
+                      label={idx === 0 ? `سعر بيع ${unitLabel} (POS)` : "سعر الجملة للوحدة (POS)"}
+                      htmlFor={`unit-price-${idx}`}
+                      required
+                    >
+                      <div className="relative">
+                        <Input
+                          id={`unit-price-${idx}`}
+                          type="number"
+                          step="any"
+                          min="0.01"
+                          inputMode="decimal"
+                          value={unit.priceWholesale === 0 ? "" : unit.priceWholesale}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            handleUnitChange(idx, "priceWholesale", raw === "" ? 0 : parseFloat(raw));
+                          }}
+                          className="pe-12 font-semibold tabular-nums"
+                          required
+                        />
+                        <span className="pointer-events-none absolute end-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-slate-500">
+                          {unit.pricingCurrency === "USD" ? "$" : "ل.س"}
+                        </span>
+                      </div>
+                    </Field>
+                  </div>
+
+                  {/* [v4.5 UX] ONE full-width barcode field per unit. Enter
+                      (what a keyboard-wedge scanner sends after each scan), the
+                      add button, or a pasted delimited list all start
+                      classification. There is no blur trigger: tabbing away used
+                      to pop the modal unexpectedly, and an unclassified value is
+                      caught by the next-step / submit checks anyway. */}
+                  <Field
+                    label={`الباركودات${unit.barcodes.length > 0 ? ` (${unit.barcodes.length})` : ""}`}
+                    htmlFor={`unit-barcode-${idx}`}
+                  >
+                    <div className="flex gap-2">
+                      <Input
+                        id={`unit-barcode-${idx}`}
+                        ref={(el) => {
+                          barcodeInputRefs.current[idx] = el;
+                        }}
+                        type="text"
+                        dir="ltr"
+                        inputMode="numeric"
+                        placeholder="امسح أو اكتب الباركود ثم Enter"
+                        value={unit.barcodeDraft}
+                        onChange={(e) => handleUnitChange(idx, "barcodeDraft", e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            requestBarcodeClassification(idx, unit.barcodeDraft);
+                          }
+                        }}
+                        onPaste={(e) => {
+                          // A pasted LIST (one barcode per line, or `;`/tab
+                          // separated) is classified together in one modal.
+                          const text = e.clipboardData.getData("text");
+                          if (/[;\n\t]/.test(text.trim())) {
+                            e.preventDefault();
+                            requestBarcodeClassification(
+                              idx,
+                              unit.barcodeDraft ? `${unit.barcodeDraft};${text}` : text
+                            );
+                          }
+                        }}
+                        className="h-10 flex-1 font-mono"
+                      />
+                      {/* Icon-only buttons: with text labels they ate most of
+                          the row on a phone and cut the placeholder off. */}
+                      <Button
                         type="button"
-                        onClick={() => setQuickScanModalOpen(true)}
-                        className={`${m.btn} ${m.btnSm} ${m.btnOutlineEmerald}`}
-                        title="مسح الكاميرا"
+                        variant="outline"
+                        size="icon"
+                        disabled={!unit.barcodeDraft.trim()}
+                        onClick={() => requestBarcodeClassification(idx, unit.barcodeDraft)}
+                        aria-label="إضافة الباركود"
+                        className="size-10 shrink-0"
                       >
-                        <Camera size={14} className={m.titleIcon} aria-hidden />
-                        <span>كاميرا</span>
-                      </button>
+                        <Plus className="size-5" aria-hidden />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        onClick={() => openUnitScanner(idx)}
+                        aria-label="مسح بالكاميرا"
+                        className="size-10 shrink-0 text-emerald-600"
+                      >
+                        <Camera className="size-5" aria-hidden />
+                      </Button>
                     </div>
 
-                    {quickLookupState === "loading" && (
-                      <p className={m.statusRow}>
-                        <RefreshCw size={12} className={m.spin} aria-hidden />
-                        <span>جارِ البحث في الكتالوج المشترك...</span>
-                      </p>
+                    {/* The unit's CONFIRMED barcodes (already classified).
+                        Removing one here only edits local state — nothing has
+                        been saved yet; once the product exists, removal goes
+                        through the ADMIN-only DELETE barcode route instead. */}
+                    {unit.barcodes.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 pt-1">
+                        {unit.barcodes.map((b) => (
+                          <span
+                            key={b.barcode}
+                            className={cn(
+                              "inline-flex items-center gap-1.5 rounded-full border py-0.5 ps-3 pe-1 text-xs font-semibold",
+                              b.barcodeSource === "GS1"
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                                : "border-slate-200 bg-slate-50 text-slate-700"
+                            )}
+                          >
+                            <span dir="ltr" className="font-mono">
+                              {b.barcode}
+                            </span>
+                            <span className="text-[10px] font-medium opacity-70">
+                              {b.barcodeSource === "GS1" ? "GS1" : "داخلي"}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveUnitBarcode(idx, b.barcode)}
+                              aria-label={`إزالة الباركود ${b.barcode}`}
+                              className="flex size-7 items-center justify-center rounded-full hover:bg-black/5"
+                            >
+                              <X className="size-3.5" aria-hidden />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
                     )}
-                    {quickLookupState === "found" && catalogInfo && (
-                      <p className={`${m.statusRow} ${m.statusOk}`}>
-                        <CheckCircle2 size={14} aria-hidden />
+
+                    {unit.barcodes.length > 1 && (
+                      <p className="flex items-start gap-1.5 rounded-md border border-sky-100 bg-sky-50 p-2.5 text-xs leading-relaxed text-sky-800">
+                        <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
                         <span>
-                          تم العثور على هذا الباركود في الكتالوج المشترك: &quot;{catalogInfo.name}&quot; — تم تعبئة الاسم/التصنيف تلقائياً.
+                          كل هالباركودات بتنباع كنفس الصنف: مخزون وسعر واحد، والفاتورة ما بتسجّل أي باركود انمسح. إذا
+                          كل نكهة إلها مخزون منفصل، أضفها كمنتج مستقل.
                         </span>
                       </p>
                     )}
-                    {quickLookupState === "not_found" && (
-                      <p className={m.statusRow}>
-                        <Info size={14} aria-hidden />
-                        <span>هذا الباركود غير مسجّل في الكتالوج المشترك بعد — سيُعتبر منتجاً جديداً، تابع إدخال البيانات يدوياً.</span>
+
+                    {isPendingClassification && (
+                      <p className="flex items-center gap-1.5 text-xs text-amber-700">
+                        <ShieldAlert className="size-4 shrink-0" aria-hidden />
+                        بانتظار تأكيد مصدر الباركود بالنافذة المنبثقة...
                       </p>
                     )}
-                  </div>
+                  </Field>
+                </section>
+              );
+            })}
 
-                  <div className={`${m.grid2} ${m.box}`}>
-                    <div className={m.field}>
-                      <label className={m.label}>اسم المنتج الرئيسي *</label>
-                      <input
-                        type="text"
-                        placeholder="مثال: زيت زيتون ممتاز 1 ليتر"
-                        value={name}
-                        onChange={(e) => setName(e.target.value)}
-                        className={`${m.input} ${m.inputProminent}`}
-                        autoFocus
-                        required
-                      />
-                    </div>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleAddUnit}
+              className="h-11 w-full gap-1.5 border-dashed border-emerald-300 text-emerald-700 hover:bg-emerald-50 hover:text-emerald-800"
+            >
+              <Plus className="size-4" aria-hidden />
+              إضافة وحدة تجميعية (كرتونة، طرد...)
+            </Button>
+          </>
+        )}
 
-                    <div className={m.field}>
-                      <label className={m.label}>التصنيف / الفئة</label>
-                      <input
-                        type="text"
-                        placeholder="مثال: زيوت ومواد غذائية"
-                        value={category}
-                        onChange={(e) => setCategory(e.target.value)}
-                        className={`${m.input} ${m.inputProminent}`}
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
+        {/* ------------------------------------------------------------ step 3 */}
+        {step === 3 && (
+          <>
+            <div className="space-y-1 rounded-lg bg-slate-50 p-4">
+              <p className="text-base font-bold text-slate-900">{name || "—"}</p>
+              {category && <p className="text-xs text-slate-500">{category}</p>}
+              <p className="text-xs text-slate-500">
+                {units.length} {units.length === 1 ? "وحدة قياس" : "وحدات قياس"}
+                {isPublic ? " · معروض بالمتجر الإلكتروني" : ""}
+              </p>
+            </div>
 
-              {step === 2 && (
-                <div className={m.stack}>
-                  <div className={m.footerRow} style={{ paddingTop: 0 }}>
-                    <label className={m.labelMd}>وحدات التعبئة والأسعار (Packaging Units)</label>
-                    <button
-                      type="button"
-                      onClick={handleAddUnit}
-                      className={`${m.btn} ${m.btnSm} ${m.btnOutlineEmerald} ${m.btnFull}`}
-                    >
-                      <Plus size={14} aria-hidden />
-                      <span>إضافة وحدة فرعية/ثانوية</span>
-                    </button>
-                  </div>
+            <div className="flex items-start justify-between gap-4 rounded-lg border border-slate-200 p-3">
+              <div>
+                <label htmlFor="is-public-toggle" className="text-sm font-semibold text-slate-900">
+                  عرض المنتج بمتجر العملاء الإلكتروني
+                </label>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  بحتاج صورة للمنتج — وبتقدر تفعّله لاحقاً من صفحة المنتج.
+                </p>
+              </div>
+              {/* dir="ltr": the stock shadcn Switch slides its thumb to the
+                  physical right when checked, wrong inside an RTL track. */}
+              <Switch
+                id="is-public-toggle"
+                dir="ltr"
+                checked={isPublic}
+                onCheckedChange={handleTogglePublic}
+                className="mt-0.5 data-[state=checked]:bg-emerald-600"
+              />
+            </div>
 
-                  <div className={m.stack}>
-                    {units.map((unit, idx) => {
-                      const isPendingClassification = barcodeGate.unitIndex === idx;
-                      return (
-                        <div key={idx} className={m.unitBox}>
-                          <div className={m.unitBoxHead}>
-                            <span>{idx === 0 ? "الوحدة الأساسية (Base Unit)" : `وحدة تجميعية #${idx + 1}`}</span>
-                            {/* Was `units.length > 1` only, which let the
-                                base unit (idx 0) be deleted whenever a
-                                second unit existed. The base unit can
-                                never be removed (T3a §0) — see
-                                handleRemoveUnit()'s matching guard above,
-                                kept as defense in depth. */}
-                            {idx !== 0 && units.length > 1 && (
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveUnit(idx)}
-                                className={`${m.btn} ${m.btnXs} ${m.btnGhostRed}`}
-                                aria-label="حذف الوحدة"
-                              >
-                                <Trash2 size={14} aria-hidden />
-                              </button>
-                            )}
-                          </div>
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-slate-200 p-3">
+              <label htmlFor="has-batch" className="text-sm font-semibold text-slate-900">
+                إضافة دفعة مخزونية أولية فوراً
+              </label>
+              <Switch
+                id="has-batch"
+                dir="ltr"
+                checked={hasInitialBatch}
+                onCheckedChange={setHasInitialBatch}
+                className="data-[state=checked]:bg-emerald-600"
+              />
+            </div>
 
-                          <div className={m.grid3}>
-                            <div className={m.field}>
-                              <label className={m.label}>اسم الوحدة *</label>
-                              <input
-                                type="text"
-                                placeholder="مثال: قطعة / كرتونة / طرد"
-                                value={unit.unitName}
-                                onChange={(e) => handleUnitChange(idx, "unitName", e.target.value)}
-                                className={m.input}
-                                required
-                              />
-                            </div>
-
-                            <div className={m.field}>
-                              <label className={m.label}>معامل التحويل (عدد الوحدات الأساسية) *</label>
-                              <input
-                                type="number"
-                                step="any"
-                                min="0.0001"
-                                disabled={idx === 0}
-                                value={idx === 0 ? 1 : unit.conversionFactor}
-                                onChange={(e) => {
-                                  // Was `parseFloat(e.target.value) || 1`.
-                                  // Since `0` is falsy in JS, the very
-                                  // first keystroke of any fractional
-                                  // value under 1 (e.g. typing "0" on the
-                                  // way to "0.25") was immediately
-                                  // snapped back to "1", making it
-                                  // practically impossible to type a
-                                  // fractional conversionFactor — even
-                                  // though fractional factors are
-                                  // explicitly allowed (a wholesaler
-                                  // selling a quarter- or half-carton).
-                                  // Fixed to only fall back when the
-                                  // parsed value isn't a real number at
-                                  // all (e.g. an empty string);
-                                  // validatePackagingUnits() below
-                                  // already rejects a submitted value
-                                  // <= 0, so no separate floor is needed
-                                  // here.
-                                  const parsed = parseFloat(e.target.value);
-                                  handleUnitChange(idx, "conversionFactor", Number.isFinite(parsed) ? parsed : 0);
-                                }}
-                                className={m.input}
-                                required
-                              />
-                            </div>
-
-                            <div className={m.field}>
-                              <label className={m.label}>العملة *</label>
-                              <select
-                                value={unit.pricingCurrency}
-                                onChange={(e) => handleUnitChange(idx, "pricingCurrency", e.target.value as "SYP" | "USD")}
-                                className={m.select}
-                              >
-                                <option value="SYP">ليرة سورية (SYP)</option>
-                                <option value="USD">دولار أمريكي (USD)</option>
-                              </select>
-                            </div>
-                          </div>
-
-                          <div className={m.grid2}>
-                            <div className={m.priceBoxEmerald}>
-                              <label className={m.label} style={{ color: "#065f46" }}>
-                                {idx === 0 ? "سعر بيع القطعة (POS) *" : "سعر الجملة للوحدة (POS) *"}
-                              </label>
-                              <input
-                                type="number"
-                                step="any"
-                                min="0.01"
-                                value={unit.priceWholesale === 0 ? "" : unit.priceWholesale}
-                                onChange={(e) => {
-                                  const raw = e.target.value;
-                                  handleUnitChange(idx, "priceWholesale", raw === "" ? 0 : parseFloat(raw));
-                                }}
-                                className={`${m.input} ${m.inputMono}`}
-                                style={{ marginTop: 4, background: "#fff" }}
-                                required
-                              />
-                            </div>
-
-                            <div className={m.priceBoxBlue}>
-                              <label className={m.label} style={{ color: "#1d4ed8" }}>
-                                سعر التجزئة للمتجر (اختياري)
-                              </label>
-                              <input
-                                type="number"
-                                step="any"
-                                min="0"
-                                placeholder="للنشر بالمتجر"
-                                value={unit.priceRetail}
-                                onChange={(e) => handleUnitChange(idx, "priceRetail", e.target.value)}
-                                className={`${m.input} ${m.inputMono}`}
-                                style={{ marginTop: 4, background: "#fff" }}
-                              />
-                              <p className={m.hintBlue}>
-                                سعر استرشادي يظهر لعميل المتجر الإلكتروني فقط — لا يُستخدم أبدًا كسعر فعلي عند البيع من الـ POS.
-                              </p>
-                            </div>
-                          </div>
-
-                          <div>
-                            <div className={m.grid3}>
-                              <div className={m.field}>
-                                <label className={m.label}>تصنيف الباركود</label>
-                                <div
-                                  className={`${m.pill} ${unit.barcodeSource === "GS1"
-                                      ? m.pillGs1
-                                      : unit.barcodeSource === "INTERNAL"
-                                        ? m.pillInternal
-                                        : unit.barcode.trim()
-                                          ? m.pillPending
-                                          : ""
-                                    }`}
-                                >
-                                  {unit.barcode.trim() && !unit.barcodeSource && <ShieldAlert size={14} aria-hidden />}
-                                  <span className={m.pillText}>
-                                    {unit.barcodeSource === "GS1"
-                                      ? "دولي (GS1)"
-                                      : unit.barcodeSource === "INTERNAL"
-                                        ? "داخلي"
-                                        : unit.barcode.trim()
-                                          ? "بانتظار التصنيف..."
-                                          : "بدون باركود"}
-                                  </span>
-                                </div>
-                              </div>
-                              <div className={m.field} style={{ gridColumn: "span 2" }}>
-                                <label className={m.label}>الباركود (Barcode)</label>
-                                <div className={m.inputRow}>
-                                  <input
-                                    type="text"
-                                    placeholder="امسح أو أدخل الباركود"
-                                    value={unit.barcode}
-                                    onChange={(e) => handleUnitChange(idx, "barcode", e.target.value)}
-                                    onBlur={(e) => requestBarcodeClassification(idx, e.target.value)}
-                                    className={`${m.input} ${m.inputMono}`}
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setActiveUnitForScan(idx);
-                                      setScannerModalOpen(true);
-                                    }}
-                                    className={`${m.btn} ${m.btnSm} ${m.btnOutline}`}
-                                    title="مسح الكاميرا"
-                                  >
-                                    <Camera size={14} className={m.titleIcon} aria-hidden />
-                                    <span>كاميرا</span>
-                                  </button>
-                                </div>
-                              </div>
-                            </div>
-                            {isPendingClassification && (
-                              <p className={m.pendingNote}>
-                                <ShieldAlert size={12} aria-hidden />
-                                <span>بانتظار تأكيد مصدر الباركود في النافذة المنبثقة...</span>
-                              </p>
-                            )}
-                          </div>
-
-                          <div className={m.field}>
-                            <label className={m.label}>صورة الوحدة/المنتج</label>
-                            <div className={m.inputRow}>
-                              <input
-                                type="text"
-                                placeholder="رابط الصورة"
-                                value={unit.imageUrl}
-                                onChange={(e) => handleUnitChange(idx, "imageUrl", e.target.value)}
-                                className={m.input}
-                              />
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setActiveUnitForCrop(idx);
-                                  setCropModalOpen(true);
-                                }}
-                                className={`${m.btn} ${m.btnSm} ${m.btnOutline}`}
-                                title="معالجة وقص الصورة"
-                              >
-                                <Crop size={14} color="#2563eb" aria-hidden />
-                                <span>قص</span>
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {step === 3 && (
-                <div className={m.stack}>
-                  <div className={m.summaryBox}>
-                    <p className={m.summaryName}>{name || "—"}</p>
-                    {category && <p className={m.summaryMeta}>{category}</p>}
-                    <p className={m.summaryMeta}>
-                      {units.length} {units.length === 1 ? "وحدة قياس" : "وحدات قياس"} مُدخلة
-                      {isPublic ? " · معروض في المتجر الإلكتروني" : ""}
-                    </p>
-                  </div>
-
-                  <div className={m.checkRow}>
-                    <input
-                      type="checkbox"
-                      id="is-public-toggle"
-                      checked={isPublic}
-                      onChange={(e) => handleTogglePublic(e.target.checked)}
-                      className={m.checkbox}
-                    />
-                    <div>
-                      <label htmlFor="is-public-toggle" className={m.labelMd} style={{ cursor: "pointer" }}>
-                        عرض المنتج في متجر العملاء الإلكتروني
-                      </label>
-                      <p className={m.summaryMeta} style={{ marginTop: 2 }}>
-                        يتطلب صورة وسعر تجزئة أكبر من صفر لوحدة نشطة واحدة على الأقل — يمكن تفعيله لاحقًا من صفحة المنتج.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className={m.checkRowSimple}>
-                    <input
-                      type="checkbox"
-                      id="has-batch"
-                      checked={hasInitialBatch}
-                      onChange={(e) => setHasInitialBatch(e.target.checked)}
-                      className={m.checkbox}
-                    />
-                    <label htmlFor="has-batch" className={m.labelMd} style={{ cursor: "pointer" }}>
-                      إضافة دفعة مخزونية أولية فوراً
-                    </label>
-                  </div>
-
-                  {hasInitialBatch && (
-                    <div className={`${m.grid2} ${m.priceBoxEmerald}`}>
-                      <div className={m.field}>
-                        <label className={m.label}>الوحدة المستلمة</label>
-                        <select
-                          value={batchUnitIndex}
-                          onChange={(e) => setBatchUnitIndex(parseInt(e.target.value))}
-                          className={m.select}
-                          style={{ background: "#fff" }}
-                        >
-                          {units.map((u, i) => (
-                            <option key={i} value={i}>
-                              {u.unitName} (معامل {u.conversionFactor})
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className={m.field}>
-                        <label className={m.label}>رقم الدفعة</label>
-                        <input
-                          type="text"
-                          placeholder="مثال: BATCH-2026-001"
-                          value={batchNumber}
-                          onChange={(e) => setBatchNumber(e.target.value)}
-                          className={m.input}
-                          style={{ background: "#fff" }}
-                        />
-                      </div>
-                      <div className={m.field}>
-                        <label className={m.label}>الكمية المستلمة</label>
-                        <input
-                          type="number"
-                          min="0"
-                          value={batchQuantity}
-                          onChange={(e) => setBatchQuantity(parseFloat(e.target.value) || 0)}
-                          className={m.input}
-                          style={{ background: "#fff" }}
-                        />
-                      </div>
-                      <div className={m.field}>
-                        <label className={m.label}>تاريخ الانتهاء</label>
-                        <input
-                          type="date"
-                          value={expiryDate}
-                          onChange={(e) => setExpiryDate(e.target.value)}
-                          className={m.input}
-                          style={{ background: "#fff" }}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              <DialogFooter>
-                <div className={m.footerRow} style={{ width: "100%" }}>
-                  <button
-                    type="button"
-                    onClick={() => handleOpenChange(false)}
-                    disabled={loading}
-                    className={`${m.btn} ${m.btnOutline} ${m.btnFull}`}
+            {hasInitialBatch && (
+              <div className="grid gap-4 rounded-xl border border-emerald-200 bg-emerald-50/40 p-4 sm:grid-cols-2">
+                <Field label="الوحدة المستلمة" htmlFor="batch-unit">
+                  <NativeSelect
+                    id="batch-unit"
+                    value={batchUnitIndex}
+                    onChange={(e) => setBatchUnitIndex(parseInt(e.target.value))}
                   >
-                    إلغاء
-                  </button>
-                  <div className={m.footerGroup}>
-                    {step > 1 && (
-                      <button
-                        key="back-btn"
-                        type="button"
-                        onClick={goBack}
-                        disabled={loading}
-                        className={`${m.btn} ${m.btnOutline} ${m.btnFull}`}
-                      >
-                        رجوع
-                      </button>
-                    )}
-                    {step < 3 ? (
-                      <button key="next-btn" type="button" onClick={goNext} className={`${m.btn} ${m.btnSolid} ${m.btnFull}`}>
-                        التالي
-                      </button>
-                    ) : (
-                      <button key="submit-btn" type="submit" disabled={loading} className={`${m.btn} ${m.btnSolid} ${m.btnFull}`}>
-                        {loading ? "جاري الحفظ..." : "حفظ المنتج"}
-                      </button>
-                    )}
+                    {units.map((u, i) => (
+                      <option key={i} value={i}>
+                        {u.unitName || `وحدة ${i + 1}`}
+                        {i === 0 ? " (أساسية)" : ` (= ${u.conversionFactor} ${baseUnitName})`}
+                      </option>
+                    ))}
+                  </NativeSelect>
+                </Field>
+
+                <Field
+                  label={`الكمية المستلمة${selectedBatchUnit?.unitName ? ` (بوحدة ${selectedBatchUnit.unitName})` : ""}`}
+                  htmlFor="batch-quantity"
+                  required
+                >
+                  <Input
+                    id="batch-quantity"
+                    type="text"
+                    inputMode="decimal"
+                    dir="ltr"
+                    placeholder="مثال: 6"
+                    value={batchQuantity}
+                    onChange={(e) => setBatchQuantity(e.target.value)}
+                    className="bg-white"
+                    required
+                  />
+                </Field>
+
+                {/* [Batch cost entry — UNIFIED] The TOTAL the merchant actually
+                    paid for the whole received quantity — never a per-base-unit
+                    figure. */}
+                <Field
+                  label="إجمالي التكلفة المدفوعة (ل.س)"
+                  htmlFor="batch-total-cost"
+                  required
+                  hint={
+                    initialBatchCostBreakdown ? (
+                      <span className="font-semibold text-emerald-700">
+                        لكل {baseUnitName}: {initialBatchCostBreakdown.pricePerBaseUnit} ل.س
+                      </span>
+                    ) : undefined
+                  }
+                >
+                  <Input
+                    id="batch-total-cost"
+                    type="text"
+                    inputMode="decimal"
+                    dir="ltr"
+                    placeholder="مثال: 54000"
+                    value={totalCost}
+                    onChange={(e) => setTotalCost(e.target.value)}
+                    className="bg-white"
+                    required
+                  />
+                </Field>
+
+                <Field label="تاريخ الانتهاء" htmlFor="batch-expiry">
+                  <Input
+                    id="batch-expiry"
+                    type="date"
+                    dir="ltr"
+                    value={expiryDate}
+                    onChange={(e) => setExpiryDate(e.target.value)}
+                    className="bg-white"
+                  />
+                </Field>
+
+                {/* [v4.4, Section 10] The date prefix is generated server-side
+                    at save time and shown here read-only (cosmetic preview from
+                    the browser clock) — the ADMIN types only the
+                    merchant-supplied suffix. The group is LTR so it reads in
+                    the same order as the stored value: 2026-10-05-1. */}
+                <Field
+                  label="رقم الدفعة الخاص بك"
+                  htmlFor="batch-suffix"
+                  required
+                  className="sm:col-span-2"
+                  hint="بينضاف تاريخ اليوم تلقائياً قبل الرقم اللي بتكتبه — لا تكتبه إنت."
+                >
+                  <div dir="ltr" className="flex items-center gap-2">
+                    <span
+                      aria-label="بادئة التاريخ التي يضيفها النظام"
+                      className="shrink-0 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 font-mono text-sm font-semibold text-emerald-700"
+                    >
+                      {todaysDatePrefix()}
+                    </span>
+                    <span className="text-slate-400" aria-hidden>
+                      -
+                    </span>
+                    <Input
+                      id="batch-suffix"
+                      type="text"
+                      placeholder="1 أو INV4471"
+                      value={batchNumberSuffix}
+                      onChange={(e) => setBatchNumberSuffix(e.target.value)}
+                      className="flex-1 bg-white font-mono"
+                      required
+                    />
                   </div>
-                </div>
-              </DialogFooter>
-            </form>
+                </Field>
+              </div>
+            )}
+          </>
+        )}
+      </ModalShell>
+
+      {/* [v4.5 UX] Per-unit scanner: CONTINUOUS, so several barcodes can be
+          scanned in one go; they are collected below the video and classified
+          together in one confirmation modal when the merchant finishes.
+          Requires the optional title / description / children props on
+          BarcodeScannerModal. */}
+      <BarcodeScannerModal
+        open={scannerModalOpen}
+        onOpenChange={handleScannerOpenChange}
+        onScan={handleBarcodeScanResult}
+        mode="continuous"
+        feedback="silent"
+        continuousCooldownMs={1500}
+        title="مسح باركودات الوحدة"
+        description="امسح باركودات هذه الوحدة بالتتابع، ثم اضغط «إنهاء المسح» لتصنيفها دفعة واحدة."
+      >
+        {scanBuffer.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {scanBuffer.map((b) => (
+              <span
+                key={b}
+                dir="ltr"
+                className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 font-mono text-xs text-slate-700"
+              >
+                {b}
+              </span>
+            ))}
           </div>
-        </DialogContent>
-      </Dialog>
+        )}
+      </BarcodeScannerModal>
 
-      <BarcodeScannerModal open={scannerModalOpen} onOpenChange={setScannerModalOpen} onScan={handleBarcodeScanResult} />
-
+      {/* The step-1 quick lookup stays single-shot. */}
       <BarcodeScannerModal open={quickScanModalOpen} onOpenChange={setQuickScanModalOpen} onScan={handleQuickScanResult} />
 
       <ImageCropModal open={cropModalOpen} onOpenChange={setCropModalOpen} onCropComplete={handleCropResult} />
 
+      {/* [v4.5] ONE modal for this action's NEW barcodes, one radio group per
+          barcode. The `key` is derived from the barcode set itself, so every
+          new classification action mounts a brand-new instance and a
+          previously-chosen source can never carry over onto a new value.
+          (It deliberately does NOT include the catalog-match results, which
+          arrive one network round-trip later — that would remount the modal
+          and wipe the merchant's clicks mid-session.) */}
       <BarcodeSourceModal
-        key={barcodeGate.unitIndex !== null ? `${barcodeGate.unitIndex}-${barcodeGate.barcode}` : "closed"}
-        open={barcodeGate.unitIndex !== null}
-        barcode={barcodeGate.barcode}
+        key={`barcode-gate-${barcodeGate.unitIndex !== null
+          ? `${barcodeGate.unitIndex}-${barcodeGate.candidates.map((c) => c.barcode).join("|")}`
+          : "closed"
+          }`}
+        open={barcodeGate.unitIndex !== null && barcodeGate.candidates.length > 0}
+        candidates={barcodeGate.candidates}
         onConfirm={handleBarcodeSourceConfirm}
         onDismiss={handleBarcodeSourceDismiss}
-        catalogMatch={catalogInfo && catalogInfo.barcode === barcodeGate.barcode ? { name: catalogInfo.name } : null}
       />
 
       {catalogInfo && (

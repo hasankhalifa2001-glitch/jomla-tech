@@ -10,7 +10,7 @@ import { auth } from "@/auth";
 // by TxOrClient's union. This route IS on lib/db.ts's documented raw-client
 // allowlist (category 5) — see that file's header comment.
 import { prisma } from "@/lib/db";
-import { tenantScopedRawQuery } from "@/lib/db/tenant-scope";
+import { tenantScopedRawQuery, type TxOrClient } from "@/lib/db/tenant-scope";
 import { commitFifoAllocation } from "@/lib/inventory/fifo";
 import { lockBatchesForFifoAllocations } from "@/lib/inventory/batch-locking";
 import { requireBaseUnit, MissingBaseUnitError } from "@/lib/inventory/base-unit";
@@ -25,11 +25,15 @@ import {
   MoneyError,
 } from "@/lib/utils/money";
 import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
+// [T4e] The ONE repayment core — this route's Payment pass and
+// POST /api/ledger/repayments both call recordRepaymentIdempotent.
+import { recordRepaymentIdempotent } from "@/lib/ledger/repayment";
 import {
   assertTenantWritable,
   SubscriptionLockedError,
   subscriptionLockedResponse,
 } from "@/lib/auth/tenant";
+
 
 export const dynamic = "force-dynamic";
 
@@ -326,7 +330,7 @@ async function lockBatchesById(
 // changes behavior when the missing customer is a member of that set;
 // every other call site/scenario is unchanged.
 async function resolveTargetCustomerId(
-  tx: Prisma.TransactionClient,
+  tx: TxOrClient,
   tenantId: string,
   customerMap: Map<string, string>,
   refs: { offlineCustomerId?: string; customerId?: string },
@@ -637,6 +641,13 @@ export async function POST(req: NextRequest) {
               batchId: string;
               quantity: string;
               unitPriceSYP: string;
+              // [v4.4, T4g] The original line's FROZEN cost basis, carried
+              // straight off the original InvoiceItem row — never
+              // recomputed from the batch's current costPricePerBaseUnit,
+              // which may have been corrected since the sale. The void
+              // simply negates this exact value, which is what makes
+              // (original + void) sum to exactly zero per line.
+              costAmountSYP: string;
             }
             interface OriginalGroup {
               batches: OriginalBatchPortion[];
@@ -651,6 +662,7 @@ export async function POST(req: NextRequest) {
                 batchId: item.batchId,
                 quantity: item.quantity.toString(),
                 unitPriceSYP: item.unitPriceSYP.toString(),
+                costAmountSYP: item.costAmountSYP.toString(),
               });
               group.totalQuantity = sumMoney([group.totalQuantity, item.quantity.toString()]);
               originalByProductUnit.set(key, group);
@@ -778,6 +790,12 @@ export async function POST(req: NextRequest) {
                     quantity: subtractMoney("0", portion.quantity),
                     unitPriceSYP: matched.unitPriceSYP,
                     unitPriceUSD: matched.unitPriceUSD,
+                    // [v4.4, T4g] The negated ORIGINAL frozen cost — via
+                    // subtractMoney("0", …), the same negation discipline
+                    // used for quantity/paid/debt above, never a raw
+                    // Decimal negation. Summing this against the original
+                    // line's own costAmountSYP is exactly zero.
+                    costAmountSYP: subtractMoney("0", portion.costAmountSYP),
                   },
                 });
               }
@@ -822,6 +840,13 @@ export async function POST(req: NextRequest) {
             unitPriceUSD: string;
             quantitySold: string;
             deductQtyInBaseUnit: string;
+            // [v4.4, T4g] Frozen cost basis for this invoice line:
+            //   multiplyMoney(allocatedQty, batch.costPricePerBaseUnit)
+            // computed HERE, once, from the value read off the same locked
+            // batch row the deduction below applies to. Never re-derived on
+            // read, so a later cost correction cannot alter an already-sold
+            // invoice's profit — the same principle as exchangeRateUsed.
+            costAmountSYP: string;
           }
 
           const resolvedAllocations: ResolvedAllocation[] = [];
@@ -874,6 +899,8 @@ export async function POST(req: NextRequest) {
                 unitPriceUSD: itemUnitPriceUSD,
                 quantitySold: soldQtyForAlloc.toFixed(4),
                 deductQtyInBaseUnit: alloc.allocatedQty,
+                // [v4.4, T4g] Frozen here, once — see the interface note.
+                costAmountSYP: multiplyMoney(alloc.allocatedQty, alloc.costPricePerBaseUnit),
               });
             }
 
@@ -889,6 +916,10 @@ export async function POST(req: NextRequest) {
                 unitPriceUSD: itemUnitPriceUSD,
                 quantitySold: remainingSoldQty.toFixed(4),
                 deductQtyInBaseUnit: resolution.remainingQty,
+                // [v4.4, T4g] The shortfall is drawn against the SAME last
+                // batch, so its cost basis uses that batch's own cost per
+                // base unit.
+                costAmountSYP: multiplyMoney(resolution.remainingQty, last.costPricePerBaseUnit),
               });
             }
           }
@@ -925,6 +956,9 @@ export async function POST(req: NextRequest) {
                 quantity: alloc.quantitySold,
                 unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
+                // [v4.4, T4g] REQUIRED, non-nullable — the frozen cost basis
+                // for this line. See ResolvedAllocation's note above.
+                costAmountSYP: alloc.costAmountSYP,
               },
             });
           }
@@ -1027,76 +1061,68 @@ export async function POST(req: NextRequest) {
   }
 
   // ==========================================================================
-  // PASS 3 — Payments. Idempotent via CustomerPayment.offlineId.
+  // PASS 3 — Payments (customer repayments). Idempotent via
+  // CustomerPayment.offlineId, and — like both PASS 2 sub-phases — resolved and
+  // written by ONE shared core.
+  //
+  // Exchange rate follows the SAME rule as the Invoice pass: when the device
+  // record carries a rate (payments always do — OfflinePayment.exchangeRate is
+  // required), freeze THAT rate onto the row via frozenRate. amountUSD is
+  // derived as SYP ÷ that frozen rate. Payload amountUSD is never persisted.
+  // A duplicate offlineId is SYNCED (recordRepaymentIdempotent), not FAILED.
+  // An amount above the current balance is FAILED with the Arabic reason —
+  // never RETRY_LATER.
   // ==========================================================================
   for (const p of payments as PaymentPayload[]) {
+    // ADMIN only — same posture as the void sub-phase in PASS 2. The sync
+    // endpoint is an API-mutation path, so it enforces the Role Capability
+    // Matrix's "log a repayment" row itself, regardless of what the client did.
+    if (userRole !== "ADMIN") {
+      paymentResults.push({
+        offlineId: p.offlineId,
+        status: "FAILED",
+        error: "تسجيل الدفعات متاح فقط لحساب المدير (ADMIN).",
+      });
+      continue;
+    }
+
     try {
-      const { id } = await withTxRetries(() =>
-        prisma.$transaction(async (tx) => {
-          const existing = await tx.customerPayment.findFirst({
-            where: { offlineId: p.offlineId, tenantId },
-            select: { id: true },
-          });
-          if (existing) return existing;
-
-          const amountSYP = serializeMoney(p.amountSYP);
-          const amountUSD = serializeMoney(p.amountUSD);
-          const exchangeRate = serializeMoney(p.exchangeRate);
-
-          if (compareMoney(amountSYP, 0) <= 0) {
-            throw new Error("قيمة الدفعة بالليرة السورية يجب أن تكون أكبر من الصفر.");
+      const recorded = await withTxRetries(() =>
+        recordRepaymentIdempotent(
+          prisma,
+          tenantId,
+          {
+            customerId: p.customerId ?? "",
+            amountSYP: p.amountSYP,
+            paymentMethod: p.paymentMethod as PaymentMethod,
+            receiptNo: p.receiptNo ?? null,
+            notes: p.notes ?? null,
+            offlineId: p.offlineId,
+            createdAt: new Date(p.createdAt),
+            syncedAt: new Date(),
+            frozenRate: p.exchangeRate,
+          },
+          {
+            transactionOptions: TX_OPTIONS,
+            resolveCustomerId: (tx) =>
+              resolveTargetCustomerId(
+                tx,
+                tenantId,
+                customerMap,
+                { offlineCustomerId: p.offlineCustomerId, customerId: p.customerId },
+                "الزبون المرتبط بهذه الدفعة غير موجود.",
+                retryableCustomerOfflineIds
+              ),
           }
-          if (compareMoney(exchangeRate, 0) <= 0) {
-            throw new Error("سعر الصرف يجب أن يكون أكبر من الصفر.");
-          }
-
-          const targetCustomerId = await resolveTargetCustomerId(
-            tx,
-            tenantId,
-            customerMap,
-            { offlineCustomerId: p.offlineCustomerId, customerId: p.customerId },
-            "الزبون المرتبط بهذه الدفعة غير موجود.",
-            // [FIX — TRANSIENT CUSTOMER DEPENDENCY]
-            retryableCustomerOfflineIds
-          );
-
-          const created = await tx.customerPayment.create({
-            data: {
-              tenantId,
-              customerId: targetCustomerId,
-              invoiceId: null,
-              amountSYP,
-              amountUSD,
-              exchangeRate,
-              paymentMethod: p.paymentMethod as PaymentMethod,
-              receiptNo: p.receiptNo || null,
-              notes: p.notes || null,
-              offlineId: p.offlineId,
-              syncedAt: new Date(),
-              createdAt: new Date(p.createdAt),
-            },
-            select: { id: true },
-          });
-          return created;
-        }, TX_OPTIONS)
+        )
       );
 
-      paymentResults.push({ offlineId: p.offlineId, status: "SYNCED", realId: id });
+      paymentResults.push({
+        offlineId: p.offlineId,
+        status: "SYNCED",
+        realId: recorded.paymentId,
+      });
     } catch (err) {
-      if (isUniqueConflict(err)) {
-        const existing = await prisma.customerPayment.findFirst({
-          where: { offlineId: p.offlineId, tenantId },
-          select: { id: true },
-        });
-        if (existing) {
-          paymentResults.push({
-            offlineId: p.offlineId,
-            status: "SYNCED",
-            realId: existing.id,
-          });
-          continue;
-        }
-      }
       // [FIX — TRANSIENT CUSTOMER DEPENDENCY] See processInvoiceSyncItem's
       // identical branch above and the file-header FIX note.
       if (err instanceof TransientDependencyError) {

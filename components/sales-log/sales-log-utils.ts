@@ -4,6 +4,11 @@
  * T4c2 — small, pure presentation helpers and label/colour maps for the
  * sales-log screen. Kept out of types.ts so that file stays a pure DTO
  * contract with no runtime code.
+ *
+ * [v4.4 — light-mode-only palette] Dark-mode variants intentionally removed
+ * for now (not on the roadmap yet) — every class below is a light-mode
+ * value only. Softened backgrounds and slightly stronger borders/text for
+ * better contrast than the previous pass.
  */
 
 import type {
@@ -27,9 +32,9 @@ export const PAYMENT_STATUS_LABELS: Record<PaymentStatusBadgeValue, string> = {
 };
 
 export const PAYMENT_STATUS_CLASSES: Record<PaymentStatusBadgeValue, string> = {
-    CASH_FULL: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900",
-    CREDIT_FULL: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900",
-    PARTIAL: "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-900",
+    CASH_FULL: "bg-emerald-50 text-emerald-700 border-emerald-200",
+    CREDIT_FULL: "bg-amber-50 text-amber-700 border-amber-200",
+    PARTIAL: "bg-blue-50 text-blue-700 border-blue-200",
 };
 
 export const INVOICE_STATUS_LABELS: Record<InvoiceStatusValue, string> = {
@@ -39,9 +44,9 @@ export const INVOICE_STATUS_LABELS: Record<InvoiceStatusValue, string> = {
 };
 
 export const INVOICE_STATUS_CLASSES: Record<InvoiceStatusValue, string> = {
-    COMPLETED: "bg-zinc-100 text-zinc-700 border-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:border-zinc-700",
-    PENDING_REVIEW: "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-900",
-    VOIDED: "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/40 dark:text-red-300 dark:border-red-900",
+    COMPLETED: "bg-zinc-100 text-zinc-700 border-zinc-200",
+    PENDING_REVIEW: "bg-orange-50 text-orange-700 border-orange-200",
+    VOIDED: "bg-red-50 text-red-700 border-red-200",
 };
 
 // ---------------------------------------------------------------------------

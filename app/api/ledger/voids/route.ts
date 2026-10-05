@@ -262,6 +262,16 @@ export async function POST(req: Request) {
             quantity: subtractMoney("0", item.quantity.toString()),
             unitPriceSYP: item.unitPriceSYP,
             unitPriceUSD: item.unitPriceUSD,
+            // [v4.4, T4g] A voided line always carries a NEGATIVE costAmountSYP
+            // — the negation of the ORIGINAL line's frozen cost basis, read
+            // straight off the stored row (never recomputed from the batch's
+            // current costPricePerBaseUnit, which may have been corrected
+            // since the sale). Negated via subtractMoney("0", …), the same
+            // discipline used for quantity above and for the invoice totals
+            // in step 1 — never a raw Decimal negation. Summing this against
+            // the original line's own costAmountSYP is exactly zero. Since the
+            // original is always non-null, there is no null case to handle.
+            costAmountSYP: subtractMoney("0", item.costAmountSYP.toString()),
           },
         });
         voidItems.push(voidItem);

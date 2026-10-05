@@ -8,17 +8,21 @@ import { Badge } from "@/components/ui/badge";
 import { Store, Phone, ShoppingCart, DollarSign, PackageCheck, AlertCircle, ImageOff } from "lucide-react";
 import { convertCurrency, formatMoney, toDecimal } from "@/lib/utils/money";
 
-// [ADD] Honest, narrow types instead of `product: any` — matches the
-// pattern already used in app/api/inventory/products/route.ts.
+// [v4.6] Unit type has NO imageUrl anymore — the image moved to Product.
+// This type describes only what the storefront needs per unit for PRICE
+// display; everything image-related is read from StorefrontProduct below.
 type StorefrontProductUnit = {
   id: string;
   unitName: string;
   conversionFactor: Prisma.Decimal | number;
   pricingCurrency: string;
   priceWholesale: Prisma.Decimal | number;
-  priceRetail: Prisma.Decimal | number | null;
-  imageUrl: string | null;
-  barcode: string | null;
+  // [v4.5] Deliberately NO barcode field here. ProductUnit.barcode no longer
+  // exists (barcodes live in the separate ProductUnitBarcode model), and the
+  // query below never `include`s that relation — so the public, anonymous
+  // storefront cannot expose a unit's barcode values even by accident. That is
+  // the intended behaviour, not an oversight: this page renders a product's
+  // name, category, image and prices only.
   isActive?: boolean;
 };
 
@@ -26,6 +30,10 @@ type StorefrontProduct = {
   id: string;
   name: string;
   category: string | null;
+  // [v4.6] THE ONE image for this product (moved here from ProductUnit).
+  // Every display that needs an image reads THIS field — no per-unit image
+  // exists and no unit-to-product fallback is ever done.
+  imageUrl: string | null;
   units: StorefrontProductUnit[];
 };
 
@@ -33,28 +41,14 @@ type StorefrontPageProps = {
   params: Promise<{ tenantSlug: string }>;
 };
 
-// [ADD] Picks the unit the storefront should actually display for a
-// product card. The publishing gate (T3) only requires ONE unit to carry
-// both priceRetail + imageUrl before Product.isPublic can be true — it
-// does NOT guarantee that unit is the base unit (conversionFactor === 1)
-// or the first unit in the array. Preference order:
-//   1. base unit (conversionFactor === 1) that is itself gate-eligible
-//   2. any other gate-eligible unit
-//   3. base unit (fallback, should not normally be reached on a public
-//      product, but keeps this defensive rather than throwing)
-//   4. first unit (last-resort fallback)
+// [v4.6] Picks the unit to display for PRICE purposes only — the image
+// now lives on the product, not the unit, so this helper no longer needs
+// to check for a per-unit imageUrl. Preference order:
+//   1. base unit (conversionFactor === 1) that is active
+//   2. any other active unit
+//   3. first unit (last-resort fallback)
 function pickDisplayUnit(units: StorefrontProductUnit[]): StorefrontProductUnit | undefined {
-  const isEligible = (u: StorefrontProductUnit) =>
-    u.isActive !== false &&
-    u.priceRetail !== null &&
-    u.priceRetail !== undefined &&
-    Number(u.priceRetail) > 0 &&
-    u.imageUrl &&
-    u.imageUrl.trim().length > 0;
-
   return (
-    units.find((u) => Number(u.conversionFactor) === 1 && isEligible(u)) ??
-    units.find(isEligible) ??
     units.find((u) => Number(u.conversionFactor) === 1 && u.isActive !== false) ??
     units.find((u) => u.isActive !== false) ??
     units[0]
@@ -83,9 +77,22 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
         // previously isPublic must never remain visible on the public
         // storefront just because isPublic was never explicitly reset.
         where: { isPublic: true, isActive: true },
-        include: {
+        select: {
+          id: true,
+          name: true,
+          category: true,
+          // [v4.6] Product-level image — the ONE image for the product card.
+          imageUrl: true,
           units: {
             where: { isActive: true },
+            select: {
+              id: true,
+              unitName: true,
+              conversionFactor: true,
+              pricingCurrency: true,
+              priceWholesale: true,
+              isActive: true,
+            },
           },
         },
         // [FIX] Removed `take: 12`. A hard cap silently hid the rest of a
@@ -247,24 +254,18 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
                 // the base-currency price only rather than a wrong number.
               }
 
-              const priceRetailDisplay =
-                displayUnit.priceRetail !== null && displayUnit.priceRetail !== undefined
-                  ? formatMoney(displayUnit.priceRetail.toString(), currency === "USD" ? "USD" : "SYP")
-                  : null;
-
               return (
                 <Card
                   key={product.id}
                   className="flex flex-col justify-between border-zinc-200 dark:border-zinc-800 hover:shadow-lg transition-shadow overflow-hidden"
                 >
-                  {/* [ADD] Product image — the publishing gate requires
-                      every publishable unit to have an imageUrl, but the
-                      previous version of this page never rendered it. */}
+                  {/* [v4.6] Product image — one image per product, read from
+                      product.imageUrl. No per-unit imageUrl exists anymore. */}
                   <div className="aspect-square w-full bg-zinc-100 dark:bg-zinc-900 flex items-center justify-center overflow-hidden">
-                    {displayUnit.imageUrl ? (
+                    {product.imageUrl ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
-                        src={displayUnit.imageUrl}
+                        src={product.imageUrl}
                         alt={product.name}
                         className="h-full w-full object-cover"
                       />
@@ -300,14 +301,6 @@ export default async function StorefrontPage({ params }: StorefrontPageProps) {
                         <span className="text-xs font-semibold text-zinc-500">({priceSYPDisplay} ل.س)</span>
                       )}
                     </div>
-                    {/* [ADD] priceRetail — spec (T5 Scope 1) requires it be
-                        "visibly distinguished" from the charged wholesale
-                        price, not omitted. */}
-                    {priceRetailDisplay && (
-                      <p className="text-[11px] text-zinc-400">
-                        السعر المقترح للتجزئة: {priceRetailDisplay}
-                      </p>
-                    )}
                   </CardContent>
 
                   <CardFooter className="border-t border-zinc-100 dark:border-zinc-900 pt-3 mt-auto">

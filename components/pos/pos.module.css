@@ -564,16 +564,6 @@
   font-weight: 700;
   color: var(--purple-600);
 }
-.priceRetail {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  font-size: 10px;
-  color: var(--slate-400);
-  text-decoration: line-through;
-  white-space: nowrap;
-}
 .rateNeeded {
   display: inline-flex;
   align-items: center;

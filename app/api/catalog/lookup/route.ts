@@ -1,12 +1,32 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 // [NOTE] ProductCatalogEntry is platform-wide, NOT tenant-scoped (see
-// schema.prisma: "id, barcode (unique), name, category, imageUrl,
-// addedByTenantId, createdAt, updatedAt" — no tenantId field at all).
-// getTenantDb(tenantId)'s Prisma Client Extension auto-injects tenantId
-// into tenant-scoped models only (see TENANT_SCOPED_MODELS in
-// lib/db/tenant-scope.ts) — ProductCatalogEntry is deliberately excluded
-// from that set, so there is nothing for the extension to inject here.
+// schema.prisma: "id, name, category, imageUrl, addedByTenantId,
+// createdAt, updatedAt" — no tenantId field at all), and so is
+// ProductCatalogEntryBarcode ("id, catalogEntryId, barcode, createdAt",
+// also no tenantId). getTenantDb(tenantId)'s Prisma Client Extension
+// auto-injects tenantId into tenant-scoped models only (see
+// TENANT_SCOPED_MODELS in lib/db/tenant-scope.ts) — both of these are
+// deliberately excluded from that set, so there is nothing for the
+// extension to inject here.
+//
+// [v4.5] The lookup itself now goes through ProductCatalogEntryBarcode:
+// the platform-wide unique barcode constraint moved off
+// ProductCatalogEntry.barcode (removed) and onto
+// ProductCatalogEntryBarcode.barcode, so ONE catalog entry can be reached
+// by ANY of the several barcodes known for the same real product. A
+// `findUnique` on the barcode column of that table is still a single
+// indexed hit, and `isOwner` still reflects the PARENT entry's
+// addedByTenantId, so this endpoint's response contract is unchanged.
+//
+// [DECISION — documented exception, read-only] This is the one file
+// outside lib/data/products.ts permitted to name
+// `productCatalogEntryBarcode` directly, because it is (a) a pure indexed
+// READ on a platform-wide table this route already legitimately reads, and
+// (b) not reachable through the tenant-scoped gateway's ownership
+// semantics (there is no tenantId to scope by). Writes to
+// productCatalogEntry/productCatalogEntryBarcode stay confined to
+// lib/data/products.ts's gateways + the inventory routes that call them.
 // This is a legitimate, narrow exception to the "always use getTenantDb"
 // rule, scoped specifically to platform-wide models with no tenantId
 // column — the same structural reasoning as VerifiedRetailer/
@@ -38,9 +58,22 @@ export async function GET(req: Request) {
 
     const tenantId = session.user.tenantId;
 
-    const entry = await prisma.productCatalogEntry.findUnique({
-      where: { barcode },
-    });
+    const entry = await prisma.productCatalogEntryBarcode
+      .findUnique({
+        where: { barcode },
+        select: {
+          catalogEntry: {
+            select: {
+              id: true,
+              name: true,
+              category: true,
+              imageUrl: true,
+              addedByTenantId: true,
+            },
+          },
+        },
+      })
+      .then((row) => row?.catalogEntry ?? null);
 
     if (!entry) {
       return NextResponse.json({ success: true, entry: null });
@@ -50,7 +83,10 @@ export async function GET(req: Request) {
       success: true,
       entry: {
         id: entry.id,
-        barcode: entry.barcode,
+        // The request's own barcode value — this row matched it exactly, and
+        // the client (AddProductModal/EditProductModal) compares the echoed
+        // value back against the barcode it asked about.
+        barcode,
         name: entry.name,
         category: entry.category,
         imageUrl: entry.imageUrl,

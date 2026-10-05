@@ -1,7 +1,14 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { getTenantDb } from "@/lib/db/tenant-scope";
-import { toDecimal, subtractMoney, convertCurrency, compareMoney } from "@/lib/utils/money";
+import { convertCurrency, compareMoney } from "@/lib/utils/money";
+// [T4e repayment] The balance formula is NOT re-typed here — it lives in
+// exactly one place (lib/ledger/balance.ts) and this route maps the arrays it
+// has already loaded for every customer through it. The same function backs
+// recordRepayment()'s per-customer balance check, so the number the ledger
+// screen displays and the number a repayment is validated against can never
+// drift apart.
+import { computeBalanceSYP } from "@/lib/ledger/balance";
 
 /**
  * GET /api/customers
@@ -117,19 +124,14 @@ export async function GET() {
     });
 
     const mappedCustomers = customers.map((c) => {
-      let debtSYP = "0.0000";
-
-      for (const inv of c.invoices) {
-        if (inv.debtAmountSYP) {
-          debtSYP = toDecimal(debtSYP).plus(toDecimal(inv.debtAmountSYP.toString())).toFixed(4);
-        }
-      }
-
-      for (const pay of c.payments) {
-        if (pay.amountSYP) {
-          debtSYP = subtractMoney(debtSYP, pay.amountSYP.toString());
-        }
-      }
+      // [T4e repayment] Delegated to lib/ledger/balance.ts's computeBalanceSYP —
+      // the ONE implementation of this formula. The two arrays handed over are
+      // backed by the SAME indexed relation reads this route always did (one
+      // grouped query for the whole page, no N+1); only the arithmetic moved.
+      const debtSYP = computeBalanceSYP(
+        c.invoices.map((inv) => inv.debtAmountSYP.toString()),
+        c.payments.map((pay) => pay.amountSYP.toString())
+      );
 
       // Informational only — a single conversion of the final balance at
       // today's rate, never a sum of historically-frozen USD figures.

@@ -76,22 +76,16 @@ export async function PATCH(
       // [FIX] existingProduct.units are now DisplayUnitWithBaseFlag[]
       // (via findProductWithUnits() -> toSafeProductWithUnits() ->
       // toDisplayUnits()), never raw ProductUnit rows — conversionFactor
-      // was already pre-serialized to a string before reaching this
-      // file, and priceRetail here is still normalized to a plain
-      // number the same way the main PATCH /api/inventory/products/[id]
-      // handler does, so this route can never disagree with it on the
-      // same publishing-gate rule.
+      // is already pre-serialized to a string before reaching this file,
+      // so this route can never disagree with the main PATCH
+      // /api/inventory/products/[id] handler on the publishing-gate rule.
       const candidateUnits = existingProduct.units.map((u) => ({
         isActive: u.isActive !== false,
-        imageUrl: u.imageUrl,
-        priceRetail:
-          u.priceRetail !== null && u.priceRetail !== undefined
-            ? Number(u.priceRetail)
-            : null,
       }));
 
       const gateCheck = checkProductPublishable({
         isActive: existingProduct.isActive,
+        imageUrl: existingProduct.imageUrl,
         units: candidateUnits,
       });
       if (!gateCheck.publishable) {

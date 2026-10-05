@@ -1,0 +1,233 @@
+﻿node.exe : [33m(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is 
+planned to become the default in a future major version of Vite:
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Program Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([33m(!) Your V...ersion of Vite::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `"type": 
+"module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.[39m
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mE:/Web Application/NEXT.JS course/JomlaTech/jomla-tech[39m
+
+ [31mΓ¥»[39m lib/inventory/__tests__/t3a-api-product-admin.test.ts [2m([22m[2m11 tests[22m[2m | [22m[31m9 failed[39m[2m)[22m[32m 33[2mms[22m[39m
+[31m       [31m├ù[31m returns 400 with PRODUCT_INACTIVE when product is inactive[39m[32m 17[2mms[22m[39m
+[31m       [31m├ù[31m returns 400 with PUBLISH_GATE_BLOCKED when active unit has no price or image[39m[32m 2[2mms[22m[39m
+[31m       [31m├ù[31m toggles isPublic to true when publishing gate is satisfied[39m[32m 1[2mms[22m[39m
+[31m       [31m├ù[31m deactivates unit without touching product.isPublic, even if the gate would now fail[39m[32m 1[2mms[22m[39m
+[31m       [31m├ù[31m deactivating product leaves isPublic untouched[39m[32m 2[2mms[22m[39m
+[31m       [31m├ù[31m DELETE soft-deactivates product without touching isPublic[39m[32m 1[2mms[22m[39m
+       [32mΓ£ô[39m rejects CASHIER role on PATCH with 403 FORBIDDEN[32m 3[2mms[22m[39m
+       [32mΓ£ô[39m rejects CASHIER role on DELETE with 403 FORBIDDEN[32m 1[2mms[22m[39m
+[31m       [31m├ù[31m updates name and category without touching units or publishing state[39m[32m 1[2mms[22m[39m
+[31m       [31m├ù[31m rejects a unit with non-empty barcode when barcodeSource is missing or null[39m[32m 1[2mms[22m[39m
+[31m       [31m├ù[31m accepts a unit with barcode when barcodeSource is explicitly GS1 or INTERNAL[39m[32m 1[2mms[22m[39m
+
+[31mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[39m[1m[41m Failed Tests 9 [49m[22m[31mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id]/toggle-public[2m > [22mreturns 400 
+with PRODUCT_INACTIVE when product is inactive
+[31m[1mAssertionError[22m: expected 404 to be 400 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 400[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m118:26[22m[39m
+    [90m116|[39m       })[33m;[39m
+    [90m117|[39m       const res = await togglePublicHandler(req, { params: Promise.resΓÇª
+    [90m118|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m400[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m119|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m120|[39m       
+[34mexpect[39m(json[33m.[39merror)[33m.[39m[34mtoBe[39m([32m"PRODUCT_INACTIVE"[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[1/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id]/toggle-public[2m > [22mreturns 400 
+with PUBLISH_GATE_BLOCKED when active unit has no price or image
+[31m[1mAssertionError[22m: expected 404 to be 400 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 400[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m143:26[22m[39m
+    [90m141|[39m       })[33m;[39m
+    [90m142|[39m       const res = await togglePublicHandler(req, { params: Promise.resΓÇª
+    [90m143|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m400[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m144|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m145|[39m       
+[34mexpect[39m(json[33m.[39merror)[33m.[39m[34mtoBe[39m([32m"PUBLISH_GATE_BLOCKED"[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[2/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id]/toggle-public[2m > [22mtoggles 
+isPublic to true when publishing gate is satisfied
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m172:26[22m[39m
+    [90m170|[39m       })[33m;[39m
+    [90m171|[39m       const res = await togglePublicHandler(req, { params: Promise.resΓÇª
+    [90m172|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m173|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m174|[39m       
+[34mexpect[39m(json[33m.[39msuccess)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[3/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id]/units/[unitId]/toggle-active[2m > 
+[22mdeactivates unit without touching product.isPublic, even if the gate would now fail
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m215:26[22m[39m
+    [90m213|[39m         params[33m:[39m [33mPromise[39m[33m.[39m[34mresolve[39m({ id[33m:[39m 
+[32m"p1"[39m[33m,[39m unitId[33m:[39m [32m"u1"[39m })[33m,[39m
+    [90m214|[39m       })[33m;[39m
+    [90m215|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m216|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m217|[39m       
+[34mexpect[39m(json[33m.[39msuccess)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[4/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id]/toggle-active & DELETE[2m > 
+[22mdeactivating product leaves isPublic untouched
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m247:26[22m[39m
+    [90m245|[39m       })[33m;[39m
+    [90m246|[39m       const res = await toggleActiveHandler(req, { params: Promise.resΓÇª
+    [90m247|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m248|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m249|[39m       
+[34mexpect[39m(json[33m.[39misActive)[33m.[39m[34mtoBe[39m([35mfalse[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[5/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id]/toggle-active & DELETE[2m > 
+[22mDELETE soft-deactivates product without touching isPublic
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m276:26[22m[39m
+    [90m274|[39m       })[33m;[39m
+    [90m275|[39m       const res = await deleteProductHandler(req, { params: Promise.reΓÇª
+    [90m276|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m277|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m278|[39m       
+[34mexpect[39m(json[33m.[39msuccess)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[6/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id] ΓÇö Name, Category & Preservation[2m 
+> [22mupdates name and category without touching units or publishing state
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m356:26[22m[39m
+    [90m354|[39m
+    [90m355|[39m       const res = await patchProductHandler(req, { params: Promise.resΓÇª
+    [90m356|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m357|[39m
+    [90m358|[39m       [34mexpect[39m(mockProduct[33m.[39mupdate)[33m.[39m[34mtoHaveBeenCalledWith[39m({
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[7/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id] ΓÇö BarcodeSource Validation Gate[2m 
+> [22mrejects a unit with non-empty barcode when barcodeSource is missing or null
+[31m[1mAssertionError[22m: expected 404 to be 400 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 400[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m399:26[22m[39m
+    [90m397|[39m
+    [90m398|[39m       const res = await patchProductHandler(req, { params: Promise.resΓÇª
+    [90m399|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m400[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m400|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m401|[39m       
+[34mexpect[39m(json[33m.[39merror)[33m.[39m[34mtoBe[39m([32m"VALIDATION_ERROR"[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[8/9]ΓÄ»[22m[39m
+
+[41m[1m FAIL [22m[49m lib/inventory/__tests__/t3a-api-product-admin.test.ts[2m > [22mT3a API Endpoints ΓÇö 
+Product & Unit Administration[2m > [22mPATCH /api/inventory/products/[id] ΓÇö BarcodeSource Validation Gate[2m 
+> [22maccepts a unit with barcode when barcodeSource is explicitly GS1 or INTERNAL
+[31m[1mAssertionError[22m: expected 404 to be 200 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 200[39m
+[31m+ 404[39m
+
+[36m [2mΓ¥»[22m lib/inventory/__tests__/t3a-api-product-admin.test.ts:[2m443:26[22m[39m
+    [90m441|[39m
+    [90m442|[39m       const res = await patchProductHandler(req, { params: Promise.resΓÇª
+    [90m443|[39m       [34mexpect[39m(res[33m.[39mstatus)[33m.[39m[34mtoBe[39m([34m200[39m)[33m;[39m
+    [90m   |[39m                          [31m^[39m
+    [90m444|[39m       [35mconst[39m json [33m=[39m [35mawait[39m res[33m.[39m[34mjson[39m()[33m;[39m
+    [90m445|[39m       
+[34mexpect[39m(json[33m.[39msuccess)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+
+[31m[2mΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»ΓÄ»[9/9]ΓÄ»[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m9 failed[39m[22m[2m | [22m[1m[32m2 passed[39m[22m[90m (11)[39m
+[2m   Start at [22m 09:45:29
+[2m   Duration [22m 763ms[2m (transform 212ms, setup 0ms, import 470ms, tests 33ms, environment 0ms)[22m
+

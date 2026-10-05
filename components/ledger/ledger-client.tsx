@@ -1,25 +1,33 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo } from "react";
-import {
-  Users,
-  Search,
-  RefreshCw,
-  CreditCard,
-  Building2,
-  Phone,
-  FileText,
-  AlertCircle,
-} from "lucide-react";
+import { Users, Search, RefreshCw, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
-import { formatMoney } from "@/lib/utils/money";
 import { MergeCustomersModal, type CustomerSummaryItem } from "./merge-customers-modal";
+import { usePendingRepaymentTotals, useFailedOfflineRepayments } from "@/lib/offline/pending-offline-payments";
+import { CustomerCard, type RepaymentAppliedResult } from "./customer-card";
 
 interface LedgerClientProps {
   tenantId: string;
   isAdmin: boolean;
+}
+
+/**
+ * Pure network helper: no React state is touched here, so it can be called from
+ * an effect without triggering a synchronous setState.
+ */
+async function requestCustomers(): Promise<CustomerSummaryItem[]> {
+  const res = await fetch("/api/customers");
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || "فشل جلب قائمة الزبائن.");
+  }
+  return data.customers || [];
+}
+
+function toErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : "حدث خطأ أثناء تحميل البيانات.";
 }
 
 export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
@@ -29,26 +37,63 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
   const [isMergeModalOpen, setIsMergeModalOpen] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
+  // Live view of repayments queued on this device but not yet synced (Dexie).
+  const pendingRepaymentTotals = usePendingRepaymentTotals(tenantId);
+  const failedRepayments = useFailedOfflineRepayments(tenantId);
+
+  /**
+   * T4e — in-place balance update after a repayment: the modal hands back the
+   * server-computed balance (online) or the locally computed balance − amount
+   * (offline; the same arithmetic the server re-derives at sync time), so the
+   * card re-renders immediately without a refetch. The secondary USD figure is
+   * cleared rather than left stale; the next /api/customers fetch restores it.
+   */
+  const handleRepaymentApplied = useCallback((result: RepaymentAppliedResult) => {
+    setCustomers((prev) =>
+      prev.map((c) =>
+        c.id === result.customerId
+          ? { ...c, cachedBalanceDebtSYP: result.balanceSYP, cachedBalanceDebtUSD: undefined }
+          : c
+      )
+    );
+  }, []);
+
+  /**
+   * Manual refresh (refresh button, merge modal onSuccess). Called from event
+   * handlers only, so setting the loading state synchronously here is fine.
+   */
   const fetchCustomers = useCallback(async () => {
     setIsLoading(true);
     setFetchError(null);
     try {
-      const res = await fetch("/api/customers");
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.message || "فشل جلب قائمة الزبائن.");
-      }
-      setCustomers(data.customers || []);
+      setCustomers(await requestCustomers());
     } catch (err) {
-      setFetchError(err instanceof Error ? err.message : "حدث خطأ أثناء تحميل البيانات.");
+      setFetchError(toErrorMessage(err));
     } finally {
       setIsLoading(false);
     }
   }, []);
 
+  // Initial load. `isLoading` already starts as true and `fetchError` as null,
+  // so nothing needs to be set synchronously: state is only updated from the
+  // async callbacks below. `cancelled` guards against unmount / StrictMode's
+  // double-invoked effect.
   useEffect(() => {
-    void fetchCustomers();
-  }, [fetchCustomers]);
+    let cancelled = false;
+    requestCustomers()
+      .then((list) => {
+        if (!cancelled) setCustomers(list);
+      })
+      .catch((err) => {
+        if (!cancelled) setFetchError(toErrorMessage(err));
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const filteredCustomers = useMemo(() => {
     if (!searchQuery.trim()) return customers;
@@ -136,76 +181,17 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredCustomers.map((customer) => {
-            const hasDebt = parseFloat(customer.cachedBalanceDebtSYP || "0") > 0;
-            return (
-              <div
-                key={customer.id}
-                className="bg-white border rounded-xl p-4 shadow-sm hover:shadow transition-shadow flex flex-col justify-between"
-              >
-                <div>
-                  <div className="flex items-start justify-between gap-2 border-b pb-2 mb-3">
-                    <div>
-                      <h3 className="font-bold text-zinc-900 text-base">{customer.name}</h3>
-                      {customer.shopName && (
-                        <p className="text-xs text-zinc-500 flex items-center gap-1 mt-0.5">
-                          <Building2 className="w-3.5 h-3.5 text-zinc-400" />
-                          <span>{customer.shopName}</span>
-                        </p>
-                      )}
-                    </div>
-
-                    {customer.isSystemGenerated ? (
-                      <Badge variant="secondary" className="text-[10px]">
-                        نقدي عام
-                      </Badge>
-                    ) : hasDebt ? (
-                      <Badge variant="destructive" className="text-[10px]">
-                        مدين
-                      </Badge>
-                    ) : (
-                      <Badge variant="outline" className="text-[10px] text-emerald-700 bg-emerald-50 border-emerald-200">
-                        مستوفى
-                      </Badge>
-                    )}
-                  </div>
-
-                  <div className="space-y-1.5 text-xs text-zinc-600 mb-3">
-                    {customer.phone && (
-                      <div className="flex items-center gap-1.5">
-                        <Phone className="w-3.5 h-3.5 text-zinc-400" />
-                        <span className="font-mono text-zinc-800">{customer.phone}</span>
-                      </div>
-                    )}
-                    <div className="flex items-center gap-1.5">
-                      <FileText className="w-3.5 h-3.5 text-zinc-400" />
-                      <span>عدد الفواتير:</span>
-                      <span className="font-semibold text-zinc-800">
-                        {customer.invoiceCount ?? (customer.isSystemGenerated ? 0 : 0)}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="pt-3 border-t flex items-center justify-between">
-                  <span className="text-xs text-zinc-500 flex items-center gap-1">
-                    <CreditCard className="w-3.5 h-3.5 text-zinc-400" />
-                    الرصيد:
-                  </span>
-                  <div className="text-left font-bold text-sm">
-                    <span className={hasDebt ? "text-rose-700" : "text-emerald-700"}>
-                      {formatMoney(customer.cachedBalanceDebtSYP, "SYP")}
-                    </span>
-                    {customer.cachedBalanceDebtUSD && (
-                      <span className="block text-[11px] font-normal text-zinc-400">
-                        ≈ {formatMoney(customer.cachedBalanceDebtUSD, "USD")}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-            );
-          })}
+          {filteredCustomers.map((customer) => (
+            <CustomerCard
+              key={customer.id}
+              tenantId={tenantId}
+              customer={customer}
+              isAdmin={isAdmin}
+              pendingRepaymentSYP={pendingRepaymentTotals[customer.id]}
+              failedRepayments={failedRepayments.filter((row) => row.customerId === customer.id)}
+              onRepaymentApplied={handleRepaymentApplied}
+            />
+          ))}
         </div>
       )}
 

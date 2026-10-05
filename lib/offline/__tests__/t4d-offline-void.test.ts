@@ -8,8 +8,9 @@
  *   2. submitOfflineVoid() SUCCEEDS on PENDING and on FAILED targets,
  *      producing negated sold-unit item quantities, negated money, and a
  *      correctly decremented cached customer balance.
- *   3. The written record's voidReason matches verbatim and survives unchanged
- *      into the eventual /api/sync payload shape (verified by running the REAL
+ *   3. [CURRENTLY DISABLED — see the commented-out block below] The written
+ *      record's voidReason matches verbatim and survives unchanged into the
+ *      eventual /api/sync payload shape (verified by running the REAL
  *      syncPendingRecords() against a mocked fetch and inspecting the body).
  *   4. canVoidOfflineInvoice() / shouldShowOfflineVoidPanel() truth tables —
  *      pure functions, no DOM required.
@@ -18,7 +19,10 @@
  *   6. Static source assertions: T4c2 never imports submitOfflineVoid; the
  *      offline panel never references /api/ledger/voids (and performs no
  *      network I/O of its own); pos-layout mounts the panel ADMIN-gated; the
- *      offline void path writes no CustomerPayment record.
+ *      offline void path writes no CustomerPayment record. All static scans
+ *      run against comment-stripped source, so explanatory comments that
+ *      merely MENTION a forbidden path can never cause a false failure (or a
+ *      false pass).
  *
  * KNOWN LIMITATION, STATED EXPLICITLY: this repository's test environment is
  * `node` (vitest.config.ts) with no jsdom / @testing-library dependency, so
@@ -58,6 +62,17 @@ const rootDir = process.cwd();
 const CARTON_FACTOR = "24";
 const UNIT_PRICE_SYP = "50000.0000";
 const CUSTOMER_NAME = "سوبرماركت الأمانة";
+
+/**
+ * Removes block comments and line comments so static source scans test the
+ * CODE, not the prose around it. Line-comment removal skips "://" so URLs in
+ * string literals are left alone.
+ */
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
 
 function testCartItem(quantity = 3): CartLineItem {
   const product = {
@@ -400,6 +415,13 @@ describe("T4d v4.1 — submitOfflineVoid success path", () => {
   });
 });
 
+// [DISABLED — kept verbatim from the previous revision.]
+// This is the only test proving voidReason and the negative sold-unit
+// quantities actually reach /api/sync. While it stays commented out, coverage
+// item 3 in the file header is NOT verified. Re-enable it (and the
+// syncPendingRecords import above becomes used) once the failure that led to
+// disabling it is understood.
+//
 // describe("T4d v4.1 — the offline void reason survives into the sync payload", () => {
 //   it("sends voidsOfflineInvoiceId, the verbatim reason, and negative sold-unit quantities to /api/sync", async () => {
 //     const sale = await seedPendingSale();
@@ -575,8 +597,9 @@ describe("T4d v4.1 — listPendingOfflineInvoices (the panel's live data source)
 });
 
 describe("T4d v4.1 — strict separation between the two void surfaces (static source scans)", () => {
+  /** Reads a source file and strips comments, so scans test code only. */
   const readSource = (relativePath: string) =>
-    fs.readFileSync(path.join(rootDir, relativePath), "utf-8");
+    stripComments(fs.readFileSync(path.join(rootDir, relativePath), "utf-8"));
 
   function readAllUnder(relativeDir: string): Array<{ file: string; source: string }> {
     const collected: Array<{ file: string; source: string }> = [];
@@ -585,7 +608,10 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) walk(full);
         else if (/\.(ts|tsx)$/.test(entry.name)) {
-          collected.push({ file: full, source: fs.readFileSync(full, "utf-8") });
+          collected.push({
+            file: full,
+            source: stripComments(fs.readFileSync(full, "utf-8")),
+          });
         }
       }
     };
@@ -604,10 +630,15 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
       expect(source, `${file} must not reference listPendingOfflineInvoices`).not.toContain(
         "listPendingOfflineInvoices"
       );
-      // No import path crossing into the POS surface either.
-      expect(source, `${file} must not import from components/pos`).not.toContain(
-        "components/pos"
-      );
+
+      // No import path crossing into the POS surface either. Only real
+      // import statements are checked — that is what constitutes a dependency.
+      const importStatements =
+        source.match(/^\s*import[\s\S]*?from\s+["'][^"']+["'];?/gm) ?? [];
+      expect(
+        importStatements.join("\n"),
+        `${file} must not import from components/pos`
+      ).not.toContain("components/pos");
     }
   });
 
@@ -617,9 +648,10 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
     // The one and only write path it is allowed to use.
     expect(source).toContain("submitOfflineVoid");
 
-    // The online void endpoint is never named here, in any form.
+    // The online void endpoint is never named in executable code.
     expect(source).not.toContain("/api/ledger/voids");
     expect(source).not.toContain("ledger/voids");
+    expect(source).not.toContain("ledger:void_invoice");
 
     // It performs no fetch/XHR itself — syncing is delegated to the
     // triggerSync prop owned by pos-layout's single useSyncWorker() instance.
@@ -636,12 +668,14 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
   });
 
   it("the offline void service writes no CustomerPayment record and no raw Decimal negation", () => {
-    const source = readSource("lib/offline/pos-service.ts");
-    const start = source.indexOf("export async function submitOfflineVoid");
+    // Slice on the RAW source first (the slice end-marker is a doc comment,
+    // which stripComments would remove), then strip comments from the slice.
+    const raw = fs.readFileSync(path.join(rootDir, "lib/offline/pos-service.ts"), "utf-8");
+    const start = raw.indexOf("export async function submitOfflineVoid");
     expect(start).toBeGreaterThan(-1);
 
-    const nextExport = source.indexOf("\n\n/**", start);
-    const body = source.slice(start, nextExport > -1 ? nextExport : undefined);
+    const nextExport = raw.indexOf("\n\n/**", start);
+    const body = stripComments(raw.slice(start, nextExport > -1 ? nextExport : undefined));
 
     expect(body).not.toContain("offlinePayments");
     expect(body).not.toContain("createOfflinePaymentRecord");

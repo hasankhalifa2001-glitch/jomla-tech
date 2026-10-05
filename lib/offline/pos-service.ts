@@ -199,14 +199,21 @@ import {
   createOfflineVoidRecord,
   createCachedProductRecord,
   createCachedCustomerRecord,
+  // [T4e] The SAME factory the sync engine's Payment pass ultimately feeds —
+  // reused unchanged, so a locally-queued repayment is byte-for-byte the shape
+  // T4c already knows how to resolve.
+  createOfflinePaymentRecord,
   type PaymentMethod,
   type CachedProduct,
+  // [v4.5] The flat barcode index row type — see db.ts's CachedProductBarcode.
+  type CachedProductBarcode,
   type CachedCustomer,
   type CachedProductUnit,
   type OfflineInvoice,
+  type OfflinePayment,
   type OfflineSyncStatus,
 } from "./db";
-import { setCachedRate } from "./exchange-rate";
+import { getCachedRate, setCachedRate } from "./exchange-rate";
 import { generateOfflineId } from "./id";
 import { saveOfflineInvoiceWithBalance, saveOfflinePaymentWithBalance } from "./transaction-helpers";
 import { refreshProductCache } from "./cache-refresh";
@@ -218,6 +225,7 @@ import {
   sumMoney,
   convertCurrency,
   serializeMoney,
+  MoneyError,
   type MoneyInput,
 } from "../utils/money";
 
@@ -277,8 +285,6 @@ export interface CartLineItem {
   // proceed without a cached rate (SYP-only carts can; USD-priced items
   // need a rate to resolve their unitPriceSYP in the first place).
   pricingCurrency: "USD" | "SYP";
-  priceRetailSYP?: string;
-  priceRetailUSD?: string | null;
 }
 
 export interface CartTotalsResult {
@@ -593,7 +599,7 @@ export function calculateCartTotals(
 
 /**
  * Resolves the billed wholesale price for a product unit in SYP.
- * Always selects priceWholesale (never priceRetail).
+ * Always selects priceWholesale.
  *
  * [v3.6] AUTHORITATIVE resolver. A rate is only required when the unit is
  * priced in USD (to convert it into SYP) — a unit already priced in SYP
@@ -679,10 +685,9 @@ export function resolveUnitPriceUSD(
 }
 
 /**
- * Resolves billed wholesale (always) and optional retail (display-only) in
- * both SYP (authoritative) and USD (derived). Uses the same currency
- * conversion path as the catalog so USD-priced units are never written
- * into the cart as if they were already SYP.
+ * Resolves the billed wholesale price in both SYP (authoritative) and USD
+ * (derived). Uses the same currency conversion path as the catalog so a
+ * USD-priced unit is never written into the cart as if it were already SYP.
  *
  * Throws (via resolveUnitPriceSYP) if `unit` is deactivated.
  */
@@ -696,22 +701,12 @@ export function resolveCartLinePrices(
   // [T4b] Merchant's denomination for THIS unit — included so callers can
   // call cartNeedsExchangeRate() without re-inspecting CachedProductUnit.
   pricingCurrency: "USD" | "SYP";
-  priceRetailSYP?: string;
-  priceRetailUSD?: string | null;
 } {
   const unitPriceSYP = resolveUnitPriceSYP(unit, product, exchangeRate);
   const unitPriceUSD = resolveUnitPriceUSD(unit, product, exchangeRate);
   const pricingCurrency: "USD" | "SYP" =
     unit.pricingCurrency === "USD" ? "USD" : "SYP";
-
-  if (unit.priceRetail === undefined || unit.priceRetail === null || unit.priceRetail === "") {
-    return { unitPriceSYP, unitPriceUSD, pricingCurrency };
-  }
-
-  const retailUnit = { ...unit, priceWholesale: unit.priceRetail };
-  const priceRetailSYP = resolveUnitPriceSYP(retailUnit, product, exchangeRate);
-  const priceRetailUSD = resolveUnitPriceUSD(retailUnit, product, exchangeRate);
-  return { unitPriceSYP, unitPriceUSD, pricingCurrency, priceRetailSYP, priceRetailUSD };
+  return { unitPriceSYP, unitPriceUSD, pricingCurrency };
 }
 
 /**
@@ -847,7 +842,11 @@ export async function getOfflineProducts(
       p.units?.some(
         (u) =>
           u.unitName.toLowerCase().includes(cleanQuery) ||
-          (u.barcode && u.barcode.toLowerCase().includes(cleanQuery))
+          // [v4.5] Matches ANY of the unit's barcodes, not just one. (Local
+          // POS text search reads the nested display list; the SCAN path uses
+          // the flat cachedProductBarcodes index instead — see
+          // lib/offline/barcode-lookup.ts.)
+          u.barcodes?.some((b) => b.barcode.toLowerCase().includes(cleanQuery))
       )
     ) {
       return true;
@@ -1257,7 +1256,15 @@ export async function getOfflineInvoicesList(tenantId?: string): Promise<Offline
 // (app/api/sync/route.ts) when this record is eventually processed.
 // ============================================================================
 
-export type OfflineVoidActorRole = "ADMIN" | "CASHIER";
+export type OfflineActorRole = "ADMIN" | "CASHIER";
+
+/**
+ * [T4e] The offline void panel's own name for that same union. Deliberately an
+ * ALIAS, not a second literal union: the offline void path and the offline
+ * repayment path must agree on what "ADMIN" means forever, and two parallel
+ * `"ADMIN" | "CASHIER"` declarations are exactly how such a pair drifts.
+ */
+export type OfflineVoidActorRole = OfflineActorRole;
 
 export interface PendingOfflineInvoiceRow {
   invoice: OfflineInvoice;
@@ -1571,6 +1578,185 @@ export async function submitOfflineVoid(
 
   return voidRecord;
 }
+/**
+ * T4e — queues an offline customer repayment (تسديد دفعة) locally.
+ *
+ * Sibling of submitOfflineVoid(): same guard posture, same local-only write, no
+ * network I/O. This function is the OFFLINE QUEUE half of a repayment; the
+ * server-side half — the fact that the repayment is applied to the ledger — is
+ * lib/ledger/repayment.ts's recordRepayment(), reached later through
+ * /api/sync's Payment pass. Nothing here computes a ledger balance; the local
+ * cached balance is adjusted only so the device's own screens agree with what
+ * has already been promised to the customer.
+ *
+ * Guards, in order (same shape and order as submitOfflineVoid's):
+ *   1. Offline DB support + a non-empty tenantId — throws otherwise.
+ *   2. actorRole !== "ADMIN" → rejected HERE, not just by the UI. The card
+ *      renders no button at all for a CASHIER (absent, not disabled), but a UI
+ *      bug or a direct call must not be able to bypass the rule: this service
+ *      is the real boundary on the offline path, exactly the way
+ *      ledger:log_repayment is on the server.
+ *   3. customerId is required.
+ *   4. The amount must be a positive decimal string (via lib/utils/money.ts).
+ *   5. A cached daily exchange rate must exist — see the note below.
+ *
+ * Guards 6-8 run INSIDE one Dexie read-write transaction on
+ * [offlinePayments, cachedCustomers]:
+ *   6. The customer must exist in this tenant's cachedCustomers, and must not
+ *      be the system-generated cash bucket. The cached row is required rather
+ *      than optional: cachedBalanceDebtSYP (guard 7) lives only there, and
+ *      saveOfflinePaymentWithBalance() decrements that same row — validating
+ *      against anything else would be validating against a number that is not
+ *      the one about to change.
+ *   7. amountSYP <= cachedBalanceDebtSYP. Like the server's own check, this is
+ *      a friendly guard, not a concurrency guarantee: two devices that each
+ *      queue a full-balance repayment will meet the real outcome at sync time,
+ *      where the second one is rejected with a FAILED + Arabic reason.
+ *   8. No duplicate: a second queue attempt for the same offlineId is refused
+ *      instead of silently writing a second local row.
+ *
+ * The exchange rate (guard 5) is read from this device's cached rate
+ * (cachedTenantSettings) rather than taken from the caller: OfflinePayment
+ * requires a non-null, positive exchangeRate and a derived amountUSD, and the
+ * cached rate is the only rate this device actually has. That stored rate is
+ * passed to recordRepayment as frozenRate at sync time (same rule as an
+ * invoice's exchangeRateUsed).
+ */
+export interface OfflineRepaymentParams {
+  customerId: string;
+  amountSYP: MoneyInput;
+  actorRole: OfflineActorRole;
+  paymentMethod?: PaymentMethod;
+  receiptNo?: string;
+  notes?: string;
+  /**
+   * Shared with the online attempt that preceded this queue (the ledger dialog
+   * generates ONE key per submission). That is what makes a lost response safe:
+   * if the online POST actually committed, the later sync of this same
+   * offlineId finds the existing row instead of writing a second.
+   */
+  offlineId?: string;
+}
+
+export async function submitOfflinePayment(
+  tenantId: string,
+  params: OfflineRepaymentParams
+): Promise<OfflinePayment> {
+  // Guard 1 — a real tenant is required, exactly like every other write path
+  // in this file (see the TENANT SCOPING POLICY header).
+  if (!tenantId || !tenantId.trim()) {
+    throw new Error("لا يمكن تسجيل دفعة دون تحديد هوية المتجر (تسجيل الدخول مطلوب).");
+  }
+  const scopedTenantId = tenantId.trim();
+
+  if (!isOfflineDbSupported()) {
+    throw new Error("IndexedDB is not supported.");
+  }
+
+  // Guard 2 — ADMIN only, re-checked here on purpose (see this function's doc).
+  if (params.actorRole !== "ADMIN") {
+    throw new Error("تسجيل الدفعات متاح فقط لحساب المدير (ADMIN).");
+  }
+
+  // Guard 3 — the target customer.
+  if (!params.customerId || !params.customerId.trim()) {
+    throw new Error("يجب تحديد الزبون المراد تسديد دفعة له.");
+  }
+  const customerId = params.customerId.trim();
+
+  // Guard 4 — positive decimal amount, through the shared money wrapper.
+  let amountSYP: string;
+  try {
+    amountSYP = serializeMoney(params.amountSYP);
+  } catch (error) {
+    if (error instanceof MoneyError) {
+      throw new Error(
+        "قيمة الدفعة غير صالحة — يرجى إدخال مبلغ رقمي صحيح بالليرة السورية."
+      );
+    }
+    throw error;
+  }
+  if (compareMoney(amountSYP, 0) <= 0) {
+    throw new Error("قيمة الدفعة يجب أن تكون أكبر من الصفر.");
+  }
+
+  // Guard 5 — the device's cached daily rate. Read BEFORE the transaction:
+  // cachedTenantSettings is not part of the transaction's table scope below,
+  // and Dexie refuses access to a table outside it.
+  const cachedRate = await getCachedRate(scopedTenantId);
+  if (!cachedRate || compareMoney(cachedRate.rate, 0) <= 0) {
+    throw new Error(
+      "لا يمكن تسجيل الدفعة دون اتصال: لم يتم تخزين سعر الصرف اليومي على هذا الجهاز بعد."
+    );
+  }
+
+  const db = getOfflineDb();
+
+  const paymentRecord = await db.transaction(
+    "rw",
+    [db.offlinePayments, db.cachedCustomers],
+    async () => {
+      // Guards 6/7 — tenant-scoped cached customer; a foreign tenant's row (or
+      // a row this device never cached) is treated as not found.
+      const customer = await db.cachedCustomers.get(customerId);
+      if (!customer || customer.tenantId !== scopedTenantId) {
+        throw new Error(
+          "الزبون غير موجود في الذاكرة المحلية لهذا الجهاز — يرجى تحديث بيانات الزبائن ثم إعادة المحاولة."
+        );
+      }
+      if (customer.isSystemGenerated) {
+        throw new Error(
+          "لا يمكن تسجيل دفعة على حساب الزبون النقدي العام — الدفعات تُسجَّل على زبائن حقيقيين فقط."
+        );
+      }
+
+      const cachedBalance = customer.cachedBalanceDebtSYP ?? "0.0000";
+      if (compareMoney(amountSYP, cachedBalance) > 0) {
+        throw new Error(
+          `قيمة الدفعة (${amountSYP} ل.س) أكبر من الرصيد المخزَّن على هذا الجهاز ` +
+            `(${cachedBalance} ل.س) — يرجى تحديث البيانات ثم إعادة المحاولة.`
+        );
+      }
+
+      const offlineId = params.offlineId?.trim() || generateOfflineId();
+
+      // Guard 8 — no duplicate local queue row for the same offlineId. Same
+      // placement and reasoning as submitOfflineVoid's local double-void guard:
+      // inside the transaction, so a double-tap genuinely waits here.
+      const existingLocal = await db.offlinePayments
+        .where("offlineId")
+        .equals(offlineId)
+        .first();
+      if (existingLocal) {
+        throw new Error("تم تسجيل هذه الدفعة محلياً بالفعل.");
+      }
+
+      const record = createOfflinePaymentRecord({
+        tenantId: scopedTenantId,
+        offlineId,
+        customerId,
+        amountSYP,
+        // Frozen onto the local row and later passed to the server as frozenRate.
+        exchangeRate: cachedRate.rate,
+        paymentMethod: params.paymentMethod ?? "CASH",
+        receiptNo: params.receiptNo?.trim() || undefined,
+        notes: params.notes?.trim() || undefined,
+        createdAt: new Date(),
+        status: "PENDING",
+      });
+
+      // Same transactional helper every offline payment already uses: it writes
+      // the row AND decrements cachedCustomers.cachedBalanceDebtSYP by amountSYP
+      // inside this already-open transaction (Dexie joins it rather than opening
+      // a second one) — no repayment-specific balance logic anywhere.
+      await saveOfflinePaymentWithBalance(record, db);
+
+      return record;
+    }
+  );
+
+  return paymentRecord;
+}
 
 /**
  * `tenantId` is REQUIRED, not optional with a sentinel fallback. This
@@ -1599,9 +1785,9 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         id: "prod-1",
         name: "سكر أبيض ناعم (الأسرة)",
         units: [
-          { id: "unit-1-1", unitName: "كيس (1 كغ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 1.2, priceRetail: 1.5, barcode: "6291001001" },
-          { id: "unit-1-2", unitName: "شوال (10 كغ)", conversionFactor: 10, pricingCurrency: "USD", priceWholesale: 11.5, priceRetail: 14.0, barcode: "6291001002" },
-          { id: "unit-1-3", unitName: "شوال كبير (50 كغ)", conversionFactor: 50, pricingCurrency: "USD", priceWholesale: 55.0, barcode: "6291001003" },
+          { id: "unit-1-1", unitName: "كيس (1 كغ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 1.2, barcodes: [{ id: "bc-6291001001", barcode: "6291001001", barcodeSource: "GS1" }] },
+          { id: "unit-1-2", unitName: "شوال (10 كغ)", conversionFactor: 10, pricingCurrency: "USD", priceWholesale: 11.5, barcodes: [{ id: "bc-6291001002", barcode: "6291001002", barcodeSource: "GS1" }] },
+          { id: "unit-1-3", unitName: "شوال كبير (50 كغ)", conversionFactor: 50, pricingCurrency: "USD", priceWholesale: 55.0, barcodes: [{ id: "bc-6291001003", barcode: "6291001003", barcodeSource: "GS1" }] },
         ],
         batches: [
           { id: "batch-1-1", unitId: "unit-1-1", batchNumber: "B2026-01", quantity: 150, expiryDate: "2027-01-01" },
@@ -1626,8 +1812,8 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         id: "prod-2",
         name: "زيت دوار الشمس (عافية 1.5 لتر)",
         units: [
-          { id: "unit-2-1", unitName: "عبوة (1.5 لتر)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 3.5, priceRetail: 4.2, barcode: "6292002001" },
-          { id: "unit-2-2", unitName: "كرتونة (6 عبوات)", conversionFactor: 6, pricingCurrency: "USD", priceWholesale: 20.0, priceRetail: 24.0, barcode: "6292002002" },
+          { id: "unit-2-1", unitName: "عبوة (1.5 لتر)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 3.5, barcodes: [{ id: "bc-6292002001", barcode: "6292002001", barcodeSource: "GS1" }] },
+          { id: "unit-2-2", unitName: "كرتونة (6 عبوات)", conversionFactor: 6, pricingCurrency: "USD", priceWholesale: 20.0, barcodes: [{ id: "bc-6292002002", barcode: "6292002002", barcodeSource: "GS1" }] },
         ],
         batches: [
           { id: "batch-2-1", unitId: "unit-2-1", batchNumber: "AF-998", quantity: 85, expiryDate: "2026-12-31" },
@@ -1638,8 +1824,8 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         id: "prod-3",
         name: "شاي أسود فرط (الكبوس 450 غرام)",
         units: [
-          { id: "unit-3-1", unitName: "باكيت (450 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 4.8, priceRetail: 5.5, barcode: "6293003001" },
-          { id: "unit-3-2", unitName: "كرتونة (24 باكيت)", conversionFactor: 24, pricingCurrency: "USD", priceWholesale: 110.0, barcode: "6293003002" },
+          { id: "unit-3-1", unitName: "باكيت (450 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 4.8, barcodes: [{ id: "bc-6293003001", barcode: "6293003001", barcodeSource: "GS1" }] },
+          { id: "unit-3-2", unitName: "كرتونة (24 باكيت)", conversionFactor: 24, pricingCurrency: "USD", priceWholesale: 110.0, barcodes: [{ id: "bc-6293003002", barcode: "6293003002", barcodeSource: "GS1" }] },
         ],
         batches: [
           { id: "batch-3-1", unitId: "unit-3-1", batchNumber: "KBS-44", quantity: 60, expiryDate: "2028-02-15" },
@@ -1650,8 +1836,8 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         id: "prod-4",
         name: "أرز بسمتي هندي (أبو كاس 5 كغ)",
         units: [
-          { id: "unit-4-1", unitName: "كيس (5 كغ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 8.5, priceRetail: 10.0, barcode: "6294004001" },
-          { id: "unit-4-2", unitName: "كرتونة (4 أكياس)", conversionFactor: 4, pricingCurrency: "USD", priceWholesale: 33.0, barcode: "6294004002" },
+          { id: "unit-4-1", unitName: "كيس (5 كغ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 8.5, barcodes: [{ id: "bc-6294004001", barcode: "6294004001", barcodeSource: "GS1" }] },
+          { id: "unit-4-2", unitName: "كرتونة (4 أكياس)", conversionFactor: 4, pricingCurrency: "USD", priceWholesale: 33.0, barcodes: [{ id: "bc-6294004002", barcode: "6294004002", barcodeSource: "GS1" }] },
         ],
         batches: [
           { id: "batch-4-1", unitId: "unit-4-1", batchNumber: "RICE-2026", quantity: 120, expiryDate: "2027-09-30" },
@@ -1662,8 +1848,8 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         id: "prod-5",
         name: "حليب مجفف كامل الدسم (نيدو 900 غرام)",
         units: [
-          { id: "unit-5-1", unitName: "علبة (900 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 7.2, priceRetail: 8.5, barcode: "6295005001" },
-          { id: "unit-5-2", unitName: "كرتونة (12 علبة)", conversionFactor: 12, pricingCurrency: "USD", priceWholesale: 84.0, barcode: "6295005002" },
+          { id: "unit-5-1", unitName: "علبة (900 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 7.2, barcodes: [{ id: "bc-6295005001", barcode: "6295005001", barcodeSource: "GS1" }] },
+          { id: "unit-5-2", unitName: "كرتونة (12 علبة)", conversionFactor: 12, pricingCurrency: "USD", priceWholesale: 84.0, barcodes: [{ id: "bc-6295005002", barcode: "6295005002", barcodeSource: "GS1" }] },
         ],
         batches: [
           { id: "batch-5-1", unitId: "unit-5-1", batchNumber: "NID-110", quantity: 45, expiryDate: "2026-11-20" },
@@ -1674,8 +1860,8 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
         id: "prod-6",
         name: "معكرونة إيطالية (سباغيتي 500 غ)",
         units: [
-          { id: "unit-6-1", unitName: "كيس (500 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 0.85, priceRetail: 1.1, barcode: "6296006001" },
-          { id: "unit-6-2", unitName: "طرد (20 كيس)", conversionFactor: 20, pricingCurrency: "USD", priceWholesale: 16.0, barcode: "6296006002" },
+          { id: "unit-6-1", unitName: "كيس (500 غ)", conversionFactor: 1, pricingCurrency: "USD", priceWholesale: 0.85, barcodes: [{ id: "bc-6296006001", barcode: "6296006001", barcodeSource: "GS1" }] },
+          { id: "unit-6-2", unitName: "طرد (20 كيس)", conversionFactor: 20, pricingCurrency: "USD", priceWholesale: 16.0, barcodes: [{ id: "bc-6296006002", barcode: "6296006002", barcodeSource: "GS1" }] },
         ],
         batches: [
           { id: "batch-6-1", unitId: "unit-6-1", batchNumber: "PST-88", quantity: 300, expiryDate: "2027-05-10" },
@@ -1692,8 +1878,7 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
             conversionFactor: 1,
             pricingCurrency: "SYP",
             priceWholesale: 18000,
-            priceRetail: 21000,
-            barcode: "6297007001",
+            barcodes: [{ id: "bc-6297007001", barcode: "6297007001", barcodeSource: "GS1" }],
           },
           {
             id: "unit-7-2",
@@ -1701,7 +1886,7 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
             conversionFactor: 10,
             pricingCurrency: "SYP",
             priceWholesale: 172000,
-            barcode: "6297007002",
+            barcodes: [{ id: "bc-6297007002", barcode: "6297007002", barcodeSource: "GS1" }],
           },
         ],
         batches: [
@@ -1710,7 +1895,31 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
       }),
     ];
 
-    await db.cachedProducts.bulkPut(sampleProducts);
+    // [v4.5] Both tables, one transaction: the demo catalog AND its flat
+    // barcode index. POS scanning reads cachedProductBarcodes only (Dexie
+    // cannot index into the nested units[].barcodes arrays), so without the
+    // second bulkPut every demo barcode would scan as "not found".
+    await db.transaction("rw", db.cachedProducts, db.cachedProductBarcodes, async () => {
+      await db.cachedProducts.bulkPut(sampleProducts);
+
+      const barcodeRows: CachedProductBarcode[] = [];
+      for (const p of sampleProducts) {
+        for (const unit of p.units) {
+          for (const b of unit.barcodes ?? []) {
+            if (!b?.barcode) continue;
+            barcodeRows.push({
+              tenantId: scopedTenantId,
+              barcode: b.barcode,
+              productId: p.id,
+              unitId: unit.id,
+            });
+          }
+        }
+      }
+      if (barcodeRows.length > 0) {
+        await db.cachedProductBarcodes.bulkPut(barcodeRows);
+      }
+    });
   }
 
   const customerCount = await db.cachedCustomers.where("tenantId").equals(scopedTenantId).count();

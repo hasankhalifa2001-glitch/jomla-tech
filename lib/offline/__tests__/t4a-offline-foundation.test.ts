@@ -1,9 +1,14 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)
  * Test Suite
  */
 
 import "fake-indexeddb/auto";
+// [v4.5] The RAW Dexie class, used by the v2-to-v3 migration test below to
+// open a genuine pre-upgrade database. Everything else in this file goes
+// through the OfflineDatabase wrapper exported from @/lib/offline.
+import Dexie from "dexie";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   getOfflineDb,
@@ -131,10 +136,10 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
             unitName: "تنكة 16 لتر",
             conversionFactor: 1,
             priceWholesale: "1200000.0000",
-            priceRetail: "1350000.0000",
             pricingCurrency: "SYP",
-            barcode: "6211234567890",
-            barcodeSource: "GS1",
+            barcodes: [
+              { id: "unit-1-bc-1", barcode: "6211234567890", barcodeSource: "GS1" },
+            ],
             isActive: true,
           },
         ],
@@ -157,8 +162,11 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(retrieved?.units).toHaveLength(1);
       expect(retrieved?.units[0].priceWholesale).toBe("1200000.0000");
       expect(retrieved?.units[0].pricingCurrency).toBe("SYP");
-      expect(retrieved?.units[0].barcode).toBe("6211234567890");
-      expect(retrieved?.units[0].barcodeSource).toBe("GS1");
+      // [v4.5] One barcode ROW, not the old scalar pair - the array is the
+      // only barcode representation CachedProductUnit has now.
+      expect(retrieved?.units[0].barcodes).toHaveLength(1);
+      expect(retrieved?.units[0].barcodes?.[0].barcode).toBe("6211234567890");
+      expect(retrieved?.units[0].barcodes?.[0].barcodeSource).toBe("GS1");
       expect(retrieved?.batches).toHaveLength(1);
       expect(retrieved?.batches[0].batchNumber).toBe("B2026-01");
       // [FIX] CachedProductBatch.quantity is now a decimal.js-serialized
@@ -330,9 +338,25 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
                 conversionFactor: 1,
                 pricingCurrency: "SYP",
                 priceWholesale: "750000.0000",
-                priceRetail: "800000.0000",
+                // [v4.5] Legacy scalar shape ON PURPOSE: this fixture is an
+                // OLDER SERVER response, so it exercises the documented scalar
+                // fallback (a tab whose service-worker cache still serves a
+                // v4.4 build). It must still cache a usable barcode.
                 barcode: "6219998887770",
                 barcodeSource: "GS1",
+                isActive: true,
+              },
+              {
+                id: "u-online-2",
+                unitName: "CARTON-12",
+                conversionFactor: 12,
+                pricingCurrency: "SYP",
+                priceWholesale: "8500000.0000",
+                // [v4.5] The authoritative shape: ONE unit, TWO barcodes.
+                barcodes: [
+                  { id: "bc-online-2a", barcode: "6219998887771", barcodeSource: "GS1" },
+                  { id: "bc-online-2b", barcode: "6219998887772", barcodeSource: "INTERNAL" },
+                ],
                 isActive: true,
               },
             ],
@@ -363,8 +387,41 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       expect(cached).toHaveLength(1);
       expect(cached[0].id).toBe("p-online-1");
       expect(cached[0].name).toBe("سكر أبيض ناعم");
-      expect(cached[0].units).toHaveLength(1);
+      expect(cached[0].units).toHaveLength(2);
       expect(cached[0].units[0].priceWholesale).toBe("750000.0000");
+      // [v4.5] The nested DISPLAY list carries every barcode: the legacy
+      // scalar became a one-element array (with a locally-generated id, since
+      // the old response carried no barcode row id), and the second unit
+      // two barcodes are cached as-is.
+      expect(cached[0].units[0].barcodes).toEqual([
+        {
+          id: "legacy-u-online-1-6219998887770",
+          barcode: "6219998887770",
+          barcodeSource: "GS1",
+        },
+      ]);
+      expect(cached[0].units[1].barcodes).toEqual([
+        { id: "bc-online-2a", barcode: "6219998887771", barcodeSource: "GS1" },
+        { id: "bc-online-2b", barcode: "6219998887772", barcodeSource: "INTERNAL" },
+      ]);
+
+      // [v4.5] ...and the FLAT scan index must agree exactly: one row per
+      // barcode, keyed [tenantId+barcode]. This is the table POS barcode
+      // scans read - never the nested arrays above.
+      const flatRows = await db.cachedProductBarcodes
+        .where("tenantId")
+        .equals(TEST_TENANT_ID)
+        .toArray();
+      expect(flatRows).toHaveLength(3);
+      const flatByBarcode = new Map(flatRows.map((r) => [r.barcode, r]));
+      expect(flatByBarcode.get("6219998887770")).toEqual({
+        tenantId: TEST_TENANT_ID,
+        barcode: "6219998887770",
+        productId: "p-online-1",
+        unitId: "u-online-1",
+      });
+      expect(flatByBarcode.get("6219998887771")?.unitId).toBe("u-online-2");
+      expect(flatByBarcode.get("6219998887772")?.unitId).toBe("u-online-2");
     });
 
     it("populates cachedCustomers when online and overwrites cleanly", async () => {
@@ -875,6 +932,231 @@ describe("T4a — Local Offline Foundation (Dexie Schema & Exchange Rate Cache)"
       const updatedCustomer = await db.cachedCustomers.get(customerId);
       // 150000 + (-50000) = 100000
       expect(updatedCustomer?.cachedBalanceDebtSYP).toBe("100000.0000");
+    });
+  });
+
+  describe("9. [v4.5] Dexie v2 to v3 multi-barcode migration", () => {
+    const LEGACY_TENANT = "tenant-legacy-t4a";
+    const OTHER_TENANT = "tenant-legacy-other";
+
+    // The exact version(2) schema - the last shape a device could have had
+    // open before this release. Restated here (not imported) so the test
+    // cannot silently follow a future edit to the production version(2)
+    // block: this is what a REAL pre-upgrade device looks like.
+    const V2_STORES = {
+      offlineInvoices:
+        "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+      offlinePayments:
+        "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+      offlineCustomers: "++id, &offlineId, tenantId, status, createdAt",
+      cachedTenantSettings: "tenantId, cachedAt",
+      cachedProducts: "id, tenantId, isActive, [tenantId+isActive]",
+      cachedCustomers: "id, tenantId, phone, isSystemGenerated, [tenantId+phone]",
+      cachedSession: "userId, tenantId, cachedAt",
+      deviceSettings: "key",
+    };
+
+    /**
+     * Seeds a genuine version(2) database with the PRE-v4.5 scalar shape and
+     * closes it, so opening OfflineDatabase() afterwards runs version(3)
+     * .upgrade() against real pre-v4.5 data - the only way to prove the
+     * migration without hand-editing a v3 database.
+     */
+    const seedVersion2Database = async () => {
+      const legacyDb = new Dexie("JomlaTechOffline");
+      legacyDb.version(2).stores({ ...V2_STORES });
+      await legacyDb.open();
+
+      await legacyDb.table("cachedProducts").bulkPut([
+        {
+          id: "p-legacy-1",
+          tenantId: LEGACY_TENANT,
+          name: "LEGACY PRODUCT 1",
+          category: "LEGACY CATEGORY",
+          isActive: true,
+          units: [
+            {
+              id: "u-legacy-1",
+              unitName: "PIECE",
+              conversionFactor: "1",
+              priceWholesale: "1000.0000",
+              pricingCurrency: "SYP",
+              barcode: "6210001110001",
+              barcodeSource: "GS1",
+              isActive: true,
+            },
+            {
+              id: "u-legacy-2",
+              unitName: "CARTON",
+              conversionFactor: "12",
+              priceWholesale: "11000.0000",
+              pricingCurrency: "SYP",
+              barcode: null,
+              barcodeSource: null,
+              isActive: true,
+            },
+            {
+              id: "u-legacy-3",
+              unitName: "BIG CARTON",
+              conversionFactor: "48",
+              priceWholesale: "42000.0000",
+              pricingCurrency: "SYP",
+              barcode: "6210001110003",
+              barcodeSource: "INTERNAL",
+              isActive: true,
+            },
+          ],
+          batches: [],
+        },
+        {
+          id: "p-legacy-2",
+          tenantId: OTHER_TENANT,
+          name: "LEGACY PRODUCT 2",
+          isActive: true,
+          units: [
+            {
+              id: "u-legacy-4",
+              unitName: "PIECE",
+              conversionFactor: "1",
+              priceWholesale: "500.0000",
+              pricingCurrency: "SYP",
+              // The SAME barcode as u-legacy-1, on ANOTHER tenant unit -
+              // exactly what the [tenantId+barcode] composite key exists for.
+              barcode: "6210001110001",
+              barcodeSource: "GS1",
+              isActive: true,
+            },
+          ],
+          batches: [],
+        },
+      ]);
+
+      // A non-product table, to prove the upgrade leaves alone what it was
+      // not asked to touch.
+      await legacyDb.table("cachedCustomers").put({
+        id: "c-legacy-1",
+        tenantId: LEGACY_TENANT,
+        name: "LEGACY CUSTOMER",
+        cachedBalanceDebtSYP: "0.0000",
+      });
+
+      legacyDb.close();
+    };
+
+    it("converts each legacy scalar into barcodes[] and backfills cachedProductBarcodes, with no data loss", async () => {
+      await resetOfflineDbForTests();
+      await seedVersion2Database();
+
+      const db = getOfflineDb();
+      await db.open(); // runs version(3) upgrade()
+
+      const products = await db.cachedProducts.toArray();
+      expect(products).toHaveLength(2);
+      const p1 = products.find((p) => p.id === "p-legacy-1");
+      if (!p1) throw new Error("p-legacy-1 missing after migration");
+      expect(p1.units).toHaveLength(3);
+
+      // 1) A unit that had a scalar barcode gets a one-element array, with a
+      // locally-generated stable id (the old schema carried no row id).
+      expect(p1.units[0].barcodes).toHaveLength(1);
+      expect(p1.units[0].barcodes?.[0].barcode).toBe("6210001110001");
+      expect(p1.units[0].barcodes?.[0].barcodeSource).toBe("GS1");
+      expect(p1.units[0].barcodes?.[0].id).toMatch(/^legacy-/);
+      // 2) A unit that had NO barcode comes back as an EMPTY ARRAY - never
+      // undefined, and never a phantom row.
+      expect(p1.units[1].barcodes).toEqual([]);
+      // 3) An INTERNAL barcode keeps its source.
+      expect(p1.units[2].barcodes?.[0].barcodeSource).toBe("INTERNAL");
+
+      // Every other field survives untouched.
+      expect(p1.name).toBe("LEGACY PRODUCT 1");
+      expect(p1.units[1].conversionFactor).toBe("12");
+      expect(p1.units[1].priceWholesale).toBe("11000.0000");
+      expect(p1.units[0].isActive).toBe(true);
+
+      // The flat index holds exactly one row per (tenant, barcode).
+      const flat = await db.cachedProductBarcodes.toArray();
+      expect(flat).toHaveLength(3);
+      expect(await db.cachedProductBarcodes.get([LEGACY_TENANT, "6210001110001"])).toEqual({
+        tenantId: LEGACY_TENANT,
+        barcode: "6210001110001",
+        productId: "p-legacy-1",
+        unitId: "u-legacy-1",
+      });
+      // Same barcode, two tenants: each resolves to ITS OWN unit.
+      expect(await db.cachedProductBarcodes.get([OTHER_TENANT, "6210001110001"])).toEqual({
+        tenantId: OTHER_TENANT,
+        barcode: "6210001110001",
+        productId: "p-legacy-2",
+        unitId: "u-legacy-4",
+      });
+      expect(await db.cachedProductBarcodes.get([LEGACY_TENANT, "6210001110003"])).toEqual({
+        tenantId: LEGACY_TENANT,
+        barcode: "6210001110003",
+        productId: "p-legacy-1",
+        unitId: "u-legacy-3",
+      });
+      // A barcode-less unit contributes no index row at all.
+      expect(await db.cachedProductBarcodes.toArray()).toHaveLength(3);
+
+      // Tables the migration was not asked to touch stay untouched.
+      expect(await db.cachedCustomers.get("c-legacy-1")).toMatchObject({
+        name: "LEGACY CUSTOMER",
+        tenantId: LEGACY_TENANT,
+      });
+    });
+
+    it("leaves a unit that already carries barcodes[] exactly as-is (the in-place guard) and still indexes it", async () => {
+      await resetOfflineDbForTests();
+
+      // Simulate the guard own case: a v2 database whose unit already has the
+      // new array shape (e.g. written by a partially-upgraded client).
+      const raw = new Dexie("JomlaTechOffline");
+      raw.version(2).stores({ ...V2_STORES });
+      await raw.open();
+      await raw.table("cachedProducts").put({
+        id: "p-already-v3",
+        tenantId: LEGACY_TENANT,
+        name: "ALREADY V3",
+        isActive: true,
+        units: [
+          {
+            id: "u-already-v3",
+            unitName: "PIECE",
+            conversionFactor: "1",
+            priceWholesale: "100.0000",
+            pricingCurrency: "SYP",
+            barcodes: [
+              { id: "bc-real-1", barcode: "6210002220001", barcodeSource: "GS1" },
+              { id: "bc-real-2", barcode: "6210002220002", barcodeSource: "INTERNAL" },
+            ],
+            isActive: true,
+          },
+        ],
+        batches: [],
+      });
+      raw.close();
+
+      const db = getOfflineDb();
+      await db.open();
+
+      const row = await db.cachedProducts.get("p-already-v3");
+      if (!row) throw new Error("p-already-v3 missing after migration");
+      // Not re-wrapped, not duplicated, real server ids preserved verbatim.
+      expect(row.units[0].barcodes).toEqual([
+        { id: "bc-real-1", barcode: "6210002220001", barcodeSource: "GS1" },
+        { id: "bc-real-2", barcode: "6210002220002", barcodeSource: "INTERNAL" },
+      ]);
+      // ...and both still made it into the flat index.
+      expect(await db.cachedProductBarcodes.get([LEGACY_TENANT, "6210002220001"])).toEqual({
+        tenantId: LEGACY_TENANT,
+        barcode: "6210002220001",
+        productId: "p-already-v3",
+        unitId: "u-already-v3",
+      });
+      expect(await db.cachedProductBarcodes.get([LEGACY_TENANT, "6210002220002"])).toMatchObject({
+        unitId: "u-already-v3",
+      });
     });
   });
 });

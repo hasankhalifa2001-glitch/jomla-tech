@@ -26,16 +26,29 @@ interface CsvImportModalProps {
 // rendered — this is what actually broke, not a cosmetic mismatch.
 interface NewProductRow {
   lineNumber: number;
+  /**
+   * [v4.5] The row's full confirmed barcode set — zero, one, or many, each with
+   * the source the merchant stated for it. This is what the server's
+   * NewProductImportData carries, and what the commit request must echo back.
+   */
+  barcodes?: Array<{ barcode: string; barcodeSource: "GS1" | "INTERNAL" }>;
+  /**
+   * [DEPRECATED — display fallback only] The pre-v4.5 single scalar. A preview
+   * produced by an older server build still sends this and no `barcodes`; it is
+   * never sent back in the commit request (the row is re-previewed first).
+   */
   barcode?: string;
   name: string;
   category?: string;
   unitName: string;
   conversionFactor: string | number;
   priceWholesale: string | number;
-  priceRetail?: string | number;
   pricingCurrency?: "SYP" | "USD";
+  /** [v4.4, Section 10.2] The merchant-supplied SUFFIX only — never a full pre-formatted batch number. */
   initialBatchNumber?: string;
   initialQuantity?: string | number;
+  /** [v4.4, T4g] Cost per base unit, always SYP. Required for a net-new-batch row. */
+  costPrice?: string | number;
   batchNumber?: string;
   quantity?: string | number;
   expiryDate?: string;
@@ -124,6 +137,89 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
       setPreview(null);
       setCommitResult(null);
     }
+  };
+
+  // [v4.4, Sections 10.2 + T4g] The downloadable CSV template T3d's
+  // acceptance criteria call for ("a downloadable CSV template, plus a hint
+  // next to the upload field"). Generated CLIENT-side as a Blob — there is
+  // no server route for it, and none is needed: the column set is a
+  // presentation concern, while every rule it hints at is enforced
+  // server-side by csv-parser.ts regardless of what a file contains.
+  //
+  // The two rules this template must never be silent about:
+  //   1. initialBatchNumber is a SUFFIX ONLY. The stored value always
+  //      carries the server-generated date prefix, so "INV4471" becomes
+  //      "2026-09-27-INV4471" — and "2026-09-27-INV4471" typed into the
+  //      column would become "2026-09-27-2026-09-27-INV4471".
+  //   2. The cost column is ALWAYS SYP and ALWAYS per the product's BASE
+  //      unit. Unlike the interactive screens — single-batch entry and the
+  //      multi-product receipt screen, where the merchant types a TOTAL for
+  //      a received quantity and the system derives the per-base-unit
+  //      figure — CSV import is bulk and non-interactive, so there is no
+  //      quantity/total pair to derive from: the column IS the per-base-unit
+  //      price, taken as-is, never divided by the row's own
+  //      conversionFactor, and never affected by the pricingCurrency column.
+  //      The template states this in the COLUMN NAME itself
+  //      ("costPricePerBaseUnit", not a bare "costPrice") — and the parser
+  //      accepts it unchanged, because csv-parser.ts's
+  //      normalizeHeaderKey() already lists "costpriceperbaseunit" as one of
+  //      costPrice's aliases.
+  // [v4.5] TWO barcode columns now:
+  //   1. `barcodes` — the DELIMITED list of every barcode that unit carries
+  //      (separate values with a semicolon `;`). Leave it empty for a unit with
+  //      no barcode at all: zero barcodes is a normal, fully supported state.
+  //   2. `barcodeSource` — MANDATORY for any row that lists a barcode, and
+  //      mandatory per ROW rather than per value (one CSV cell cannot carry a
+  //      per-barcode source). Exactly one of: GS1 or INTERNAL. It is never
+  //      guessed from the digits — a 13-digit number is not automatically GS1.
+  //      A price-only row (one whose barcode already exists) may leave it empty,
+  //      because no barcode row is written for such a row.
+  const CSV_TEMPLATE_HEADER =
+    "barcodes,barcodeSource,name,category,unitName,conversionFactor,priceWholesale,pricingCurrency,initialBatchNumber,initialQuantity,costPricePerBaseUnit,expiryDate";
+  const CSV_TEMPLATE_EXAMPLE_ROWS = [
+    // Net-new product + its first batch: all of unitName/conversionFactor/
+    // initialBatchNumber/initialQuantity/costPrice are present. Two barcodes on
+    // ONE unit — the multi-barcode case a single `barcode` column could never
+    // express (same physical product, a different GS1 code per variant).
+    "6210001234567;6210001234568,GS1,رز الشعلان,مواد غذائية,كيس 5كغ,1,150000,SYP,INV4471,20,120000,2027-06-30",
+    // Price-update-only row (existing barcode): no batch is created, so
+    // initialBatchNumber/initialQuantity/costPrice/barcodeSource are
+    // intentionally empty — no barcode row is written for this row.
+    "6281007001,,حليب نادك,ألبان,كرتونة,1,85000,SYP,,,,,",
+  ];
+
+  /**
+   * [v4.5] Renders ONE preview row's barcodes for the merchant.
+   *
+   * `barcodes` is authoritative and always preferred; the legacy single
+   * `barcode` scalar is consulted only for a preview produced by an older
+   * server build. Each value is shown with its confirmed source, because the
+   * source is the part a merchant is most likely to have got wrong and it is
+   * exactly what the server will store.
+   */
+  const barcodeLabel = (row: {
+    barcodes?: Array<{ barcode: string; barcodeSource: string }>;
+    barcode?: string;
+  }): string => {
+    if (row.barcodes && row.barcodes.length > 0) {
+      return row.barcodes.map((b) => `${b.barcode} (${b.barcodeSource})`).join("، ");
+    }
+    return row.barcode || "";
+  };
+
+  const handleDownloadTemplate = () => {
+    // The leading BOM keeps Arabic column values readable when the file is
+    // opened in Excel, which otherwise assumes the system's legacy encoding.
+    const csv = "\uFEFF" + [CSV_TEMPLATE_HEADER, ...CSV_TEMPLATE_EXAMPLE_ROWS].join("\r\n") + "\r\n";
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "inventory-import-template.csv";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const handleUploadAndPreview = async () => {
@@ -339,14 +435,57 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                     currency-mixup csv-parser.ts's own currency-safety
                     logic exists to prevent. */}
                 <p className="text-xs text-zinc-400 mt-1 mb-3">
-                  يدعم أعمدة: الباركود، اسم المنتج، التصنيف، الوحدة، معامل التحويل، السعر، العملة (SYP أو USD، اختياري)، رقم الدفعة، الكمية، تاريخ الانتهاء (YYYY-MM-DD).
+                  يدعم أعمدة: الباركود، اسم المنتج، التصنيف، الوحدة، معامل التحويل، السعر، العملة (SYP أو USD، اختياري)، رقم الدفعة، الكمية، سعر التكلفة لكل وحدة أساسية، تاريخ الانتهاء (YYYY-MM-DD).
                 </p>
+                {/* [v4.4, Sections 10.2 + T4g] The two clarifications the
+                    spec's T3d acceptance criteria call for, stated plainly
+                    next to the upload field and mirrored in the downloadable
+                    template's header row: the batch-number column carries a
+                    SUFFIX ONLY (the date is added automatically), and the
+                    cost column is ALWAYS SYP per the product's BASE unit.
+                    Both are required for any row that creates a new batch.
+                    [Batch cost entry] The cost rule is spelled out in full
+                    below — it is the per-base-unit price, NEVER a total paid
+                    for a quantity: the two screens where a merchant types a
+                    total and the system derives the per-base figure are the
+                    single-batch and multi-product receipt forms, not this
+                    bulk, non-interactive file path. */}
+                <div className="mt-1 mb-3 space-y-1 text-right">
+                  <p className="text-[11px] leading-5 text-amber-700 dark:text-amber-400">
+                    عمود <span className="font-semibold">&quot;رقم الدفعة&quot;</span> هو{" "}
+                    <span className="font-semibold">اللاحقة فقط</span> — اكتب INV4471، وليس
+                    2026-09-27-INV4471؛ فتاريخ اليوم يُضاف تلقائياً عند الاستيراد. تركه فارغاً
+                    يُرفض السطر.
+                  </p>
+                  <p className="text-[11px] leading-5 text-amber-700 dark:text-amber-400">
+                    عمود <span className="font-semibold">&quot;سعر التكلفة لكل وحدة أساسية&quot;</span>{" "}
+                    (costPricePerBaseUnit) مطلوب لكل سطر يُنشئ دفعة جديدة، وهو{" "}
+                    <span className="font-semibold">دائماً</span> بالليرة السورية و{" "}
+                    <span className="font-semibold">دائماً لكل وحدة أساسية واحدة</span> — لا يتأثر
+                    بعمود العملة ولا بمعامل التحويل في السطر. الاستيراد الجماعي يتم على شكل دفعات
+                    (بدون إدخال كمية وإجمالي معاً)، لذلك يُكتب هنا سعر الوحدة الأساسية مباشرة —
+                    بخلاف شاشة إضافة الدفعة وشاشة استلام البضاعة، حيثُ يُدخل الإجمالي المدفوع
+                    وتُحسب تكلفة الوحدة الأساسية تلقائياً.
+                  </p>
+                </div>
                 <input
                   type="file"
                   accept=".csv,text/csv"
                   onChange={handleFileChange}
                   className="text-xs text-zinc-500 file:ml-4 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer"
                 />
+                {/* [v4.4, Section 10.2] The downloadable template — see
+                    handleDownloadTemplate() for the two rules it states. */}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDownloadTemplate}
+                  className="mt-3 gap-1.5 text-xs"
+                >
+                  <FileUp className="h-3.5 w-3.5" />
+                  <span>تحميل قالب CSV جاهز</span>
+                </Button>
                 {file && (
                   <p className="text-[11px] text-zinc-500 mt-2">
                     الملف المحدد: <span className="font-medium">{file.name}</span>
@@ -454,9 +593,17 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                                 </p>
                                 <p className="text-zinc-500 mt-0.5">
                                   {row.unitName} · معامل {row.conversionFactor}
-                                  {row.barcode ? ` · باركود ${row.barcode}` : " · بدون باركود"}
+                                  {barcodeLabel(row)
+                                    ? ` · باركود ${barcodeLabel(row)}`
+                                    : " · بدون باركود"}
                                   {row.quantity ? ` · كمية أولية ${row.quantity}` : ""}
                                   {row.expiryDate ? ` · ينتهي ${row.expiryDate}` : ""}
+                                </p>
+                                <p className="text-zinc-500 mt-0.5">
+                                  {row.initialBatchNumber
+                                    ? `رقم الدفعة: ${row.initialBatchNumber} (يُسبق بتاريخ الاستيراد)`
+                                    : "بدون رقم دفعة"}
+                                  {row.costPrice ? ` · التكلفة للوحدة الأساسية: ${formatMoney(row.costPrice, "SYP")} ل.س` : ""}
                                 </p>
                               </div>
                               {/* [FIX] priceUSD → priceWholesale, rendered

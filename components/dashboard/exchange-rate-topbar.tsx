@@ -98,7 +98,7 @@ export function ExchangeRateTopbar() {
     // CASHIER view: purely read-only value with zero input controls or buttons
     if (!isAdmin) {
         return (
-            <div className={`${s.chip} ${s.rate}`}>
+            <div className={`${s.chip} ${s.rate} max-md:!min-w-0 max-md:!flex-1`}>
                 <span className={s.rateIcon} aria-hidden>
                     <DollarSign size={15} />
                 </span>
@@ -119,18 +119,24 @@ export function ExchangeRateTopbar() {
     }
 
     return (
-        <form onSubmit={handleSave} className={`${s.chip} ${s.rate}`}>
+        <form
+            onSubmit={handleSave}
+            className={`${s.chip} ${s.rate} max-md:!min-w-0 max-md:!flex-1 max-md:!gap-1.5`}
+        >
             <span className={s.rateIcon} aria-hidden>
                 <DollarSign size={15} />
             </span>
-            <label htmlFor="daily-exchange-rate" className={s.rateLabel}>
+
+            {/* The text label is hidden on mobile only (the input keeps an aria-label) */}
+            <label htmlFor="daily-exchange-rate" className={`${s.rateLabel} max-md:!hidden`}>
                 <span className={s.onlyMobile}>سعر الصرف:</span>
                 <span className={s.onlyDesktop}>سعر الصرف اليومي (SYP/$):</span>
             </label>
 
-            <div className={s.rateField}>
+            <div className={`${s.rateField} max-md:!min-w-0 max-md:!flex-1`}>
                 <input
                     id="daily-exchange-rate"
+                    aria-label="سعر الصرف اليومي"
                     type="number"
                     step="any"
                     inputMode="decimal"
@@ -140,7 +146,7 @@ export function ExchangeRateTopbar() {
                         setInputValue(e.target.value);
                         setIsEditing(true);
                     }}
-                    className={s.rateInput}
+                    className={`${s.rateInput} max-md:!w-full max-md:!min-w-0`}
                     disabled={isUpdating}
                 />
 
@@ -152,7 +158,7 @@ export function ExchangeRateTopbar() {
                         isNaN(parseFloat(inputValue)) ||
                         (!isEditing && dailyExchangeRate === parseFloat(inputValue))
                     }
-                    className={s.rateBtn}
+                    className={`${s.rateBtn} max-md:!shrink-0 max-md:!px-2.5`}
                 >
                     {isUpdating ? (
                         <RefreshCw size={14} className={s.spin} aria-label="جاري التحديث" />

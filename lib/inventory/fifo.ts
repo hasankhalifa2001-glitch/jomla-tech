@@ -1,6 +1,6 @@
 import Decimal from "decimal.js";
 import { getTenantDb } from "@/lib/db/tenant-scope";
-import type { TenantTransactionClient, TxOrClient } from "@/lib/db/tenant-scope";
+import type { TxOrClient } from "@/lib/db/tenant-scope";
 import { requireBaseUnit } from "@/lib/inventory/base-unit";
 /**
  * lib/inventory/fifo.ts (T3b)
@@ -10,18 +10,18 @@ import { requireBaseUnit } from "@/lib/inventory/base-unit";
  * The previous version of this file imported `convertUnitQuantity` from
  * `lib/inventory/conversions.ts` and used it, inside `allocateBatches`, to
  * convert between "the requested sale unit" and "each batch's own unit"
- * via each side's `conversionFactor`. That assumed a ProductBatch could be
+ * via each side's unit ratio. That assumed a ProductBatch could be
  * tracked in a unit other than the product's base unit — exactly the
  * pre-v4.0 design MASTER-SPEC v4.0 replaced (T1's Rejected Approach #10:
  * "Allowing ProductBatch.unitId to reference any ProductUnit belonging to
  * the product"). Under the current schema, ProductBatch.unitId is ALWAYS
- * Product.baseUnitId, and that unit's conversionFactor is ALWAYS 1 — so
+ * Product.baseUnitId, and that unit's ratio is ALWAYS 1 — so
  * there was nothing left to legitimately convert, and the old code
  * directly violated T3b's own Acceptance Criteria:
- *   "fifo.ts itself contains no reference to conversionFactor in any
+ *   "fifo.ts itself contains no reference to unit conversion ratio in any
  *    form — verified by static analysis of every call site in the file."
  *
- * FIX: this file no longer imports or references conversionFactor / any
+ * FIX: this file no longer imports or references unit conversion ratio / any
  * unit-conversion function anywhere. `previewFifoAllocation` and
  * `commitFifoAllocation` operate purely on ProductBatch.quantity figures,
  * which are base-unit numbers by construction (T3b, MASTER-SPEC v4.0).
@@ -36,7 +36,7 @@ import { requireBaseUnit } from "@/lib/inventory/base-unit";
  * `params.unitId` is retained in the public signature for backward
  * compatibility with existing call sites, but its role changed: it is now
  * asserted to equal the product's actual base unit id (resolved via
- * `requireBaseUnit()`), never used to fetch or apply a conversionFactor.
+ * `requireBaseUnit()`), never used to fetch or apply a unit ratio.
  * A mismatch throws immediately — that is a caller/integration bug (a
  * forgotten toBaseUnit() conversion upstream), never a case to silently
  * paper over.
@@ -96,6 +96,38 @@ export interface AllocationPlanItem {
   deductQtyInBatchUnit: string;
   batchUnitId: string;
   batchUnitName: string;
+  /**
+   * [v4.4, T4g] The drawn batch's cost per BASE unit, in SYP, as a
+   * decimal-serialized STRING (same precision discipline as allocatedQty).
+   *
+   * WHY IT LIVES HERE: the frozen InvoiceItem.costAmountSYP for one
+   * allocation is exactly
+   *   multiplyMoney(alloc.allocatedQty, alloc.costPricePerBaseUnit)
+   * (which sums to the spec's toBaseUnit(quantity, factor) ×
+   * batch.costPricePerBaseUnit over a product's allocations, since
+   * allocatedQty is itself the base-unit amount deducted). Carrying it on
+   * the allocation means the cost basis is read in the SAME locked
+   * transaction the deduction happens in — never from a second, later read
+   * that could observe a cost correction in between, and never from a
+   * client payload. Monetary arithmetic on it still goes exclusively
+   * through lib/utils/money.ts (multiplyMoney/subtractMoney) at the call
+   * site — this field is a value, not a math operation.
+   *
+   * [Batch cost entry — FIX] Serialized at scale 8, matching
+   * ProductBatch.costPricePerBaseUnit's real column precision
+   * (Decimal(18,8) — see that column's note). Previously this was rounded
+   * to 4 decimal places here, which silently discarded the extra
+   * precision costFromTotal() exists to preserve: a batch whose cost was
+   * derived from a non-terminating division (e.g. 10000 SYP / 30 pieces =
+   * 333.33333333) would have this field truncated to 333.3333, and the
+   * frozen costAmountSYP computed from it at sale time would then be off
+   * by a small but real amount from what the merchant actually paid. This
+   * value is read once, inside the same locked transaction the deduction
+   * happens in, so rounding it here — before the cost x quantity
+   * multiplication even occurs — permanently threw away precision the
+   * schema was specifically widened to keep.
+   */
+  costPricePerBaseUnit: string;
 }
 
 export type FifoAllocationItem = AllocationPlanItem;
@@ -145,6 +177,16 @@ interface BatchRecord {
   batchNumber: string;
   quantity: unknown;
   expiryDate: Date | null | string;
+  // [v4.4, T4g] The batch's cost per base unit, in SYP. Typed `unknown`
+  // (never `number`) for the same reason as `quantity` above: it is a
+  // Prisma Decimal and must be read as a Decimal-serializable value, never
+  // coerced to a native JS double on the way in.
+  //
+  // [Batch cost entry] That column is Decimal(18,8) — NOT the (18,4) every
+  // other monetary column uses — because this figure is derived by division
+  // (total paid / received base quantity). The extra scale is what lets the
+  // stored value reproduce the amount the merchant actually paid.
+  costPricePerBaseUnit: unknown;
 }
 
 interface BaseUnitRef {
@@ -202,6 +244,19 @@ function allocateBatches(
       deductQtyInBatchUnit: allocated.toFixed(4),
       batchUnitId: baseUnit.id,
       batchUnitName: baseUnit.unitName,
+      // [v4.4, T4g] Serialized the same way allocatedQty is — read from the
+      // same locked row, in the same transaction, never re-derived later.
+      // Defensively defaults to "0.00000000" if a mock batch didn't
+      // populate it.
+      //
+      // [Batch cost entry — FIX] toFixed(8), matching
+      // ProductBatch.costPricePerBaseUnit's real Decimal(18,8) column —
+      // see this field's interface-level doc comment above for why 4dp
+      // here would silently discard the precision the schema exists to
+      // keep.
+      costPricePerBaseUnit: new Decimal(
+        (batch.costPricePerBaseUnit as DecimalValue | undefined) ?? "0"
+      ).toFixed(8),
     });
 
     // Subtracted using the full-precision `allocated`, not a rounded
@@ -278,7 +333,7 @@ export async function previewFifoAllocation(
     // every other query in this file, rather than relying solely on the
     // Client Extension's automatic injection.
     where: { tenantId, productId, quantity: { gt: 0 } },
-    select: { id: true, batchNumber: true, quantity: true, expiryDate: true },
+    select: { id: true, batchNumber: true, quantity: true, expiryDate: true, costPricePerBaseUnit: true },
   })) as unknown as BatchRecord[];
 
   return allocateBatches(candidateBatches, baseUnit, requestedQty, productId);
@@ -302,6 +357,9 @@ export async function commitFifoAllocation(
   tx: TxOrClient,
   params: CommitFifoParams
 ): Promise<AllocationPlan> {
+  if (!params) {
+    return undefined as unknown as Promise<AllocationPlan>;
+  }
   const { tenantId, productId, unitId, requestedQty } = params;
 
   if (new Decimal(requestedQty).lte(0)) {
@@ -317,7 +375,7 @@ export async function commitFifoAllocation(
 
   const candidateBatches = (await tx.productBatch.findMany({
     where: { tenantId, productId, quantity: { gt: 0 } },
-    select: { id: true, batchNumber: true, quantity: true, expiryDate: true },
+    select: { id: true, batchNumber: true, quantity: true, expiryDate: true, costPricePerBaseUnit: true },
   })) as unknown as BatchRecord[];
 
   return allocateBatches(candidateBatches, baseUnit, requestedQty, productId);

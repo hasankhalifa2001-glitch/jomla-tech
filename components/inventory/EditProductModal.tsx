@@ -24,7 +24,6 @@ import {
   Barcode as BarcodeIcon,
   Camera,
   Image as ImageIcon,
-  AlertTriangle,
   Globe,
   Loader2,
   CheckCircle2,
@@ -34,7 +33,12 @@ import { toast } from "sonner";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
-import { BarcodeSourceModal, type BarcodeSourceChoice } from "@/components/inventory/BarcodeSourceModal";
+import {
+  BarcodeSourceModal,
+  type BarcodeSourceChoice,
+  type BarcodeSourceCandidate,
+  type BarcodeSourceSelection,
+} from "@/components/inventory/BarcodeSourceModal";
 // [FIX] lib/inventory/packaging-unit-validation.ts was deleted when
 // validatePackagingUnits() was merged into lib/inventory/units.ts. This
 // file was still importing from the deleted path — same fix already
@@ -43,8 +47,8 @@ import { validatePackagingUnits } from "@/lib/inventory/units";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import type { ProductItem } from "@/components/inventory/ProductTable";
 
-// [FIX] `[id]/route.ts`'s PATCH validates conversionFactor/priceWholesale/
-// priceRetail as decimal STRINGS (regex-checked, max 4 decimal places).
+// [FIX] `[id]/route.ts`'s PATCH validates conversionFactor/priceWholesale
+// as decimal STRINGS (regex-checked, max 4 decimal places).
 // This modal's internal state stays `number`, but every such value
 // crossing into the PATCH payload must go through this helper rather than
 // a raw `String(...)` cast — see AddProductModal.tsx's identical helper
@@ -60,10 +64,15 @@ export interface EditUnitForm {
   conversionFactor: number;
   pricingCurrency: "SYP" | "USD";
   priceWholesale: number;
-  priceRetail: number | "";
-  barcode: string;
-  barcodeSource: BarcodeSourceChoice | "";
-  imageUrl: string;
+  // [v4.5] `id` is present for an ALREADY-SAVED barcode row (which is what the
+  // ADMIN-only DELETE route needs to remove it) and absent for one the
+  // merchant just added in this session (which the PATCH creates on save).
+  barcodes: Array<{ id?: string; barcode: string; barcodeSource: BarcodeSourceChoice }>;
+  // [v4.5] Transient text in this unit's barcode input — never submitted; a
+  // confirmed value moves into `barcodes` above, and a dismissed one is
+  // discarded entirely (spec: "the barcode value itself is also not saved").
+  barcodeDraft: string;
+  // [v4.6] imageUrl removed — the image lives on the Product, not on individual units.
   isActive: boolean;
 }
 
@@ -92,6 +101,7 @@ export function EditProductModal({
 }: EditProductModalProps) {
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
+  const [imageUrl, setImageUrl] = useState("");
   const [isPublic, setIsPublic] = useState(false);
   const [isActive, setIsActive] = useState(true);
   const [units, setUnits] = useState<EditUnitForm[]>([]);
@@ -102,14 +112,25 @@ export function EditProductModal({
   const [catalogReportOpen, setCatalogReportOpen] = useState(false);
   const [activeUnitIndex, setActiveUnitIndex] = useState<number>(0);
 
+  // [v4.5 UX] Barcodes collected by the camera in continuous mode; classified
+  // together, in ONE confirmation modal, when the scanner closes. The ref
+  // mirrors the state so the scanner's (ref-held) onScan callback never reads a
+  // stale list while scans arrive quickly.
+  const [scanBuffer, setScanBuffer] = useState<string[]>([]);
+  const scanBufferRef = useRef<string[]>([]);
+
   const [barcodeGate, setBarcodeGate] = useState<{
     unitIndex: number | null;
-    barcode: string;
-  }>({ unitIndex: null, barcode: "" });
+    // [v4.5] The NEW barcodes awaiting classification in this one action.
+    candidates: BarcodeSourceCandidate[];
+  }>({ unitIndex: null, candidates: [] });
 
   const [catalogInfo, setCatalogInfo] = useState<CatalogLookupResult | null>(null);
 
   const lookupAbortRef = useRef<AbortController | null>(null);
+  // [v4.5 UX] Per-unit barcode inputs, so focus can return to the field after a
+  // confirmation (back-to-back hardware scanning without re-clicking).
+  const barcodeInputRefs = useRef<Record<number, HTMLInputElement | null>>({});
 
   const [initializedFor, setInitializedFor] = useState<string | null>(null);
   const currentInitKey = open && product ? product.id : null;
@@ -120,22 +141,31 @@ export function EditProductModal({
     if (product) {
       setName(product.name || "");
       setCategory(product.category || "");
+      setImageUrl(product.imageUrl || "");
       setIsPublic(product.isPublic ?? false);
       setIsActive(product.isActive ?? true);
 
-      // [FIX] Explicit numeric coercion. The API now consistently returns
-      // conversionFactor/priceWholesale/priceRetail as strings (see
-      // route.ts's GET/PATCH — unified to strings project-wide for
-      // Decimal-precision fields). Reading them into this modal's
-      // `number`-typed local state without converting relied on JS's
-      // implicit string coercion in arithmetic/comparisons to avoid
-      // breaking outright — it worked by accident, not by type
-      // correctness. `Number(...)` here makes the local state genuinely
-      // match its declared type regardless of whether the API happens to
-      // send a string or a number.
-      const sortedUnits = [...(product.units || [])].sort(
-        (a, b) => Number(a.conversionFactor) - Number(b.conversionFactor)
-      );
+      // [FIX] Explicit numeric coercion. The API consistently returns
+      // conversionFactor/priceWholesale as strings (Decimal
+      // precision fields); `Number(...)` here makes the local state genuinely
+      // match its declared type regardless of whether the API sends a string
+      // or a number.
+      //
+      // [FIX — base unit ordering] The BASE unit must be index 0 (the rest of
+      // this screen treats `index === 0` as "the base unit": locked factor, no
+      // delete). Sorting by conversionFactor alone put a fractional non-base
+      // unit (e.g. a half-carton, factor 0.5) BEFORE the base unit (factor 1),
+      // so the wrong unit was locked. The server's own `isBaseUnit` flag now
+      // decides (falling back to factor === 1 for a response that lacks it),
+      // and the remaining units follow in ascending factor order.
+      const isBaseRow = (u: any) =>
+        u.isBaseUnit !== undefined ? !!u.isBaseUnit : Number(u.conversionFactor) === 1;
+      const sortedUnits = [...(product.units || [])].sort((a: any, b: any) => {
+        const aBase = isBaseRow(a);
+        const bBase = isBaseRow(b);
+        if (aBase !== bBase) return aBase ? -1 : 1;
+        return Number(a.conversionFactor) - Number(b.conversionFactor);
+      });
 
       setUnits(
         sortedUnits.map((u) => ({
@@ -144,140 +174,305 @@ export function EditProductModal({
           conversionFactor: Number(u.conversionFactor) || 1,
           pricingCurrency: u.pricingCurrency || "SYP",
           priceWholesale: Number(u.priceWholesale) || 0,
-          priceRetail:
-            u.priceRetail !== null && u.priceRetail !== undefined && u.priceRetail !== ""
-              ? Number(u.priceRetail)
-              : "",
-          barcode: u.barcode || "",
-          barcodeSource: (u.barcodeSource as BarcodeSourceChoice) || "",
-          imageUrl: u.imageUrl || "",
+          // [v4.5] The unit's saved barcodes (each with its row id, so the
+          // ADMIN-only DELETE route can remove one) — the scalar
+          // `barcode`/`barcodeSource` pair is only a fallback for a response
+          // cached by an older client build.
+          barcodes:
+            u.barcodes && u.barcodes.length > 0
+              ? u.barcodes.map((b) => ({
+                id: b.id,
+                barcode: b.barcode,
+                barcodeSource: (b.barcodeSource as BarcodeSourceChoice) || "INTERNAL",
+              }))
+              : u.barcode
+                ? [
+                  {
+                    barcode: u.barcode,
+                    barcodeSource: (u.barcodeSource as BarcodeSourceChoice) || "INTERNAL",
+                  },
+                ]
+                : [],
+          barcodeDraft: "",
           isActive: u.isActive !== false,
         }))
       );
       setCatalogInfo(null);
-      setBarcodeGate({ unitIndex: null, barcode: "" });
+      setBarcodeGate({ unitIndex: null, candidates: [] });
     }
   }
 
-  const requestBarcodeClassification = (unitIndex: number, rawBarcode: string) => {
-    const cleaned = rawBarcode.trim();
+  /** Every barcode already on this form's units (persisted or just added). */
+  const allBarcodesOnForm = (source: EditUnitForm[]) =>
+    source.flatMap((u) => u.barcodes.map((b) => b.barcode));
 
-    if (!cleaned) {
-      setUnits((prev) => {
-        const next = [...prev];
-        next[unitIndex] = { ...next[unitIndex], barcode: "", barcodeSource: "" };
-        return next;
-      });
-      setCatalogInfo(null);
-      // [FIX] Close the classification gate if it was open for this exact
-      // unit — previously only the unit's own fields were cleared, but a
-      // still-open BarcodeSourceModal could be left pointing at a barcode
-      // that no longer exists on this unit. Same fix already applied to
-      // AddProductModal.tsx.
-      if (barcodeGate.unitIndex === unitIndex) {
-        setBarcodeGate({ unitIndex: null, barcode: "" });
-      }
-      return;
-    }
+  /**
+   * [v4.5] Splits one input/paste into individual barcode values — `;`, tab and
+   * newline are the separators, mirroring the CSV import and AddProductModal.
+   */
+  const splitBarcodeInput = (raw: string): string[] =>
+    raw
+      .split(/[;\n\t]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
 
-    const currentUnit = units[unitIndex];
-    if (currentUnit && currentUnit.barcode === cleaned && currentUnit.barcodeSource) {
-      return;
-    }
-
+  const clearUnitBarcodeDraft = (unitIndex: number) => {
     setUnits((prev) => {
       const next = [...prev];
-      next[unitIndex] = { ...next[unitIndex], barcodeSource: "" };
+      if (next[unitIndex]) {
+        next[unitIndex] = { ...next[unitIndex], barcodeDraft: "" };
+      }
       return next;
     });
-
-    setBarcodeGate({ unitIndex, barcode: cleaned });
-    lookupBarcodeInCatalog(cleaned, unitIndex);
+    setBarcodeGate((prev) =>
+      prev.unitIndex === unitIndex ? { unitIndex: null, candidates: [] } : prev
+    );
   };
 
-  const handleBarcodeSourceConfirm = (source: BarcodeSourceChoice) => {
-    const { unitIndex, barcode } = barcodeGate;
+  const focusBarcodeInput = (unitIndex: number) => {
+    // Next tick: the confirmation dialog has to finish closing (and release its
+    // focus trap) before focus can land back on the input.
+    setTimeout(() => barcodeInputRefs.current[unitIndex]?.focus(), 60);
+  };
+
+  const requestBarcodeClassification = (unitIndex: number, rawValue: string) => {
+    // [UX] A classification session is already open — never re-open or replace
+    // it (an Enter followed by a stray second event would otherwise remount the
+    // modal and wipe the merchant's clicks).
+    if (barcodeGate.unitIndex !== null) return;
+
+    // [v4.5 — FIX, mirrors AddProductModal.tsx] Deduplicate at parse time so a
+    // paste/scan of "123;123" can never produce two identical candidates.
+    const parsed = Array.from(new Set(splitBarcodeInput(rawValue)));
+
+    if (parsed.length === 0) {
+      // [UX] Deliberately does NOT clear catalogInfo: an empty field firing this
+      // used to wipe the shared-catalog suggestion the merchant had just earned.
+      clearUnitBarcodeDraft(unitIndex);
+      return;
+    }
+
+    // Never propose a value already attached to any unit of this product (the
+    // backend rejects a barcode shared across units; catching it here gives a
+    // friendly message instead of a 400 after the whole form is filled in).
+    const used = new Set(allBarcodesOnForm(units));
+    const fresh = parsed.filter((b) => !used.has(b));
+    const clashes = parsed.filter((b) => used.has(b));
+    if (clashes.length > 0) {
+      toast.error(
+        clashes.length === 1
+          ? `الباركود ${clashes[0]} مضاف مسبقاً لهذا المنتج.`
+          : `${clashes.length} باركودات مضافة مسبقاً لهذا المنتج وتم تجاهلها.`
+      );
+    }
+    if (fresh.length === 0) {
+      clearUnitBarcodeDraft(unitIndex);
+      return;
+    }
+
+    setBarcodeGate({ unitIndex, candidates: fresh.map((barcode) => ({ barcode })) });
+    lookupCatalogMatches(fresh, unitIndex);
+  };
+
+  const handleBarcodeSourceConfirm = (selections: BarcodeSourceSelection[]) => {
+    const { unitIndex } = barcodeGate;
     if (unitIndex === null) return;
 
     setUnits((prev) => {
       const next = [...prev];
-      next[unitIndex] = { ...next[unitIndex], barcode, barcodeSource: source };
+      const unit = next[unitIndex];
+      if (!unit) return prev;
+      const existing = new Set(unit.barcodes.map((b) => b.barcode));
+      const added = selections
+        .filter((s) => !existing.has(s.barcode))
+        .map((s) => ({ barcode: s.barcode, barcodeSource: s.barcodeSource }));
+      next[unitIndex] = {
+        ...unit,
+        barcodes: [...unit.barcodes, ...added],
+        barcodeDraft: "",
+      };
       return next;
     });
 
-    setBarcodeGate({ unitIndex: null, barcode: "" });
+    setBarcodeGate({ unitIndex: null, candidates: [] });
+    // [UX] Ready for the next scan/typed barcode with no extra click.
+    focusBarcodeInput(unitIndex);
   };
 
   const handleBarcodeSourceDismiss = () => {
     const { unitIndex } = barcodeGate;
     if (unitIndex !== null) {
-      setUnits((prev) => {
-        const next = [...prev];
-        next[unitIndex] = { ...next[unitIndex], barcode: "", barcodeSource: "" };
-        return next;
-      });
+      // Spec: dismissing the gate means the barcode VALUE is not saved either.
+      clearUnitBarcodeDraft(unitIndex);
     }
-    setBarcodeGate({ unitIndex: null, barcode: "" });
+    setBarcodeGate({ unitIndex: null, candidates: [] });
   };
 
-  const lookupBarcodeInCatalog = async (barcode: string, targetUnitIndex: number) => {
+  /**
+   * [v4.5] Removes ONE barcode from ONE unit.
+   *
+   * A barcode that is not saved yet is purely local state. A SAVED barcode can
+   * only be removed through the dedicated, ADMIN-only DELETE route — the
+   * product PATCH is deliberately additive-only, so that every real deletion
+   * travels through this single auditable path (see that route's header).
+   * Because that deletion is immediate and permanent (it does not wait for the
+   * "save" button), it asks for confirmation first.
+   *
+   * Deleting a barcode never touches a sale: InvoiceItem references the UNIT,
+   * not a barcode row (schema.prisma's [v4.5] note).
+   */
+  const handleRemoveBarcode = async (unitIndex: number, barcode: string) => {
+    const unit = units[unitIndex];
+    const entry = unit?.barcodes.find((b) => b.barcode === barcode);
+    if (!unit || !entry) return;
+
+    const removeLocally = () => {
+      setUnits((prev) => {
+        const next = [...prev];
+        const current = next[unitIndex];
+        if (!current) return prev;
+        next[unitIndex] = {
+          ...current,
+          barcodes: current.barcodes.filter((b) => b.barcode !== barcode),
+        };
+        return next;
+      });
+    };
+
+    if (!entry.id || !unit.id || !product) {
+      removeLocally();
+      return;
+    }
+
+    if (!window.confirm(`حذف الباركود ${barcode} نهائياً؟ لن ينتظر هذا الحذف زر «حفظ التعديلات».`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch(
+        `/api/inventory/products/${product.id}/units/${unit.id}/barcodes/${entry.id}`,
+        { method: "DELETE" }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.message || "تعذّر حذف الباركود.");
+      }
+      removeLocally();
+      toast.success("تم حذف الباركود.");
+    } catch (err: any) {
+      toast.error(err?.message || "تعذّر حذف الباركود.");
+    }
+  };
+
+  /**
+   * [v4.5] Looks up EVERY freshly entered barcode in the shared catalog in one
+   * pass: per-barcode matches feed the confirmation gate (so a barcode the
+   * platform already knows gets the simplified one-click GS1 view), and the
+   * FIRST match also populates the one-click "copy catalog data" suggestion
+   * this screen already offered.
+   */
+  const lookupCatalogMatches = async (barcodesList: string[], targetUnitIndex: number) => {
     lookupAbortRef.current?.abort();
     const controller = new AbortController();
     lookupAbortRef.current = controller;
 
-    try {
-      const res = await fetch(`/api/catalog/lookup?barcode=${encodeURIComponent(barcode)}`, {
-        signal: controller.signal,
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.success && data.entry) {
-        setCatalogInfo({ ...data.entry, targetUnitIndex });
-        toast.info(
-          `تم العثور على هذا المنتج في الكتالوج المشترك (${data.entry.name}). يمكنك نسخ بياناته بنقرة واحدة.`
-        );
-      } else {
-        setCatalogInfo(null);
-      }
-    } catch (err: any) {
-      if (err.name !== "AbortError") {
-        console.error("Error querying shared catalog:", err);
-      }
+    const matches: Record<string, { name: string } | null> = {};
+    const found: CatalogLookupResult[] = [];
+
+    await Promise.all(
+      barcodesList.map(async (value) => {
+        try {
+          const res = await fetch(`/api/catalog/lookup?barcode=${encodeURIComponent(value)}`, {
+            signal: controller.signal,
+          });
+          if (!res.ok) {
+            matches[value] = null;
+            return;
+          }
+          const data = await res.json();
+          if (data.success && data.entry) {
+            matches[value] = { name: data.entry.name };
+            found.push({ ...(data.entry as Omit<CatalogLookupResult, "targetUnitIndex">), targetUnitIndex });
+          } else {
+            matches[value] = null;
+          }
+        } catch (err: any) {
+          if (err?.name !== "AbortError") {
+            console.error("Error querying shared catalog:", err);
+          }
+        }
+      })
+    );
+
+    // Fold the matches into the open gate — only rows still present are updated.
+    setBarcodeGate((prev) =>
+      prev.unitIndex === null
+        ? prev
+        : {
+          ...prev,
+          candidates: prev.candidates.map((c) => ({
+            ...c,
+            catalogMatch: matches[c.barcode] ?? c.catalogMatch ?? null,
+          })),
+        }
+    );
+
+    const firstEntry = found[0];
+    if (!firstEntry) {
+      setCatalogInfo(null);
+      return;
     }
+
+    setCatalogInfo(firstEntry);
+    toast.info(
+      `تم العثور على هذا المنتج في الكتالوج المشترك (${firstEntry.name}). يمكنك نسخ بياناته بنقرة واحدة.`
+    );
   };
 
   const applyCatalogSuggestion = () => {
     if (!catalogInfo) return;
     if (catalogInfo.name && !name) setName(catalogInfo.name);
     if (catalogInfo.category && !category) setCategory(catalogInfo.category);
-    if (catalogInfo.imageUrl) {
-      setUnits((prev) => {
-        const next = [...prev];
-        const idx = catalogInfo.targetUnitIndex;
-        if (next[idx] && !next[idx].imageUrl) {
-          next[idx] = { ...next[idx], imageUrl: catalogInfo.imageUrl! };
-        }
-        return next;
-      });
+    if (catalogInfo.imageUrl && !imageUrl) {
+      setImageUrl(catalogInfo.imageUrl);
     }
     toast.success("تم تطبيق بيانات الكتالوج المشترك بنجاح.");
   };
 
+  // [v4.5 UX] The unit scanner runs in CONTINUOUS mode: each accepted scan only
+  // lands in the buffer (a barcode still sitting in front of the camera is
+  // ignored); the whole batch is classified once, when the scanner closes.
   const handleScanSuccess = (scannedCode: string) => {
-    requestBarcodeClassification(activeUnitIndex, scannedCode);
-    setScannerOpen(false);
+    const value = scannedCode.trim();
+    if (!value || scanBufferRef.current.includes(value)) return;
+    scanBufferRef.current = [...scanBufferRef.current, value];
+    setScanBuffer(scanBufferRef.current);
+  };
+
+  const handleScannerOpenChange = (isOpen: boolean) => {
+    setScannerOpen(isOpen);
+    if (isOpen) return;
+
+    const collected = scanBufferRef.current;
+    scanBufferRef.current = [];
+    setScanBuffer([]);
+
+    if (collected.length > 0) {
+      requestBarcodeClassification(activeUnitIndex, collected.join(";"));
+    }
+  };
+
+  const openUnitScanner = (unitIndex: number) => {
+    scanBufferRef.current = [];
+    setScanBuffer([]);
+    setActiveUnitIndex(unitIndex);
+    setScannerOpen(true);
   };
 
   const handleCropComplete = (uploadedUrl: string) => {
-    setUnits((prev) => {
-      const next = [...prev];
-      if (next[activeUnitIndex]) {
-        next[activeUnitIndex] = { ...next[activeUnitIndex], imageUrl: uploadedUrl };
-      }
-      return next;
-    });
+    setImageUrl(uploadedUrl);
     setCropModalOpen(false);
-    toast.success("تم تحديث صورة الوحدة بنجاح.");
+    toast.success("تم تحديث صورة المنتج بنجاح.");
   };
 
   const handleAddUnit = () => {
@@ -293,10 +488,8 @@ export function EditProductModal({
         conversionFactor: highestFactor * 6,
         pricingCurrency: prev[0]?.pricingCurrency || "SYP",
         priceWholesale: 0,
-        priceRetail: "",
-        barcode: "",
-        barcodeSource: "",
-        imageUrl: "",
+        barcodes: [],
+        barcodeDraft: "",
         isActive: true,
       },
     ]);
@@ -323,17 +516,22 @@ export function EditProductModal({
 
     setUnits((prev) => prev.filter((_, i) => i !== index));
 
-    // [FIX] Same bug class fixed in AddProductModal.tsx: removing a unit
-    // shifts every later index down by one. Previously the open
-    // barcodeGate's stored unitIndex was left unchanged, so if the gate
-    // was open for a unit AFTER the removed one, it would end up pointing
-    // at the wrong unit (or out of bounds if it was the last one).
+    // [FIX] Removing a unit shifts every later index down by one: shift an open
+    // gate's stored unitIndex accordingly, and clear it only on an exact match.
     setBarcodeGate((prev) => {
       if (prev.unitIndex === null) return prev;
-      if (prev.unitIndex === index) return { unitIndex: null, barcode: "" };
+      if (prev.unitIndex === index) return { unitIndex: null, candidates: [] };
       if (prev.unitIndex > index) return { ...prev, unitIndex: prev.unitIndex - 1 };
       return prev;
     });
+  };
+
+  const handleClearImage = () => {
+    if (isPublic) {
+      toast.error("ألغِ النشر أولاً");
+      return;
+    }
+    setImageUrl("");
   };
 
   const handleToggleUnitActive = (index: number) => {
@@ -346,15 +544,12 @@ export function EditProductModal({
 
   const handleToggleIsPublic = (checked: boolean) => {
     if (checked) {
-      const candidateUnits = units.map((u) => ({
-        isActive: u.isActive,
-        priceRetail: u.priceRetail === "" ? null : Number(u.priceRetail),
-        imageUrl: u.imageUrl || null,
-      }));
-
       const gate = checkProductPublishable({
         isActive,
-        units: candidateUnits,
+        imageUrl: imageUrl.trim() || null,
+        units: units.map((u) => ({
+          isActive: u.isActive,
+        })),
       });
 
       if (!gate.publishable) {
@@ -381,35 +576,41 @@ export function EditProductModal({
       return;
     }
 
-    const packagingValidation = validatePackagingUnits(
-      units.map((u) => ({
-        ...u,
-        priceRetail: u.priceRetail === "" ? null : u.priceRetail,
-      }))
-    );
+    const packagingValidation = validatePackagingUnits(units);
     if (!packagingValidation.valid) {
       toast.error(packagingValidation.error);
       return;
     }
 
+    // [v4.5] The only unfinished barcode state left is a DRAFT that never got
+    // classified (duplicates cannot exist among confirmed barcodes). Saving
+    // with a draft present would silently discard what the merchant typed, so
+    // the gate is opened for that unit and this save is aborted; press save
+    // again once it is resolved.
+    if (barcodeGate.unitIndex !== null) {
+      toast.error("يرجى إكمال تصنيف مصدر الباركود المعلّق قبل الحفظ.");
+      return;
+    }
     for (let i = 0; i < units.length; i++) {
       const u = units[i];
-      if (u.barcode.trim() && !u.barcodeSource) {
-        toast.error(`الوحدة "${u.unitName || i + 1}": يجب تحديد مصدر الباركود (GS1 أو INTERNAL).`);
-        requestBarcodeClassification(i, u.barcode);
+      if (u.barcodeDraft.trim()) {
+        toast.error(`الوحدة "${u.unitName || i + 1}": يجب تأكيد مصدر الباركود قبل الحفظ.`);
+        requestBarcodeClassification(i, u.barcodeDraft);
         return;
       }
     }
 
     if (isPublic) {
-      const candidateUnits = units.map((u) => ({
-        isActive: u.isActive,
-        priceRetail: u.priceRetail === "" ? null : Number(u.priceRetail),
-        imageUrl: u.imageUrl || null,
-      }));
+      if (!imageUrl.trim()) {
+        toast.error("ألغِ النشر أولاً");
+        return;
+      }
       const gate = checkProductPublishable({
         isActive,
-        units: candidateUnits,
+        imageUrl: imageUrl.trim() || null,
+        units: units.map((u) => ({
+          isActive: u.isActive,
+        })),
       });
       if (!gate.publishable) {
         toast.error(`لا يمكن تفعيل النشر: ${gate.reason}`);
@@ -422,6 +623,7 @@ export function EditProductModal({
       const payload = {
         name: name.trim(),
         category: category.trim() || null,
+        imageUrl: imageUrl.trim() || null,
         isPublic,
         isActive,
         units: units.map((u) => ({
@@ -430,13 +632,14 @@ export function EditProductModal({
           conversionFactor: toDecimalString(Number(u.conversionFactor)),
           pricingCurrency: u.pricingCurrency,
           priceWholesale: toDecimalString(Number(u.priceWholesale) || 0),
-          priceRetail:
-            u.priceRetail === "" || u.priceRetail === null
-              ? null
-              : toDecimalString(Number(u.priceRetail)),
-          barcode: u.barcode.trim() || null,
-          barcodeSource: u.barcode.trim() ? u.barcodeSource : null,
-          imageUrl: u.imageUrl.trim() || null,
+          // [v4.5] The unit's full confirmed barcode list. The PATCH is
+          // ADDITIVE-ONLY: the route skips any value already stored on the
+          // unit and creates the rest — removal is exclusively the dedicated
+          // ADMIN-only DELETE route's job (see handleRemoveBarcode above).
+          barcodes: u.barcodes.map((b) => ({
+            barcode: b.barcode,
+            barcodeSource: b.barcodeSource,
+          })),
           isActive: u.isActive,
         })),
       };
@@ -544,6 +747,60 @@ export function EditProductModal({
               </div>
             </div>
 
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-image" className="text-xs font-semibold">
+                صورة المنتج
+              </Label>
+              <div className="flex items-center gap-2">
+                {imageUrl && (
+                  <Image
+                    src={imageUrl}
+                    alt="معاينة"
+                    width={36}
+                    height={36}
+                    unoptimized
+                    className="w-9 h-9 object-cover rounded border border-zinc-200 dark:border-zinc-700 shrink-0"
+                  />
+                )}
+                <Input
+                  id="edit-image"
+                  value={imageUrl}
+                  onChange={(e) => {
+                    const newVal = e.target.value;
+                    if (isPublic && !newVal.trim() && imageUrl.trim()) {
+                      toast.error("ألغِ النشر أولاً");
+                      return;
+                    }
+                    setImageUrl(newVal);
+                  }}
+                  placeholder="رابط الصورة أو ارفع وقص صورة..."
+                  className="text-xs flex-1"
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setCropModalOpen(true)}
+                  className="h-9 text-xs gap-1 border-zinc-300 shrink-0"
+                >
+                  <ImageIcon className="w-3.5 h-3.5" />
+                  <span>{imageUrl ? "تغيير الصورة" : "رفع وقص"}</span>
+                </Button>
+                {imageUrl && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={handleClearImage}
+                    className="h-9 text-xs text-red-500 hover:bg-red-50 shrink-0"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 ml-1" />
+                    <span>إزالة</span>
+                  </Button>
+                )}
+              </div>
+            </div>
+
             <div className="p-4 bg-zinc-50 dark:bg-zinc-800/40 rounded-xl border border-zinc-200 dark:border-zinc-800 space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
@@ -574,7 +831,7 @@ export function EditProductModal({
                       <span>النشر بالمتجر العام</span>
                     </Label>
                     <p className="text-[11px] text-zinc-500">
-                      يتطلب وجود سعر تجزئة وصورة لوحدة قياس نشطة واحدة على الأقل.
+                      يتطلب وجود صورة للمنتج ووحدة قياس نشطة واحدة على الأقل.
                     </p>
                   </div>
                 </div>
@@ -664,14 +921,8 @@ export function EditProductModal({
                           <Input
                             value={unit.unitName}
                             onChange={(e) => {
-                              // [FIX] Was direct mutation (`next[index].unitName =
-                              // ...; setUnits(next)`) — `[...units]` only copies
-                              // the array shallowly, so `next[index]` was the
-                              // SAME object reference as `units[index]`, meaning
-                              // this line mutated the current state in place
-                              // before React had a chance to diff it. Fixed to
-                              // create a new object for the changed index, same
-                              // pattern AddProductModal.tsx already uses.
+                              // Immutable update — never mutate `units[index]` in
+                              // place (see AddProductModal.tsx's same pattern).
                               const value = e.target.value;
                               setUnits((prev) => {
                                 const next = [...prev];
@@ -695,21 +946,10 @@ export function EditProductModal({
                             disabled={isBase}
                             value={unit.conversionFactor}
                             onChange={(e) => {
-                              // [FIX — real bug, same class as
-                              // AddProductModal.tsx] Was
-                              // `Math.max(0.0001, parseFloat(e.target.value) || 1)`
-                              // — `|| 1` snapped any falsy parse (including the
-                              // first "0" keystroke on the way to typing "0.25")
-                              // straight to 1, and Math.max clamped anything
-                              // below 0.0001 immediately while typing. Fractional
-                              // conversionFactor values are explicitly allowed
-                              // (a wholesaler selling a quarter- or half-carton)
-                              // — only fall back when the parse isn't a real
-                              // number at all; validatePackagingUnits() already
-                              // rejects <= 0 at submit time, so no separate
-                              // floor is needed here. Also fixed to build an
-                              // immutable next-object instead of mutating in
-                              // place.
+                              // Fractional conversionFactor values are explicitly
+                              // allowed (a quarter- or half-carton) — only fall
+                              // back when the parse isn't a real number at all;
+                              // validatePackagingUnits() rejects <= 0 at submit.
                               const parsed = parseFloat(e.target.value);
                               const value = Number.isFinite(parsed) ? parsed : 0;
                               setUnits((prev) => {
@@ -763,46 +1003,54 @@ export function EditProductModal({
                           />
                         </div>
 
-                        <div>
+                        <div className="sm:col-span-3">
                           <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            سعر التجزئة (مطلوب للنشر)
+                            الباركودات
+                            {unit.barcodes.length > 0 ? ` (${unit.barcodes.length})` : ""}
                           </Label>
-                          <Input
-                            type="number"
-                            min="0"
-                            value={unit.priceRetail}
-                            onChange={(e) => {
-                              const raw = e.target.value;
-                              const value = raw === "" ? "" : Number(raw);
-                              setUnits((prev) => {
-                                const next = [...prev];
-                                next[index] = { ...next[index], priceRetail: value };
-                                return next;
-                              });
-                            }}
-                            placeholder="اختياري"
-                            className="h-8 text-xs mt-1"
-                          />
-                        </div>
 
-                        <div>
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            الباركود ومصدره
-                          </Label>
+                          {/* [v4.5 UX] ONE full-width barcode field per unit.
+                              Enter (what a keyboard-wedge scanner sends after each
+                              scan), the Add button, or a pasted delimited list all
+                              start classification. There is no blur trigger:
+                              tabbing/clicking away used to pop the modal
+                              unexpectedly, and an unclassified value is caught by
+                              the save check anyway. */}
                           <div className="flex items-center gap-1.5 mt-1">
                             <div className="relative flex-1">
                               <Input
-                                value={unit.barcode}
-                                onBlur={(e) => requestBarcodeClassification(index, e.target.value)}
+                                ref={(el) => {
+                                  barcodeInputRefs.current[index] = el;
+                                }}
+                                dir="ltr"
+                                value={unit.barcodeDraft}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    requestBarcodeClassification(index, unit.barcodeDraft);
+                                  }
+                                }}
+                                onPaste={(e) => {
+                                  // A pasted LIST (one barcode per line, or `;`/tab
+                                  // separated) is classified together in one modal.
+                                  const text = e.clipboardData.getData("text");
+                                  if (/[;\n\t]/.test(text.trim())) {
+                                    e.preventDefault();
+                                    requestBarcodeClassification(
+                                      index,
+                                      unit.barcodeDraft ? `${unit.barcodeDraft};${text}` : text
+                                    );
+                                  }
+                                }}
                                 onChange={(e) => {
                                   const value = e.target.value;
                                   setUnits((prev) => {
                                     const next = [...prev];
-                                    next[index] = { ...next[index], barcode: value };
+                                    next[index] = { ...next[index], barcodeDraft: value };
                                     return next;
                                   });
                                 }}
-                                placeholder="امسح أو اكتب الباركود..."
+                                placeholder="امسح أو اكتب الباركود ثم Enter"
                                 className="h-8 text-xs pl-7"
                               />
                               <BarcodeIcon className="w-3.5 h-3.5 absolute left-2 top-2.5 text-zinc-400" />
@@ -811,88 +1059,72 @@ export function EditProductModal({
                               type="button"
                               size="sm"
                               variant="outline"
-                              onClick={() => {
-                                setActiveUnitIndex(index);
-                                setScannerOpen(true);
-                              }}
+                              disabled={!unit.barcodeDraft.trim()}
+                              onClick={() => requestBarcodeClassification(index, unit.barcodeDraft)}
+                              className="h-8 px-2 gap-1 text-xs border-zinc-300"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>إضافة</span>
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => openUnitScanner(index)}
                               className="h-8 px-2 border-zinc-300"
                               title="مسح بالكاميرا"
                             >
                               <Camera className="w-3.5 h-3.5 text-zinc-600" />
                             </Button>
                           </div>
-                          {unit.barcode && unit.barcodeSource && (
-                            <div className="mt-1 flex items-center gap-1 text-[10px] text-zinc-500">
-                              <span>المصدر:</span>
-                              <Badge variant="outline" className="text-[9px] px-1 py-0">
-                                {unit.barcodeSource}
-                              </Badge>
+
+                          {/* [v4.5] The unit's CONFIRMED barcodes. A SAVED one is
+                              removed through the ADMIN-only DELETE route — that is
+                              the ONLY removal path, since the product PATCH is
+                              additive-only; one added in this session has no id yet
+                              and is removed from local state. */}
+                          {unit.barcodes.length > 0 && (
+                            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500">
+                              {unit.barcodes.map((b) => (
+                                <span
+                                  key={b.barcode}
+                                  className="inline-flex items-center gap-1 rounded border border-zinc-200 px-1.5 py-0.5 dark:border-zinc-700"
+                                >
+                                  <span className="font-mono" dir="ltr">
+                                    {b.barcode}
+                                  </span>
+                                  <Badge variant="outline" className="text-[9px] px-1 py-0">
+                                    {b.barcodeSource}
+                                  </Badge>
+                                  {!b.id && (
+                                    <span className="text-[9px] text-amber-600">جديد</span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveBarcode(index, b.barcode)}
+                                    className="text-red-500 hover:text-red-600 p-1.5 -m-1.5"
+                                    aria-label={`حذف الباركود ${b.barcode}`}
+                                    title={b.id ? "حذف هذا الباركود نهائياً" : "إزالة هذا الباركود"}
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </span>
+                              ))}
                             </div>
                           )}
-                          {unit.barcode && !unit.barcodeSource && (
-                            <div className="mt-1 flex items-center gap-1 text-[10px] text-amber-600">
-                              <AlertTriangle className="w-3 h-3" />
-                              <button
-                                type="button"
-                                onClick={() => requestBarcodeClassification(index, unit.barcode)}
-                                className="underline hover:text-amber-700 font-medium"
-                              >
-                                اضغط لتصنيف مصدر الباركود
-                              </button>
-                            </div>
+
+                          {unit.barcodes.length > 1 && (
+                            <p className="mt-1 text-[10px] text-blue-700">
+                              كل هذه الباركودات تُباع كنفس الصنف: مخزون وسعر واحد، والفاتورة لا تسجّل أي باركود انمسح.
+                              إذا كان لكل نكهة مخزون منفصل، أضف كل نكهة كمنتج مستقل.
+                            </p>
+                          )}
+                          {unit.barcodes.some((b) => !b.id) && (
+                            <p className="mt-1 text-[10px] text-amber-700">
+                              الباركودات المعلّمة «جديد» تُحفظ عند الضغط على «حفظ التعديلات».
+                            </p>
                           )}
                         </div>
-                      </div>
-
-                      <div className="mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-800 flex items-center justify-between text-xs">
-                        <div className="flex items-center gap-2">
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            صورة الوحدة:
-                          </Label>
-                          {unit.imageUrl ? (
-                            <div className="flex items-center gap-2">
-                              <Image
-                                src={unit.imageUrl}
-                                alt="معاينة"
-                                width={28}
-                                height={28}
-                                unoptimized
-                                className="w-7 h-7 object-cover rounded border"
-                              />
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => {
-                                  setUnits((prev) => {
-                                    const next = [...prev];
-                                    next[index] = { ...next[index], imageUrl: "" };
-                                    return next;
-                                  });
-                                }}
-                                className="h-6 text-[10px] text-red-500 hover:bg-red-50"
-                              >
-                                إزالة
-                              </Button>
-                            </div>
-                          ) : (
-                            <span className="text-[11px] text-zinc-400">لا توجد صورة</span>
-                          )}
-                        </div>
-
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => {
-                            setActiveUnitIndex(index);
-                            setCropModalOpen(true);
-                          }}
-                          className="h-7 text-xs gap-1 border-zinc-300"
-                        >
-                          <ImageIcon className="w-3.5 h-3.5" />
-                          <span>{unit.imageUrl ? "تغيير الصورة" : "رفع وقص صورة"}</span>
-                        </Button>
                       </div>
                     </div>
                   );
@@ -933,26 +1165,51 @@ export function EditProductModal({
         </DialogContent>
       </Dialog>
 
-      {barcodeGate.unitIndex !== null && (
-        <BarcodeSourceModal
-          key={`${barcodeGate.unitIndex}-${barcodeGate.barcode}`}
-          open={barcodeGate.unitIndex !== null}
-          barcode={barcodeGate.barcode}
-          onConfirm={handleBarcodeSourceConfirm}
-          onDismiss={handleBarcodeSourceDismiss}
-          catalogMatch={
-            catalogInfo && catalogInfo.targetUnitIndex === barcodeGate.unitIndex && catalogInfo.barcode === barcodeGate.barcode
-              ? { name: catalogInfo.name }
-              : null
-          }
-        />
-      )}
+      {/* [v4.5] ONE modal for this action's NEW barcodes, one radio group per
+          barcode; the `key` is derived from the barcode set itself so a brand
+          new instance is mounted per action and a previously-chosen source can
+          never carry over. It deliberately excludes the catalog-match results
+          (they arrive a round-trip later and would wipe clicks). */}
+      <BarcodeSourceModal
+        key={`barcode-gate-${barcodeGate.unitIndex !== null
+          ? `${barcodeGate.unitIndex}-${barcodeGate.candidates.map((c) => c.barcode).join("|")}`
+          : "closed"
+          }`}
+        open={barcodeGate.unitIndex !== null && barcodeGate.candidates.length > 0}
+        candidates={barcodeGate.candidates}
+        onConfirm={handleBarcodeSourceConfirm}
+        onDismiss={handleBarcodeSourceDismiss}
+      />
 
+      {/* [v4.5 UX] Per-unit scanner: CONTINUOUS, so several barcodes can be
+          scanned in one go; they are collected below the video and classified
+          together in one confirmation modal when the merchant finishes.
+          Requires the optional title / description / children props on
+          BarcodeScannerModal. */}
       <BarcodeScannerModal
         open={scannerOpen}
-        onOpenChange={setScannerOpen}
+        onOpenChange={handleScannerOpenChange}
         onScan={handleScanSuccess}
-      />
+        mode="continuous"
+        feedback="silent"
+        continuousCooldownMs={1500}
+        title="مسح باركودات الوحدة"
+        description="امسح باركودات هذه الوحدة بالتتابع، ثم اضغط «إنهاء المسح» لتصنيفها دفعة واحدة."
+      >
+        {scanBuffer.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {scanBuffer.map((b) => (
+              <span
+                key={b}
+                dir="ltr"
+                className="font-mono text-[11px] rounded border border-zinc-200 px-1.5 py-0.5"
+              >
+                {b}
+              </span>
+            ))}
+          </div>
+        )}
+      </BarcodeScannerModal>
 
       <ImageCropModal
         open={cropModalOpen}

@@ -6,6 +6,9 @@ import {
   validatePackagingUnits,
   isReservedBaseUnitFactor,
   assertIsValidBaseUnitFactor,
+  costFromTotal,
+  costBreakdownForDisplay,
+  InvalidCostInputError,
 } from "../units";
 
 // [FIX — full rewrite] The previous version of this file tested
@@ -135,25 +138,23 @@ describe("T1/T3a/T3b Unit Conversion Engine (v4.0)", () => {
       expect(result.error).toContain("يجب تحديد وحدة أساسية واحدة بمعامل تحويل يساوي 1");
     });
 
-    // NOTE ON IMPLEMENTATION BEHAVIOR: units.ts checks for a duplicate
-    // conversionFactor *inside* the same loop that counts base units, and
-    // the duplicate-factor check fires before the post-loop
-    // baseUnitCount > 1 check ever runs. Since two units can only both
-    // have conversionFactor === 1 by definition sharing the same
-    // normalized factorKey ("1"), the duplicate-factor branch always
-    // catches this case first — the dedicated "أكثر من وحدة أساسية"
-    // message is currently unreachable dead code. This test asserts the
-    // actual (reachable) behavior; flagged for a product decision on
-    // whether the check order should change to surface a more specific
-    // message for this case.
-    it("fails if multiple units share conversionFactor 1 (caught by the duplicate-factor check, not a separate 'multiple base units' message)", () => {
+    // NOTE ON IMPLEMENTATION BEHAVIOR: units.ts counts base units *inside*
+    // the same loop that detects duplicate conversionFactors, and the
+    // base-unit check now runs FIRST — so two units that both declare
+    // conversionFactor === 1 are reported with the specific "أكثر من وحدة
+    // أساسية واحدة" message rather than the generic duplicate-factor one.
+    // (The reverse ordering made that specific message unreachable dead
+    // code; units.ts's own header documents the change, and this assertion
+    // was left behind by it. The generic duplicate-factor check in the next
+    // test still covers every OTHER repeated factor.)
+    it("reports the specific 'more than one base unit' message when two units both declare conversionFactor 1", () => {
       const units = [
         { unitName: "قطعة 1", conversionFactor: 1 },
         { unitName: "قطعة 2", conversionFactor: 1 },
       ];
       const result = validatePackagingUnits(units);
       expect(result.valid).toBe(false);
-      expect(result.error).toContain("معامل التحويل مكرر");
+      expect(result.error).toContain("لا يمكن تحديد أكثر من وحدة أساسية واحدة بمعامل تحويل يساوي 1");
     });
 
     it("fails on duplicate conversion factor", () => {
@@ -222,3 +223,122 @@ describe("T1/T3a/T3b Unit Conversion Engine (v4.0)", () => {
 // wanted, that needs to be confirmed as a real business decision first —
 // then units.ts's five-rule list, its scope note, and this test file
 // should all be updated together, not just the test.
+
+// ============================================================================
+// [Batch cost entry] T3a/T4g — "the merchant enters the TOTAL paid for the
+// received quantity, the system derives the cost per BASE unit".
+//
+// costFromTotal() is the ONE derivation the server actually stores from
+// (lib/inventory/batch-creation.ts's createBatchRow() calls it), and
+// costBreakdownForDisplay() is what both batch forms render live off the same
+// function — so these cases pin both what gets written and what the merchant
+// is promised on screen.
+// ============================================================================
+
+describe("costFromTotal — Total paid -> cost per base unit", () => {
+  it("derives the worked example the screens use: 6 طرد (factor 6) for 54,000 SYP", () => {
+    const result = costFromTotal("54000", "6", 6);
+    // 6 طرد x factor 6 = 36 قطعة, and 54,000 / 36 = 1,500 per قطعة.
+    expect(result.baseQuantity).toBe("36.0000");
+    expect(result.perBaseUnit).toBe("1500.00000000");
+    // The two stored values reconcile back to exactly what was paid.
+    expect(new Decimal(result.perBaseUnit).times(result.baseQuantity).toString()).toBe("54000");
+  });
+
+  it("emits the base quantity at the column's own scale 4 and the cost at scale 8", () => {
+    const result = costFromTotal("54000", "6", 6);
+    expect(result.baseQuantity.split(".")[1]).toHaveLength(4);
+    expect(result.perBaseUnit.split(".")[1]).toHaveLength(8);
+  });
+
+  it("degenerates to a plain division when the purchase unit IS the base unit (factor 1)", () => {
+    const result = costFromTotal("4500", "3", 1);
+    expect(result.baseQuantity).toBe("3.0000");
+    expect(result.perBaseUnit).toBe("1500.00000000");
+  });
+
+  it("divides by the quantity AFTER converting it with the purchase unit's own factor", () => {
+    // 2 كرتونة x factor 12 = 24 pieces, 24,000 / 24 = 1,000 per piece.
+    const result = costFromTotal("24000", "2", 12);
+    expect(result.baseQuantity).toBe("24.0000");
+    expect(result.perBaseUnit).toBe("1000.00000000");
+  });
+
+  it("does NOT round a non-terminating per-base price to 4 dp — the reason the column is Decimal(18,8)", () => {
+    const result = costFromTotal("100", "3", 1);
+    expect(result.perBaseUnit).toBe("33.33333333");
+    // At 4 dp the stored value would be 33.3333, and 33.3333 x 3 = 99.9999,
+    // i.e. the batch's cost basis would no longer reconcile with the 100 paid.
+    expect(new Decimal(result.perBaseUnit).times(result.baseQuantity).toDecimalPlaces(4).toString()).toBe("100");
+  });
+
+  it("accepts decimal-string inputs without native-float drift", () => {
+    const result = costFromTotal("3.3", "2.5", "1");
+    expect(result.baseQuantity).toBe("2.5000");
+    expect(result.perBaseUnit).toBe("1.32000000");
+  });
+
+  it("rejects a zero or negative total", () => {
+    expect(() => costFromTotal("0", "6", 6)).toThrow(InvalidCostInputError);
+    expect(() => costFromTotal("-54000", "6", 6)).toThrow(InvalidCostInputError);
+  });
+
+  it("rejects a zero or negative quantity", () => {
+    expect(() => costFromTotal("54000", "0", 6)).toThrow(InvalidCostInputError);
+    expect(() => costFromTotal("54000", "-6", 6)).toThrow(InvalidCostInputError);
+  });
+
+  it("rejects a non-positive conversion factor", () => {
+    expect(() => costFromTotal("54000", "6", 0)).toThrow(InvalidCostInputError);
+    expect(() => costFromTotal("54000", "6", -6)).toThrow(InvalidCostInputError);
+  });
+
+  it("rejects empty or malformed numeric input", () => {
+    expect(() => costFromTotal("", "6", 6)).toThrow(InvalidCostInputError);
+    expect(() => costFromTotal("54000", "", 6)).toThrow(InvalidCostInputError);
+    expect(() => costFromTotal("abc", "6", 6)).toThrow(InvalidCostInputError);
+  });
+
+  it("rejects a derived cost that would overflow Decimal(18,8)", () => {
+    // 99,999,999,999,999 over a single base unit exceeds the column's 10
+    // integer digits — better a clear Arabic error at entry time than a
+    // silent Postgres overflow at write time.
+    expect(() => costFromTotal("99999999999999", "1", 1)).toThrow(InvalidCostInputError);
+  });
+});
+
+describe("costBreakdownForDisplay — the live lines in both batch forms", () => {
+  it("renders the brief's three figures for 6 طرد @ 54,000", () => {
+    const breakdown = costBreakdownForDisplay("54000", "6", 6);
+    expect(breakdown).not.toBeNull();
+    expect(breakdown!.quantityInBaseUnits).toBe("36");
+    expect(breakdown!.pricePerPurchaseUnit).toBe("9000.00"); // 54,000 / 6 طرد
+    expect(breakdown!.pricePerBaseUnit).toBe("1500.00"); // 54,000 / 36 قطعة
+  });
+
+  it("returns one and the same figure for both price lines when the unit IS the base unit", () => {
+    // This equality is exactly why the UI hides the redundant
+    // per-purchase-unit line in that case, rather than repeating it.
+    const breakdown = costBreakdownForDisplay("4500", "3", 1);
+    expect(breakdown!.quantityInBaseUnits).toBe("3");
+    expect(breakdown!.pricePerPurchaseUnit).toBe("1500.00");
+    expect(breakdown!.pricePerBaseUnit).toBe("1500.00");
+  });
+
+  it("rounds both displayed prices to 2 dp, ROUND_HALF_UP", () => {
+    const breakdown = costBreakdownForDisplay("100", "3", 1);
+    expect(breakdown!.pricePerPurchaseUnit).toBe("33.33");
+    expect(breakdown!.pricePerBaseUnit).toBe("33.33");
+  });
+
+  it("returns null — so the form renders nothing rather than a misleading 0.00 — for any not-yet-derivable pair", () => {
+    // Empty (still being typed), zero (not yet a real quantity) and malformed
+    // input all land here; the live block is simply absent in those states.
+    expect(costBreakdownForDisplay("", "6", 6)).toBeNull();
+    expect(costBreakdownForDisplay("54000", "", 6)).toBeNull();
+    expect(costBreakdownForDisplay("0", "6", 6)).toBeNull();
+    expect(costBreakdownForDisplay("54000", "0", 6)).toBeNull();
+    expect(costBreakdownForDisplay("54000", "6", 0)).toBeNull();
+    expect(costBreakdownForDisplay("abc", "6", 6)).toBeNull();
+  });
+});

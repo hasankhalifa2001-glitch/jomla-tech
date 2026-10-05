@@ -67,6 +67,7 @@ CREATE TABLE "Product" (
     "tenantId" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "category" TEXT,
+    "imageUrl" TEXT,
     "isPublic" BOOLEAN NOT NULL DEFAULT false,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "baseUnitId" TEXT,
@@ -85,15 +86,23 @@ CREATE TABLE "ProductUnit" (
     "conversionFactor" DECIMAL(18,4) NOT NULL,
     "pricingCurrency" "PricingCurrency" NOT NULL DEFAULT 'SYP',
     "priceWholesale" DECIMAL(18,4) NOT NULL,
-    "priceRetail" DECIMAL(18,4),
     "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "imageUrl" TEXT,
-    "barcode" TEXT,
-    "barcodeSource" "BarcodeSource",
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "ProductUnit_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProductUnitBarcode" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "unitId" TEXT NOT NULL,
+    "barcode" TEXT NOT NULL,
+    "barcodeSource" "BarcodeSource",
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "ProductUnitBarcode_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -106,6 +115,7 @@ CREATE TABLE "ProductBatch" (
     "quantity" DECIMAL(18,4) NOT NULL,
     "expiryDate" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "costPricePerBaseUnit" DECIMAL(18,8) NOT NULL,
 
     CONSTRAINT "ProductBatch_pkey" PRIMARY KEY ("id")
 );
@@ -140,7 +150,6 @@ CREATE TABLE "VerifiedRetailer" (
 -- CreateTable
 CREATE TABLE "ProductCatalogEntry" (
     "id" TEXT NOT NULL,
-    "barcode" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "category" TEXT,
     "imageUrl" TEXT,
@@ -149,6 +158,16 @@ CREATE TABLE "ProductCatalogEntry" (
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "ProductCatalogEntry_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProductCatalogEntryBarcode" (
+    "id" TEXT NOT NULL,
+    "catalogEntryId" TEXT NOT NULL,
+    "barcode" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "ProductCatalogEntryBarcode_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -204,6 +223,7 @@ CREATE TABLE "InvoiceItem" (
     "quantity" DECIMAL(18,4) NOT NULL,
     "unitPriceSYP" DECIMAL(18,4) NOT NULL,
     "unitPriceUSD" DECIMAL(18,4) NOT NULL,
+    "costAmountSYP" DECIMAL(18,4) NOT NULL,
 
     CONSTRAINT "InvoiceItem_pkey" PRIMARY KEY ("id")
 );
@@ -305,6 +325,9 @@ CREATE TABLE "StockAdjustment" (
     "id" TEXT NOT NULL,
     "tenantId" TEXT NOT NULL,
     "batchId" TEXT NOT NULL,
+    "productId" TEXT NOT NULL,
+    "unitId" TEXT NOT NULL,
+    "batchNumber" TEXT NOT NULL,
     "adjustedByUserId" TEXT NOT NULL,
     "quantityDelta" DECIMAL(18,4) NOT NULL,
     "reason" TEXT NOT NULL,
@@ -322,6 +345,7 @@ CREATE TABLE "BatchDeletionLog" (
     "unitId" TEXT NOT NULL,
     "batchNumber" TEXT NOT NULL,
     "quantityAtDeletion" DECIMAL(18,4) NOT NULL,
+    "costPriceAtDeletion" DECIMAL(18,8) NOT NULL,
     "deletedByUserId" TEXT NOT NULL,
     "reason" TEXT NOT NULL,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -341,6 +365,20 @@ CREATE TABLE "BaseUnitChangeLog" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "BaseUnitChangeLog_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "CostPriceChangeLog" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "batchId" TEXT NOT NULL,
+    "oldCostPrice" DECIMAL(18,8) NOT NULL,
+    "newCostPrice" DECIMAL(18,8) NOT NULL,
+    "changedByUserId" TEXT NOT NULL,
+    "reason" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "CostPriceChangeLog_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateIndex
@@ -374,7 +412,10 @@ CREATE INDEX "ProductUnit_productId_idx" ON "ProductUnit"("productId");
 CREATE INDEX "ProductUnit_tenantId_isActive_idx" ON "ProductUnit"("tenantId", "isActive");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "ProductUnit_tenantId_barcode_key" ON "ProductUnit"("tenantId", "barcode");
+CREATE INDEX "ProductUnitBarcode_tenantId_unitId_idx" ON "ProductUnitBarcode"("tenantId", "unitId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProductUnitBarcode_tenantId_barcode_key" ON "ProductUnitBarcode"("tenantId", "barcode");
 
 -- CreateIndex
 CREATE INDEX "ProductBatch_tenantId_idx" ON "ProductBatch"("tenantId");
@@ -413,13 +454,13 @@ CREATE UNIQUE INDEX "VerifiedRetailer_phone_key" ON "VerifiedRetailer"("phone");
 CREATE INDEX "VerifiedRetailer_phone_idx" ON "VerifiedRetailer"("phone");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "ProductCatalogEntry_barcode_key" ON "ProductCatalogEntry"("barcode");
-
--- CreateIndex
-CREATE INDEX "ProductCatalogEntry_barcode_idx" ON "ProductCatalogEntry"("barcode");
-
--- CreateIndex
 CREATE INDEX "ProductCatalogEntry_addedByTenantId_idx" ON "ProductCatalogEntry"("addedByTenantId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProductCatalogEntryBarcode_barcode_key" ON "ProductCatalogEntryBarcode"("barcode");
+
+-- CreateIndex
+CREATE INDEX "ProductCatalogEntryBarcode_catalogEntryId_idx" ON "ProductCatalogEntryBarcode"("catalogEntryId");
 
 -- CreateIndex
 CREATE INDEX "ProductCatalogEntryReport_catalogEntryId_idx" ON "ProductCatalogEntryReport"("catalogEntryId");
@@ -524,6 +565,9 @@ CREATE INDEX "StockAdjustment_tenantId_idx" ON "StockAdjustment"("tenantId");
 CREATE INDEX "StockAdjustment_batchId_idx" ON "StockAdjustment"("batchId");
 
 -- CreateIndex
+CREATE INDEX "StockAdjustment_tenantId_batchId_idx" ON "StockAdjustment"("tenantId", "batchId");
+
+-- CreateIndex
 CREATE INDEX "BatchDeletionLog_tenantId_idx" ON "BatchDeletionLog"("tenantId");
 
 -- CreateIndex
@@ -534,6 +578,15 @@ CREATE INDEX "BaseUnitChangeLog_tenantId_idx" ON "BaseUnitChangeLog"("tenantId")
 
 -- CreateIndex
 CREATE INDEX "BaseUnitChangeLog_productId_idx" ON "BaseUnitChangeLog"("productId");
+
+-- CreateIndex
+CREATE INDEX "CostPriceChangeLog_tenantId_idx" ON "CostPriceChangeLog"("tenantId");
+
+-- CreateIndex
+CREATE INDEX "CostPriceChangeLog_batchId_idx" ON "CostPriceChangeLog"("batchId");
+
+-- CreateIndex
+CREATE INDEX "CostPriceChangeLog_tenantId_batchId_idx" ON "CostPriceChangeLog"("tenantId", "batchId");
 
 -- AddForeignKey
 ALTER TABLE "Tenant" ADD CONSTRAINT "Tenant_systemCustomerId_fkey" FOREIGN KEY ("systemCustomerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -554,6 +607,12 @@ ALTER TABLE "ProductUnit" ADD CONSTRAINT "ProductUnit_tenantId_fkey" FOREIGN KEY
 ALTER TABLE "ProductUnit" ADD CONSTRAINT "ProductUnit_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "ProductUnitBarcode" ADD CONSTRAINT "ProductUnitBarcode_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductUnitBarcode" ADD CONSTRAINT "ProductUnitBarcode_unitId_fkey" FOREIGN KEY ("unitId") REFERENCES "ProductUnit"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -564,6 +623,9 @@ ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_unitId_fkey" FOREIGN KEY
 
 -- AddForeignKey
 ALTER TABLE "Customer" ADD CONSTRAINT "Customer_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductCatalogEntryBarcode" ADD CONSTRAINT "ProductCatalogEntryBarcode_catalogEntryId_fkey" FOREIGN KEY ("catalogEntryId") REFERENCES "ProductCatalogEntry"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "ProductCatalogEntryReport" ADD CONSTRAINT "ProductCatalogEntryReport_catalogEntryId_fkey" FOREIGN KEY ("catalogEntryId") REFERENCES "ProductCatalogEntry"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -653,9 +715,6 @@ ALTER TABLE "CustomerMergeLogItem" ADD CONSTRAINT "CustomerMergeLogItem_mergeLog
 ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_batchId_fkey" FOREIGN KEY ("batchId") REFERENCES "ProductBatch"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-
--- AddForeignKey
 ALTER TABLE "StockAdjustment" ADD CONSTRAINT "StockAdjustment_adjustedByUserId_fkey" FOREIGN KEY ("adjustedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -678,3 +737,9 @@ ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_newBaseUnitId_
 
 -- AddForeignKey
 ALTER TABLE "BaseUnitChangeLog" ADD CONSTRAINT "BaseUnitChangeLog_changedByUserId_fkey" FOREIGN KEY ("changedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CostPriceChangeLog" ADD CONSTRAINT "CostPriceChangeLog_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CostPriceChangeLog" ADD CONSTRAINT "CostPriceChangeLog_changedByUserId_fkey" FOREIGN KEY ("changedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

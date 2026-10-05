@@ -399,6 +399,13 @@ export async function PATCH(
         unitPriceUSD: string;
         quantitySold: string;
         deductQtyInBaseUnit: string;
+        // [v4.4, T4g] Frozen cost basis for this invoice line:
+        //   multiplyMoney(allocatedQty, batch.costPricePerBaseUnit)
+        // Computed HERE, once, from the cost read off the same locked batch
+        // row the deduction below applies to — never re-derived on read, so
+        // a later cost correction cannot change an approved order's profit
+        // (the same freezing principle as exchangeRateUsed).
+        costAmountSYP: string;
       }
       const resolvedAllocations: ResolvedAllocation[] = [];
 
@@ -444,6 +451,8 @@ export async function PATCH(
             // distinct from the base-unit figure applied to the batch.
             quantitySold: fromBaseUnit(alloc.allocatedQty, soldUnitFactor).toFixed(4),
             deductQtyInBaseUnit: alloc.allocatedQty,
+            // [v4.4, T4g] Frozen here, once — see the interface note.
+            costAmountSYP: multiplyMoney(alloc.allocatedQty, alloc.costPricePerBaseUnit),
           });
         }
 
@@ -460,6 +469,9 @@ export async function PATCH(
             unitPriceUSD,
             quantitySold: fromBaseUnit(resolution.remainingQty, soldUnitFactor).toFixed(4),
             deductQtyInBaseUnit: resolution.remainingQty,
+            // [v4.4, T4g] Drawn against the SAME last batch, so it uses that
+            // batch's own cost per base unit.
+            costAmountSYP: multiplyMoney(resolution.remainingQty, last.costPricePerBaseUnit),
           });
         }
       }
@@ -498,6 +510,9 @@ export async function PATCH(
             quantity: alloc.quantitySold,
             unitPriceSYP: alloc.unitPriceSYP,
             unitPriceUSD: alloc.unitPriceUSD,
+            // [v4.4, T4g] REQUIRED, non-nullable — the frozen cost basis for
+            // this line. See ResolvedAllocation's note above.
+            costAmountSYP: alloc.costAmountSYP,
           },
         });
       }

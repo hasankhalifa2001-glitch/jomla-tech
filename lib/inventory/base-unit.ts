@@ -8,47 +8,66 @@
  * DIRECTLY — see lib/data/products.ts's header for the model-level
  * rationale, and eslint.config.mjs's per-file override block for this file.
  *
+ * [v4.5] This file is ALSO now permitted to call `tx.productUnitBarcode.*`
+ * — a NARROW, documented exception to lib/data/products.ts's "sole
+ * sanctioned caller" rule for that model, mirroring the existing
+ * per-file override this file already has for tx.product./tx.productUnit.*.
+ * The ONLY call site that needs it is resetProductUnits()'s barcode
+ * cleanup below — everywhere else, barcode reads / writes still go through
+ * lib/data/products.ts's dedicated functions
+ * (listBarcodesForUnit / createUnitBarcode / deleteUnitBarcode).
+ * eslint.config.mjs's per-file rule override for this file carries the matching
+ * productUnitBarcode ban-lift too — see that file's
+ * PRODUCT_UNIT_BARCODE_MODEL_RULES note for the exact entry. That override
+ * already exists; it is not a pending task.
+ *
  * This file never names `.conversionFactor` as a literal object key or
  * MemberExpression property either — see lib/inventory/units.ts's header.
  * Wherever this file needs to WRITE a conversionFactor value, it spreads
  * units.ts's buildConversionFactorField().
  *
  * [FIX — tx type] Every function below now takes `TenantTransactionClient`
- * (imported from lib/db/tenant-scope.ts, the single place that derives it
- * from getTenantDb()'s real $transaction signature) instead of a
- * hand-defined union or the raw `Prisma.TransactionClient`. See
- * tenant-scope.ts's header for why those are NOT structurally identical
- * in this codebase.
+ * (imported from lib/db/tenant-scope.ts, the single place that derives it from
+ * getTenantDb()'s real $transaction signature) instead of a hand-defined union
+ * or the raw `Prisma.TransactionClient`. See tenant-scope.ts's header for why
+ * those are NOT structurally identical in this codebase.
  *
- * [FIX — BaseUnitLockedError] `assertBaseUnitMutable()` previously threw a
- * plain `Error` with a specific message, and callers (the PATCH route)
- * detected it via brittle string-matching (`error.message.includes(...)`).
+ * [FIX — BaseUnitLockedError]`assertBaseUnitMutable()` previously threw a
+    * plain`Error` with a specific message, and callers(the PATCH route)
+        * detected it via brittle string - matching(`error.message.includes(...)`).
  * A future wording change to that message would have silently broken the
- * route's friendly-error mapping with no compile-time warning. Replaced
- * with a dedicated `BaseUnitLockedError` class, matching the pattern
- * `MissingBaseUnitError`/`PendingB2BReferenceError` already use — callers
- * now do `error instanceof BaseUnitLockedError`, immune to message wording.
+    * route's friendly-error mapping with no compile-time warning. Replaced
+        * with a dedicated `BaseUnitLockedError` class, matching the pattern
+            * `MissingBaseUnitError` / `PendingB2BReferenceError` already use — callers
+                * now do `error instanceof BaseUnitLockedError`, immune to message wording.
  *
  * [FIX — UnitNotBelongingToProductError wired up] This class was
  * previously defined at the bottom of the file but never actually thrown
- * — `commitBaseUnitLink()` and `updateNonBaseUnitConversionFactor()` both
- * still raised a plain `Error` for the exact "this unit belongs to a
- * different product" situation the class exists to describe, leaving
- * callers with the same brittle string-matching problem
- * `BaseUnitLockedError` was introduced to solve elsewhere in this file.
+    * — `commitBaseUnitLink()` and `updateNonBaseUnitConversionFactor()` both
+        * still raised a plain `Error` for the exact "this unit belongs to a
+            * different product" situation the class exists to describe, leaving
+                * callers with the same brittle string - matching problem
+                    * `BaseUnitLockedError` was introduced to solve elsewhere in this file.
  * Both call sites now throw `UnitNotBelongingToProductError` instead.
  *
- * [FIX — resetProductUnits() clears barcode/barcodeSource on soft-delete]
- * `ProductUnit` carries `@@unique([tenantId, barcode])` — a DB-level
- * constraint that does NOT distinguish active from inactive rows.
- * Previously, deactivating a product's units here left their `barcode`
- * value in place, which would permanently block any FUTURE unit on this
- * product (including a corrected base unit that legitimately reuses the
- * same physical barcode) from ever using that value again — failing with
- * a raw P2002 the caller has no clean way to explain. Fixed: the
- * soft-delete step now also clears `barcode`/`barcodeSource` to null. A
- * barcode reattached later goes through T3a's confirmation modal fresh,
- * consistent with that flow's existing rule for any changed barcode.
+ * [v4.5, supersedes the previous "resetProductUnits() clears
+        * barcode / barcodeSource" fix below] ProductUnit.barcode/barcodeSource no
+        * longer exist as scalar fields — barcodes now live in the separate,
+ * hard - deletable ProductUnitBarcode model(schema.prisma's [v4.5] note).
+            * The REASONING behind the original fix is unchanged and, if anything,
+ * more clearly correct now: `ProductUnitBarcode`'s `@@unique([tenantId,
+    * barcode])` still does not distinguish active from inactive parent
+ * units, so leaving a deactivated unit's barcode rows in place would
+ * permanently block any FUTURE unit on this product (including a
+ * corrected base unit legitimately reusing the same physical barcode)
+ * from ever using that value again. Since ProductUnitBarcode rows are
+ * ALWAYS safe to hard-delete (InvoiceItem/B2BOrderRequestItem key off
+ * unitId, never off a barcode row — see schema.prisma's [v4.5] note),
+ * resetProductUnits() below now issues a genuine `deleteMany` against
+ * ProductUnitBarcode for every unit being deactivated, rather than
+ * zeroing out two scalar fields that no longer exist. A barcode
+ * reattached later to any unit goes through T3a's confirmation modal
+ * fresh, exactly as before.
  *
  * ============================================================================
  * [Earlier, still-active fix] `resetProductUnits()` previously called
@@ -72,6 +91,7 @@ import {
     isReservedBaseUnitFactor,
     toDisplayUnits,
     type DisplayUnit,
+    type ProductUnitWithBarcodes,
 } from "@/lib/inventory/units";
 
 export type { TenantTransactionClient, TxOrClient };
@@ -79,9 +99,9 @@ export type { TenantTransactionClient, TxOrClient };
 export class MissingBaseUnitError extends Error {
     constructor(productId: string) {
         super(
-            `Product ${productId} has no baseUnitId (or its baseUnit relation ` +
-            `could not be resolved). This should be structurally impossible ` +
-            `outside the create-transaction window — treat this as a data ` +
+            `Product ${productId} has no baseUnitId(or its baseUnit relation` +
+            `could not be resolved).This should be structurally impossible ` +
+            `outside the create - transaction window — treat this as a data ` +
             `integrity bug, never as a null case to silently route around. ` +
             `Do not catch this error and fall back to a default/first unit — ` +
             `surface it, fix the underlying product row, or block the ` +
@@ -113,10 +133,10 @@ export class BaseUnitLockedError extends Error {
  * Thrown by resetProductUnits() when the product has at least one
  * still-pending (PENDING_REVIEW) B2BOrderRequestItem referencing one of
  * its units. A BUSINESS-level guard, not an FK-safety one — since
- * resetProductUnits() no longer deletes any row, nothing here prevents a
- * database-level error. The reason to still block the reset is UX/data
- * coherence — an admin shouldn't have units change out from under a
- * pending retailer decision. APPROVED/REJECTED orders are exempt.
+ * resetProductUnits() no longer deletes any ProductUnit row, nothing here
+ * prevents a database-level error. The reason to still block the reset
+ * is UX/data coherence — an admin shouldn't have units change out from
+ * under a pending retailer decision. APPROVED/REJECTED orders are exempt.
  */
 export class PendingB2BReferenceError extends Error {
     constructor(productId: string, pendingOrderCount: number) {
@@ -220,9 +240,13 @@ export interface DisplayUnitWithBaseFlag extends DisplayUnit {
  * Product-plus-units result and returns the same object with
  * `baseUnitId` stripped and `units` replaced by
  * DisplayUnitWithBaseFlag[] (each unit's `isBaseUnit` precomputed).
+ *
+ * [v4.5] `units` is now typed as `ProductUnitWithBarcodes[]` — the caller
+ * (lib/data/products.ts) must `include: { units: { include: { barcodes:
+ * {...} } } }` before passing its result here, or this fails to compile.
  */
 export function toSafeProductWithUnits<
-    T extends { baseUnitId: string | null; units: ProductUnit[] }
+    T extends { baseUnitId: string | null; units: ProductUnitWithBarcodes[] }
 >(product: T): Omit<T, "baseUnitId" | "units"> & { units: DisplayUnitWithBaseFlag[] } {
     const { baseUnitId, units, ...rest } = product;
     const annotatedUnits: DisplayUnitWithBaseFlag[] = toDisplayUnits(units).map((u) => ({
@@ -331,21 +355,29 @@ export async function commitBaseUnitLink(
  *      current unit (assertNoPendingB2BReferences).
  *
  * Writes, in one transaction (per T1's nested-write rule):
- *   1. Deactivates every existing ProductUnit for this product
- *      (isActive: false), also clearing barcode/barcodeSource — see the
- *      file-header FIX note on why the barcode clear is required.
- *   2. Creates the new base ProductUnit (conversionFactor forced to "1").
- *   3. Links it via commitBaseUnitLink().
- *   4. Writes one BaseUnitChangeLog row — never a silent reset.
+ *   1. Hard-deletes every ProductUnitBarcode row belonging to any
+ *      existing unit of this product — see the file-header [v4.5] note
+ *      on why this must be a real delete, not a scalar reset, and why
+ *      this function is one of the narrow, documented exceptions
+ *      permitted to call tx.productUnitBarcode.* directly.
+ *   2. Deactivates every existing ProductUnit for this product
+ *      (isActive: false) — no barcode fields to clear on this model
+ *      anymore, since they no longer live here.
+ *   3. Creates the new base ProductUnit (conversionFactor forced to "1").
+ *   4. Links it via commitBaseUnitLink().
+ *   5. Writes one BaseUnitChangeLog row — never a silent reset.
  *
- * Callers whose product may currently be published (isPublic: true) MUST
- * separately force isPublic to false in the SAME transaction — this
- * function has no opinion on publishing state.
+ * [v4.6] The product image lives on Product, so a base-unit reset no longer
+ * invalidates publishing the way it did when the image lived on the unit: this
+ * function no longer requires the caller to force isPublic to false. The caller
+ * still owns publishing state; products/[id]/route.ts re-runs
+ * checkProductPublishable() after a reset and rejects only if the product would
+ * not still qualify.
  *
  * This function never accepts a barcode/barcodeSource for the new base
- * unit — a barcode is only ever attached afterward, through the
- * dedicated per-unit edit flow that triggers T3a's confirmation modal,
- * never bundled into a base-unit reset.
+ * unit — a barcode is only ever attached afterward, through
+ * lib/data/products.ts's createUnitBarcode(), which triggers T3a's
+ * confirmation modal, never bundled into a base-unit reset.
  *
  * @throws {BaseUnitLockedError} via assertBaseUnitMutable if the product
  *   already has at least one ProductBatch.
@@ -362,8 +394,6 @@ export async function resetProductUnits(
             unitName: string;
             pricingCurrency: "SYP" | "USD";
             priceWholesale: string;
-            priceRetail?: string | null;
-            imageUrl?: string | null;
         };
         changedByUserId: string;
         reason: string;
@@ -374,14 +404,33 @@ export async function resetProductUnits(
 
     const oldBaseUnit = await requireBaseUnit(tx, params.tenantId, params.productId);
 
-    // [FIX] Soft-delete AND clear barcode/barcodeSource — see the
-    // file-header FIX note. `@@unique([tenantId, barcode])` does not
-    // distinguish active from inactive rows, so leaving the old value in
-    // place would permanently block any future unit on this product from
-    // reusing it.
+    // [v4.5] Hard-delete every barcode row belonging to any unit currently
+    // on this product, BEFORE deactivating the units themselves — see the
+    // file-header [v4.5] note for why this must be a genuine delete
+    // (ProductUnitBarcode's `@@unique([tenantId, barcode])` does not
+    // distinguish active from inactive parent units, and these rows are
+    // always safe to hard-delete regardless of sales history, since
+    // InvoiceItem/B2BOrderRequestItem key off unitId, never off a barcode
+    // row).
+    const existingUnits = await tx.productUnit.findMany({
+        where: { productId: params.productId, tenantId: params.tenantId },
+        select: { id: true },
+    });
+    if (existingUnits.length > 0) {
+        await tx.productUnitBarcode.deleteMany({
+            where: {
+                tenantId: params.tenantId,
+                unitId: { in: existingUnits.map((u) => u.id) },
+            },
+        });
+    }
+
+    // [v4.5] No longer clears barcode/barcodeSource here — those fields
+    // don't exist on ProductUnit anymore; their equivalent cleanup is the
+    // deleteMany above.
     await tx.productUnit.updateMany({
         where: { productId: params.productId, tenantId: params.tenantId },
-        data: { isActive: false, barcode: null, barcodeSource: null },
+        data: { isActive: false },
     });
 
     const newBaseUnit = await tx.productUnit.create({
@@ -392,8 +441,6 @@ export async function resetProductUnits(
             ...buildConversionFactorField(BASE_UNIT_CONVERSION_FACTOR),
             pricingCurrency: params.newBaseUnit.pricingCurrency,
             priceWholesale: params.newBaseUnit.priceWholesale,
-            priceRetail: params.newBaseUnit.priceRetail ?? null,
-            imageUrl: params.newBaseUnit.imageUrl ?? null,
             isActive: true,
         },
     });
@@ -429,6 +476,8 @@ export async function resetProductUnits(
  * unit is the base goes through resetProductUnits() instead.
  *
  * No BaseUnitChangeLog entry — this never changes Product.baseUnitId.
+ * Never touches barcode data — this function only ever changes
+ * conversionFactor.
  *
  * The final write is scoped by BOTH `id` and `tenantId`.
  *

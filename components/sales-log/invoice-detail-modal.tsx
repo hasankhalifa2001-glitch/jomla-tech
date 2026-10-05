@@ -116,6 +116,14 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
                                         (≈ ${formatMoney(lineUSD, "USD")})
                                     </span>
                                 </p>
+                                {/* [v4.4, T4c2] ADMIN-only profit display. When the
+                                    caller is a CASHIER, `item.profitSYP` is undefined
+                                    because the server excluded the key entirely. */}
+                                {item.profitSYP !== undefined && (
+                                    <p className="font-mono text-[10px] text-emerald-700 dark:text-emerald-400">
+                                        الربح: {formatMoney(item.profitSYP, "SYP")} ل.س
+                                    </p>
+                                )}
                             </div>
                         </div>
                     );
@@ -312,6 +320,18 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                                     </span>
                                 </div>
                             </div>
+
+                            {/* [v4.4, T4c2] ADMIN-only total invoice profit in SYP */}
+                            {detail.totalProfitSYP !== undefined && (
+                                <div className="flex items-center justify-between rounded bg-emerald-50/60 px-2 py-1 dark:bg-emerald-950/20">
+                                    <span className="font-semibold text-emerald-800 dark:text-emerald-300">
+                                        إجمالي ربح الفاتورة
+                                    </span>
+                                    <span className="font-mono text-xs font-bold text-emerald-700 dark:text-emerald-400">
+                                        {formatMoney(detail.totalProfitSYP, "SYP")} ل.س
+                                    </span>
+                                </div>
+                            )}
 
                             <div className="flex items-center justify-between">
                                 <span className="text-zinc-500">المبلغ المدفوع</span>

@@ -17,14 +17,15 @@ import {
   Minus,
   User,
   AlertTriangle,
+  Info,
   UserPlus,
   CreditCard,
-  Tag,
 } from "lucide-react";
 import {
   calculateCartTotals,
   resolveUnitPriceSYP,
   isSystemCashCustomer,
+  cartNeedsExchangeRate,
   type CartLineItem,
   type SelectedCustomer,
 } from "@/lib/offline";
@@ -82,6 +83,15 @@ export function CartPanel({
   const isRateMissing =
     exchangeRate === null || compareMoney(exchangeRate, 0) <= 0;
   const isCartEmpty = items.length === 0;
+
+  // [T4b FIX] A missing exchange rate is only a BLOCKER when the cart
+  // actually contains a USD-priced unit (the one case where a SYP figure
+  // cannot be computed without a rate). A SYP-only cart never needs a
+  // rate. Previously `isRateMissing` alone drove the red banner AND the
+  // disabled checkout button, blocking every sale on a tenant that had
+  // not yet entered a rate, even for SYP-only carts — contradicting T4b.
+  const rateRequired = useMemo(() => cartNeedsExchangeRate(items), [items]);
+  const isRateBlocking = rateRequired && isRateMissing;
 
   // [v3.6] Map item IDs to their calculated line totals for fast lookup.
   // `syp` is authoritative (never null); `usd` is derived/display-only
@@ -197,32 +207,23 @@ export function CartPanel({
                 key={item.id}
                 className="rounded-xl border border-zinc-200 bg-white p-3 space-y-2 dark:border-zinc-800 dark:bg-zinc-900/90 shadow-2xs hover:border-zinc-300 dark:hover:border-zinc-700 transition-colors"
               >
-                {/* Top Row: Name, Wholesale/Retail Prices, and Delete Button */}
+                {/* Top Row: Name, Price, and Delete Button */}
                 <div className="flex items-start justify-between gap-2">
                   <div className="space-y-0.5 truncate flex-1">
                     <p className="text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate">
                       {item.product.name}
                     </p>
                     {/*
-                      [v3.6] FIX — was reading item.unitPriceUSD /
-                      item.priceRetailUSD as the primary, always-present
-                      price. Both are now nullable derived fields on
-                      CartLineItem (pos-service.ts); the always-present,
-                      authoritative fields are unitPriceSYP /
-                      priceRetailSYP. Reading the old fields here would
-                      call formatMoney(null, "USD") and throw the moment
-                      no exchange rate was cached when the item was added.
+                      [v3.6] The always-present, authoritative price is
+                      unitPriceSYP (pos-service.ts); unitPriceUSD is a
+                      nullable derived field, shown only when an exchange
+                      rate was cached. Reading a nullable field as if it
+                      were always present would call formatMoney(null, …).
                     */}
                     <div className="flex items-center gap-2 text-[10px] text-zinc-400">
                       <span className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">
                         سعر الجملة: {formatMoney(item.unitPriceSYP, "SYP")} ل.س
                       </span>
-                      {item.priceRetailSYP && (
-                        <span className="flex items-center gap-0.5 text-zinc-400 line-through decoration-zinc-300">
-                          <Tag className="h-2.5 w-2.5" />
-                          مفرد: {formatMoney(item.priceRetailSYP, "SYP")} ل.س
-                        </span>
-                      )}
                     </div>
                   </div>
 
@@ -243,26 +244,11 @@ export function CartPanel({
                 </div>
 
                 {/*
-                  [FIX — mobile/narrow-column overflow] The previous
-                  markup put the unit Select (fixed w-28), the quantity
-                  stepper, and the line totals all in ONE row. That row's
-                  own minimum width (~310-320px) is right at, or over,
-                  the actual available width in both places this
-                  component renders: the desktop cart column (~35-40% of
-                  a laptop screen) and the mobile drawer (full phone
-                  width minus padding) — on a 320-360px-wide phone,
-                  common for budget Android devices, that row would
-                  genuinely overflow or crush its own contents.
-
-                  Split into two independent rows:
+                  [FIX — mobile/narrow-column overflow] Two independent
+                  rows so neither exceeds ~300px:
                   - Row 1: unit selector (flex-1, can shrink/truncate) +
-                    quantity stepper (shrink-0) — the two things the
-                    cashier actively interacts with.
-                  - Row 2: line totals, right-aligned — informational,
-                    doesn't need to share horizontal space with anything.
-                  Each row's own minimum width is now comfortably under
-                  300px, so this holds up at any realistic container
-                  width this component is used at.
+                    quantity stepper (shrink-0).
+                  - Row 2: line totals, right-aligned.
                 */}
                 <div className="pt-1 border-t border-zinc-100 dark:border-zinc-800 space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
@@ -331,11 +317,9 @@ export function CartPanel({
                   </div>
 
                   {/*
-                    [v3.6] FIX — SYP is now the primary/large line total
-                    (was USD before); USD is the secondary "≈" derived
-                    figure and only rendered when not null (was inverted
-                    before: USD assumed always present, SYP guarded by a
-                    null check).
+                    [v3.6] SYP is the primary/large line total; USD is the
+                    secondary "≈" derived figure and only rendered when
+                    not null.
                   */}
                   <div className="flex items-baseline justify-end gap-2">
                     <p className="text-xs font-extrabold text-emerald-600 dark:text-emerald-400">
@@ -354,17 +338,37 @@ export function CartPanel({
         )}
       </div>
 
-      {/* 3. Exchange Rate Missing Alert (Rate Guard) */}
-      {isRateMissing && (
+      {/*
+        3. Exchange Rate notices.
+        [T4b FIX] Two distinct states instead of one blanket blocker:
+        - isRateBlocking (a USD-priced line is in the cart AND no rate):
+          RED, the sale really is stopped.
+        - rate missing but the cart is SYP-only (or empty): AMBER and
+          informational — SYP sales work normally, only the USD
+          equivalent is unavailable.
+      */}
+      {isRateBlocking && (
         <div className="m-3 p-3 rounded-xl border border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/60 dark:text-red-200 text-xs space-y-1 shrink-0">
           <div className="flex items-center gap-1.5 font-bold">
             <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
-            <span>تنبيه: سعر الصرف اليومي غير محدد! (البيع موقوف)</span>
+            <span>لا يمكن إتمام البيع: سعر الصرف اليومي غير محدد</span>
           </div>
           <p className="text-[11px] leading-relaxed text-red-700 dark:text-red-300">
-            لا يمكن إتمام عملية البيع بدون سعر صرف مخزن في الذاكرة المحلية. يرجى
-            تحديد سعر الصرف أولاً من الشريط العلوي.
+            يوجد في السلة صنف مسعّر بالدولار، ولا يمكن تحويله إلى الليرة بدون
+            سعر صرف. يرجى تحديد سعر الصرف من الشريط العلوي، أو حذف هذا الصنف
+            من السلة.
           </p>
+        </div>
+      )}
+      {isRateMissing && !rateRequired && (
+        <div className="m-3 p-2.5 rounded-xl border border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/50 dark:text-amber-200 text-xs shrink-0">
+          <div className="flex items-start gap-1.5">
+            <Info className="h-4 w-4 text-amber-600 shrink-0 mt-px" />
+            <p className="text-[11px] leading-relaxed">
+              سعر الصرف غير محدد. البيع بالليرة السورية متاح بشكل طبيعي، لكن
+              المعادل بالدولار غير متاح. حدّد سعر الصرف من الشريط العلوي لعرضه.
+            </p>
+          </div>
         </div>
       )}
 
@@ -382,13 +386,9 @@ export function CartPanel({
           </div>
 
           {/*
-            [v3.6] FIX — SYP is now the primary "المجموع الإجمالي" row
-            (was labeled "(USD)" and driven by totals.totalUSD before);
-            USD is now the "المعادل" secondary row and correctly guards
-            against totals.totalUSD being null (was inverted before: the
-            old code guarded totals.totalSYP as if IT were the nullable
-            one, when totalUSD — the field it displayed unconditionally —
-            is actually the one that can be null).
+            [v3.6] SYP is the primary "المجموع الإجمالي" row; USD is the
+            "المعادل" secondary row and guards against totals.totalUSD
+            being null (no cached rate).
           */}
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
@@ -428,9 +428,9 @@ export function CartPanel({
 
           <Button
             type="button"
-            disabled={isCartEmpty || isRateMissing}
+            disabled={isCartEmpty || isRateBlocking}
             onClick={onOpenPaymentModal}
-            className={`flex-1 h-11 text-xs font-bold shadow-md rounded-xl transition-all ${isRateMissing
+            className={`flex-1 h-11 text-xs font-bold shadow-md rounded-xl transition-all ${isRateBlocking
               ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
               : "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20"
               }`}
@@ -438,11 +438,11 @@ export function CartPanel({
             <div className="flex items-center justify-between w-full px-1">
               <span className="flex items-center gap-1.5">
                 <CreditCard className="h-4 w-4" />
-                {isRateMissing
-                  ? "البيع موقوف لعدم وجود سعر صرف"
+                {isRateBlocking
+                  ? "يلزم سعر صرف لصنف مسعّر بالدولار"
                   : "إتمام البيع والدفع (F9)"}
               </span>
-              {!isRateMissing && !isCartEmpty && (
+              {!isRateBlocking && !isCartEmpty && (
                 <span className="text-xs font-mono font-extrabold bg-emerald-700/50 px-2 py-0.5 rounded-lg">
                   {formatMoney(totals.totalSYP, "SYP")} ل.س
                 </span>

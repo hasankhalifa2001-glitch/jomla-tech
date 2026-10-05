@@ -53,6 +53,8 @@ export interface InvoiceDetailItem {
     quantity: string;
     unitPriceSYP: string;
     unitPriceUSD: string;
+    /** [v4.4, T4c2] ADMIN-only profit in SYP. Omitted for a CASHIER. */
+    profitSYP?: string;
 }
 
 export interface InvoiceDetail {
@@ -82,6 +84,8 @@ export interface InvoiceDetail {
     user: { id: string; name: string };
     customer: { id: string; name: string; phone: string | null };
     items: InvoiceDetailItem[];
+    /** [v4.4, T4c2] ADMIN-only total invoice profit in SYP. Omitted for a CASHIER. */
+    totalProfitSYP?: string;
 }
 
 /** Minimal shape consumed from the already-existing ADMIN-only GET /api/staff. */

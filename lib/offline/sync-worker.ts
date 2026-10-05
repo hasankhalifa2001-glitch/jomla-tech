@@ -664,7 +664,11 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
     }
   }
 
-  if (summary.syncedInvoices > 0 || summary.syncedPayments > 0) {
+  if (
+    summary.syncedInvoices > 0 ||
+    summary.syncedPayments > 0 ||
+    summary.failedPayments > 0
+  ) {
     try {
       const customerResult = await refreshCustomerCache(scopedTenantId);
       if (!customerResult.ok && customerResult.reason !== "offline") {

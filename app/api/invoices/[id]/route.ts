@@ -50,7 +50,14 @@ export async function GET(
     const db = getTenantDb(tenantId);
 
     try {
-        const invoice = await findInvoiceDetail(db, tenantId, id);
+        // [v4.4, T4c2 / T4g Role Capability Matrix] Cost/profit figures are
+        // strictly ADMIN-only. The server-side guarantee is that a CASHIER's
+        // payload never carries the number in the first place (findInvoiceDetail
+        // leaves them un-selected and omitted when includeProfit is false).
+        const isAdmin = session.user.role === "ADMIN";
+        const invoice = await findInvoiceDetail(db, tenantId, id, {
+            includeProfit: isAdmin,
+        });
 
         if (!invoice) {
             return NextResponse.json(

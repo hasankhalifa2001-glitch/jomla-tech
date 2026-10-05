@@ -49,6 +49,18 @@ export const ROLE_CAPABILITY_MATRIX: Record<AppAction, Record<UserRole, boolean>
     CASHIER: true,
   },
   // /dashboard/inventory (T3) — create/edit products, batches, CSV import, storefront toggle, barcode source
+  //
+  // [v4.4, T4g — Role Capability Matrix's new rows] Three further ADMIN-only
+  // actions ride this SAME capability rather than declaring AppActions of
+  // their own, because their ADMIN/CASHIER truth is identical to it:
+  //   - entering a batch's cost price at creation (every entry path:
+  //     single-batch, the multi-product receipt screen, CSV import),
+  //   - editing an existing batch's cost price (a correction, always logged
+  //     to CostPriceChangeLog),
+  //   - the multi-product batch receipt screen (Section 11) as a whole.
+  // Each backing route calls assertRolePermission(role, "inventory:mutate"),
+  // so a CASHIER's direct API call is rejected with 403 regardless of what
+  // the UI shows.
   "inventory:mutate": {
     ADMIN: true,
     CASHIER: false,

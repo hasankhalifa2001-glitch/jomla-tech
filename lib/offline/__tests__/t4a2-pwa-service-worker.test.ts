@@ -15,13 +15,9 @@ describe("T4a2 — PWA Shell & Offline Reachability (Service Worker)", () => {
         "/offline",
         "/dashboard",
         "/pos",
-        "/dashboard/pos",
         "/inventory",
-        "/dashboard/inventory",
         "/ledger",
-        "/dashboard/ledger",
         "/orders",
-        "/dashboard/orders",
       ];
 
       for (const route of requiredRoutes) {

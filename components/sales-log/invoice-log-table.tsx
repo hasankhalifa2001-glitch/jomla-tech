@@ -21,9 +21,17 @@
  * a void created today almost always reverses an original from an earlier
  * date, i.e. outside the currently filtered window, so the sibling row is
  * usually not on screen at all.
+ *
+ * [v4.4 — visual pass, light mode only] Zebra striping and a clearer hover
+ * tint on desktop rows, larger/clearer mobile cards with a stronger visual
+ * hierarchy (total first, meta second), a softer empty state, a calmer
+ * loading state (no more solitary spinner-and-text — three staged
+ * skeleton rows instead, which reads as "content incoming" rather than
+ * "something is stuck"), and every row/card fades and slides in gently on
+ * first paint. No dark-mode classes: intentionally not on the roadmap yet.
  */
 
-import { Clock, Loader2, Ban, Link2, User } from "lucide-react";
+import { Clock, Loader2, Ban, Link2, User, Receipt } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -72,14 +80,13 @@ function TotalsCell({ row }: { row: InvoiceLogRow }) {
         <div className="flex flex-col text-left md:text-right">
             <span
                 className={cn(
-                    "font-mono text-sm font-extrabold text-zinc-900 dark:text-zinc-100",
-                    row.status === "VOIDED" &&
-                    "text-zinc-500 line-through decoration-red-400 dark:text-zinc-400"
+                    "font-mono text-sm font-extrabold text-zinc-900",
+                    row.status === "VOIDED" && "text-zinc-500 line-through decoration-red-400"
                 )}
             >
                 {formatMoney(row.totalSYP, "SYP")} ل.س
             </span>
-            <span className="text-[11px] font-semibold text-purple-600 dark:text-purple-400">
+            <span className="text-[11px] font-semibold text-purple-600">
                 ≈ ${formatMoney(row.totalUSD, "USD")}
             </span>
         </div>
@@ -109,7 +116,7 @@ function CrossLinks({ row, onOpenDetail }: { row: InvoiceLogRow; onOpenDetail: (
     if (!row.voidsInvoiceId && !row.voidedByInvoiceId) return null;
 
     const chipClass =
-        "inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50/60 px-1.5 py-0.5 text-[10px] font-bold text-red-700 hover:bg-red-100 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300";
+        "inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50/60 px-1.5 py-0.5 text-[10px] font-bold text-red-700 transition-colors hover:bg-red-100";
 
     return (
         <div className="flex flex-wrap items-center gap-1.5">
@@ -165,11 +172,44 @@ function VoidButton({
                 e.stopPropagation();
                 onVoid(row);
             }}
-            className="h-7 gap-1 border-red-200 px-2 text-[11px] font-bold text-red-600 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40"
+            className="h-7 gap-1 border-red-200 px-2 text-[11px] font-bold text-red-600 transition-colors hover:border-red-300 hover:bg-red-50"
         >
             <Ban className="h-3 w-3" />
             <span>إلغاء الفاتورة</span>
         </Button>
+    );
+}
+
+/** Three staged, gently pulsing placeholder rows — reads as "loading content" rather than a bare spinner. */
+function LoadingRows() {
+    return (
+        <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-3">
+            <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold text-zinc-400">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-500" />
+                <span>جارٍ تحميل سجل الفواتير...</span>
+            </div>
+            {[0, 1, 2].map((i) => (
+                <div
+                    key={i}
+                    className="h-14 animate-pulse rounded-lg bg-zinc-100"
+                    style={{ animationDelay: `${i * 120}ms` }}
+                />
+            ))}
+        </div>
+    );
+}
+
+function EmptyState() {
+    return (
+        <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-zinc-300 bg-white py-16 text-center animate-in fade-in duration-300">
+            <div className="grid h-12 w-12 place-items-center rounded-full bg-zinc-100">
+                <Receipt className="h-6 w-6 text-zinc-400" />
+            </div>
+            <div>
+                <p className="text-sm font-bold text-zinc-700">لا توجد فواتير ضمن الفترة المحددة</p>
+                <p className="mt-1 text-xs text-zinc-500">جرّب توسيع نطاق التاريخ أو إزالة الفلاتر.</p>
+            </div>
+        </div>
     );
 }
 
@@ -180,27 +220,8 @@ export function InvoiceLogTable({
     onOpenDetail,
     onVoid,
 }: InvoiceLogTableProps) {
-    if (loading) {
-        return (
-            <div className="flex items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-white py-16 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>جارٍ تحميل سجل الفواتير...</span>
-            </div>
-        );
-    }
-
-    if (rows.length === 0) {
-        return (
-            <div className="rounded-xl border border-dashed border-zinc-300 bg-white py-16 text-center dark:border-zinc-700 dark:bg-zinc-900">
-                <p className="text-sm font-bold text-zinc-700 dark:text-zinc-300">
-                    لا توجد فواتير ضمن الفترة المحددة
-                </p>
-                <p className="mt-1 text-xs text-zinc-500">
-                    جرّب توسيع نطاق التاريخ أو إزالة الفلاتر.
-                </p>
-            </div>
-        );
-    }
+    if (loading) return <LoadingRows />;
+    if (rows.length === 0) return <EmptyState />;
 
     // Whole-row activation, keyboard included. Inner controls (cross-link
     // chips, the void button) stop propagation so they never also open the
@@ -226,9 +247,9 @@ export function InvoiceLogTable({
     return (
         <>
             {/* Desktop / tablet table */}
-            <div className="hidden overflow-x-auto rounded-xl border border-zinc-200 bg-white md:block dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="hidden overflow-x-auto rounded-xl border border-zinc-200 bg-white shadow-sm md:block">
                 <table className="w-full text-right text-xs">
-                    <thead className="border-b border-zinc-200 bg-zinc-50/75 font-bold text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/50 dark:text-zinc-400">
+                    <thead className="border-b border-zinc-200 bg-zinc-50/75 font-bold text-zinc-500">
                         <tr>
                             <th className="px-4 py-3">الوقت</th>
                             <th className="px-4 py-3">مرجع الفاتورة</th>
@@ -239,17 +260,19 @@ export function InvoiceLogTable({
                             <th className="px-4 py-3">إجراءات</th>
                         </tr>
                     </thead>
-                    <tbody className="divide-y divide-zinc-200/60 font-medium dark:divide-zinc-800/60">
-                        {rows.map((row) => (
+                    <tbody className="divide-y divide-zinc-100 font-medium">
+                        {rows.map((row, i) => (
                             <tr
                                 key={row.id}
                                 {...rowHandlers(row)}
                                 className={cn(
-                                    "cursor-pointer transition-colors hover:bg-zinc-50/70 dark:hover:bg-zinc-900/40",
-                                    row.status === "VOIDED" && "bg-red-50/30 dark:bg-red-950/10"
+                                    "cursor-pointer transition-colors duration-150 hover:bg-emerald-50/60 animate-in fade-in slide-in-from-bottom-1",
+                                    i % 2 === 1 && "bg-zinc-50/50",
+                                    row.status === "VOIDED" && "bg-red-50/40 hover:bg-red-50/70"
                                 )}
+                                style={{ animationDelay: `${Math.min(i, 12) * 25}ms`, animationDuration: "250ms" }}
                             >
-                                <td className="whitespace-nowrap px-4 py-3 text-zinc-600 dark:text-zinc-400">
+                                <td className="whitespace-nowrap px-4 py-3 text-zinc-600">
                                     <span className="inline-flex items-center gap-1.5 font-mono">
                                         <Clock className="h-3.5 w-3.5 text-zinc-400" />
                                         {formatRowTime(row.createdAt)}
@@ -258,14 +281,14 @@ export function InvoiceLogTable({
 
                                 <td className="px-4 py-3">
                                     <div className="flex flex-col gap-1">
-                                        <span className="font-mono text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                                        <span className="font-mono text-xs font-bold text-zinc-900">
                                             {invoiceReference(row.id)}
                                         </span>
                                         <CrossLinks row={row} onOpenDetail={onOpenDetail} />
                                     </div>
                                 </td>
 
-                                <td className="whitespace-nowrap px-4 py-3 text-zinc-700 dark:text-zinc-300">
+                                <td className="whitespace-nowrap px-4 py-3 text-zinc-700">
                                     <span className="inline-flex items-center gap-1.5">
                                         <User className="h-3.5 w-3.5 text-zinc-400" />
                                         {row.user.name}
@@ -274,13 +297,11 @@ export function InvoiceLogTable({
 
                                 <td className="px-4 py-3">
                                     <div className="flex flex-col gap-1">
-                                        <span className="font-semibold text-zinc-800 dark:text-zinc-200">
-                                            {row.customer.name}
-                                        </span>
+                                        <span className="font-semibold text-zinc-800">{row.customer.name}</span>
                                         {row.customer.isSystemGenerated && (
                                             <Badge
                                                 variant="secondary"
-                                                className="w-fit bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                                                className="w-fit bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600"
                                             >
                                                 زبون نقدي عام
                                             </Badge>
@@ -307,25 +328,25 @@ export function InvoiceLogTable({
 
             {/* Mobile cards — same data, same actions, no horizontal scroll. */}
             <div className="space-y-3 md:hidden">
-                {rows.map((row) => (
+                {rows.map((row, i) => (
                     <div
                         key={row.id}
                         {...rowHandlers(row)}
                         className={cn(
-                            "cursor-pointer rounded-xl border border-zinc-200 bg-white p-3 transition-colors dark:border-zinc-800 dark:bg-zinc-900",
-                            row.status === "VOIDED" &&
-                            "border-red-200 bg-red-50/30 dark:border-red-900 dark:bg-red-950/10"
+                            "cursor-pointer rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition-all duration-150 active:scale-[0.99] animate-in fade-in slide-in-from-bottom-1",
+                            row.status === "VOIDED" && "border-red-200 bg-red-50/40"
                         )}
+                        style={{ animationDelay: `${Math.min(i, 12) * 30}ms`, animationDuration: "250ms" }}
                     >
                         <div className="flex items-start justify-between gap-2">
                             <div className="flex flex-col gap-1">
-                                <span className="font-mono text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                                <span className="font-mono text-xs font-bold text-zinc-900">
                                     {invoiceReference(row.id)}
                                 </span>
                                 <span className="inline-flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-500">
                                     <Clock className="h-3 w-3" />
                                     {formatRowTime(row.createdAt)}
-                                    <span className="text-zinc-300 dark:text-zinc-700">|</span>
+                                    <span className="text-zinc-300">|</span>
                                     <User className="h-3 w-3" />
                                     {row.user.name}
                                 </span>
@@ -333,25 +354,23 @@ export function InvoiceLogTable({
                             <TotalsCell row={row} />
                         </div>
 
-                        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-600 dark:text-zinc-400">
-                            <span className="font-semibold text-zinc-800 dark:text-zinc-200">
-                                {row.customer.name}
-                            </span>
+                        <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-600">
+                            <span className="font-semibold text-zinc-800">{row.customer.name}</span>
                             {row.customer.isSystemGenerated && (
                                 <Badge
                                     variant="secondary"
-                                    className="bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                                    className="bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600"
                                 >
                                     زبون نقدي عام
                                 </Badge>
                             )}
                         </div>
 
-                        <div className="mt-2">
+                        <div className="mt-2.5">
                             <BadgesCell row={row} />
                         </div>
 
-                        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2.5">
                             <CrossLinks row={row} onOpenDetail={onOpenDetail} />
                             <VoidButton row={row} isAdmin={isAdmin} onVoid={onVoid} />
                         </div>
@@ -361,7 +380,3 @@ export function InvoiceLogTable({
         </>
     );
 }
-
-
-
-

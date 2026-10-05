@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertTriangle, AlertCircle, CheckCircle2 } from "lucide-react";
-import s from "./inventory.module.css";
+import { StatusBadge } from "@/components/inventory/status-badge";
 
 interface ExpiryBadgeProps {
   daysToExpiry: number | null;
@@ -11,13 +11,12 @@ interface ExpiryBadgeProps {
 
 export function ExpiryBadge({ daysToExpiry, expiryDate, status }: ExpiryBadgeProps) {
   if (!expiryDate || daysToExpiry === null) {
-    return <span className={`${s.badge} ${s.badgeSlate}`}>بدون تاريخ انتهاء</span>;
+    return <StatusBadge tone="slate">بدون تاريخ انتهاء</StatusBadge>;
   }
 
   // Targets Syrian Arabic specifically (per the Global UI/UX spec's
-  // Intl.NumberFormat('ar-SY') requirement for currency) — "ar-EG" would
-  // produce Egyptian month names (e.g. "يناير") rather than the Levantine
-  // convention Syrian users expect (e.g. "كانون الثاني").
+  // Intl.NumberFormat('ar-SY') requirement) — "ar-EG" would produce Egyptian
+  // month names rather than the Levantine convention Syrian users expect.
   const formattedDate = new Date(expiryDate).toLocaleDateString("ar-SY", {
     year: "numeric",
     month: "short",
@@ -27,26 +26,28 @@ export function ExpiryBadge({ daysToExpiry, expiryDate, status }: ExpiryBadgePro
   if (status === "RED") {
     const isExpired = daysToExpiry <= 0;
     return (
-      <span className={`${s.badge} ${s.badgeRed}`}>
-        <AlertCircle size={14} aria-hidden />
+      <StatusBadge tone="red">
+        <AlertCircle className="size-3.5" aria-hidden />
         <span>{isExpired ? "منتهي الصلاحية" : `ينتهي خلال ${daysToExpiry} يوم (${formattedDate})`}</span>
-      </span>
+      </StatusBadge>
     );
   }
 
   if (status === "YELLOW") {
     return (
-      <span className={`${s.badge} ${s.badgeAmber}`}>
-        <AlertTriangle size={14} aria-hidden />
-        <span>ينتهي خلال {daysToExpiry} يوم ({formattedDate})</span>
-      </span>
+      <StatusBadge tone="amber">
+        <AlertTriangle className="size-3.5" aria-hidden />
+        <span>
+          ينتهي خلال {daysToExpiry} يوم ({formattedDate})
+        </span>
+      </StatusBadge>
     );
   }
 
   return (
-    <span className={`${s.badge} ${s.badgeGreen}`}>
-      <CheckCircle2 size={14} aria-hidden />
+    <StatusBadge tone="green">
+      <CheckCircle2 className="size-3.5" aria-hidden />
       <span>صالح ({formattedDate})</span>
-    </span>
+    </StatusBadge>
   );
 }

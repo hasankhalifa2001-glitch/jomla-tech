@@ -4,15 +4,27 @@ import { Prisma } from "@prisma/client";
 
 const {
   mockTenant,
+  mockProduct,
   mockProductBatch,
   mockInvoiceItem,
   mockStockAdjustment,
   mockBatchDeletionLog,
+  mockCostPriceChangeLog,
   mockRawPrisma,
   mockSessionState,
 } = vi.hoisted(() => {
   const mockTenant = {
     findUnique: vi.fn(),
+  };
+  // [v4.3 T1/T3c corrigendum] GET /api/inventory/batches/[id] resolves the
+  // product through lib/data/products.ts's findProductById() — the sanctioned
+  // gateway, which reads tx.product.findUnique — never through a nested
+  // `product` relation on the batch query.
+  const mockProduct = {
+    findUnique: vi.fn(),
+    findFirst: vi.fn(),
+    findMany: vi.fn(),
+    update: vi.fn(),
   };
   const mockProductBatch = {
     findFirst: vi.fn(),
@@ -25,22 +37,44 @@ const {
   const mockInvoiceItem = {
     count: vi.fn(),
   };
+  // [v4.3 T1/T3c corrigendum] `count` is here on purpose so a test can assert
+  // the delete path NEVER counts adjustment rows (that count was the silent
+  // second eligibility condition this corrigendum removed), and
+  // delete/deleteMany are here so a test can assert a hard-deleted batch's
+  // StockAdjustment rows are never touched.
   const mockStockAdjustment = {
     count: vi.fn(),
     create: vi.fn(),
     findMany: vi.fn(),
+    delete: vi.fn(),
+    deleteMany: vi.fn(),
   };
   const mockBatchDeletionLog = {
     create: vi.fn(),
     findMany: vi.fn(),
   };
+  // [v4.3 T1/T3c corrigendum — acceptance criteria #5/#6] CostPriceChangeLog
+  // (T4g's audit trail) is the second "snapshot, not live FK" log. Its write
+  // endpoint belongs to T4g; what this file verifies is that a batch holding
+  // such a row is still hard-deletable, and that the row is neither deleted
+  // nor even looked at by the delete path. `create` is wired statefully by the
+  // combined-case test to record the row.
+  const mockCostPriceChangeLog = {
+    create: vi.fn(),
+    count: vi.fn(),
+    findMany: vi.fn(),
+    delete: vi.fn(),
+    deleteMany: vi.fn(),
+  };
 
   const mockRawPrisma: any = {
     tenant: mockTenant,
+    product: mockProduct,
     productBatch: mockProductBatch,
     invoiceItem: mockInvoiceItem,
     stockAdjustment: mockStockAdjustment,
     batchDeletionLog: mockBatchDeletionLog,
+    costPriceChangeLog: mockCostPriceChangeLog,
   };
 
   mockRawPrisma.$transaction = vi.fn(async (cb: (tx: any) => Promise<any>) => cb(mockRawPrisma));
@@ -58,10 +92,12 @@ const {
 
   return {
     mockTenant,
+    mockProduct,
     mockProductBatch,
     mockInvoiceItem,
     mockStockAdjustment,
     mockBatchDeletionLog,
+    mockCostPriceChangeLog,
     mockRawPrisma,
     mockSessionState,
   };
@@ -166,6 +202,10 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(json.adjustment.quantityDelta).toBe(5);
       expect(json.adjustment.reason).toBe("جرد دوري وإضافة النقص");
 
+      // [FIX] The stale `include: { unit: true }` expectation is gone: this
+      // route deliberately never includes the unit relation on the update
+      // (carrying a raw ProductUnit row — conversionFactor included — into the
+      // response was the leak that include used to feed).
       expect(mockProductBatch.update).toHaveBeenCalledWith({
         where: { id: "batch-1", tenantId: "tenant-al-baraka" },
         data: {
@@ -173,10 +213,35 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
             increment: "5",
           },
         },
-        include: { unit: true },
       });
 
+      // [v4.3 T1/T3c corrigendum — acceptance criterion #2] The adjustment row
+      // itself carries a snapshot of productId/unitId/batchNumber matching the
+      // batch's values at that instant. There is no live relation to read them
+      // back through anymore, so this snapshot is the only thing keeping the
+      // row meaningful once the batch is hard-deleted.
       expect(mockStockAdjustment.create).toHaveBeenCalledTimes(1);
+      expect(mockStockAdjustment.create).toHaveBeenCalledWith({
+        data: {
+          tenantId: "tenant-al-baraka",
+          batchId: "batch-1",
+          productId: "prod-1",
+          unitId: "unit-1",
+          batchNumber: "B100",
+          adjustedByUserId: "admin-user-id",
+          quantityDelta: "5",
+          reason: "جرد دوري وإضافة النقص",
+        },
+        include: {
+          adjustedByUser: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+            },
+          },
+        },
+      });
     });
 
     it("rejects reconciliation with zero delta or empty reason", async () => {
@@ -228,18 +293,42 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
   });
 
   describe("2. Mistaken Batch Hard Deletion (DELETE /api/inventory/batches/[id])", () => {
-    it("hard-deletes batch with zero sales and zero adjustments, writing a snapshot to BatchDeletionLog", async () => {
-      mockProductBatch.findFirst.mockResolvedValueOnce({
-        id: "batch-err",
-        tenantId: "tenant-al-baraka",
-        productId: "prod-1",
-        unitId: "unit-1",
-        batchNumber: "TYPO-999",
-        quantity: new Prisma.Decimal("10.0000"),
-      });
+    // [v4.3 T1/T3c corrigendum] Zero InvoiceItem references is now the ONE and
+    // ONLY hard-delete eligibility condition. Every fixture below carries a
+    // costPricePerBaseUnit (required by the v4.4 schema and snapshotted into
+    // BatchDeletionLog.costPriceAtDeletion), and the tests differ only in which
+    // *historical* audit rows exist for the batch being deleted.
+    const batchFixture = (overrides: Record<string, unknown> = {}) => ({
+      id: "batch-1",
+      tenantId: "tenant-al-baraka",
+      productId: "prod-1",
+      unitId: "unit-1",
+      batchNumber: "B100",
+      quantity: new Prisma.Decimal("10.0000"),
+      costPricePerBaseUnit: new Prisma.Decimal("5000.0000"),
+      ...overrides,
+    });
+
+    const attemptHardDelete = (id: string, reason: string) =>
+      deleteBatchHandler(
+        new Request(`http://localhost/api/inventory/batches/${id}`, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason }),
+        }),
+        { params: Promise.resolve({ id }) }
+      );
+
+    it("hard-deletes a batch with zero sales, writing a snapshot to BatchDeletionLog", async () => {
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({
+          id: "batch-err",
+          batchNumber: "TYPO-999",
+          quantity: new Prisma.Decimal("10.0000"),
+        })
+      );
 
       mockInvoiceItem.count.mockResolvedValueOnce(0);
-      mockStockAdjustment.count.mockResolvedValueOnce(0);
       mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-1" });
       mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-err" });
 
@@ -265,6 +354,7 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
           unitId: "unit-1",
           batchNumber: "TYPO-999",
           quantityAtDeletion: new Prisma.Decimal("10.0000"),
+          costPriceAtDeletion: new Prisma.Decimal("5000.0000"),
           deletedByUserId: "admin-user-id",
           reason: "تم إدخال الدفعة بالخطأ وبشكل مكرر",
         },
@@ -304,50 +394,358 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(mockBatchDeletionLog.create).not.toHaveBeenCalled();
     });
 
-    it("blocks deletion if batch has StockAdjustment history but zero InvoiceItem references", async () => {
-      mockProductBatch.findFirst.mockResolvedValueOnce({
-        id: "batch-adj-only",
-        tenantId: "tenant-al-baraka",
-        productId: "prod-1",
-        unitId: "unit-1",
-        batchNumber: "B-ADJ",
-        quantity: new Prisma.Decimal("7.0000"),
-      });
+    // ========================================================================
+    // [v4.3 T1/T3c corrigendum — acceptance criteria #1 and #3]
+    //
+    // This test REPLACES the old "blocks deletion if batch has StockAdjustment
+    // history but zero InvoiceItem references" assertion, which encoded the
+    // very bug being fixed: a live `onDelete: Restrict` FK from StockAdjustment
+    // to ProductBatch silently added a second, undocumented eligibility
+    // condition. T3c states exactly one condition — zero InvoiceItem
+    // references — and the API now implements exactly that.
+    // ========================================================================
+    it("hard-deletes a batch with zero InvoiceItem references but a prior StockAdjustment row", async () => {
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({
+          id: "batch-adj-only",
+          batchNumber: "B-ADJ",
+          quantity: new Prisma.Decimal("7.0000"),
+        })
+      );
 
       mockInvoiceItem.count.mockResolvedValueOnce(0);
-      mockStockAdjustment.count.mockResolvedValueOnce(1);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-adj" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-adj-only" });
 
-      const req = new Request("http://localhost/api/inventory/batches/batch-adj-only", {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          reason: "محاولة حذف دفعة خضعت لتسوية سابقة",
-        }),
-      });
+      const res = await attemptHardDelete("batch-adj-only", "حذف دفعة خضعت لتسوية سابقة");
 
-      const res = await deleteBatchHandler(req, {
-        params: Promise.resolve({ id: "batch-adj-only" }),
-      });
-      expect(res.status).toBe(400);
-
+      expect(res.status).toBe(200);
       const json = await res.json();
-      expect(json.error).toBe("CANNOT_DELETE_RECONCILED_BATCH");
-      expect(mockProductBatch.delete).not.toHaveBeenCalled();
-      expect(mockBatchDeletionLog.create).not.toHaveBeenCalled();
+      expect(json.success).toBe(true);
+
+      // The prior reconciliation is irrelevant to eligibility: the delete path
+      // never even counts adjustment rows anymore.
+      expect(mockInvoiceItem.count).toHaveBeenCalledWith({
+        where: { batchId: "batch-adj-only", tenantId: "tenant-al-baraka" },
+      });
+      expect(mockStockAdjustment.count).not.toHaveBeenCalled();
+
+      expect(mockBatchDeletionLog.create).toHaveBeenCalledWith({
+        data: {
+          tenantId: "tenant-al-baraka",
+          batchId: "batch-adj-only",
+          productId: "prod-1",
+          unitId: "unit-1",
+          batchNumber: "B-ADJ",
+          quantityAtDeletion: new Prisma.Decimal("7.0000"),
+          costPriceAtDeletion: new Prisma.Decimal("5000.0000"),
+          deletedByUserId: "admin-user-id",
+          reason: "حذف دفعة خضعت لتسوية سابقة",
+        },
+      });
+
+      expect(mockProductBatch.delete).toHaveBeenCalledWith({
+        where: { id: "batch-adj-only", tenantId: "tenant-al-baraka" },
+      });
+
+      // [criterion #3] The historical adjustment row is neither deleted nor
+      // blocking — nothing in this handler touches it at all. It survives as a
+      // standalone record, queryable by its own (tenantId, batchId) snapshot
+      // fields plus productId/unitId/batchNumber.
+      expect(mockStockAdjustment.delete).not.toHaveBeenCalled();
+      expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
+    });
+
+    // [v4.3 T1/T3c corrigendum — acceptance criterion #1, end-to-end] The
+    // literal acceptance scenario: create a batch, reconcile it once, then
+    // hard-delete it. Both handlers run for real against the same mock, so a
+    // regression in either the write path (missing snapshot fields) or the
+    // delete path (reinstated adjustment guard) fails this test.
+    it("reconcile → hard-delete: a reconciled batch can then be hard-deleted, and its adjustment survives", async () => {
+      const batch = batchFixture({
+        id: "batch-chain",
+        batchNumber: "2026-09-27-CHAIN",
+        quantity: new Prisma.Decimal("-3.0000"),
+      });
+
+      // Step 1 — reconcile once, writing the StockAdjustment row.
+      mockProductBatch.findFirst.mockResolvedValueOnce(batch);
+      mockStockAdjustment.create.mockResolvedValueOnce({
+        id: "adj-chain",
+        tenantId: "tenant-al-baraka",
+        batchId: "batch-chain",
+        productId: "prod-1",
+        unitId: "unit-1",
+        batchNumber: "2026-09-27-CHAIN",
+        adjustedByUserId: "admin-user-id",
+        quantityDelta: new Prisma.Decimal("5.0000"),
+        reason: "جرد دوري وإضافة النقص",
+        createdAt: new Date(),
+        adjustedByUser: { id: "admin-user-id", name: "Admin", email: "admin@baraka.sy" },
+      });
+      mockProductBatch.update.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("2.0000"),
+      });
+
+      const reconcileRes = await reconcileHandler(
+        new Request("http://localhost/api/inventory/batches/batch-chain/reconcile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quantityDelta: "5", reason: "جرد دوري وإضافة النقص" }),
+        }),
+        { params: Promise.resolve({ id: "batch-chain" }) }
+      );
+      expect(reconcileRes.status).toBe(200);
+      expect(mockStockAdjustment.create).toHaveBeenCalledTimes(1);
+
+      // Step 2 — the very same batch now has one StockAdjustment row and still
+      // zero InvoiceItem references, so the hard delete must succeed.
+      mockProductBatch.findFirst.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("2.0000"),
+      });
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-chain" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-chain" });
+
+      const deleteRes = await attemptHardDelete("batch-chain", "الدفعة مسجلة بالخطأ");
+      expect(deleteRes.status).toBe(200);
+      expect((await deleteRes.json()).success).toBe(true);
+
+      expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expect(mockProductBatch.delete).toHaveBeenCalledTimes(1);
+      // The adjustment written in step 1 is left completely alone.
+      expect(mockStockAdjustment.delete).not.toHaveBeenCalled();
+      expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
+    });
+
+    // ========================================================================
+    // [v4.3 T1/T3c corrigendum — acceptance criterion #5] The identical hazard
+    // exists one model over: CostPriceChangeLog. Its batchId was designed as a
+    // plain snapshot field from the start (BatchDeletionLog's precedent), so no
+    // code change is needed here — but the criterion must be proven, not
+    // assumed: a batch whose only history is a cost-price correction deletes
+    // normally, and that log row neither blocks nor disappears.
+    // ========================================================================
+    it("hard-deletes a batch whose only history is a prior CostPriceChangeLog row (ADMIN cost correction)", async () => {
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({
+          id: "batch-cost-only",
+          batchNumber: "B-COST",
+          quantity: new Prisma.Decimal("4.0000"),
+        })
+      );
+
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-cost" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-cost-only" });
+
+      const res = await attemptHardDelete("batch-cost-only", "دفعة مسجلة بالخطأ بعد تصحيح التكلفة");
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).success).toBe(true);
+      expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expect(mockProductBatch.delete).toHaveBeenCalledWith({
+        where: { id: "batch-cost-only", tenantId: "tenant-al-baraka" },
+      });
+
+      // The delete path neither deletes the cost-price audit row nor even
+      // looks at the model: there is no count guard, no existence check, and
+      // no relation left to raise P2003 on.
+      expect(mockCostPriceChangeLog.count).not.toHaveBeenCalled();
+      expect(mockCostPriceChangeLog.findMany).not.toHaveBeenCalled();
+      expect(mockCostPriceChangeLog.delete).not.toHaveBeenCalled();
+      expect(mockCostPriceChangeLog.deleteMany).not.toHaveBeenCalled();
+    });
+
+    // ========================================================================
+    // [v4.3 T1/T3c corrigendum — acceptance criterion #6] The realistic
+    // combined case, in BOTH orders: one reconciliation and one ADMIN
+    // cost-price correction written against the very same batch. Both audit
+    // rows must survive the hard delete, and neither may block it. The
+    // cost-price correction itself is T4g's write path (not built yet), so the
+    // row is recorded through the same mocked model the delete path sees —
+    // statefully, so "the row still exists afterwards" is a real assertion
+    // rather than a mock-arity one.
+    // ========================================================================
+    it("hard-deletes a batch holding BOTH a StockAdjustment and a CostPriceChangeLog row (reconciliation first)", async () => {
+      const batch = batchFixture({
+        id: "batch-combined-a",
+        batchNumber: "2026-09-27-COMBINED-A",
+        quantity: new Prisma.Decimal("8.0000"),
+      });
+      const adjustments: any[] = [];
+      const costPriceLogs: any[] = [];
+
+      // 1. Reconcile once — the real handler, with a stateful mock.
+      mockStockAdjustment.create.mockImplementationOnce(async ({ data }: any) => {
+        const row = {
+          id: "adj-combined-a",
+          createdAt: new Date(),
+          adjustedByUser: { id: "admin-user-id", name: "Admin", email: "admin@baraka.sy" },
+          ...data,
+        };
+        adjustments.push(row);
+        return row;
+      });
+      mockProductBatch.findFirst.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("-1.0000"),
+      });
+      mockProductBatch.update.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("9.0000"),
+      });
+
+      const reconcileRes = await reconcileHandler(
+        new Request("http://localhost/api/inventory/batches/batch-combined-a/reconcile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quantityDelta: "2", reason: "جرد دوري" }),
+        }),
+        { params: Promise.resolve({ id: "batch-combined-a" }) }
+      );
+      expect(reconcileRes.status).toBe(200);
+      expect(adjustments).toHaveLength(1);
+
+      // 2. Correct the cost price once (T4g write path — simulated).
+      mockCostPriceChangeLog.create.mockImplementationOnce(async ({ data }: any) => {
+        const row = { id: "cost-combined-a", createdAt: new Date(), ...data };
+        costPriceLogs.push(row);
+        return row;
+      });
+      await mockRawPrisma.costPriceChangeLog.create({
+        data: {
+          tenantId: "tenant-al-baraka",
+          batchId: "batch-combined-a",
+          oldCostPrice: new Prisma.Decimal("5000.0000"),
+          newCostPrice: new Prisma.Decimal("4500.0000"),
+          changedByUserId: "admin-user-id",
+          reason: "تصحيح سعر التكلفة",
+        },
+      });
+      expect(costPriceLogs).toHaveLength(1);
+
+      // 3. Zero InvoiceItem references — the delete must succeed, with one
+      //    BatchDeletionLog row written as usual.
+      mockProductBatch.findFirst.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("9.0000"),
+      });
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-combined-a" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-combined-a" });
+
+      const res = await attemptHardDelete(
+        "batch-combined-a",
+        "دفعة مسجلة بالخطأ رغم التسوية وتصحيح التكلفة"
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).success).toBe(true);
+
+      // Both historical rows survive, untouched, still keyed to the deleted
+      // batch by their snapshot batchId.
+      expect(adjustments).toHaveLength(1);
+      expect(costPriceLogs).toHaveLength(1);
+      expect(adjustments[0].batchId).toBe("batch-combined-a");
+      expect(costPriceLogs[0].batchId).toBe("batch-combined-a");
+
+      expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expect(mockStockAdjustment.delete).not.toHaveBeenCalled();
+      expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
+      expect(mockCostPriceChangeLog.delete).not.toHaveBeenCalled();
+      expect(mockCostPriceChangeLog.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it("hard-deletes a batch holding BOTH rows written in the opposite order (cost correction first)", async () => {
+      const batch = batchFixture({
+        id: "batch-combined-b",
+        batchNumber: "2026-09-27-COMBINED-B",
+        quantity: new Prisma.Decimal("6.0000"),
+      });
+      const adjustments: any[] = [];
+      const costPriceLogs: any[] = [];
+
+      // 1. Cost-price correction first (T4g write path — simulated).
+      mockCostPriceChangeLog.create.mockImplementationOnce(async ({ data }: any) => {
+        const row = { id: "cost-combined-b", createdAt: new Date(), ...data };
+        costPriceLogs.push(row);
+        return row;
+      });
+      await mockRawPrisma.costPriceChangeLog.create({
+        data: {
+          tenantId: "tenant-al-baraka",
+          batchId: "batch-combined-b",
+          oldCostPrice: new Prisma.Decimal("5000.0000"),
+          newCostPrice: new Prisma.Decimal("5200.0000"),
+          changedByUserId: "admin-user-id",
+          reason: "تصحيح سعر التكلفة",
+        },
+      });
+
+      // 2. Then a reconciliation — the real handler.
+      mockStockAdjustment.create.mockImplementationOnce(async ({ data }: any) => {
+        const row = {
+          id: "adj-combined-b",
+          createdAt: new Date(),
+          adjustedByUser: { id: "admin-user-id", name: "Admin", email: "admin@baraka.sy" },
+          ...data,
+        };
+        adjustments.push(row);
+        return row;
+      });
+      mockProductBatch.findFirst.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("1.0000"),
+      });
+      mockProductBatch.update.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("3.0000"),
+      });
+
+      const reconcileRes = await reconcileHandler(
+        new Request("http://localhost/api/inventory/batches/batch-combined-b/reconcile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quantityDelta: "2", reason: "تسوية عجز" }),
+        }),
+        { params: Promise.resolve({ id: "batch-combined-b" }) }
+      );
+      expect(reconcileRes.status).toBe(200);
+      expect(adjustments).toHaveLength(1);
+      expect(costPriceLogs).toHaveLength(1);
+
+      // 3. Delete.
+      mockProductBatch.findFirst.mockResolvedValueOnce({
+        ...batch,
+        quantity: new Prisma.Decimal("3.0000"),
+      });
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-combined-b" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-combined-b" });
+
+      const res = await attemptHardDelete("batch-combined-b", "الدفعة مسجلة بالخطأ");
+      expect(res.status).toBe(200);
+      expect((await res.json()).success).toBe(true);
+
+      expect(adjustments).toHaveLength(1);
+      expect(costPriceLogs).toHaveLength(1);
+      expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
+      expect(mockCostPriceChangeLog.deleteMany).not.toHaveBeenCalled();
     });
 
     it("catches Prisma P2003 foreign-key violation cleanly without leaking internal error", async () => {
-      mockProductBatch.findFirst.mockResolvedValueOnce({
-        id: "batch-fk",
-        tenantId: "tenant-al-baraka",
-        productId: "prod-1",
-        unitId: "unit-1",
-        batchNumber: "B-FK",
-        quantity: new Prisma.Decimal("5.0000"),
-      });
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({
+          id: "batch-fk",
+          batchNumber: "B-FK",
+          quantity: new Prisma.Decimal("5.0000"),
+        })
+      );
 
       mockInvoiceItem.count.mockResolvedValueOnce(0);
-      mockStockAdjustment.count.mockResolvedValueOnce(0);
       mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-fk" });
 
       const p2003Error = new Prisma.PrismaClientKnownRequestError(
@@ -392,18 +790,24 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
   });
 
   describe("3. Direct Non-Quantity Batch Edit (PATCH /api/inventory/batches/[id])", () => {
-    it("updates batchNumber and expiryDate for ADMIN", async () => {
+    it("updates batchNumberSuffix and expiryDate for ADMIN", async () => {
       mockProductBatch.findFirst.mockResolvedValueOnce({
         id: "batch-1",
         tenantId: "tenant-al-baraka",
+        batchNumber: "2026-09-27-OLD",
+        // [Batch cost entry] ProductBatch.costPricePerBaseUnit is REQUIRED
+        // (non-nullable) — the PATCH response now serializes it, so the
+        // fixture must carry a real value.
+        costPricePerBaseUnit: new Prisma.Decimal("5000.0000"),
       });
 
       mockProductBatch.update.mockResolvedValueOnce({
         id: "batch-1",
         tenantId: "tenant-al-baraka",
-        batchNumber: "BATCH-CORRECTED-2026",
+        batchNumber: "2026-09-27-CORRECTED",
         expiryDate: new Date("2026-12-31"),
         quantity: new Prisma.Decimal("15.0000"),
+        costPricePerBaseUnit: new Prisma.Decimal("5000.0000"),
         unit: { unitName: "قطعة" },
       });
 
@@ -411,7 +815,7 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          batchNumber: "BATCH-CORRECTED-2026",
+          batchNumberSuffix: "CORRECTED",
           expiryDate: "2026-12-31",
         }),
       });
@@ -421,7 +825,7 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
 
       const json = await res.json();
       expect(json.success).toBe(true);
-      expect(json.batch.batchNumber).toBe("BATCH-CORRECTED-2026");
+      expect(json.batch.batchNumber).toBe("2026-09-27-CORRECTED");
     });
 
     it("explicitly blocks direct edits to quantity (must use reconciliation)", async () => {
@@ -461,30 +865,45 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
   describe("4. Batch Detail Query (GET /api/inventory/batches/[id])", () => {
     it("returns live batch quantity, expiry badges, and full adjustment history", async () => {
       mockProductBatch.findFirst.mockResolvedValueOnce({
+        // [v4.3 T1/T3c corrigendum] No `adjustments` relation and no
+        // `_count.adjustments` on the batch query anymore — the history is read
+        // separately through StockAdjustment's plain snapshot (tenantId,
+        // batchId) pair (mocked below), and the count is derived from its
+        // length.
         id: "batch-1",
         tenantId: "tenant-al-baraka",
         productId: "prod-1",
         unitId: "unit-1",
         batchNumber: "B100",
         quantity: new Prisma.Decimal("12.0000"),
+        // [Batch cost entry] REQUIRED (non-nullable) — the ADMIN batch-detail
+        // payload serializes it via .toString().
+        costPricePerBaseUnit: new Prisma.Decimal("1500.00000000"),
         expiryDate: new Date(Date.now() + 15 * 24 * 60 * 60 * 1000),
         createdAt: new Date(),
         unit: { unitName: "كرتونة" },
-        product: { id: "prod-1", name: "أرز بسمتي", category: "مواد غذائية" },
-        adjustments: [
-          {
-            id: "adj-1",
-            quantityDelta: new Prisma.Decimal("2.0000"),
-            reason: "تسوية عجز",
-            createdAt: new Date(),
-            adjustedByUser: { id: "u1", name: "سامر", email: "samer@baraka.sy" },
-          },
-        ],
-        _count: {
-          invoiceItems: 0,
-          adjustments: 1,
-        },
+        _count: { invoiceItems: 0 },
       });
+
+      // findProductById() (lib/data/products.ts) is the sanctioned gateway and
+      // reads tx.product.findUnique — it is a REAL module here (not mocked), so
+      // the `product` model must exist on the Prisma mock or the route 500s.
+      mockProduct.findUnique.mockResolvedValueOnce({
+        id: "prod-1",
+        name: "أرز بسمتي",
+        category: "مواد غذائية",
+      });
+
+      // Adjustment history, by snapshot batchId (not a relation).
+      mockStockAdjustment.findMany.mockResolvedValueOnce([
+        {
+          id: "adj-1",
+          quantityDelta: new Prisma.Decimal("2.0000"),
+          reason: "تسوية عجز",
+          createdAt: new Date(),
+          adjustedByUser: { id: "u1", name: "سامر", email: "samer@baraka.sy" },
+        },
+      ]);
 
       const req = new Request("http://localhost/api/inventory/batches/batch-1");
       const res = await getBatchHandler(req, { params: Promise.resolve({ id: "batch-1" }) });
@@ -497,7 +916,86 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(json.batch.expiryStatus).toBe("RED");
       expect(json.batch.adjustments).toHaveLength(1);
       expect(json.batch.adjustments[0].reason).toBe("تسوية عجز");
+      expect(json.batch.adjustments[0].adjustedByUserName).toBe("سامر");
+      // Response contract preserved: _count.adjustments is the history length.
       expect(json.batch._count.adjustments).toBe(1);
+      expect(json.batch._count.invoiceItems).toBe(0);
+
+      // Read through the plain snapshot pair, never a relation.
+      expect(mockStockAdjustment.findMany).toHaveBeenCalledWith({
+        where: { tenantId: "tenant-al-baraka", batchId: "batch-1" },
+        select: {
+          id: true,
+          quantityDelta: true,
+          reason: true,
+          createdAt: true,
+          adjustedByUser: { select: { id: true, name: true, email: true } },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+    });
+  });
+
+  // ==========================================================================
+  // [v4.3 T1/T3c corrigendum — acceptance criterion #4]
+  //
+  // Both halves of the fix are proven against the GENERATED PRISMA CLIENT's own
+  // metadata (DMMF), not against the .prisma source text: what the application
+  // actually gets at runtime is the generated client, so a source file that
+  // merely looks right while the client was generated from something else would
+  // still be broken. `Prisma.dmmf` IS that compiled datamodel — i.e. exactly
+  // "inspecting the generated Prisma client's types".
+  // ==========================================================================
+  describe("5. Schema shape of the corrigendum (generated Prisma client metadata)", () => {
+    type DmmfField = { name: string; kind: string; type: string };
+    type DmmfModel = { name: string; fields: DmmfField[] };
+
+    const dmmfModels = (Prisma.dmmf as unknown as { datamodel: { models: DmmfModel[] } })
+      .datamodel.models;
+
+    const modelNamed = (name: string) => dmmfModels.find((m) => m.name === name);
+    const fieldNamed = (model: DmmfModel | undefined, name: string) =>
+      model?.fields.find((f) => f.name === name);
+
+    it("keeps StockAdjustment.batchId a plain scalar snapshot beside productId/unitId/batchNumber", () => {
+      const stockAdjustment = modelNamed("StockAdjustment");
+      expect(stockAdjustment).toBeDefined();
+
+      for (const field of ["batchId", "productId", "unitId", "batchNumber"]) {
+        expect(fieldNamed(stockAdjustment, field)?.kind).toBe("scalar");
+      }
+    });
+
+    it("has NO relation from StockAdjustment to ProductBatch", () => {
+      const stockAdjustment = modelNamed("StockAdjustment")!;
+      const objectFields = stockAdjustment.fields.filter((f) => f.kind === "object");
+
+      // The only relation fields left are the tenant scope and the audit user.
+      expect(objectFields.map((f) => f.name).sort()).toEqual(["adjustedByUser", "tenant"]);
+      expect(objectFields.some((f) => f.type === "ProductBatch")).toBe(false);
+    });
+
+    it("has NO `adjustments` back-relation field on ProductBatch", () => {
+      const productBatch = modelNamed("ProductBatch")!;
+      expect(fieldNamed(productBatch, "adjustments")).toBeUndefined();
+
+      // The ONLY relations a batch still has. The snapshot logs (this one
+      // included) are deliberately not among them.
+      expect(
+        productBatch.fields
+          .filter((f) => f.kind === "object")
+          .map((f) => f.name)
+          .sort()
+      ).toEqual(["invoiceItems", "product", "tenant", "unit"]);
+    });
+
+    it("keeps CostPriceChangeLog.batchId a plain scalar snapshot too (no ProductBatch relation)", () => {
+      const costPriceChangeLog = modelNamed("CostPriceChangeLog");
+      expect(costPriceChangeLog).toBeDefined();
+      expect(fieldNamed(costPriceChangeLog, "batchId")?.kind).toBe("scalar");
+      expect(
+        costPriceChangeLog!.fields.some((f) => f.kind === "object" && f.type === "ProductBatch")
+      ).toBe(false);
     });
   });
 });

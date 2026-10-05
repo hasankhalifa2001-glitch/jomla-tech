@@ -14,6 +14,13 @@ import bcrypt from "bcryptjs";
 // "./lib/db" import resolved to a nonexistent prisma/lib/db.ts and failed
 // to compile. Corrected to walk up one directory first.
 import { prisma } from "../lib/db";
+// [v4.5] Sole gateway for ProductUnitBarcode writes. Imported RELATIVELY (not
+// via the "@/" alias) to match this file's existing "../lib/db" import, since
+// this script runs outside Next's bundler (`npx tsx prisma/seed.ts`).
+import { createUnitBarcode } from "../lib/data/products";
+// [v4.5, lint fix] The ONE sanctioned way to write a conversionFactor — the
+// same builder lib/data/products.ts and lib/inventory/base-unit.ts spread.
+import { buildConversionFactorField } from "../lib/inventory/units";
 
 // ============================================================================
 // [v3.6] CURRENCY RE-ANCHORING — SYP is now authoritative, USD informational.
@@ -30,24 +37,21 @@ async function createProductWithUnit(
         name: string;
         category: string;
         isPublic: boolean;
+        // [v4.6] The ONE image for this product (moved here from ProductUnit).
+        // The publishing gate blocks isPublic: true unless this is non-empty,
+        // so every isPublic: true seed row below MUST supply it -- an
+        // application-level rule with no DB constraint to catch a mistake.
+        imageUrl?: string;
         unit: {
             unitName: string;
             conversionFactor: number;
             pricingCurrency: "USD" | "SYP";
-            priceWholesale: number;
-            priceRetail?: number;
-            // [FIX] Was previously missing entirely from this type, even
-            // though schema.prisma enforces (at the application layer)
-            // that isPublic = true on the parent Product is blocked unless
-            // priceRetail AND imageUrl are both present on the unit. This
-            // function had no way to set imageUrl at all, so every
-            // isPublic: true product seeded below was silently violating
-            // that rule — an application-level rule with no DB constraint
-            // to catch it, which is exactly what let it slip through
-            // unnoticed.
-            imageUrl?: string;
-            barcode?: string;
-            barcodeSource?: BarcodeSource;
+            priceWholesale: number;            // [v4.5] Was `barcode?: string; barcodeSource?: BarcodeSource;` —
+            // ProductUnit no longer carries barcode scalars. A seeded unit may
+            // carry zero, one, or many barcodes; each row below is written as
+            // its own top-level ProductUnitBarcode.create() inside the same
+            // $transaction (T1's nested-write rule).
+            barcodes?: Array<{ barcode: string; barcodeSource: BarcodeSource }>;
         };
     }
 ) {
@@ -55,9 +59,9 @@ async function createProductWithUnit(
     // imageUrl correctly at every call site — this is the one place that
     // actually enforces the publishing gate for seed data, mirroring the
     // real application-layer rule T3 describes for the live product form.
-    if (args.isPublic && (!args.unit.priceRetail || !args.unit.imageUrl)) {
+    if (args.isPublic && !args.imageUrl) {
         throw new Error(
-            `Cannot seed "${args.name}" with isPublic: true — priceRetail and imageUrl are both required before a product may be public.`
+            `Cannot seed "${args.name}" with isPublic: true — imageUrl is required before a product may be public.`
         );
     }
 
@@ -67,6 +71,7 @@ async function createProductWithUnit(
             name: args.name,
             category: args.category,
             isPublic: args.isPublic,
+            imageUrl: args.imageUrl,
         },
     });
 
@@ -75,15 +80,46 @@ async function createProductWithUnit(
             tenantId: args.tenantId,
             productId: product.id,
             unitName: args.unit.unitName,
-            conversionFactor: args.unit.conversionFactor,
+            // [v4.5, lint fix] The value is written through the SAME sanctioned
+            // builder every other creation path uses, so the stored decimal
+            // string is formalized identically to the live app's (never this
+            // file's own un-formalized literal).
+            //
+            // The one remaining read of a `.conversionFactor` property is
+            // disabled deliberately and locally: this seed factory receives the
+            // factor as plain DEMO DATA on a hand-written in-memory object, and
+            // no conversion math happens anywhere in this file — the rounding-
+            // error class CONVERSION_FACTOR_RULES exists to prevent cannot
+            // occur here. lib/data/products.ts avoids even this read by taking
+            // the factor as a separate positional argument, which is not
+            // possible here without restructuring every one of this file's
+            // createProductWithUnit() call sites (dozens of hand-written demo
+            // rows) for a lint-only gain. The rule itself stays fully ACTIVE for
+            // this file — see eslint.config.mjs's prisma/seed.ts block. Do NOT
+            // copy this disable anywhere else, and revisit it if seed.ts ever
+            // gains real quantity conversion.
+            // eslint-disable-next-line no-restricted-syntax -- plain demo-data read, never a conversion (see the note above).
+            ...buildConversionFactorField(args.unit.conversionFactor),
             pricingCurrency: args.unit.pricingCurrency,
             priceWholesale: args.unit.priceWholesale,
-            priceRetail: args.unit.priceRetail,
-            imageUrl: args.unit.imageUrl,
-            barcode: args.unit.barcode,
-            barcodeSource: args.unit.barcodeSource,
         },
     });
+
+    // [v4.5] Barcodes live in their own model now — one top-level gateway call
+    // per barcode row, in the SAME transaction as the unit above, so a failure
+    // can never leave a unit with a partial barcode set. Routed through
+    // lib/data/products.ts's createUnitBarcode() rather than writing
+    // tx.productUnitBarcode directly: seed.ts is exempt from
+    // PRODUCT_MODEL_RULES (it creates Product/ProductUnit itself, documented in
+    // T1's Developer Tooling section) but it is NOT one of the two files
+    // permitted to touch ProductUnitBarcode — see eslint.config.mjs's
+    // PRODUCT_UNIT_BARCODE_MODEL_RULES block.
+    for (const row of args.unit.barcodes ?? []) {
+        await createUnitBarcode(tx, args.tenantId, unit.id, {
+            barcode: row.barcode,
+            barcodeSource: row.barcodeSource,
+        });
+    }
 
     return { product, unit };
 }
@@ -111,6 +147,16 @@ async function createInvoiceAtomic(
             quantity: number;
             unitPriceUSD: number;
             unitPriceSYP: number;
+            /**
+             * [v4.4, T4g] The frozen cost basis for this seeded line, in SYP.
+             * Required and non-nullable on InvoiceItem — seed data must
+             * supply a real figure, exactly like every live write path
+             * (T4c's sync commit and T5's B2B approval). Demo values are
+             * derived by the caller from the same batch's
+             * costPricePerBaseUnit, so seeded profit figures stay coherent
+             * with the seeded batches.
+             */
+            costAmountSYP: number;
         }>;
         batchAdjustments: Array<{ batchId: string; delta: number }>;
         payment?: {
@@ -151,6 +197,8 @@ async function createInvoiceAtomic(
                 quantity: item.quantity,
                 unitPriceUSD: item.unitPriceUSD,
                 unitPriceSYP: item.unitPriceSYP,
+                // [v4.4, T4g] Required, non-nullable — see the item type note.
+                costAmountSYP: item.costAmountSYP,
             },
         });
     }
@@ -329,8 +377,8 @@ async function main() {
     });
 
     // Product 1: rice, with a batch and expiry.
-    // [FIX] unit.imageUrl now supplied — required because isPublic: true
-    // + priceRetail is set below (see createProductWithUnit's new guard).
+    // [v4.6] Product.imageUrl now supplied — required because isPublic: true
+    // needs an image on the product (see createProductWithUnit's guard).
     const { product: rice, unit: riceUnit } = await prisma.$transaction(
         (tx: Prisma.TransactionClient) =>
             createProductWithUnit(tx, {
@@ -338,32 +386,42 @@ async function main() {
                 name: "أرز مصري ممتاز",
                 category: "المواد الغذائية",
                 isPublic: true,
+                imageUrl: "https://placehold.co/600x400?text=Rice",
                 unit: {
                     unitName: "كيس 25كغ",
                     conversionFactor: 1,
                     pricingCurrency: "USD",
                     priceWholesale: 20.0,
-                    priceRetail: 22.0,
-                    imageUrl: "https://placehold.co/600x400?text=Rice",
-                    barcode: "6211234500011",
-                    barcodeSource: BarcodeSource.GS1,
+                    barcodes: [
+                        { barcode: "6211234500011", barcodeSource: BarcodeSource.GS1 },
+                    ],
                 },
             })
     );
 
+    // [v4.4, T4g] Cost per BASE unit, in SYP — required from creation on every
+    // write path, seed included. The base unit here IS the bag/طرد
+    // (conversionFactor 1), so these are simply per-sale-unit figures.
+    const riceCostPerBaseUnitSYP = 120000;
+    // [v4.4, Section 10] batchNumber now follows the standardized
+    // "{date}-{merchant text}" format. Seed data uses a FIXED date prefix
+    // (rather than today's) so repeated seed runs are byte-identical —
+    // this is demo data written directly by prisma/seed.ts, never through
+    // an API route, so no server-clock rule applies to it.
     const riceBatch = await prisma.productBatch.create({
         data: {
             tenantId: tenantAlBaraka.id,
             productId: rice.id,
             unitId: riceUnit.id,
-            batchNumber: "BATCH-2026-001",
+            batchNumber: "2026-01-15-RICE-001",
             quantity: 40,
+            costPricePerBaseUnit: riceCostPerBaseUnitSYP,
             expiryDate: new Date(Date.now() + 20 * 24 * 60 * 60 * 1000),
         },
     });
 
     // Product 2: cooking oil.
-    // [FIX] unit.imageUrl now supplied — same reasoning as rice above.
+    // [v4.6] Product.imageUrl now supplied — same reasoning as rice above.
     const { product: oil, unit: oilUnit } = await prisma.$transaction(
         (tx: Prisma.TransactionClient) =>
             createProductWithUnit(tx, {
@@ -371,26 +429,32 @@ async function main() {
                 name: "زيت نباتي الصافي",
                 category: "المواد الغذائية",
                 isPublic: true,
+                imageUrl: "https://placehold.co/600x400?text=Cooking+Oil",
                 unit: {
                     unitName: "طرد 12 لتر",
                     conversionFactor: 1,
                     pricingCurrency: "USD",
                     priceWholesale: 18.5,
-                    priceRetail: 20.0,
-                    imageUrl: "https://placehold.co/600x400?text=Cooking+Oil",
-                    barcode: "6211234500028",
-                    barcodeSource: BarcodeSource.GS1,
+                    barcodes: [
+                        { barcode: "6211234500028", barcodeSource: BarcodeSource.GS1 },
+                    ],
                 },
             })
     );
 
+    // [v4.4, T4g] Always SYP (≈15 USD at this tenant's seeded 15000 rate),
+    // even though the unit's selling prices are denominated in USD — the cost
+    // figure deliberately has no pricingCurrency counterpart.
+    const oilCostPerBaseUnitSYP = 225000;
+    // [v4.4, Section 10] Same fixed-prefix demo value as the rice batch above.
     const oilBatch = await prisma.productBatch.create({
         data: {
             tenantId: tenantAlBaraka.id,
             productId: oil.id,
             unitId: oilUnit.id,
-            batchNumber: "BATCH-2026-002",
+            batchNumber: "2026-01-15-OIL-001",
             quantity: 15,
+            costPricePerBaseUnit: oilCostPerBaseUnitSYP,
             expiryDate: null,
         },
     });
@@ -428,6 +492,9 @@ async function main() {
                     quantity: 2,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
+                    // [v4.4, T4g] Frozen cost basis for this line:
+                    // quantity (base units) × the batch's cost per base unit.
+                    costAmountSYP: 2 * riceCostPerBaseUnitSYP,
                 },
             ],
             batchAdjustments: [{ batchId: riceBatch.id, delta: -2 }],
@@ -477,6 +544,8 @@ async function main() {
                     quantity: 1,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
+                    // [v4.4, T4g] Frozen cost basis for this line.
+                    costAmountSYP: riceCostPerBaseUnitSYP,
                 },
             ],
             batchAdjustments: [{ batchId: riceBatch.id, delta: -1 }],
@@ -506,6 +575,10 @@ async function main() {
                     quantity: -1,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
+                    // [v4.4, T4d/T4g] A voided line always carries the NEGATED
+                    // cost of the line it reverses, so (original + void) sums
+                    // to exactly zero here and in every live void path.
+                    costAmountSYP: -riceCostPerBaseUnitSYP,
                 },
             ],
             batchAdjustments: [{ batchId: riceBatch.id, delta: 1 }],
@@ -536,6 +609,8 @@ async function main() {
                     quantity: 1,
                     unitPriceUSD: 18.5,
                     unitPriceSYP: usdToSyp(18.5, rate1),
+                    // [v4.4, T4g] Frozen cost basis for this line.
+                    costAmountSYP: oilCostPerBaseUnitSYP,
                 },
             ],
             batchAdjustments: [{ batchId: oilBatch.id, delta: -1 }],

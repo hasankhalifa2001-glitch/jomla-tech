@@ -33,6 +33,9 @@
  *   - v3.7 omitted B2BOrderRequest, B2BOrderRequestItem, CustomerMergeLog.
  *   - v3.9 omitted StockAdjustment, BatchDeletionLog.
  *   - v4.0 omitted BaseUnitChangeLog — [FIX, this revision] now included.
+ *   - v4.2 omitted CostPriceChangeLog — [FIX, v4.3 T1/T3c corrigendum review]
+ *     now included. This was the FOURTH occurrence of the same gap; see the
+ *     CostPriceChangeLog model note in schema.prisma.
  * Each omission meant getTenantDb() never injected tenantId into queries
  * against that model: a call site that forgot to filter by tenantId
  * manually would have executed completely unscoped, with no error, no
@@ -40,8 +43,20 @@
  *
  * Deliberately NOT in this set (correct, not an oversight):
  *   - Tenant itself — it IS the scope, not scoped by it.
- *   - VerifiedRetailer, ProductCatalogEntry, ProductCatalogEntryReport —
- *     platform-wide models with no tenantId column at all.
+ *   - VerifiedRetailer, ProductCatalogEntry, ProductCatalogEntryReport,
+ *     ProductCatalogEntryBarcode — platform-wide models with no tenantId
+ *     column at all. ([v4.5] ProductCatalogEntryBarcode carries the
+ *     platform-wide `@unique` barcode constraint the old
+ *     ProductCatalogEntry.barcode scalar used to carry; it has the exact
+ *     same "no tenantId column" shape as its parent, so it belongs in this
+ *     list for exactly the same reason.)
+ *
+ * [v4.5, FIX — the same gap a FIFTH time] ProductUnitBarcode was missing
+ * from the set below. Its schema note in schema.prisma claims it is
+ * "covered by the T1 tenant-scope Prisma Client Extension", but nothing
+ * injected tenantId into a query against it — every v4.5 write path just
+ * happened to filter tenantId explicitly, which is luck, not structure.
+ * Added below.
  * ============================================================================
  */
 
@@ -52,6 +67,9 @@ export const TENANT_SCOPED_MODELS = new Set([
   "User",
   "Product",
   "ProductUnit",
+  // [v4.5] zero-to-many barcode rows per ProductUnit (denormalized tenantId +
+  // Tenant relation) — see the file-header FIX note above.
+  "ProductUnitBarcode",
   "ProductBatch",
   "Customer",
   "Invoice",
@@ -68,6 +86,13 @@ export const TENANT_SCOPED_MODELS = new Set([
   // [FIX] v4.0 addition — see the file-header history note above. Same
   // shape (tenantId + Tenant relation) as StockAdjustment/BatchDeletionLog.
   "BaseUnitChangeLog",
+  // [FIX] v4.2 addition, caught during the v4.3 T1/T3c corrigendum review —
+  // see the file-header history note above. This model has the identical
+  // shape (denormalized tenantId + Tenant relation) as
+  // StockAdjustment/BatchDeletionLog/BaseUnitChangeLog, so leaving it out
+  // meant a query against the cost-price audit trail would have run
+  // completely unscoped the moment a caller's own `where` omitted tenantId.
+  "CostPriceChangeLog",
 ]);
 
 // Operations that read/target existing rows and must be scoped via `where`.

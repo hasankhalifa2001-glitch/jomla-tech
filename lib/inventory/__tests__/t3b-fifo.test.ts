@@ -434,6 +434,7 @@ describe("T3b — Shared FIFO Resolver (lib/inventory/fifo.ts)", () => {
           batchNumber: true,
           quantity: true,
           expiryDate: true,
+          costPricePerBaseUnit: true,
         },
       });
 

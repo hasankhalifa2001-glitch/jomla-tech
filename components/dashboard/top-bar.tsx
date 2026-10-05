@@ -47,8 +47,11 @@ export function DashboardTopBar() {
                 <h1 className={s.title}>{title}</h1>
             </div>
 
-            {/* Controls: exchange rate, storefront link, connection / sync status */}
-            <div className={s.controls}>
+            {/* Controls: exchange rate, storefront link, connection / sync status.
+                On mobile (<md) the three controls share ONE row; laptop is untouched. */}
+            <div
+                className={`${s.controls} max-md:!w-full max-md:!basis-full max-md:!flex-nowrap max-md:!gap-2`}
+            >
                 <ExchangeRateTopbar />
                 <SublinkLauncher />
                 <ConnectionStatus />

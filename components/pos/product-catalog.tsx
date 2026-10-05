@@ -12,7 +12,6 @@ import {
   Info,
   Sparkles,
   RefreshCw,
-  Tag,
   AlertTriangle,
 } from "lucide-react";
 import type { PosProductItem, CachedProductUnit } from "@/lib/offline";
@@ -232,21 +231,6 @@ export function ProductCatalog({
                 ? resolveUnitPriceUSD(defaultUnit, product, exchangeRate)
                 : null;
 
-              // priceRetail is stored in the SAME pricingCurrency as
-              // priceWholesale on that unit — resolved the same way, by
-              // temporarily substituting priceRetail as the "wholesale"
-              // value being resolved (the currency-resolution logic is
-              // identical for either field; only the DB write path
-              // treats them differently, not the currency math).
-              const retailPriceSYP =
-                defaultUnit?.priceRetail !== undefined
-                  ? resolveSYPOrNull(
-                    { ...defaultUnit, priceWholesale: defaultUnit.priceRetail },
-                    product,
-                    exchangeRate
-                  )
-                  : null;
-
               // [FIX] `totalCachedStock` is now correctly computed in the
               // product's base unit (pos-service.ts). Rendered here as a
               // multi-unit breakdown ("5 كرتونة و5 قطعة") instead of a
@@ -266,9 +250,18 @@ export function ProductCatalog({
                     {/* Header: Name and Informational Stock Badge */}
                     <div className="space-y-1">
                       <div className="flex items-start justify-between gap-2">
-                        <h3 className="text-xs font-bold text-zinc-900 dark:text-zinc-100 line-clamp-1 group-hover:text-emerald-600 transition-colors">
-                          {product.name}
-                        </h3>
+                        <div className="flex items-center gap-2 min-w-0">
+                          {product.imageUrl && (
+                            <img
+                              src={product.imageUrl}
+                              alt={product.name}
+                              className="w-7 h-7 rounded object-cover shrink-0 border border-zinc-200 dark:border-zinc-800"
+                            />
+                          )}
+                          <h3 className="text-xs font-bold text-zinc-900 dark:text-zinc-100 line-clamp-1 group-hover:text-emerald-600 transition-colors">
+                            {product.name}
+                          </h3>
+                        </div>
                         <Badge
                           variant="secondary"
                           className="shrink-0 text-[10px] font-mono px-1.5 py-0 bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
@@ -279,21 +272,6 @@ export function ProductCatalog({
                         </Badge>
                       </div>
 
-                      {/*
-                        [FIX — layout bug] The previous markup put the
-                        retail strikethrough price INSIDE the same
-                        `flex-wrap` row as the SYP/USD prices, positioned
-                        with `mr-auto`. `margin-auto` on a wrapped flex
-                        item doesn't reliably push to the row's end once
-                        wrapping actually kicks in (long product names /
-                        narrow cards), so the retail price could land
-                        directly after the USD price instead of visually
-                        separated. Split into two independent flex
-                        containers with `justify-between`: the primary
-                        price block on the "start" side, retail price
-                        pinned to the "end" side — position is guaranteed
-                        regardless of how the primary block wraps.
-                      */}
                       <div className="flex items-baseline justify-between gap-2">
                         <div className="flex items-baseline flex-wrap gap-x-2 gap-y-0.5 min-w-0">
                           {wholesalePriceSYP !== null ? (
@@ -317,13 +295,6 @@ export function ProductCatalog({
                             </Badge>
                           )}
                         </div>
-
-                        {wholesalePriceSYP !== null && retailPriceSYP !== null && (
-                          <span className="shrink-0 text-[10px] text-zinc-400 line-through decoration-zinc-300 flex items-center gap-0.5">
-                            <Tag className="h-2.5 w-2.5" />
-                            مفرد: {formatMoney(retailPriceSYP, "SYP")} ل.س
-                          </span>
-                        )}
                       </div>
                     </div>
 

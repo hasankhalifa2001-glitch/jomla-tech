@@ -31,11 +31,14 @@ export function ConnectionStatus() {
         <div
             role="status"
             aria-live="polite"
-            className={`${s.chip} ${s.conn} ${isOnline ? s.connOn : s.connOff}`}
+            className={`${s.chip} ${s.conn} ${isOnline ? s.connOn : s.connOff} max-md:!shrink-0 max-md:!gap-1.5 max-md:!px-2.5`}
         >
             <span className={`${s.dot} ${isOnline ? s.dotOn : s.dotOff}`} aria-hidden />
             {isOnline ? <Wifi size={16} aria-hidden /> : <WifiOff size={16} aria-hidden />}
-            <span>{isOnline ? "متصل" : "غير متصل"}</span>
+            {/* On mobile the word is hidden while online, and shown when offline */}
+            <span className={isOnline ? "max-md:hidden" : ""}>
+                {isOnline ? "متصل" : "غير متصل"}
+            </span>
         </div>
     );
 }

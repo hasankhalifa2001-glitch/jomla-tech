@@ -25,7 +25,12 @@
 
 import type { InvoiceStatus, Prisma } from "@prisma/client";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
-import { compareMoney } from "@/lib/utils/money";
+import {
+    compareMoney,
+    multiplyMoney,
+    subtractMoney,
+    sumMoney,
+} from "@/lib/utils/money";
 
 export type PaymentStatusBadge = "CASH_FULL" | "CREDIT_FULL" | "PARTIAL";
 
@@ -244,6 +249,24 @@ export interface InvoiceDetailItem {
     quantity: string;
     unitPriceSYP: string;
     unitPriceUSD: string;
+    /**
+     * [v4.4, T4c2] Per-line profit, in SYP, present ONLY when the caller
+     * passed `includeProfit: true` (i.e. the session is an ADMIN).
+     *
+     *   profitSYP = (unitPriceSYP × quantity) − costAmountSYP
+     *
+     * Derived on read, never stored — see schema.prisma's InvoiceItem note.
+     * costAmountSYP is non-nullable, so there is deliberately no
+     * null-exclusion branch here. A CASHIER's payload omits this key (and
+     * costAmountSYP) ENTIRELY rather than sending a hidden figure: the
+     * server-side guarantee is that the number never leaves the server for
+     * that role, not that the UI declines to render it.
+     *
+     * For a void line, costAmountSYP is already negative (T4d), so this
+     * value is the negated profit of the line it reverses — adding the two
+     * gives exactly zero.
+     */
+    profitSYP?: string;
 }
 
 export interface InvoiceDetail {
@@ -283,6 +306,13 @@ export interface InvoiceDetail {
     customer: { id: string; name: string; phone: string | null };
     items: InvoiceDetailItem[];
     /**
+     * [v4.4, T4c2] The invoice's TOTAL profit, in SYP, present ONLY when the
+     * caller passed `includeProfit: true` (ADMIN). Summed from the per-line
+     * profitSYP values via sumMoney() — never recomputed from the invoice's
+     * own totals, which carry no cost information.
+     */
+    totalProfitSYP?: string;
+    /**
      * [FIX — business name] Tenant.name, resolved in this same query.
      * Feeds receipt-model.ts's headerBlocks() for a server-sourced receipt
      * (a synced invoice's thermal print, or the shared PDF raster).
@@ -293,8 +323,21 @@ export interface InvoiceDetail {
 export async function findInvoiceDetail(
     db: TxOrClient,
     tenantId: string,
-    invoiceId: string
+    invoiceId: string,
+    /**
+     * [v4.4, T4c2/T4g] Whether cost/profit figures may be included at all.
+     * Passed by the ROUTE from the session role (ADMIN only) — this data layer
+     * makes no role decision of its own, matching its file-header convention
+     * that "role/permission decisions stay in the route handlers".
+     *
+     * When false (the default), costAmountSYP is not even selected from the
+     * database and no profit field is produced, so a CASHIER's response is
+     * structurally incapable of carrying either figure.
+     */
+    options: { includeProfit?: boolean } = {}
 ): Promise<InvoiceDetail | null> {
+    const includeProfit = options.includeProfit === true;
+
     const invoice = await db.invoice.findUnique({
         where: { id: invoiceId, tenantId },
         select: {
@@ -321,6 +364,7 @@ export async function findInvoiceDetail(
                     id: true, productId: true, product: { select: { name: true } },
                     unitId: true, unit: { select: { unitName: true } },
                     batchId: true, quantity: true, unitPriceSYP: true, unitPriceUSD: true,
+                    costAmountSYP: includeProfit,
                 },
             },
         },
@@ -350,18 +394,53 @@ export async function findInvoiceDetail(
         user: invoice.user,
         customer: invoice.customer,
         // [FIX — business name]
-        businessName: invoice.tenant.name,
-        items: invoice.items.map((item) => ({
-            id: item.id,
-            productId: item.productId,
-            productName: item.product.name,
-            unitId: item.unitId,
-            unitName: item.unit.unitName,
-            batchId: item.batchId,
-            quantity: item.quantity.toString(),
-            unitPriceSYP: item.unitPriceSYP.toString(),
-            unitPriceUSD: item.unitPriceUSD.toString(),
-        })),
+        businessName: invoice.tenant?.name ?? null,
+        items: invoice.items.map((item) => {
+            const rawItem = item as typeof item & {
+                costAmountSYP?: Prisma.Decimal;
+            };
+            let profitSYP: string | undefined;
+            if (includeProfit && rawItem.costAmountSYP !== undefined) {
+                // profitSYP = (unitPriceSYP × quantity) − costAmountSYP
+                const revenueSYP = multiplyMoney(
+                    item.unitPriceSYP.toString(),
+                    item.quantity.toString()
+                );
+                profitSYP = subtractMoney(revenueSYP, rawItem.costAmountSYP.toString());
+            }
+
+            return {
+                id: item.id,
+                productId: item.productId,
+                productName: item.product.name,
+                unitId: item.unitId,
+                unitName: item.unit.unitName,
+                batchId: item.batchId,
+                quantity: item.quantity.toString(),
+                unitPriceSYP: item.unitPriceSYP.toString(),
+                unitPriceUSD: item.unitPriceUSD.toString(),
+                ...(profitSYP !== undefined ? { profitSYP } : {}),
+            };
+        }),
+        ...(includeProfit
+            ? {
+                totalProfitSYP: sumMoney(
+                    invoice.items.map((item) => {
+                        const rawItem = item as typeof item & {
+                            costAmountSYP?: Prisma.Decimal;
+                        };
+                        const revenueSYP = multiplyMoney(
+                            item.unitPriceSYP.toString(),
+                            item.quantity.toString()
+                        );
+                        const costStr = (
+                            rawItem.costAmountSYP ?? "0"
+                        ).toString();
+                        return subtractMoney(revenueSYP, costStr);
+                    })
+                ),
+            }
+            : {}),
     };
 }
 

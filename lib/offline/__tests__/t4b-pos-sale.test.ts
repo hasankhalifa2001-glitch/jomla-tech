@@ -9,7 +9,7 @@
  *      - SYP-priced units resolve unitPriceSYP without rate.
  *      - USD-priced units need a valid cached rate or fail loud.
  *      - cartNeedsExchangeRate() returns false for SYP-only carts, true for USD carts.
- *      - priceWholesale is always billed; priceRetail is display-only.
+ *      - priceWholesale is always the billed figure.
  *   3. Customer selection & payment rules:
  *      - System customer shortcut is strictly cash-only (zero debt).
  *      - Any credit/partial payment forces a real customer.
@@ -63,7 +63,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
             unitName: "شاحنة",
             conversionFactor: 1000,
             priceWholesale: "187543210.7500",
-            priceRetail: "195000000.0000",
             pricingCurrency: "SYP",
             isActive: true,
           },
@@ -82,7 +81,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
           unitPriceSYP: "187543210.7500",
           unitPriceUSD: null,
           pricingCurrency: "SYP",
-          priceRetailSYP: "195000000.0000",
         },
         {
           id: "line-2",
@@ -94,7 +92,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
           unitPriceSYP: "29481235.5000",
           unitPriceUSD: null,
           pricingCurrency: "SYP",
-          priceRetailSYP: "31000000.0000",
         },
         {
           id: "line-3",
@@ -124,7 +121,7 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
       expect(cartTotals.itemCount).toBe(43 + 125 + 999);
       expect(cartTotals.lineItems).toHaveLength(3);
 
-      // Ensure wholesale price was billed, not retail price
+      // Ensure the unit's wholesale price is what actually gets billed
       expect(cartTotals.totalSYP).not.toBe(
         new Decimal(43).times(195000000).plus(new Decimal(125).times(31000000)).toFixed(4)
       );
@@ -144,7 +141,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
           unitName: "شوال",
           conversionFactor: 50,
           priceWholesale: "750000.0000",
-          priceRetail: "780000.0000",
           pricingCurrency: "SYP",
           isActive: true,
         },
@@ -162,7 +158,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
           unitName: "كرتونة",
           conversionFactor: 12,
           priceWholesale: "32.5000",
-          priceRetail: "35.0000",
           pricingCurrency: "USD",
           isActive: true,
         },
@@ -177,7 +172,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
       expect(resolved.unitPriceSYP).toBe("750000.0000");
       expect(resolved.unitPriceUSD).toBeNull();
       expect(resolved.pricingCurrency).toBe("SYP");
-      expect(resolved.priceRetailSYP).toBe("780000.0000");
     });
 
     it("fails loud when resolving USD-priced unit without a valid exchange rate", () => {
@@ -201,9 +195,6 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
       expect(resolved.unitPriceSYP).toBe("487500.0000");
       expect(resolved.unitPriceUSD).toBe("32.5000");
       expect(resolved.pricingCurrency).toBe("USD");
-      // Retail: 35.0000 * 15000 = 525000.0000
-      expect(resolved.priceRetailSYP).toBe("525000.0000");
-      expect(resolved.priceRetailUSD).toBe("35.0000");
     });
 
     it("cartNeedsExchangeRate correctly detects whether rate is mandatory", () => {

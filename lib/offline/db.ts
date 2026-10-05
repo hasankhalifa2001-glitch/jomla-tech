@@ -193,12 +193,65 @@ export interface CachedProductUnit {
    */
   conversionFactor: string;
   priceWholesale: string;
-  priceRetail?: string;
   pricingCurrency?: "USD" | "SYP";
-  barcode?: string;
-  barcodeSource?: "GS1" | "INTERNAL";
+  // [v4.5] REPLACED the old single `barcode?: string; barcodeSource?: ...`
+  // scalar pair. A unit may carry zero, one, or many barcodes.
+  //
+  // NOTE: this nested list is for DISPLAY and catalog search only. POS
+  // barcode-scan resolution must NOT query it (Dexie cannot efficiently
+  // index into a nested array) — it queries the flat `cachedProductBarcodes`
+  // table below instead, which refreshProductCache() keeps in sync with
+  // exactly these values.
+  barcodes?: CachedUnitBarcode[];
   isActive?: boolean;
 }
+
+/**
+ * [v4.5] One barcode row as cached on the device, nested inside
+ * CachedProductUnit.barcodes. Mirrors ProductUnitBarcode's display fields.
+ */
+export interface CachedUnitBarcode {
+  id: string;
+  barcode: string;
+  barcodeSource?: "GS1" | "INTERNAL";
+}
+
+/**
+ * [v4.5] FLAT barcode -> location index, one row per cached barcode.
+ *
+ * Why a separate table instead of reading CachedProduct.units[].barcodes:
+ * Dexie can only index top-level properties, so a scan lookup against a
+ * nested array would degrade into a full in-memory scan of every cached
+ * product on every keystroke/scan. This table is keyed by
+ * [tenantId+barcode] (unique), so resolving a scanned barcode is a single
+ * indexed get() — and it is the ONLY place a scan ever looks.
+ *
+ * Written exclusively by refreshProductCache() (delete-then-bulkPut, in the
+ * same transaction as cachedProducts), so the two can never disagree.
+ */
+export interface CachedProductBarcode {
+  tenantId: string;
+  barcode: string;
+  productId: string;
+  unitId: string;
+}
+
+/**
+ * [v4.5] The PRE-v4.5 shape of a cached unit — used only by version(3)'s
+ * .upgrade() migration, which has to read rows written by an older build.
+ * `barcode`/`barcodeSource` are the scalar pair that no longer exists on
+ * CachedProductUnit; keeping this type means the migration can be written
+ * without a single `any` (and without pretending today's type describes
+ * yesterday's data).
+ */
+export type LegacyCachedProductUnit = CachedProductUnit & {
+  barcode?: string | null;
+  barcodeSource?: "GS1" | "INTERNAL" | null;
+};
+
+export type LegacyCachedProduct = Omit<CachedProduct, "units"> & {
+  units: LegacyCachedProductUnit[];
+};
 
 export interface CachedProductBatch {
   id: string;
@@ -229,6 +282,11 @@ export interface CachedProduct {
   tenantId: string;
   name: string;
   category?: string;
+  // [v4.6] The ONE image for this product (moved here from ProductUnit).
+  // Non-indexed plain value field — no Dexie version bump required.
+  // Code reading this offline MUST tolerate `undefined` on devices whose
+  // cache predates the next refreshProductCache call.
+  imageUrl?: string;
   isActive?: boolean;
   units: CachedProductUnit[];
   batches: CachedProductBatch[];
@@ -284,6 +342,8 @@ export class OfflineDatabase extends Dexie {
   offlineCustomers!: Table<OfflineCustomer, number>;
   cachedTenantSettings!: Table<CachedTenantSettings, string>;
   cachedProducts!: Table<CachedProduct, string>;
+  /** [v4.5] Flat barcode -> unit lookup, keyed [tenantId+barcode]. */
+  cachedProductBarcodes!: Table<CachedProductBarcode, [string, string]>;
   cachedCustomers!: Table<CachedCustomer, string>;
   cachedSession!: Table<CachedSession, string>;
   /** [T4f — Rule 4] Device-scoped settings (currently: the thermal printer). */
@@ -334,6 +394,104 @@ export class OfflineDatabase extends Dexie {
         // file's own rule below requires a matching .upgrade() for every new
         // version block: an explicit "nothing to migrate" is a statement that
         // the upgrade path was considered, not an omission.
+      });
+
+    // [v4.5] version(3): MULTI-BARCODE SUPPORT — the flat barcode lookup table.
+    //
+    // Restates all eight v2 schemas verbatim alongside the new one, per this
+    // file's standing rule: a new table/field lands as a NEW version(N) block
+    // with a MATCHING .upgrade(); an already-shipped version(N) block is never
+    // edited, because Dexie will not retroactively create a table on a device
+    // that already opened the database at an earlier version.
+    //
+    // `cachedProductBarcodes` is keyed by [tenantId+barcode] (unique): a
+    // barcode resolves to at most one unit WITHIN a tenant, but the same GS1
+    // barcode legitimately exists for two different tenants (that is the whole
+    // point of the shared catalog), so `barcode` alone cannot be the primary
+    // key. A secondary plain `barcode` index is kept for queries that don't
+    // know the tenant (diagnostics).
+    this.version(3)
+      .stores({
+        offlineInvoices:
+          "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+        offlinePayments:
+          "++id, &offlineId, tenantId, customerId, offlineCustomerId, status, createdAt",
+        offlineCustomers: "++id, &offlineId, tenantId, status, createdAt",
+        cachedTenantSettings: "tenantId, cachedAt",
+        cachedProducts: "id, tenantId, isActive, [tenantId+isActive]",
+        cachedProductBarcodes: "&[tenantId+barcode], barcode, tenantId, productId, unitId",
+        cachedCustomers: "id, tenantId, phone, isSystemGenerated, [tenantId+phone]",
+        cachedSession: "userId, tenantId, cachedAt",
+        deviceSettings: "key",
+      })
+      .upgrade(async (tx) => {
+        // Migrate an already-cached device IN PLACE, so a device that was
+        // cached before this release can still scan immediately rather than
+        // waiting for its next refreshProductCache():
+        //   1. rewrite every CachedProductUnit's old scalar barcode/barcodeSource
+        //      into the new barcodes[] array ([] when it had no barcode);
+        //   2. backfill the new flat table from those values.
+        // Both run inside Dexie's own version-change transaction, so a failure
+        // rolls the entire version bump back — no device is left half-migrated.
+        //
+        // A legacy unit's barcode becomes a row with a locally-generated id
+        // (`legacy-...`): the old schema had no ProductUnitBarcode row id to
+        // carry over, and a stable id keeps React keys — and any id-based
+        // delete call — working. The next refreshProductCache() replaces it
+        // with the server's real row ids.
+        let seq = 0;
+
+        await tx
+          .table<LegacyCachedProduct>("cachedProducts")
+          .toCollection()
+          .modify((product) => {
+            if (!product?.units) return;
+            product.units = product.units.map((unit) => {
+              if (Array.isArray(unit.barcodes)) return unit; // already v3-shaped
+              const legacy = typeof unit.barcode === "string" ? unit.barcode.trim() : "";
+              const migrated: CachedUnitBarcode[] = legacy
+                ? [
+                  {
+                    id: `legacy-${unit.id}-${seq++}`,
+                    barcode: legacy,
+                    barcodeSource: unit.barcodeSource ?? undefined,
+                  },
+                ]
+                : [];
+              const migratedUnit: CachedProductUnit = {
+                id: unit.id,
+                unitName: unit.unitName,
+                conversionFactor: unit.conversionFactor,
+                priceWholesale: unit.priceWholesale,
+                pricingCurrency: unit.pricingCurrency,
+                barcodes: migrated,
+                isActive: unit.isActive,
+              };
+              return migratedUnit;
+            });
+          });
+
+        const barcodeTable = tx.table<CachedProductBarcode, [string, string]>("cachedProductBarcodes");
+        // Idempotent by construction: the table is brand new in v3, and the
+        // clear() keeps this safe if a later version ever reuses this shape.
+        await barcodeTable.clear();
+
+        const products = await tx.table<LegacyCachedProduct>("cachedProducts").toArray();
+        const rows: CachedProductBarcode[] = [];
+        for (const product of products) {
+          for (const unit of product.units ?? []) {
+            for (const b of unit.barcodes ?? []) {
+              if (!b?.barcode) continue;
+              rows.push({
+                tenantId: product.tenantId,
+                barcode: b.barcode,
+                productId: product.id,
+                unitId: unit.id,
+              });
+            }
+          }
+        }
+        if (rows.length > 0) await barcodeTable.bulkPut(rows);
       });
 
     // Any future table/field addition must land as a NEW
@@ -826,16 +984,19 @@ export function createCachedProductRecord(data: {
   id: string;
   name: string;
   category?: string;
+  // [v4.6] The ONE image for this product. Optional so existing callers
+  // that pre-date this change don't need to be updated all at once.
+  imageUrl?: string;
   isActive?: boolean;
   units: Array<{
     id: string;
     unitName: string;
     conversionFactor: MoneyInput;
     priceWholesale: MoneyInput;
-    priceRetail?: MoneyInput;
     pricingCurrency?: "USD" | "SYP";
-    barcode?: string;
-    barcodeSource?: "GS1" | "INTERNAL";
+    // [v4.5] Zero, one, or many barcodes per unit (was a single `barcode` /
+    // `barcodeSource` scalar pair).
+    barcodes?: Array<{ id: string; barcode: string; barcodeSource?: "GS1" | "INTERNAL" }>;
     isActive?: boolean;
   }>;
   batches: Array<{
@@ -855,16 +1016,22 @@ export function createCachedProductRecord(data: {
     tenantId: data.tenantId,
     name: data.name,
     category: data.category,
+    // [v4.6] Carry the product-level image through.
+    imageUrl: data.imageUrl,
     isActive: data.isActive !== false,
     units: data.units.map((u) => ({
       id: u.id,
       unitName: u.unitName,
       conversionFactor: serializeMoney(u.conversionFactor),
       priceWholesale: serializeMoney(u.priceWholesale),
-      priceRetail: u.priceRetail !== undefined ? serializeMoney(u.priceRetail) : undefined,
       pricingCurrency: u.pricingCurrency,
-      barcode: u.barcode,
-      barcodeSource: u.barcodeSource,
+      // [v4.5] The unit's full barcode list. Always an array (possibly empty),
+      // never the old scalar pair — see CachedProductUnit.barcodes.
+      barcodes: (u.barcodes ?? []).map((b) => ({
+        id: b.id,
+        barcode: b.barcode,
+        barcodeSource: b.barcodeSource,
+      })),
       isActive: u.isActive,
     })),
     batches: data.batches.map((b) => ({

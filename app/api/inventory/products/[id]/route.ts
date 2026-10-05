@@ -28,10 +28,17 @@ import {
   findProductWithUnits,
   findProductUnitByBarcodeExcludingProduct,
   updateProduct,
+  // [FIX] existing-unit edits (name/prices/image/isActive) were never
+  // persisted by this route — see the `if (u.id)` branch in the transaction.
   updateProductUnit,
   createAdditionalUnit,
   countProductBatches,
   setProductActive,
+  // [v4.5] Barcode writes + the shared-catalog decision both live behind
+  // lib/data/products.ts — this route never names productUnitBarcode or
+  // productCatalogEntryBarcode (see eslint.config.mjs's barcode rule arrays).
+  createUnitBarcode,
+  resolveSharedCatalogForBarcode,
 } from "@/lib/data/products";
 import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
@@ -51,20 +58,44 @@ const nonNegativeDecimalString = (message: string) =>
     .regex(DECIMAL_STRING_REGEX, message)
     .refine((val) => Number(val) >= 0, { message });
 
+// [v4.5] One barcode row's worth of validated input — mirrors
+// products/route.ts's unitBarcodeSchema. Both fields are REQUIRED per
+// element: a barcode value and its human-confirmed source always travel
+// together. `barcodeSource` is never inferred from the barcode's digit
+// pattern (T3a §5).
+const unitBarcodeSchema = z.object({
+  barcode: z.string().trim().min(1, "قيمة الباركود مطلوبة"),
+  barcodeSource: z.enum(["GS1", "INTERNAL"]),
+});
+
 const unitSchema = z
   .object({
     id: z.string().optional(),
     unitName: z.string().min(1, "اسم الوحدة مطلوب"),
     conversionFactor: positiveDecimalString("معامل التحويل يجب أن يكون رقماً موجباً"),
-    pricingCurrency: z.enum(["SYP", "USD"]).default("SYP"),
+    // [FIX] No `.default(...)` on pricingCurrency / isActive. A Zod default
+    // silently injected "SYP" / true into every submitted unit that omitted
+    // them — harmless while existing-unit edits weren't persisted, but once
+    // they are, it would re-activate a deactivated unit and flip a USD unit
+    // to SYP on an unrelated edit. `undefined` now means "leave unchanged"
+    // for an existing unit; the create paths below apply the real defaults
+    // ("SYP" / true) explicitly.
+    pricingCurrency: z.enum(["SYP", "USD"]).optional(),
     priceWholesale: nonNegativeDecimalString("سعر الجملة لا يمكن أن يكون سالباً"),
-    priceRetail: nonNegativeDecimalString("سعر التجزئة لا يمكن أن يكون سالباً")
-      .optional()
-      .nullable(),
+    // [v4.5] REPLACED the old single `barcode`/`barcodeSource` scalar pair.
+    // On an EXISTING unit this list is the unit's full desired set as the edit
+    // screen sees it; the PATCH is ADDITIVE-ONLY (see the transaction below:
+    // barcodes already stored on the unit are skipped, and REMOVAL happens
+    // exclusively through the dedicated DELETE barcode route, ADMIN-only).
+    barcodes: z.array(unitBarcodeSchema).optional().default([]),
+    // [DEPRECATED — INPUT SHIM, remove together with the deprecated `barcode`
+    // field on products/route.ts's GET response] A client build cached by
+    // T4a2's service worker before this change still sends the two scalars.
+    // Folded into `barcodes` by the transform below; the original
+    // "source required whenever a barcode is present" refine is kept verbatim.
     barcode: z.string().optional().nullable(),
     barcodeSource: z.enum(["GS1", "INTERNAL"]).optional().nullable(),
-    imageUrl: z.string().optional().nullable(),
-    isActive: z.boolean().optional().default(true),
+    isActive: z.boolean().optional(),
   })
   .refine(
     (u) => {
@@ -77,11 +108,25 @@ const unitSchema = z
       message: "يجب تحديد مصدر الباركود (GS1 أو INTERNAL) عند إدخال باركود للوحدة.",
       path: ["barcodeSource"],
     }
-  );
+  )
+  .transform((u) => {
+    const legacyBarcode = u.barcode?.trim();
+    if (u.barcodes.length === 0 && legacyBarcode) {
+      return u.barcodeSource
+        ? { ...u, barcodes: [{ barcode: legacyBarcode, barcodeSource: u.barcodeSource }] }
+        : u;
+    }
+    return u;
+  });
+
+type SubmittedUnit = z.infer<typeof unitSchema>;
 
 const updateProductSchema = z.object({
   name: z.string().min(1, "اسم المنتج مطلوب").optional(),
   category: z.string().optional().nullable(),
+  // [v4.6] The ONE image for this product (moved here from ProductUnit).
+  // undefined = untouched; null or an empty/blank string = cleared.
+  imageUrl: z.string().optional().nullable(),
   isActive: z.boolean().optional(),
   isPublic: z.boolean().optional(),
   units: z.array(unitSchema).min(1, "يجب أن يحتوي المنتج على وحدة قياس واحدة على الأقل").optional(),
@@ -93,8 +138,6 @@ const updateProductSchema = z.object({
 
 interface PublishabilityCandidateUnit {
   isActive: boolean;
-  imageUrl: string | null | undefined;
-  priceRetail: string | number | Prisma.Decimal | null | undefined;
 }
 
 interface EffectiveUnit {
@@ -102,9 +145,36 @@ interface EffectiveUnit {
   unitName: string;
   conversionFactor: string;
   priceWholesale?: string | number | Prisma.Decimal;
-  priceRetail?: string | number | Prisma.Decimal | null;
-  imageUrl?: string | null;
   isActive?: boolean;
+}
+
+/**
+ * Overlays a submitted unit onto an effective unit, copying ONLY the fields
+ * the client actually sent (undefined = leave as-is). Never spreads the raw
+ * submitted object, so barcode/legacy fields can't leak into the effective
+ * list and an omitted isActive can't overwrite a stored value.
+ */
+function overlaySubmittedUnit(base: EffectiveUnit, s: SubmittedUnit): EffectiveUnit {
+  return {
+    ...base,
+    unitName: s.unitName,
+    conversionFactor: s.conversionFactor,
+    priceWholesale: s.priceWholesale,
+    ...(s.isActive !== undefined ? { isActive: s.isActive } : {}),
+  };
+}
+
+// [DEPRECATED — compatibility shim, removal target: same release as the GET
+// shim below] mirrors the FIRST barcode onto the old scalar fields, so a
+// cached client that reads the PATCH response sees the same unit shape as GET.
+function withLegacyBarcodeFields<
+  U extends { barcodes: { barcode: string; barcodeSource: string | null }[] }
+>(units: U[]) {
+  return units.map((u) => ({
+    ...u,
+    barcode: u.barcodes[0]?.barcode ?? null,
+    barcodeSource: u.barcodes[0]?.barcodeSource ?? null,
+  }));
 }
 
 export async function GET(
@@ -131,17 +201,11 @@ export async function GET(
     // findProductWithUnits() (via base-unit.ts's toSafeProductWithUnits()),
     // which is itself the sanctioned gateway for resolving
     // Product.baseUnitId — this file never reads that field directly.
-    // No separate requireBaseUnit() round-trip is needed here anymore;
-    // that DB call is now redundant with data findProductWithUnits()
-    // already fetched in the same request.
     const baseUnit = product.units.find((u) => u.isBaseUnit);
 
     if (!baseUnit) {
       // Structurally the same situation MissingBaseUnitError signals —
-      // toSafeProductWithUnits() found no unit whose id matches
-      // Product.baseUnitId (a data-integrity bug, never expected in
-      // normal operation). Surfaced the same way requireBaseUnit()
-      // would have, without needing to import/throw that class here.
+      // a data-integrity bug, never expected in normal operation.
       return NextResponse.json(
         {
           error: "MISSING_BASE_UNIT",
@@ -156,8 +220,11 @@ export async function GET(
       product: {
         ...product,
         baseUnitId: baseUnit.id,
-        // product.units already carries isBaseUnit on every entry — no
-        // extra .map() needed to re-annotate it.
+        // [v4.5] Deprecated per-unit `barcode`/`barcodeSource` siblings, for a
+        // client build an old T4a2 service-worker cache may still be serving.
+        // [DEPRECATED — REMOVAL TARGET: the release after T4a2's service worker
+        // has rolled the new client build to all cached devices]
+        units: withLegacyBarcodeFields(product.units),
       },
     });
   } catch (error) {
@@ -220,7 +287,7 @@ export async function PATCH(
 
     // Build the EFFECTIVE resulting unit list — existing units not
     // mentioned in data.units stay as they are; units with a matching
-    // `id` are replaced by their submitted values; units with no `id`
+    // `id` are overlaid by their submitted values; units with no `id`
     // are additions. Every validation check below runs against this
     // merged list, not just the submitted subset.
     const effectiveUnits: EffectiveUnit[] = existingProduct.units.map((u) => ({
@@ -228,31 +295,44 @@ export async function PATCH(
       unitName: u.unitName,
       conversionFactor: u.conversionFactor.toString(),
       priceWholesale: u.priceWholesale,
-      priceRetail: u.priceRetail,
-      imageUrl: u.imageUrl,
       isActive: u.isActive,
     }));
 
     if (data.units) {
       for (const submitted of data.units) {
-        if (submitted.id) {
-          const idx = effectiveUnits.findIndex((u) => u.id === submitted.id);
-          if (idx >= 0) {
-            effectiveUnits[idx] = { ...effectiveUnits[idx], ...submitted };
-          } else {
-            effectiveUnits.push(submitted);
-          }
+        const idx = submitted.id
+          ? effectiveUnits.findIndex((u) => u.id === submitted.id)
+          : -1;
+        if (idx >= 0) {
+          effectiveUnits[idx] = overlaySubmittedUnit(effectiveUnits[idx], submitted);
         } else {
-          effectiveUnits.push(submitted);
+          effectiveUnits.push(
+            overlaySubmittedUnit(
+              { unitName: submitted.unitName, conversionFactor: submitted.conversionFactor },
+              submitted
+            )
+          );
         }
       }
     }
 
     let wantsBaseUnitChange = false;
-    let newBaseUnitSubmission: z.infer<typeof unitSchema> | null = null;
+    let newBaseUnitSubmission: SubmittedUnit | null = null;
 
     if (data.units) {
-      const packagingCheck = validatePackagingUnits(effectiveUnits as PackagingUnit[]);
+      // [FIX] Packaging rules (exactly one factor-1 unit, no duplicate
+      // factors) apply to the units that are LIVE after this request —
+      // active ones, plus the product's current base unit even if a request
+      // deactivates it. resetProductUnits() soft-deletes the old units
+      // (isActive: false) and never removes them, so validating over ALL
+      // rows made every PATCH after a base-unit reset fail with "more than
+      // one base unit" (a leftover deactivated factor-1 row), and could make
+      // the base-unit lookup below pick that dead row.
+      const liveEffectiveUnits = effectiveUnits.filter(
+        (u) => u.isActive !== false || u.id === currentBaseUnit.id
+      );
+
+      const packagingCheck = validatePackagingUnits(liveEffectiveUnits as PackagingUnit[]);
       if (!packagingCheck.valid) {
         return NextResponse.json(
           { error: "INVALID_PACKAGING_UNITS", message: packagingCheck.error },
@@ -260,7 +340,8 @@ export async function PATCH(
         );
       }
 
-      const effectiveBaseUnit = effectiveUnits.find((u) =>
+      // Safe: validatePackagingUnits() just confirmed exactly one factor-1 unit.
+      const effectiveBaseUnit = liveEffectiveUnits.find((u) =>
         new Decimal(u.conversionFactor).equals(1)
       )!;
       wantsBaseUnitChange = !effectiveBaseUnit.id || effectiveBaseUnit.id !== currentBaseUnit.id;
@@ -294,12 +375,23 @@ export async function PATCH(
 
         // A base-unit change is a dedicated, standalone correction flow —
         // it does not attempt to also apply arbitrary sibling-unit edits
-        // from the same payload. If other unit edits are genuinely
-        // needed, submit them in a separate PATCH after the base-unit
-        // correction.
-        newBaseUnitSubmission = data.units.find(
-          (u) => new Decimal(u.conversionFactor).equals(1)
-        )!;
+        // from the same payload (the response message says so when the
+        // payload carried more than the new base unit).
+        const submittedBase = data.units.find((u) =>
+          new Decimal(u.conversionFactor).equals(1)
+        );
+        if (!submittedBase) {
+          // The new base unit came from an existing stored row that wasn't
+          // (re)submitted with factor 1 — there is nothing to build it from.
+          return NextResponse.json(
+            {
+              error: "INVALID_PACKAGING_UNITS",
+              message: "يجب إرسال بيانات الوحدة الأساسية الجديدة (معامل تحويل 1) ضمن الطلب.",
+            },
+            { status: 400 }
+          );
+        }
+        newBaseUnitSubmission = submittedBase;
       } else {
         // Ordinary path (no base-unit change): validate name/barcode
         // uniqueness for the submitted units.
@@ -315,12 +407,14 @@ export async function PATCH(
           }
           names.add(lowerName);
 
-          if (u.barcode && u.barcode.trim()) {
-            const barcodeTrim = u.barcode.trim();
+          // [v4.5] EVERY barcode of THIS unit — the request-wide Set and the
+          // live-DB check both span all units of the request.
+          for (const barcodeRow of u.barcodes) {
+            const barcodeTrim = barcodeRow.barcode;
 
             if (barcodesInRequest.has(barcodeTrim)) {
               return NextResponse.json(
-                { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مكرر لأكثر من وحدة ضمن نفس الطلب.` },
+                { error: "DUPLICATE_BARCODE", message: `الباركود ${barcodeTrim} مكرر ضمن نفس الطلب.` },
                 { status: 400 }
               );
             }
@@ -359,18 +453,31 @@ export async function PATCH(
       }
     }
 
+    // Only used for the publishing gate below. It is NOT forwarded to
+    // updateProduct(): fields the client didn't send stay `undefined` there
+    // (= "don't touch"), so a concurrent toggle-public/toggle-active can't
+    // be overwritten with a stale value read at the top of this handler.
     const nextIsActive = data.isActive !== undefined ? data.isActive : existingProduct.isActive;
-    let nextIsPublic = data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
 
-    // A base-unit reset always forces the product private — the freshly
-    // created base unit has no priceRetail/imageUrl, so a product left
-    // `isPublic: true` across a reset would silently keep failing (or
-    // worse, keep passing on stale cached data) T3a's publishing gate.
-    if (wantsBaseUnitChange) {
-      nextIsPublic = false;
-    }
+    // [v4.6] The image lives on Product, not on a unit. productImageWrite is
+    // the value this request would SAVE: undefined = the client sent nothing
+    // (leave as-is), otherwise the trimmed value or null (cleared).
+    // effectiveImageUrl is the value the gate must validate -- the one the
+    // product would actually carry afterwards -- so the gate can never
+    // approve an image this request is not going to persist.
+    const productImageWrite =
+      data.imageUrl === undefined ? undefined : data.imageUrl?.trim() || null;
+    const effectiveImageUrl =
+      data.imageUrl === undefined ? existingProduct.imageUrl : productImageWrite;
 
-    if (data.isPublic === true && !wantsBaseUnitChange) {
+    // The gate is evaluated against the publishing state the product WOULD
+    // end up in, not only against an explicit isPublic: true. That is what
+    // makes "clear the image while the product is public" a 400 instead of a
+    // silent violation of the T3a publishing rule.
+    const nextIsPublic =
+      data.isPublic !== undefined ? data.isPublic : existingProduct.isPublic;
+
+    if (nextIsPublic && !wantsBaseUnitChange) {
       if (!nextIsActive) {
         return NextResponse.json(
           { error: "PRODUCT_INACTIVE", message: "لا يمكن نشر منتج موقوف في المتجر." },
@@ -380,14 +487,37 @@ export async function PATCH(
 
       const candidateUnits: PublishabilityCandidateUnit[] = effectiveUnits.map((u) => ({
         isActive: u.isActive !== false,
-        imageUrl: u.imageUrl,
-        priceRetail: u.priceRetail,
       }));
 
-      const gateCheck = checkProductPublishable({ isActive: nextIsActive, units: candidateUnits });
+      const gateCheck = checkProductPublishable({
+        isActive: nextIsActive,
+        imageUrl: effectiveImageUrl,
+        units: candidateUnits,
+      });
       if (!gateCheck.publishable) {
         return NextResponse.json(
           { error: "PUBLISH_GATE_BLOCKED", message: gateCheck.reason },
+          { status: 400 }
+        );
+      }
+    }
+
+    // [v4.6] A base-unit reset no longer forces the product private. The
+    // image belongs to the product, so swapping the unit rows cannot strip
+    // the photo and cannot invalidate publishing on its own. Publishing
+    // state is left untouched below; instead the gate is re-run here against
+    // the POST-reset unit state -- resetProductUnits() always creates the
+    // new base unit with isActive: true -- and this request is rejected
+    // only if the product would genuinely no longer qualify.
+    if (nextIsPublic && wantsBaseUnitChange) {
+      const resetGateCheck = checkProductPublishable({
+        isActive: nextIsActive,
+        imageUrl: effectiveImageUrl,
+        units: [{ isActive: true }],
+      });
+      if (!resetGateCheck.publishable) {
+        return NextResponse.json(
+          { error: "PUBLISH_GATE_BLOCKED", message: resetGateCheck.reason },
           { status: 400 }
         );
       }
@@ -397,36 +527,73 @@ export async function PATCH(
       if (wantsBaseUnitChange && newBaseUnitSubmission) {
         // resetProductUnits() itself calls assertBaseUnitMutable() AND
         // assertNoPendingB2BReferences() as its first two actions, inside
-        // THIS transaction — this is the actual, race-free gate.
-        await resetProductUnits(tx, {
+        // THIS transaction.
+        //
+        // [v4.5] Its return value is captured because resetProductUnits()
+        // deliberately accepts NO barcode for the new base unit — a barcode
+        // is only ever attached AFTER a reset, through createUnitBarcode().
+        // A duplicate value is caught by @@unique([tenantId, barcode]) and
+        // surfaces as the friendly BARCODE_EXISTS response below.
+        const resetBaseUnit = await resetProductUnits(tx, {
           tenantId,
           productId: id,
           newBaseUnit: {
             unitName: newBaseUnitSubmission.unitName,
-            pricingCurrency: newBaseUnitSubmission.pricingCurrency,
+            // [FIX] the schema no longer defaults this — apply it here.
+            pricingCurrency: newBaseUnitSubmission.pricingCurrency ?? "SYP",
             priceWholesale: newBaseUnitSubmission.priceWholesale,
-            priceRetail: newBaseUnitSubmission.priceRetail ?? null,
-            imageUrl: newBaseUnitSubmission.imageUrl ?? null,
           },
           changedByUserId: session.user.id,
           reason: data.baseUnitChangeReason!.trim(),
         });
 
+        for (const barcodeRow of newBaseUnitSubmission.barcodes) {
+          await createUnitBarcode(tx, tenantId, resetBaseUnit.id, {
+            barcode: barcodeRow.barcode,
+            barcodeSource: barcodeRow.barcodeSource,
+          });
+        }
+
+        // GS1 shared-catalog reconciliation for the new base unit's barcodes —
+        // the same request-scoped continuity rule as products/route.ts's POST.
+        let resetSharedCatalogEntryId: string | null = null;
+        for (const barcodeRow of newBaseUnitSubmission.barcodes) {
+          if (barcodeRow.barcodeSource !== "GS1") continue;
+          resetSharedCatalogEntryId = await resolveSharedCatalogForBarcode(tx, {
+            barcode: barcodeRow.barcode,
+            name: data.name || existingProduct.name,
+            category: data.category !== undefined ? data.category : existingProduct.category,
+            imageUrl: effectiveImageUrl ?? null,
+            addedByTenantId: tenantId,
+            preferEntryId: resetSharedCatalogEntryId,
+          });
+        }
+
+        // [v4.6] Publishing state is NOT forced to false here: the image
+        // belongs to the product, so a base-unit reset cannot invalidate it.
+        // The gate was already re-run against the post-reset state above and
+        // this request was rejected if the product would not still qualify.
         await updateProduct(tx, tenantId, id, {
           name: data.name,
-          category: data.category !== undefined ? data.category : undefined,
-          isActive: nextIsActive,
-          isPublic: false, // forced — see the note above
+          category: data.category,
+          isActive: data.isActive,
+          isPublic: data.isPublic,
+          imageUrl: productImageWrite,
         });
       } else {
         await updateProduct(tx, tenantId, id, {
           name: data.name,
-          category: data.category !== undefined ? data.category : undefined,
-          isActive: nextIsActive,
-          isPublic: nextIsPublic,
+          category: data.category, // undefined = untouched, null = cleared
+          isActive: data.isActive,
+          isPublic: data.isPublic,
+          imageUrl: productImageWrite, // undefined = untouched, null = cleared
         });
 
         if (data.units) {
+          // [v4.5] Request-scoped continuity for the shared catalog — see the
+          // GS1 loop at the bottom of this block.
+          let sharedCatalogEntryId: string | null = null;
+
           for (const u of data.units) {
             if (u.id && !existingProduct.units.some((eu) => eu.id === u.id)) {
               throw new UnitNotBelongingToProductError(u.id, id);
@@ -453,54 +620,71 @@ export async function PATCH(
                   newConversionFactor: u.conversionFactor,
                 });
               }
+
+              // [FIX] Persist the unit's own editable fields. Previously this
+              // branch handled only the factor and barcodes, so a name /
+              // price / image / isActive edit returned 200 "updated" while
+              // writing nothing — and the publishing gate above had already
+              // validated the never-saved values. `undefined` = untouched;
+              // conversionFactor is deliberately absent (SafeProductUnitUpdate
+              // excludes it — see the guarded path above).
               await updateProductUnit(tx, tenantId, u.id, {
                 unitName: u.unitName,
-                pricingCurrency: u.pricingCurrency,
                 priceWholesale: u.priceWholesale,
-                priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
-                barcode: u.barcode ? u.barcode.trim() : null,
-                barcodeSource: u.barcode ? u.barcodeSource : null,
-                imageUrl: u.imageUrl || null,
-                isActive: u.isActive !== undefined ? u.isActive : true,
+                pricingCurrency: u.pricingCurrency,
+                isActive: u.isActive,
               });
+
+              // [v4.5] ADDITIVE-ONLY barcode writes for an existing unit. A
+              // barcode already stored is skipped, so re-saving the form is
+              // idempotent rather than a P2002. REMOVAL is exclusively the
+              // dedicated DELETE barcode route's job (ADMIN-only).
+              const storedBarcodes = new Set(
+                (existingProduct.units.find((eu) => eu.id === u.id)?.barcodes ?? []).map(
+                  (b) => b.barcode
+                )
+              );
+              for (const barcodeRow of u.barcodes) {
+                if (storedBarcodes.has(barcodeRow.barcode)) continue;
+                await createUnitBarcode(tx, tenantId, u.id, {
+                  barcode: barcodeRow.barcode,
+                  barcodeSource: barcodeRow.barcodeSource,
+                });
+              }
             } else {
-              await createAdditionalUnit(tx, tenantId, id, u.conversionFactor, {
+              const createdAdditional = await createAdditionalUnit(tx, tenantId, id, u.conversionFactor, {
                 unitName: u.unitName,
-                pricingCurrency: u.pricingCurrency,
+                // [FIX] the schema no longer defaults this — apply it here.
+                pricingCurrency: u.pricingCurrency ?? "SYP",
                 priceWholesale: u.priceWholesale,
-                priceRetail: u.priceRetail !== undefined ? u.priceRetail : null,
-                barcode: u.barcode ? u.barcode.trim() : null,
-                barcodeSource: u.barcode ? u.barcodeSource : null,
-                imageUrl: u.imageUrl || null,
                 isActive: u.isActive !== undefined ? u.isActive : true,
               });
+
+              // [v4.5] A brand-new unit starts with no barcodes, so every
+              // submitted row is written.
+              for (const barcodeRow of u.barcodes) {
+                await createUnitBarcode(tx, tenantId, createdAdditional.id, {
+                  barcode: barcodeRow.barcode,
+                  barcodeSource: barcodeRow.barcodeSource,
+                });
+              }
             }
 
-            if (u.barcodeSource === "GS1" && u.barcode?.trim()) {
-              const barcodeTrim = u.barcode.trim();
-              const existingCatalog = await tx.productCatalogEntry.findUnique({
-                where: { barcode: barcodeTrim },
+            // [v4.5] GS1 shared-catalog reconciliation for this unit's
+            // barcodes (one entry per real product; a new barcode links to
+            // the entry this request already resolved). Re-resolving an
+            // already-stored barcode is harmless. INTERNAL barcodes never
+            // contribute to the shared cross-tenant catalog (T3a §5).
+            for (const barcodeRow of u.barcodes) {
+              if (barcodeRow.barcodeSource !== "GS1") continue;
+              sharedCatalogEntryId = await resolveSharedCatalogForBarcode(tx, {
+                barcode: barcodeRow.barcode,
+                name: data.name || existingProduct.name,
+                category: data.category !== undefined ? data.category : existingProduct.category,
+                imageUrl: effectiveImageUrl ?? null,
+                addedByTenantId: tenantId,
+                preferEntryId: sharedCatalogEntryId,
               });
-              if (!existingCatalog) {
-                try {
-                  await tx.productCatalogEntry.create({
-                    data: {
-                      barcode: barcodeTrim,
-                      name: data.name || existingProduct.name,
-                      category: data.category !== undefined ? data.category : existingProduct.category,
-                      imageUrl: u.imageUrl || null,
-                      addedByTenantId: tenantId,
-                    },
-                  });
-                } catch (catalogError) {
-                  const isBenignRace =
-                    catalogError instanceof Prisma.PrismaClientKnownRequestError &&
-                    catalogError.code === "P2002";
-                  if (!isBenignRace) {
-                    throw catalogError;
-                  }
-                }
-              }
             }
           }
         }
@@ -509,11 +693,19 @@ export async function PATCH(
       return findProductWithUnits(tx, tenantId, id);
     });
 
+    const otherUnitEditsIgnored =
+      wantsBaseUnitChange && (data.units?.length ?? 0) > 1;
+
     return NextResponse.json({
       success: true,
-      product: updatedProduct,
+      product: updatedProduct
+        ? { ...updatedProduct, units: withLegacyBarcodeFields(updatedProduct.units) }
+        : updatedProduct,
       message: wantsBaseUnitChange
-        ? "تم تصحيح الوحدة الأساسية للمنتج بنجاح. تم إلغاء نشر المنتج تلقائياً — يرجى مراجعة بيانات النشر (السعر والصورة) قبل إعادة نشره."
+        ? "تم تصحيح الوحدة الأساسية للمنتج بنجاح." +
+        (otherUnitEditsIgnored
+          ? " ملاحظة: لم يتم تطبيق أي تعديلات أخرى على الوحدات ضمن هذا الطلب — أرسلها في طلب منفصل."
+          : "")
         : "تم تحديث بيانات المنتج والوحدات بنجاح.",
     });
   } catch (error) {
@@ -532,15 +724,10 @@ export async function PATCH(
         { status: 409 }
       );
     }
-    // [FIX] Was brittle string-matching on error.message.includes(...) —
-    // replaced with instanceof against the dedicated BaseUnitLockedError
-    // class (see base-unit.ts's header FIX note). Catches the race where
-    // assertBaseUnitMutable()'s re-check inside the transaction finds a
-    // batch that was created concurrently, after the early informational
-    // check above already passed — for BOTH the base-unit-reset path
-    // (resetProductUnits) and the non-base conversionFactor-edit path
-    // (updateNonBaseUnitConversionFactor), since both throw this same
-    // error class.
+    // Catches the race where assertBaseUnitMutable()'s re-check inside the
+    // transaction finds a batch created concurrently, after the early
+    // informational check above already passed — for BOTH the base-unit-reset
+    // path and the non-base conversionFactor-edit path.
     if (error instanceof BaseUnitLockedError) {
       return NextResponse.json(
         {

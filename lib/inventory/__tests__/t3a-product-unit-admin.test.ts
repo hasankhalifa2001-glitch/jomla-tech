@@ -1,222 +1,169 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect } from "vitest";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
-import { Prisma } from "@prisma/client";
 
 describe("T3a — Product & Unit Administration", () => {
   describe("1. Storefront Publishing Gate Logic (checkProductPublishable)", () => {
     it("rejects publishing when product is inactive (isActive = false)", () => {
       const result = checkProductPublishable({
         isActive: false,
-        units: [
-          {
-            isActive: true,
-            priceRetail: 1500,
-            imageUrl: "https://example.com/item.jpg",
-          },
-        ],
+        imageUrl: "https://example.com/item.jpg",
+        units: [{ isActive: true }],
       });
 
       expect(result.publishable).toBe(false);
       expect(result.reason).toContain("موقوف");
     });
 
-    it("rejects publishing when product has no units", () => {
-      const result = checkProductPublishable({
+    it("rejects publishing when the product has no active unit", () => {
+      const noUnitsAtAll = checkProductPublishable({
         isActive: true,
+        imageUrl: "https://example.com/item.jpg",
         units: [],
       });
+      expect(noUnitsAtAll.publishable).toBe(false);
+      expect(noUnitsAtAll.reason).toContain("وحدة قياس نشطة واحدة على الأقل");
 
-      expect(result.publishable).toBe(false);
-      expect(result.reason).toContain("وحدة نشطة واحدة على الأقل");
+      const everyUnitInactive = checkProductPublishable({
+        isActive: true,
+        imageUrl: "https://example.com/item.jpg",
+        units: [{ isActive: false }, { isActive: false }],
+      });
+      expect(everyUnitInactive.publishable).toBe(false);
+      expect(everyUnitInactive.reason).toContain("وحدة قياس نشطة");
     });
 
-    it("rejects publishing when all units are inactive", () => {
+    it("rejects publishing when the PRODUCT image is missing or blank", () => {
+      const missingImage = checkProductPublishable({
+        isActive: true,
+        imageUrl: null,
+        units: [{ isActive: true }],
+      });
+      expect(missingImage.publishable).toBe(false);
+      expect(missingImage.reason).toContain("صورة");
+
+      const blankImage = checkProductPublishable({
+        isActive: true,
+        imageUrl: "   ",
+        units: [{ isActive: true }],
+      });
+      expect(blankImage.publishable).toBe(false);
+      expect(blankImage.reason).toContain("صورة");
+
+      const omittedImage = checkProductPublishable({
+        isActive: true,
+        units: [{ isActive: true }],
+      });
+      expect(omittedImage.publishable).toBe(false);
+      expect(omittedImage.reason).toContain("صورة");
+    });
+
+    it("does NOT let an individual unit's own state satisfy the product image", () => {
+      // The image is a PRODUCT field: no per-unit image exists anymore, and a
+      // unit carrying its own value must not make a photo-less product
+      // publishable.
       const result = checkProductPublishable({
         isActive: true,
-        units: [
-          {
-            isActive: false,
-            priceRetail: 1500,
-            imageUrl: "https://example.com/item.jpg",
-          },
-          {
-            isActive: false,
-            priceRetail: 5000,
-            imageUrl: "https://example.com/carton.jpg",
-          },
-        ],
-      });
-
-      expect(result.publishable).toBe(false);
-      expect(result.reason).toContain("وحدة نشطة");
-    });
-
-    it("rejects publishing when active units have missing or zero retail price", () => {
-      const resultNullPrice = checkProductPublishable({
-        isActive: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: null,
-            imageUrl: "https://example.com/item.jpg",
-          },
-        ],
-      });
-      expect(resultNullPrice.publishable).toBe(false);
-      expect(resultNullPrice.reason).toContain("سعر مفرق");
-
-      const resultZeroPrice = checkProductPublishable({
-        isActive: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: 0,
-            imageUrl: "https://example.com/item.jpg",
-          },
-        ],
-      });
-      expect(resultZeroPrice.publishable).toBe(false);
-      expect(resultZeroPrice.reason).toContain("سعر مفرق");
-
-      const resultNegativePrice = checkProductPublishable({
-        isActive: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: -50,
-            imageUrl: "https://example.com/item.jpg",
-          },
-        ],
-      });
-      expect(resultNegativePrice.publishable).toBe(false);
-    });
-
-    it("rejects publishing when active units have missing or empty image URL", () => {
-      const resultNullImg = checkProductPublishable({
-        isActive: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: 2500,
-            imageUrl: null,
-          },
-        ],
-      });
-      expect(resultNullImg.publishable).toBe(false);
-      expect(resultNullImg.reason).toContain("صورة");
-
-      const resultEmptyImg = checkProductPublishable({
-        isActive: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: 2500,
-            imageUrl: "   ",
-          },
-        ],
-      });
-      expect(resultEmptyImg.publishable).toBe(false);
-      expect(resultEmptyImg.reason).toContain("صورة");
-    });
-
-    it("does NOT count inactive units toward publishing gate requirements", () => {
-      const result = checkProductPublishable({
-        isActive: true,
-        units: [
-          {
-            isActive: false,
-            priceRetail: 2500,
-            imageUrl: "https://example.com/img.jpg",
-          },
-          {
-            isActive: true,
-            priceRetail: 2500,
-            imageUrl: null,
-          },
-        ],
+        imageUrl: null,
+        units: [{ isActive: true }, { isActive: true }],
       });
       expect(result.publishable).toBe(false);
     });
 
-    it("accepts publishing when at least one active unit has valid priceRetail and imageUrl", () => {
+    it("reports the missing image INSTEAD of the missing unit only when the unit rule passes", () => {
+      // Two distinct messages: an inactive unit is never masked by a good image,
+      // and a missing image is never masked by a healthy unit.
+      const noActiveUnit = checkProductPublishable({
+        isActive: true,
+        imageUrl: "https://example.com/item.jpg",
+        units: [{ isActive: false }],
+      });
+      expect(noActiveUnit.reason).toContain("وحدة قياس نشطة");
+      expect(noActiveUnit.reason).not.toContain("صورة");
+
+      const noImage = checkProductPublishable({
+        isActive: true,
+        imageUrl: null,
+        units: [{ isActive: true }],
+      });
+      expect(noImage.reason).toContain("صورة");
+      expect(noImage.reason).not.toContain("وحدة قياس نشطة");
+    });
+
+    it("accepts publishing when the product is active, has an image and an active unit", () => {
       const result = checkProductPublishable({
         isActive: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: null,
-            imageUrl: null,
-          },
-          {
-            isActive: true,
-            priceRetail: new Prisma.Decimal("1250.50") as any,
-            imageUrl: "https://example.com/consumer-pack.jpg",
-          },
-        ],
+        imageUrl: "https://example.com/product.jpg",
+        units: [{ isActive: false }, { isActive: true }],
       });
 
       expect(result.publishable).toBe(true);
-      expect(result.eligibleUnit).toBeDefined();
+      expect(result.reason).toBeUndefined();
+    });
+
+    it("never returns a per-unit 'eligibleUnit' any more", () => {
+      const result = checkProductPublishable({
+        isActive: true,
+        imageUrl: "https://example.com/product.jpg",
+        units: [{ isActive: true }],
+      });
+      expect(result).not.toHaveProperty("eligibleUnit");
     });
   });
   describe("2. Unit & Product State Transitions & Cascades", () => {
-    it("deactivating the only gate-compliant unit invalidates storefront publishing", () => {
+    it("deactivating the last active unit invalidates storefront publishing", () => {
       const product = {
         isActive: true,
-        isPublic: true,
+        imageUrl: "https://example.com/base.jpg",
         units: [
-          {
-            id: "u-base",
-            isActive: true,
-            priceRetail: 1000,
-            imageUrl: "https://example.com/base.jpg",
-          },
-          {
-            id: "u-box",
-            isActive: true,
-            priceRetail: null,
-            imageUrl: null,
-          },
+          { id: "u-base", isActive: true },
+          { id: "u-box", isActive: true },
         ],
       };
 
       // Before deactivation: publishable
       expect(checkProductPublishable(product).publishable).toBe(true);
 
-      // Now deactivate u-base
-      const unitsAfterDeactivation = product.units.map((u) =>
+      // Deactivating ONE of two active units keeps it publishable — the image
+      // now lives on the product, so losing a unit no longer costs the photo.
+      const afterOneDeactivation = product.units.map((u) =>
         u.id === "u-base" ? { ...u, isActive: false } : u
       );
+      expect(
+        checkProductPublishable({ ...product, units: afterOneDeactivation }).publishable
+      ).toBe(true);
 
-      // Gate check after deactivation
-      const checkAfter = checkProductPublishable({
-        isActive: product.isActive,
-        units: unitsAfterDeactivation,
-      });
-
-      // Must NOT be publishable anymore
-      expect(checkAfter.publishable).toBe(false);
+      // Deactivating the LAST active unit does close the gate.
+      const afterAllDeactivation = afterOneDeactivation.map((u) => ({
+        ...u,
+        isActive: false,
+      }));
+      expect(
+        checkProductPublishable({ ...product, units: afterAllDeactivation }).publishable
+      ).toBe(false);
     });
 
-    it("product deactivation forces isPublic to false", () => {
+    it("clearing the product image closes the storefront gate", () => {
       const product = {
-        isActive: false,
-        isPublic: true,
-        units: [
-          {
-            isActive: true,
-            priceRetail: 1000,
-            imageUrl: "https://example.com/base.jpg",
-          },
-        ],
+        isActive: true,
+        imageUrl: "https://example.com/base.jpg",
+        units: [{ id: "u-base", isActive: true }],
       };
+      expect(checkProductPublishable(product).publishable).toBe(true);
 
-      const gateCheck = checkProductPublishable(product);
+      const cleared = checkProductPublishable({ ...product, imageUrl: "" });
+      expect(cleared.publishable).toBe(false);
+      expect(cleared.reason).toContain("صورة");
+    });
+
+    it("product deactivation closes the gate even with an image and an active unit", () => {
+      const gateCheck = checkProductPublishable({
+        isActive: false,
+        imageUrl: "https://example.com/base.jpg",
+        units: [{ isActive: true }],
+      });
       expect(gateCheck.publishable).toBe(false);
     });
   });
-
   describe("3. POS Unit Filtering Contracts", () => {
     it("filters out inactive units from cart unit-switching options", () => {
       const product = {
@@ -248,7 +195,6 @@ describe("T3a — Product & Unit Administration", () => {
       expect(scanBarcode("6210001234568")?.id).toBe("u-new");
     });
   });
-
   describe("4. BarcodeSource Invariants (GS1 vs INTERNAL)", () => {
     it("differentiates GS1 and INTERNAL barcodes for shared catalog promotion", () => {
       const gs1Unit = {

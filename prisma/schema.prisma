@@ -87,6 +87,142 @@ datasource db {
 // exception is Subscription.amountUSD (the platform's own SaaS revenue).
 // ============================================================================
 
+// ============================================================================
+// [v4.2] BATCH PURCHASE COST NOTE: ProductBatch.costPricePerBaseUnit and
+// InvoiceItem.costAmountSYP back T4g's profit-tracking feature.
+// CostPriceChangeLog is the append-only audit trail for correcting an
+// existing batch's cost price. All three (plus BatchDeletionLog's
+// costPriceAtDeletion snapshot) are always SYP-denominated, with no
+// pricingCurrency counterpart — an internal bookkeeping figure, never a
+// customer-facing price.
+//
+// [v4.3] STOCKADJUSTMENT FIX: StockAdjustment.batchId is a plain snapshot
+// field (with productId/unitId/batchNumber snapshots alongside it), not a
+// live @relation to ProductBatch — see the note on the StockAdjustment
+// model below for the full rationale. This is a fix to the base T1/T3c
+// spec, surfaced during T4g's design but independent of it.
+//
+// [v4.3, rev.4] Performance indexes added on StockAdjustment and
+// CostPriceChangeLog: @@index([tenantId, batchId]) alongside the existing
+// single-column indexes — the real query pattern for both (T3c's
+// adjustment-history panel, and any future cost-change history panel) is
+// always "this tenant's rows for this batchId," never batchId alone across
+// tenants. The single-column @@index([tenantId]) is kept for general
+// tenant-scoped listing/paging queries that don't filter by batch at all.
+//
+// [v4.4] PRE-LAUNCH SIMPLIFICATION: this platform has not yet been used in
+// production and carries no real pre-existing data. Every null-permitting
+// "migration/backfill" accommodation that existed in v4.2–v4.3 is removed
+// as unnecessary complexity — there is no "cost not yet set" state to
+// protect data that does not exist:
+//   - ProductBatch.costPricePerBaseUnit is now REQUIRED (non-nullable).
+//     Mandatory at batch-creation time on every creation path (single-batch
+//     entry, the multi-product receipt screen, CSV import), ADMIN-only.
+//   - InvoiceItem.costAmountSYP is now REQUIRED (non-nullable) — every
+//     batch always has a cost price, so this is always computable at
+//     commit time. No null-exclusion branch exists anywhere profit is
+//     calculated (T4c2, T4h).
+//   - CostPriceChangeLog.oldCostPrice is now REQUIRED (non-nullable) —
+//     every correction always has a real prior value to record; there is
+//     no first-time-backfill case.
+//   - BatchDeletionLog.costPriceAtDeletion is now REQUIRED (non-nullable)
+//     — every batch always has a real cost price by the time it could be
+//     deleted.
+//   - The @@index([tenantId, costPricePerBaseUnit]) index that used to back
+//     the "batches with no cost price set" backfill filter/banner has been
+//     REMOVED — that filter no longer exists, since the null state it
+//     searched for can never occur.
+//   - StockAdjustment's three-step data migration (add nullable → backfill
+//     → convert to NOT NULL) is likewise no longer relevant — there is no
+//     pre-existing data to migrate. The model below is simply the correct
+//     schema from day one.
+//   - This revision also standardizes ProductBatch.batchNumber's format
+//     ({server-date}-{required merchant text}) and adds a multi-product
+//     batch receipt screen — neither requires any schema change;
+//     batchNumber is already a plain String, and the new screen simply
+//     creates multiple ProductBatch rows sharing one batchNumber inside a
+//     single $transaction. Purely an application-layer change.
+// ============================================================================
+
+// ============================================================================
+// [v4.5] MULTI-BARCODE SUPPORT — closes a real-world gap found during
+// merchant field testing: a single ProductUnit often carries MORE THAN ONE
+// barcode (e.g. a detergent line where the manufacturer prints a different
+// barcode per scent/variant, but the merchant tracks it as one stock item
+// with one price and one batch history). The old design (a scalar
+// ProductUnit.barcode/barcodeSource pair, unique per tenant) could only
+// ever represent one barcode per unit.
+//
+// THE FIX: ProductUnit.barcode/barcodeSource are REMOVED. A new tenant-
+// scoped model, ProductUnitBarcode, holds zero, one, or many barcode rows
+// per unit. This is purely additive to the multi-unit architecture above —
+// InvoiceItem/B2BOrderRequestItem still key off unitId, never off a
+// barcode, so nothing about FIFO, sync, void, or the ledger changes.
+// ProductUnitBarcode is a full tenant-scoped model: covered by the T1
+// tenant-scope Prisma Client Extension, subject to the nested-write ban
+// (its own top-level prisma.productUnitBarcode.create(...) call inside
+// whatever $transaction it belongs to), and included in T7's cross-tenant
+// isolation test suite.
+//
+// A ProductUnitBarcode row may be hard-deleted (unlike Tenant/Product/
+// ProductUnit — see T1's Tenant Lifecycle & Deletion Policy). This is safe
+// specifically because InvoiceItem/B2BOrderRequestItem reference unitId,
+// never a barcode row — removing a mistaken barcode entry can never orphan
+// a financial record. ADMIN-only, mirroring every other inventory-mutation
+// action.
+//
+// SHARED CATALOG (ProductCatalogEntry) — redesigned in parallel: the old
+// `barcode String @unique` scalar would have written one near-duplicate
+// catalog row per barcode for the same real product (e.g. ten "مدار" rows,
+// one per scent). ProductCatalogEntry now holds ONE row per real product,
+// linked to a growing list of known barcodes via ProductCatalogEntryBarcode
+// (platform-wide unique). Matching any known barcode for a product
+// resolves to the same suggested name/category/photo; a merchant entering
+// an additional barcode for a product whose other barcode already matched
+// an existing entry links the new barcode to that SAME entry instead of
+// creating a new one.
+//
+// [v4.5, review fix] ProductCatalogEntryBarcode.barcode carries `@unique`,
+// which already generates its own index at the database level — the
+// earlier draft of this model also had a redundant `@@index([barcode])`
+// alongside it. Removed: an explicit index over the exact same column an
+// implicit unique index already covers wastes storage and slightly slows
+// writes for zero read benefit. (VerifiedRetailer.phone above has this same
+// redundant pattern from a prior revision, unrelated to this change — left
+// untouched here since it's outside this task's scope.)
+// ============================================================================
+
+// ============================================================================
+// [v4.6] PRODUCT-LEVEL IMAGE — the product image moved from ProductUnit to
+// Product. Before this revision every packaging unit (قطعة, طرد, كرتونة)
+// carried its own ProductUnit.imageUrl, which forced the merchant to upload
+// the same photo once per unit (or leave some units without one) and made
+// the storefront's "which unit's image do we show" choice depend on which
+// unit happened to have a photo.
+//
+// THE FIX: ONE image per product — Product.imageUrl. ProductUnit.imageUrl is
+// REMOVED with no per-unit override and no unit→product fallback logic
+// anywhere. Every screen that shows a product image reads Product.imageUrl.
+// The image is uploaded in step 1 of the add-product wizard (معلومات المنتج),
+// next to name and category.
+//
+// Publishing gate (application layer, lib/inventory/publishing-gate.ts):
+//   Product.isActive AND Product.imageUrl non-empty
+// (a product still needs at least one active unit to be sellable, but no
+// unit needs an image). Product.isPublic = true is blocked without it.
+//
+// This lines up with the shared catalog: ProductCatalogEntry.imageUrl and
+// ProductCatalogEntryReport.suggestedImageUrl were already one-image-per-
+// real-product, so a catalog suggestion now fills Product.imageUrl directly.
+//
+// No data migration: all current data is test data. The baseline migration
+// is edited in place (add "imageUrl" TEXT to "Product", drop it from
+// "ProductUnit") followed by `prisma migrate reset`. Offline (Dexie): the
+// product-level imageUrl is a plain non-indexed value field, so no Dexie
+// version bump is required, but code reading it offline MUST tolerate
+// undefined on devices whose cache predates the next refreshProductCache.
+// ============================================================================
+
 enum UserRole {
   ADMIN
   CASHIER
@@ -160,6 +296,8 @@ model Tenant {
   users                 User[]
   products              Product[]
   productUnits          ProductUnit[]
+  // [v4.5] tenant-scoped, per T1's isolation rules
+  productUnitBarcodes   ProductUnitBarcode[]
   productBatches        ProductBatch[]
   customers             Customer[]
   invoices              Invoice[]
@@ -171,8 +309,9 @@ model Tenant {
   customerMergeLogItems CustomerMergeLogItem[]
   stockAdjustments      StockAdjustment[]
   batchDeletionLogs     BatchDeletionLog[]
-  // [v4.0]
   baseUnitChangeLogs    BaseUnitChangeLog[]
+  // [v4.2]
+  costPriceChangeLogs   CostPriceChangeLog[]
 
   systemCustomerId     String?               @unique
   systemCustomer       Customer?             @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
@@ -198,8 +337,9 @@ model User {
   customerMergeLogs        CustomerMergeLog[]
   stockAdjustments         StockAdjustment[]
   batchDeletionLogs        BatchDeletionLog[]
-  // [v4.0]
   baseUnitChangeLogs       BaseUnitChangeLog[]
+  // [v4.2]
+  costPriceChangeLogs      CostPriceChangeLog[]
 
   @@index([tenantId])
 }
@@ -209,6 +349,20 @@ model Product {
   tenantId String
   name     String
   category String?
+
+  // [v4.6] ADDITION — the ONE image for this product (moved here from
+  // ProductUnit.imageUrl). Uploaded in step 1 of the add-product wizard,
+  // next to name and category. Nullable at the schema level because a
+  // product may legitimately exist without a photo (it simply cannot be
+  // published): the publishing gate (lib/inventory/publishing-gate.ts)
+  // requires `Product.isActive AND imageUrl non-empty` before isPublic may
+  // be true. Every screen that displays a product image (storefront card,
+  // POS card, inventory table) reads THIS field — there is no per-unit
+  // override and no unit→product fallback. Plain value field, not part of
+  // any index, so it needs no Dexie version bump (see the [v4.6] note near
+  // the top of this file).
+  imageUrl String?
+
   isPublic Boolean @default(false)
   isActive Boolean @default(true)
 
@@ -265,7 +419,6 @@ model Product {
   batches              ProductBatch[]
   invoiceItems         InvoiceItem[]
   b2bOrderRequestItems B2BOrderRequestItem[]
-  // [v4.0]
   baseUnitChangeLogs   BaseUnitChangeLog[]
 
   @@index([tenantId])
@@ -295,11 +448,18 @@ model ProductUnit {
 
   pricingCurrency PricingCurrency @default(SYP)
   priceWholesale  Decimal         @db.Decimal(18, 4)
-  priceRetail     Decimal?        @db.Decimal(18, 4)
   isActive        Boolean         @default(true)
-  imageUrl        String?
-  barcode         String?
-  barcodeSource   BarcodeSource?
+
+  // [v4.6] REMOVED — `imageUrl String?` used to live here (one image per
+  // packaging unit). Replaced by the single Product.imageUrl above: images
+  // are a PRODUCT-level concept, with no per-unit override and no fallback
+  // logic. A unit has no image of its own anymore.
+
+  // [v4.5] REMOVED — `barcode String?` / `barcodeSource BarcodeSource?` used
+  // to live here as scalar fields, one barcode per unit maximum, with
+  // `@@unique([tenantId, barcode])` below. Replaced by the `barcodes`
+  // relation to ProductUnitBarcode, which allows zero, one, or many
+  // barcodes per unit — see the [v4.5] note near the top of this file.
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -312,6 +472,11 @@ model ProductUnit {
   // Product can point back here, enforced by @unique on Product.baseUnitId.
   isBaseUnitOf Product? @relation("ProductBaseUnit")
 
+  // [v4.5] zero, one, or many barcodes for this unit — see ProductUnitBarcode
+  // below. The tenant-wide uniqueness constraint on barcode value now lives
+  // on that model, not here.
+  barcodes ProductUnitBarcode[]
+
   batches              ProductBatch[]
   invoiceItems         InvoiceItem[]
   b2bOrderRequestItems B2BOrderRequestItem[]
@@ -320,10 +485,50 @@ model ProductUnit {
   baseUnitChangesFrom  BaseUnitChangeLog[]   @relation("BaseUnitChangeOld")
   baseUnitChangesTo    BaseUnitChangeLog[]   @relation("BaseUnitChangeNew")
 
-  @@unique([tenantId, barcode])
   @@index([tenantId])
   @@index([productId])
   @@index([tenantId, isActive])
+}
+
+// ============================================================================
+// [v4.5] ProductUnitBarcode — one row per physical barcode attached to a
+// ProductUnit. Replaces ProductUnit.barcode/barcodeSource. A unit may have
+// zero rows (no barcode yet), one row (today's common case, unchanged in
+// behavior), or many rows (a merchant grouping several manufacturer
+// barcodes — e.g. one per scent/variant — under a single tracked unit).
+//
+// barcodeSource keeps the exact same meaning and confirmation rule as
+// before (T3a §5): null until a human explicitly classifies it as GS1 or
+// INTERNAL, no inference from digit pattern ever permitted, enforced by the
+// same ESLint mechanism. With multiple barcodes added in one session, the
+// UI presents one modal listing every new barcode with its own radio group
+// (no pre-selection), plus an optional human-initiated "apply to all"
+// action — see the T3a-addendum spec doc for the full UI rule.
+//
+// Deletion of a single row here is a real, hard DELETE (unlike Tenant/
+// Product/ProductUnit's soft-delete-only policy) — safe because
+// InvoiceItem/B2BOrderRequestItem key off unitId, never off a barcode row,
+// so removing a mistaken barcode can never orphan a financial record.
+// ADMIN-only, per T2b's Role Capability Matrix.
+// ============================================================================
+model ProductUnitBarcode {
+  id            String         @id @default(cuid())
+  tenantId      String
+  unitId        String
+  barcode       String
+  barcodeSource BarcodeSource?
+  createdAt     DateTime       @default(now())
+
+  tenant Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Restrict, not Cascade — mirrors T1's general "financially-adjacent rows
+  // are never silently swept away by a parent delete" posture. In practice
+  // a ProductUnit is soft-deleted (isActive: false), never hard-deleted, so
+  // this Restrict is never actually exercised, but it keeps the same
+  // explicit-over-implicit stance as the rest of this schema.
+  unit   ProductUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, barcode])
+  @@index([tenantId, unitId])
 }
 
 model ProductBatch {
@@ -347,15 +552,61 @@ model ProductBatch {
   batchNumber String
   // Always expressed in the product's base unit — see the note on
   // Product.baseUnitId above. Never a "طرد" count, never a "كرتونة" count.
+  //
+  // [v4.4] batchNumber's VALUE follows a standardized, application-enforced
+  // format: {server-date}-{required merchant-supplied text}, e.g.
+  // "2026-09-27-1" or "2026-09-27-INV4471". The date prefix is generated
+  // server-side at the moment of creation (never client-supplied); the
+  // merchant part is required free text with no auto-increment/uniqueness
+  // suggestion. This is a write-time construction rule enforced identically
+  // on every batch-creation path (single-batch entry, the multi-product
+  // receipt screen, CSV import) — no schema change, since this field was
+  // already a plain String.
   quantity    Decimal   @db.Decimal(18, 4)
   expiryDate  DateTime?
   createdAt   DateTime  @default(now())
 
-  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  product      Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
-  unit         ProductUnit       @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  // [v4.2] T4g's batch purchase-cost figure. Always SYP, always expressed
+  // per unit of the product's base unit (same principle as `quantity`).
+  //
+  // [v4.4] REQUIRED (non-nullable) — mandatory at creation time on every
+  // batch-creation path (single-batch entry, the multi-product receipt
+  // screen, CSV import), ADMIN-only, enforced at the API layer. There is no
+  // "cost not yet set" state: this platform has no pre-existing data to
+  // protect via a nullable/backfill accommodation, so the field is required
+  // from day one. Never read directly for a sale's cost calculation without
+  // going through the frozen InvoiceItem.costAmountSYP at commit time.
+  // Editing this field on an existing batch always writes one
+  // CostPriceChangeLog row in the same transaction (see that model below).
+  // [Batch cost entry] Decimal(18, 8) — deliberately NOT (18, 4) like every
+  // other monetary column in this schema. Unlike a price a human types
+  // directly, this figure is DERIVED by division: the merchant enters the
+  // TOTAL paid for a received quantity, and lib/inventory/units.ts's
+  // costFromTotal() computes total / (quantity x conversionFactor). A
+  // non-terminating per-base price (100,000 SYP over 3 pieces) must survive
+  // at 8 dp, because it is the value that must reproduce the typed total
+  // when multiplied back out; at 4 dp Postgres would silently round it and
+  // the stored figure would stop reconciling with what was actually paid.
+  costPricePerBaseUnit Decimal @db.Decimal(18, 8)
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product      Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit         ProductUnit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
   invoiceItems InvoiceItem[]
-  adjustments  StockAdjustment[]
+
+  // [v4.3] REMOVED — `adjustments StockAdjustment[]` used to be here. It is
+  // deleted because StockAdjustment no longer carries a live @relation back
+  // to ProductBatch (see the note on the StockAdjustment model below) — a
+  // Prisma relation requires both sides, and keeping a one-sided back-
+  // reference is not valid. This brings ProductBatch in line with how it
+  // already treats BatchDeletionLog (never listed as a back-relation here
+  // either, for the identical "snapshot, not live FK" reason). Look up a
+  // batch's adjustment history via `where: { batchId }` against
+  // StockAdjustment's plain indexed field instead.
+  // [v4.4] REMOVED — @@index([tenantId, costPricePerBaseUnit]) used to be
+  // here, backing a "batches with no cost price set" backfill filter/banner.
+  // That filter no longer exists: costPricePerBaseUnit can never be null,
+  // so there is nothing for such a query to search for.
 
   @@index([tenantId])
   @@index([productId])
@@ -403,9 +654,29 @@ model VerifiedRetailer {
   @@index([phone])
 }
 
+// ============================================================================
+// [v4.5] ProductCatalogEntry — REDESIGNED. The old model keyed on a single
+// `barcode String @unique` column, writing one row per barcode. With a
+// ProductUnit now able to carry many barcodes, that would write one
+// near-duplicate catalog row per barcode for the same real product (e.g.
+// ten separate "مدار" rows, one per scent, all sharing name/category/photo).
+//
+// Now: ONE ProductCatalogEntry per real product, linked to a growing list
+// of known barcodes via ProductCatalogEntryBarcode. Matching ANY of a
+// product's known barcodes resolves to the same suggested name/category/
+// photo for the one-time fill-in convenience (T3a §6, unchanged in
+// behavior otherwise — still a one-time suggestion, never re-synced). A
+// merchant entering an additional GS1 barcode on a unit whose OTHER
+// barcode already matched an existing entry links the new barcode to that
+// SAME entry (a new ProductCatalogEntryBarcode row) instead of creating a
+// second entry.
+//
+// [v4.6] imageUrl here is one-image-per-real-product, which now matches
+// Product.imageUrl directly: a catalog suggestion fills Product.imageUrl
+// (previously it had to pick a single unit's image field to fill).
+// ============================================================================
 model ProductCatalogEntry {
   id              String   @id @default(cuid())
-  barcode         String   @unique
   name            String
   category        String?
   imageUrl        String?
@@ -413,10 +684,31 @@ model ProductCatalogEntry {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  reports ProductCatalogEntryReport[]
+  barcodes ProductCatalogEntryBarcode[]
+  reports  ProductCatalogEntryReport[]
 
-  @@index([barcode])
   @@index([addedByTenantId])
+}
+
+// ============================================================================
+// [v4.5] ProductCatalogEntryBarcode — platform-wide, one row per barcode
+// known for a catalog entry. `barcode` keeps the platform-wide @unique
+// constraint the old ProductCatalogEntry.barcode field used to carry — this
+// alone already provides the index; no separate @@index([barcode]) is
+// added (see the [v4.5, review fix] note near the top of this file).
+// Cascade on delete: these rows have no independent meaning without their
+// parent entry (unlike ProductUnitBarcode, which is tenant-scoped and
+// financially adjacent enough to warrant Restrict — this table is neither).
+// ============================================================================
+model ProductCatalogEntryBarcode {
+  id             String   @id @default(cuid())
+  catalogEntryId String
+  barcode        String   @unique
+  createdAt      DateTime @default(now())
+
+  catalogEntry ProductCatalogEntry @relation(fields: [catalogEntryId], references: [id], onDelete: Cascade)
+
+  @@index([catalogEntryId])
 }
 
 model ProductCatalogEntryReport {
@@ -498,6 +790,13 @@ model InvoiceItem {
   // ALWAYS read from THIS unit row (via this unitId) — never from
   // requireBaseUnit(), which resolves an unrelated base-unit row whose
   // conversionFactor is always 1.
+  //
+  // [v4.5] NOTE — which specific barcode the cashier scanned to arrive at
+  // this unitId is never recorded here. If a unit has several barcodes
+  // (e.g. multiple مدار scents grouped under one unit), the invoice line
+  // reflects the unit sold, not which barcode variant was scanned — this is
+  // an accepted limitation, not a bug (see the T3a-addendum spec doc's
+  // "حدود بالمنتج نفسو" section).
   unitId String
 
   batchId      String
@@ -511,6 +810,23 @@ model InvoiceItem {
   quantity     Decimal @db.Decimal(18, 4)
   unitPriceSYP Decimal @db.Decimal(18, 4)
   unitPriceUSD Decimal @db.Decimal(18, 4)
+
+  // [v4.2] T4g's frozen cost basis for this line, computed once at commit
+  // time (T4c sync or T5 B2B approval):
+  //   costAmountSYP = toBaseUnit(quantity, soldUnit.conversionFactor)
+  //                   × batch.costPricePerBaseUnit
+  // Once written, this value is frozen forever — a later edit to the
+  // batch's cost price never touches an already-written InvoiceItem,
+  // mirroring how exchangeRateUsed is frozen at sale time.
+  //
+  // [v4.4] REQUIRED (non-nullable) — since ProductBatch.costPricePerBaseUnit
+  // can never be null, this is always computable at commit time. Profit
+  // (unitPriceSYP × quantity − costAmountSYP) is always fully derivable on
+  // read (T4c2, T4h) with no null-exclusion branch anywhere.
+  //
+  // A VOIDED invoice's line carries the negated value (via
+  // subtractMoney("0", …), never a raw Decimal negation) — see T4d/T4g.
+  costAmountSYP Decimal @db.Decimal(18, 4)
 
   tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoice Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
@@ -664,10 +980,47 @@ model CustomerMergeLogItem {
   @@index([recordId])
 }
 
+// ============================================================================
+// [v4.3] StockAdjustment.batchId is a plain, indexed snapshot field, NOT a
+// live @relation to ProductBatch. Previously (v3.9–v4.2), this was
+// `batch ProductBatch @relation(fields: [batchId], references: [id],
+// onDelete: Restrict)`. That silently blocked T3c's own stated hard-delete
+// eligibility rule ("zero InvoiceItem references") with an undocumented,
+// stricter one ("...and zero StockAdjustment references too") — a batch
+// that had ever received even one routine reconciliation, regardless of
+// sales history, became permanently undeletable. This is the same class of
+// conflict CostPriceChangeLog (see below) was deliberately designed from
+// the start to avoid, and that BatchDeletionLog.batchId already solved
+// correctly since it was introduced.
+//
+// Three snapshot fields (productId, unitId, batchNumber) accompany batchId
+// so this log stays meaningful even after the batch it describes is later
+// hard-deleted — mirroring BatchDeletionLog's existing snapshot rationale.
+// ProductBatch carries no back-relation field for this model (a Prisma
+// relation requires both sides; this one is deliberately one-sided by
+// design).
+//
+// [v4.4] No migration is required for this fix — the platform has no
+// pre-existing data. This model is simply the correct schema from day one.
+//
+// [v4.3, rev.4] @@index([tenantId, batchId]) added alongside the existing
+// single-column indexes — see the schema-level performance note near the
+// top of this file.
+// ============================================================================
 model StockAdjustment {
-  id               String   @id @default(cuid())
-  tenantId         String
-  batchId          String
+  id       String @id @default(cuid())
+  tenantId String
+
+  // Plain snapshot field — deliberately NOT a live @relation. See the
+  // model-level note above for the full rationale.
+  batchId     String
+  // Snapshot fields captured at the moment this row is written, so the
+  // adjustment stays meaningful even if the batch is later hard-deleted
+  // (possible regardless of adjustment history, per this same fix).
+  productId   String
+  unitId      String
+  batchNumber String
+
   adjustedByUserId String
   // [v4.0] NOTE — always in the batch's base unit, same as
   // ProductBatch.quantity itself. A reconciliation screen that lets an
@@ -679,28 +1032,42 @@ model StockAdjustment {
   reason           String
   createdAt        DateTime @default(now())
 
-  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  batch          ProductBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
-  adjustedByUser User         @relation(fields: [adjustedByUserId], references: [id], onDelete: Restrict)
+  tenant         Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  adjustedByUser User   @relation(fields: [adjustedByUserId], references: [id], onDelete: Restrict)
+  // NOTE: no `batch` relation field here. Look up a batch's adjustment
+  // history via `where: { tenantId, batchId }` against the plain indexed
+  // fields below — exactly like BatchDeletionLog already does.
 
   @@index([tenantId])
   @@index([batchId])
+  // [v4.3, rev.4] composite — the real query shape used everywhere this
+  // log is read (T3c's adjustment-history panel).
+  @@index([tenantId, batchId])
 }
 
 model BatchDeletionLog {
   id       String @id @default(cuid())
   tenantId String
 
-  batchId            String
-  productId          String
-  unitId             String
-  batchNumber        String
+  batchId             String
+  productId           String
+  unitId              String
+  batchNumber         String
   // [v4.0] NOTE — snapshot is in the base unit, consistent with the batch's
   // own quantity field at the moment it existed.
-  quantityAtDeletion Decimal  @db.Decimal(18, 4)
-  deletedByUserId    String
-  reason             String
-  createdAt          DateTime @default(now())
+  quantityAtDeletion  Decimal  @db.Decimal(18, 4)
+  // [v4.2] Snapshot of the batch's cost price at the moment of deletion.
+  // Keeps this log's existing promise ("prove what was lost, not just that
+  // a deletion happened") consistent now that a batch carries a cost figure
+  // too.
+  //
+  // [v4.4] REQUIRED (non-nullable) — every batch always has a real cost
+  // price by the time it could be deleted, since costPricePerBaseUnit can
+  // never be null.
+  costPriceAtDeletion Decimal  @db.Decimal(18, 8)
+  deletedByUserId     String
+  reason              String
+  createdAt           DateTime @default(now())
 
   tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   deletedByUser User   @relation(fields: [deletedByUserId], references: [id], onDelete: Restrict)
@@ -710,7 +1077,7 @@ model BatchDeletionLog {
 }
 
 // ============================================================================
-// [v4.0, new] BaseUnitChangeLog — append-only audit trail for the rare,
+// [v4.0] BaseUnitChangeLog — append-only audit trail for the rare,
 // zero-batch-only correction of a product's designated base unit (see
 // UNIT-ARCHITECTURE.md's Immutability rule). Same pattern as
 // StockAdjustment/BatchDeletionLog: append-only, no updatedAt, every
@@ -719,6 +1086,12 @@ model BatchDeletionLog {
 // This model exists specifically to back the audit-logging promise made in
 // the spec's Unit Conversion Architecture section — a base-unit correction
 // on a zero-batch product is never a silent field edit.
+//
+// NOTE: this model's FK relations (product, oldBaseUnit, newBaseUnit) are
+// safe to keep live/Restrict because it only ever applies to a zero-batch
+// product's ProductUnit rows, not to ProductBatch — there is no equivalent
+// hard-delete-eligibility conflict here the way there was for
+// StockAdjustment/CostPriceChangeLog and ProductBatch.
 // ============================================================================
 model BaseUnitChangeLog {
   id              String   @id @default(cuid())
@@ -738,4 +1111,47 @@ model BaseUnitChangeLog {
 
   @@index([tenantId])
   @@index([productId])
+}
+
+// ============================================================================
+// [v4.2] CostPriceChangeLog — append-only audit trail for correcting an
+// EXISTING batch's costPricePerBaseUnit (T4g). Closes the one place a
+// sensitive financial edit had no audit trail, consistent with
+// StockAdjustment / BatchDeletionLog / CustomerMergeLog / BaseUnitChangeLog.
+// ADMIN-only per T2b's Role Capability Matrix.
+//
+// batchId is DELIBERATELY a plain snapshot field, not a live @relation —
+// designed correctly from the start, following BatchDeletionLog's
+// precedent, rather than repeating the mistake later fixed on
+// StockAdjustment in v4.3 (see that model's note above for the full
+// rationale: a live Restrict relation here would create the identical
+// conflict with T3c's zero-InvoiceItem hard-delete rule).
+//
+// [v4.4] oldCostPrice and newCostPrice are both REQUIRED (non-nullable) —
+// since ProductBatch.costPricePerBaseUnit is mandatory from creation, every
+// correction always has a real prior value to record. There is no
+// first-time-backfill case.
+//
+// [v4.3, rev.4] @@index([tenantId, batchId]) added alongside the existing
+// single-column indexes — see the schema-level performance note near the
+// top of this file.
+// ============================================================================
+model CostPriceChangeLog {
+  id              String   @id @default(cuid())
+  tenantId        String
+  batchId         String // plain snapshot field, deliberately NOT a live @relation
+  oldCostPrice    Decimal  @db.Decimal(18, 8)
+  newCostPrice    Decimal  @db.Decimal(18, 8)
+  changedByUserId String
+  reason          String
+  createdAt       DateTime @default(now())
+
+  tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  changedByUser User   @relation(fields: [changedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([batchId])
+  // [v4.3, rev.4] composite — the real query shape any future cost-change
+  // history panel would use.
+  @@index([tenantId, batchId])
 }
