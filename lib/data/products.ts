@@ -74,6 +74,7 @@ import {
 } from "@/lib/inventory/base-unit";
 import {
     buildConversionFactorField,
+    getUnitConversionFactor,
     isReservedBaseUnitFactor,
     BASE_UNIT_CONVERSION_FACTOR,
     type DisplayUnit,
@@ -1005,4 +1006,186 @@ export async function findProductByNameCategory(
     });
     if (!product) return null;
     return toSafeProductWithUnits(product);
+}
+// ----------------------------------------------------------------------------
+// [T4h] DASHBOARD SUPPORT GATEWAYS
+//
+// Three deliberately NARROW read helpers for lib/data/analytics.ts (invoked
+// per /dashboard load through app/api/analytics/route.ts), added here because
+// this file is the ONLY place allowed to name the product / productUnit /
+// productBatch models or to reach a `.conversionFactor` at all (see
+// eslint.config.mjs's BACKEND_ONLY_FILES block and this file's own header).
+//
+// WHY NOT REUSE listProductsWithInventoryDetails():
+// that function fetches EVERY product with EVERY unit AND EVERY batch (plus
+// their barcode lists and adjustment histories) — correct for the inventory
+// screen, far too heavy to run on every /dashboard load. These three helpers
+// read exactly what the analytics screen needs and nothing else.
+// ----------------------------------------------------------------------------
+
+/**
+ * Fail-loud tenant guard. Belt-and-suspenders: every `where` below ALSO
+ * carries `tenantId` explicitly (and the getTenantDb() extension would inject
+ * it a third time), but a missing tenant id must never silently widen one of
+ * these reads to the whole table if this gateway is ever called through a raw
+ * client.
+ */
+function requireTenantId(tenantId: string, caller: string): void {
+    if (typeof tenantId !== "string" || tenantId.trim() === "") {
+        throw new Error(`lib/data/products.ts: ${caller}() requires a tenantId.`);
+    }
+}
+
+/**
+ * Fail-loud guard over a caller-supplied id list: no blank entries. An EMPTY
+ * list is legal — an empty dashboard window has no products / no units — and
+ * the helpers below return an empty map for it instead of querying with an
+ * empty `in: []`.
+ */
+function requireIdList(ids: readonly string[], caller: string): void {
+    for (const id of ids) {
+        if (typeof id !== "string" || id.trim() === "") {
+            throw new Error(`lib/data/products.ts: ${caller}() received a blank id.`);
+        }
+    }
+}
+
+/**
+ * Resolves a set of SOLD unit ids (an InvoiceItem's `unitId`) to that unit's
+ * conversion factor, in ONE batch of reads.
+ *
+ * - The factor is read ONLY through units.ts's getUnitConversionFactor() — the
+ *   one sanctioned reader — never by naming `conversionFactor` in a select
+ *   here (banned in this file too; see CONVERSION_FACTOR_RULES).
+ * - The BASE-UNIT NAME deliberately does NOT travel with the factor: the
+ *   analytics layer resolves the (at most 15) surfaced products' base-unit
+ *   names itself via base-unit.ts's fail-loud requireBaseUnits(), degrading a
+ *   missing label to an empty unit name instead of failing the dashboard.
+ *
+ * A unit id that does not exist for this tenant simply has no map entry; the
+ * caller decides what that means (T4h treats it as a data-integrity bug and
+ * throws rather than ranking a wrong number).
+ */
+export async function listUnitConversionFactors(
+    tx: TxOrClient,
+    tenantId: string,
+    unitIds: readonly string[]
+): Promise<Map<string, string>> {
+    requireTenantId(tenantId, "listUnitConversionFactors");
+    requireIdList(unitIds, "listUnitConversionFactors");
+
+    const unique = [...new Set(unitIds)];
+    const result = new Map<string, string>();
+    if (unique.length === 0) return result;
+
+    const unitRows = await tx.productUnit.findMany({
+        where: { tenantId, id: { in: unique } },
+        select: { id: true },
+    });
+
+    for (const row of unitRows) {
+        const factor = await getUnitConversionFactor(tx, tenantId, row.id);
+        result.set(row.id, factor.toString());
+    }
+
+    return result;
+}
+
+/** One stock-risk batch row, flattened for the dashboard alerts. */
+export interface AlertBatchRow {
+    id: string;
+    batchNumber: string;
+    quantity: string;
+    expiryDate: Date | null;
+    productId: string;
+    productName: string;
+    unitName: string;
+}
+
+/**
+ * The ONLY batches worth alerting on: negative-stock batches, and real stock
+ * (`quantity > 0`) expiring BEFORE `expiringBefore`. Filtered IN THE DATABASE
+ * (a single indexed read), not by fetching a tenant's whole batch table and
+ * discarding most of it in application code.
+ *
+ * Product names are fetched separately by id — this file may not name
+ * `product` as an `include`/`select`/`where` KEY (PRODUCT_MODEL_RULES bans
+ * `include: { product: ... }` outside this file, and cleanup-by-inlining it
+ * here would defeat the point of the ban), so a second tiny keyed read stands
+ * in for the join (listProductNamesByIds below).
+ *
+ * The rows come back FLAT and UNCLASSIFIED: splitting them into
+ * "needs reconciliation" vs "expiring soon", the calendar-day math and the
+ * list caps all belong to lib/data/analytics.ts's buildAlerts(), which owns
+ * the dashboard's alert semantics.
+ */
+export async function listBatchAlertRows(
+    tx: TxOrClient,
+    tenantId: string,
+    options: { expiringBefore: Date }
+): Promise<AlertBatchRow[]> {
+    requireTenantId(tenantId, "listBatchAlertRows");
+
+    const rows = await tx.productBatch.findMany({
+        where: {
+            tenantId,
+            OR: [
+                { quantity: { lt: 0 } },
+                { quantity: { gt: 0 }, expiryDate: { not: null, lt: options.expiringBefore } },
+            ],
+        },
+        select: {
+            id: true,
+            batchNumber: true,
+            quantity: true,
+            expiryDate: true,
+            productId: true,
+            unit: { select: { unitName: true } },
+        },
+        orderBy: { expiryDate: "asc" },
+    });
+
+    const productIds = [...new Set(rows.map((row) => row.productId))];
+    const nameById =
+        productIds.length > 0
+            ? await listProductNamesByIds(tx, tenantId, productIds)
+            : new Map<string, string>();
+
+    return rows.map((row) => ({
+        id: row.id,
+        batchNumber: row.batchNumber,
+        quantity: row.quantity.toString(),
+        expiryDate: row.expiryDate,
+        productId: row.productId,
+        productName: nameById.get(row.productId) ?? "منتج غير متوفر",
+        unitName: row.unit.unitName,
+    }));
+}
+
+// [T4h] THE narrowest of the dashboard's three reads from this gateway: just
+// id → display name for the products the analytics window actually touched.
+// The Top-5 lists are built from InvoiceItem rows, so a product soft-deleted
+// after it was sold has no catalog row to name it; this lookup substitutes a
+// placeholder for exactly those, and is the ONLY thing the analytics data layer
+// needs from the catalog — listProductsWithInventoryDetails() would be the
+// wrong call here for the reason listBatchAlertRows() gives (same heavy-read
+// rationale as the gateway section above).
+export async function listProductNamesByIds(
+    tx: TxOrClient,
+    tenantId: string,
+    productIds: readonly string[]
+): Promise<Map<string, string>> {
+    requireTenantId(tenantId, "listProductNamesByIds");
+    requireIdList(productIds, "listProductNamesByIds");
+
+    const names = new Map<string, string>();
+    if (productIds.length === 0) return names;
+
+    const rows = await tx.product.findMany({
+        where: { tenantId, id: { in: [...productIds] } },
+        select: { id: true, name: true },
+    });
+
+    for (const row of rows) names.set(row.id, row.name);
+    return names;
 }
