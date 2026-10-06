@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-syntax */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
@@ -11,7 +12,7 @@ import Decimal from "decimal.js";
  * REAL here, not mocked:
  *   - app/api/analytics/route.ts — the actual handler under test.
  *   - lib/data/analytics.ts — the actual data layer (windowing, bucketing,
- *     ranking, alert derivation), so the acceptance figures are exercised as
+ *     ranking, alert reshaping), so the acceptance figures are exercised as
  *     written rather than re-implemented in the test.
  *   - lib/utils/money.ts and lib/ledger/balance.ts — real decimal arithmetic
  *     and the single T4e ledger formula.
@@ -22,8 +23,22 @@ import Decimal from "decimal.js";
  * MOCKED only where a real call needs a real database: the Prisma boundary
  * (getTenantDb + the fakes below), the session, and the THREE narrow dashboard
  * gateways of lib/data/products.ts (product names, unit conversion factors,
- * batch alert rows) — their SQL is the gateway's own concern; here they exist
- * only to feed analytics.ts's real derivations.
+ * batch alert sets) — their SQL is the gateway's own concern (and needs its
+ * own test against a real/faked Prisma client: the capped, separately counted
+ * WHERE clauses live THERE, not in analytics.ts); here they exist only to feed
+ * analytics.ts's real derivations.
+ *
+ * [Revised for the T4h review fixes]
+ *   - listBatchAlertRows → listBatchAlertSets (two capped lists, each with its
+ *     own exact DB count). analytics.ts no longer filters or caps batch alerts
+ *     itself; it reshapes what the gateway returns.
+ *   - the expiry boundary is EXACT: start of the local day EXPIRING_SOON_DAYS
+ *     from today (no +1 slack).
+ *   - invoiceCount is EVENT-DATED: COMPLETED rows created today, independent
+ *     of any void (the invoice read no longer even selects `voidedBy`).
+ *   - unit conversion factors are fetched ONCE (batched), and a failure to
+ *     resolve base-unit names is logged, not swallowed silently.
+ *   - the route sets `Cache-Control: private, max-age=30`.
  *
  * COVERAGE → ACCEPTANCE CRITERIA
  *   1. CASHIER rejected server-side, no figure ever exposed.
@@ -31,35 +46,38 @@ import Decimal from "decimal.js";
  *   3. The chart reflects the last 7/30 days per the selected filter, with
  *      tenant-local (UTC+3) day boundaries — a 23:30 UTC sale belongs to the
  *      NEXT local day.
- *   4. "Most profitable" vs "top-selling" contain different items (seeded
- *      high-volume/low-margin vs low-volume/high-margin data).
+ *   4. "Most profitable" vs "top-selling" contain different items.
  *   5. by-value vs by-quantity produce two genuinely different orderings
- *      (quantities converted to BASE units per line — raw carton counts must
- *      never win).
+ *      (quantities converted to BASE units per line).
  *   6. The balance alert never references or implies a payment deadline —
- *      enforced by a static source scan over all three analytics files plus a
- *      response-shape assertion.
+ *      enforced by a static source scan plus a response-shape assertion.
  */
 
-const { mockSessionState, mockGetTenantDb, fakeDb, mockListNames, mockListFactors, mockListBatchRows } =
-    vi.hoisted(() => {
-        const fakeDb: any = {
-            invoice: { findMany: vi.fn(), groupBy: vi.fn() },
-            invoiceItem: { findMany: vi.fn() },
-            customer: { findMany: vi.fn() },
-            customerPayment: { groupBy: vi.fn() },
-            tenant: { findUnique: vi.fn() },
-            product: { findMany: vi.fn() },
-        };
-        return {
-            fakeDb,
-            mockGetTenantDb: vi.fn(() => fakeDb),
-            mockSessionState: { session: null as any },
-            mockListNames: vi.fn(),
-            mockListFactors: vi.fn(),
-            mockListBatchRows: vi.fn(),
-        };
-    });
+const {
+    mockSessionState,
+    mockGetTenantDb,
+    fakeDb,
+    mockListNames,
+    mockListFactors,
+    mockListBatchSets,
+} = vi.hoisted(() => {
+    const fakeDb: any = {
+        invoice: { findMany: vi.fn(), groupBy: vi.fn() },
+        invoiceItem: { findMany: vi.fn() },
+        customer: { findMany: vi.fn() },
+        customerPayment: { groupBy: vi.fn() },
+        tenant: { findUnique: vi.fn() },
+        product: { findMany: vi.fn() },
+    };
+    return {
+        fakeDb,
+        mockGetTenantDb: vi.fn(() => fakeDb),
+        mockSessionState: { session: null as any },
+        mockListNames: vi.fn(),
+        mockListFactors: vi.fn(),
+        mockListBatchSets: vi.fn(),
+    };
+});
 
 vi.mock("@/lib/db/tenant-scope", () => ({
     getTenantDb: mockGetTenantDb,
@@ -69,9 +87,10 @@ vi.mock("@/lib/db/tenant-scope", () => ({
 vi.mock("@/auth", () => ({ auth: vi.fn(async () => mockSessionState.session) }));
 
 vi.mock("@/lib/data/products", () => ({
+    UNKNOWN_PRODUCT_NAME: "منتج غير متوفر",
     listProductNamesByIds: mockListNames,
     listUnitConversionFactors: mockListFactors,
-    listBatchAlertRows: mockListBatchRows,
+    listBatchAlertSets: mockListBatchSets,
 }));
 
 import { GET as getAnalytics } from "@/app/api/analytics/route";
@@ -86,6 +105,7 @@ import {
     EXPIRING_SOON_DAYS,
     ALERT_LIST_LIMIT,
 } from "@/lib/data/analytics";
+import { UNKNOWN_PRODUCT_NAME } from "@/lib/data/products";
 import { computeBalanceSYP } from "@/lib/ledger/balance";
 import { ROLE_CAPABILITY_MATRIX } from "@/lib/auth/role-matrix";
 import { addLocalDays, localDayKey, startOfLocalDay } from "@/lib/utils/syria-time";
@@ -108,7 +128,7 @@ function expectMoneyEq(actual: string, expected: string | number): void {
 // === SEEDS — one fixed calendar; every date is chosen deliberately ===
 const D = (iso: string) => new Date(iso);
 const INV_T1 = D("2026-10-05T09:00:00.000Z"); // today (local)
-const INV_T2 = D("2026-10-05T10:00:00.000Z"); // today — this original was later voided
+const INV_T2 = D("2026-10-05T10:00:00.000Z"); // today — this original is voided by INV_T3
 const INV_T3 = D("2026-10-05T11:00:00.000Z"); // today — VOID mirror row (negated totals)
 const INV_T7 = D("2026-10-04T22:30:00.000Z"); // 22:30 UTC yesterday → LOCAL TODAY 01:30
 const INV_O4 = D("2026-10-03T10:00:00.000Z"); // two local days ago
@@ -116,13 +136,13 @@ const INV_M5 = D("2026-09-15T10:00:00.000Z"); // inside the 30-day window only
 const INV_OUT = D("2026-09-01T10:00:00.000Z"); // 35 local days ago — outside BOTH windows
 
 const invoiceRows: any[] = [
-    { totalSYP: "10000", totalUSD: "10", status: "COMPLETED", createdAt: INV_T1, voidedBy: null },
-    { totalSYP: "1000", totalUSD: "1", status: "COMPLETED", createdAt: INV_T2, voidedBy: { id: "void-1" } },
-    { totalSYP: "-1000", totalUSD: "-1", status: "VOIDED", createdAt: INV_T3, voidedBy: null },
-    { totalSYP: "600", totalUSD: "6", status: "COMPLETED", createdAt: INV_T7, voidedBy: null },
-    { totalSYP: "10000", totalUSD: "10", status: "COMPLETED", createdAt: INV_O4, voidedBy: null },
-    { totalSYP: "7000", totalUSD: "7", status: "COMPLETED", createdAt: INV_M5, voidedBy: null },
-    { totalSYP: "99999", totalUSD: "99", status: "COMPLETED", createdAt: INV_OUT, voidedBy: null },
+    { totalSYP: "10000", totalUSD: "10", status: "COMPLETED", createdAt: INV_T1 },
+    { totalSYP: "1000", totalUSD: "1", status: "COMPLETED", createdAt: INV_T2 },
+    { totalSYP: "-1000", totalUSD: "-1", status: "VOIDED", createdAt: INV_T3 },
+    { totalSYP: "600", totalUSD: "6", status: "COMPLETED", createdAt: INV_T7 },
+    { totalSYP: "10000", totalUSD: "10", status: "COMPLETED", createdAt: INV_O4 },
+    { totalSYP: "7000", totalUSD: "7", status: "COMPLETED", createdAt: INV_M5 },
+    { totalSYP: "99999", totalUSD: "99", status: "COMPLETED", createdAt: INV_OUT },
 ];
 
 const line = (
@@ -188,14 +208,40 @@ const repaymentGroups: any[] = [
 ];
 
 const DAY_MS = 86400000;
-const BATCH_ROWS: any[] = [
-    { id: "b-neg2", batchNumber: "BN-2", quantity: "-10", expiryDate: null, productId: "prod-volume", productName: "زيت دوار الشمس", unitName: "لتر" },
-    { id: "b-neg", batchNumber: "BN-1", quantity: "-3", expiryDate: null, productId: "prod-value", productName: "شاي أحمر", unitName: "علبة" },
-    { id: "b-old", batchNumber: "BE-1", quantity: "5", expiryDate: new Date(NOW.getTime() - 2 * DAY_MS), productId: "prod-profit", productName: "عسل جبلي", unitName: "كيس" },
-    { id: "b-soon", batchNumber: "BE-2", quantity: "12", expiryDate: new Date(NOW.getTime() + 10 * DAY_MS), productId: "prod-edge", productName: "تمر مجدول", unitName: "كرتون" },
-    { id: "b-zero", batchNumber: "BZ-1", quantity: "0", expiryDate: new Date(NOW.getTime() + 5 * DAY_MS), productId: "prod-volume", productName: "زيت دوار الشمس", unitName: "لتر" },
-    { id: "b-far", batchNumber: "BF-1", quantity: "8", expiryDate: new Date(NOW.getTime() + 200 * DAY_MS), productId: "prod-value", productName: "شاي أحمر", unitName: "علبة" },
-];
+
+/**
+ * What lib/data/products.ts's listBatchAlertSets() hands back. The gateway —
+ * not analytics.ts — selects, caps and COUNTS these in the database, so the
+ * mock models its OUTPUT contract: two lists, each with an exact `count`.
+ * Rows are deliberately given in the WRONG order to prove analytics.ts still
+ * presents them worst-first.
+ */
+const batchRow = (
+    id: string,
+    batchNumber: string,
+    quantity: string,
+    expiryDate: Date | null,
+    productId: string,
+    productName: string,
+    unitName: string
+) => ({ id, batchNumber, quantity, expiryDate, productId, productName, unitName });
+
+const BATCH_SETS = {
+    needsReconciliation: {
+        count: 2,
+        rows: [
+            batchRow("b-neg", "BN-1", "-3", null, "prod-value", "شاي أحمر", "علبة"),
+            batchRow("b-neg2", "BN-2", "-10", null, "prod-volume", "زيت دوار الشمس", "لتر"),
+        ],
+    },
+    expiringSoon: {
+        count: 2,
+        rows: [
+            batchRow("b-soon", "BE-2", "12", new Date(NOW.getTime() + 10 * DAY_MS), "prod-edge", "تمر مجدول", "كرتون"),
+            batchRow("b-old", "BE-1", "5", new Date(NOW.getTime() - 2 * DAY_MS), "prod-profit", "عسل جبلي", "كيس"),
+        ],
+    },
+};
 
 beforeEach(() => {
     vi.resetAllMocks();
@@ -204,7 +250,7 @@ beforeEach(() => {
     mockGetTenantDb.mockImplementation(() => fakeDb);
     mockListNames.mockImplementation(async () => PRODUCT_NAMES);
     mockListFactors.mockImplementation(async () => UNIT_FACTORS);
-    mockListBatchRows.mockImplementation(async () => BATCH_ROWS);
+    mockListBatchSets.mockImplementation(async () => BATCH_SETS);
 
     fakeDb.invoice.findMany.mockImplementation(async ({ where }: any) =>
         invoiceRows.filter((r) => r.createdAt >= where.createdAt.gte && r.createdAt < where.createdAt.lt)
@@ -231,7 +277,7 @@ beforeEach(() => {
 async function callRoute(query: string, session: unknown) {
     mockSessionState.session = session as any;
     const res = await getAnalytics(new NextRequest(`http://localhost/api/analytics${query}`));
-    return { status: res.status, body: await res.json() };
+    return { status: res.status, body: await res.json(), headers: res.headers };
 }
 
 describe("T4h — GET /api/analytics: route guards", () => {
@@ -257,6 +303,7 @@ describe("T4h — GET /api/analytics: route guards", () => {
         expect(mockGetTenantDb).not.toHaveBeenCalled();
         expect(fakeDb.invoice.findMany).not.toHaveBeenCalled();
         expect(fakeDb.invoiceItem.findMany).not.toHaveBeenCalled();
+        expect(mockListBatchSets).not.toHaveBeenCalled();
         // …and no financial figure leaks into the body by any path.
         const raw = JSON.stringify(body);
         for (const leaked of ["kpis", "salesSYP", "salesUSD", "netProfitSYP", "outstandingDebtSYP", "trend", "topProducts"]) {
@@ -296,7 +343,7 @@ describe("T4h — GET /api/analytics: route guards", () => {
             invoiceCount: expect.any(Number),
             outstandingDebtSYP: expect.any(String),
         });
-        // Alerts are clock-independent (their rows are mocked) — always 2/2/1.
+        // Alert COUNTS come straight from the (mocked) gateway — clock-independent.
         expect(body.alerts.needsReconciliation.count).toBe(2);
         expect(body.alerts.expiringSoon.count).toBe(2);
         expect(body.alerts.largeBalances.count).toBe(1);
@@ -304,6 +351,47 @@ describe("T4h — GET /api/analytics: route guards", () => {
         for (const list of [body.topProducts.bySalesValue, body.topProducts.byQuantity, body.topProducts.byProfit]) {
             expect(list.length).toBeLessThanOrEqual(5);
         }
+    });
+
+    it("3b. range=30 is honoured end to end", async () => {
+        const { status, body } = await callRoute("?range=30", ADMIN_SESSION);
+
+        expect(status).toBe(200);
+        expect(body.range).toBe(30);
+        expect(body.trend).toHaveLength(30);
+    });
+
+    it("3b-ii. range=1 (today) is honoured end to end, charted by hour", async () => {
+        const { status, body } = await callRoute("?range=1", ADMIN_SESSION);
+
+        expect(status).toBe(200);
+        expect(body.range).toBe(1);
+        expect(body.trendGranularity).toBe("hour");
+        expect(body.trend.length).toBeGreaterThanOrEqual(1);
+        expect(body.trend.length).toBeLessThanOrEqual(24);
+        for (const point of body.trend) expect(point.date).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}$/);
+    });
+
+    it("3c. the response is private and briefly cacheable (financial data)", async () => {
+        const { status, headers } = await callRoute("?range=7", ADMIN_SESSION);
+
+        expect(status).toBe(200);
+        // `private` is the point: a shared cache must never store a revenue figure.
+        expect(headers.get("cache-control")).toBe("private, max-age=30");
+    });
+
+    it("3d. an internal failure is a generic 500 that leaks no detail", async () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => { });
+        fakeDb.invoice.findMany.mockImplementation(async () => {
+            throw new Error("db down: secret-connection-string");
+        });
+
+        const { status, body } = await callRoute("?range=7", ADMIN_SESSION);
+
+        expect(status).toBe(500);
+        expect(body.error).toBe("SERVER_ERROR");
+        expect(JSON.stringify(body)).not.toContain("secret-connection-string");
+        errorSpy.mockRestore();
     });
 });
 
@@ -315,8 +403,11 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
         // yesterday → local today) = 10600. Out-of-window rows must not add up.
         expectMoneyEq(dash.kpis.salesSYP, 10600);
         expectMoneyEq(dash.kpis.salesUSD, 16);
-        // Live sale DOCUMENTS today: the voided original and the VOID row are excluded.
-        expect(dash.kpis.invoiceCount).toBe(2);
+        // EVENT-DATED count: COMPLETED invoices created today = T1, T2, T7.
+        // T2 was later voided, but the count does not move for a void (the VOID
+        // mirror row is VOIDED, so it is never counted either) — salesSYP above
+        // is what nets the reversal.
+        expect(dash.kpis.invoiceCount).toBe(3);
         // Σ(unitPrice × qty − cost) over today's lines: 60 + 140 + 1200 + 50 − 50 + 100.
         expectMoneyEq(dash.kpis.netProfitSYP, 1500);
         // T4e's equation over ACTIVE customers only: (50000−20000) + 0 + (10000−15000).
@@ -325,6 +416,31 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
         expectMoneyEq(dash.kpis.outstandingDebtSYP, expectedDebt);
         // The informational current rate travels as a Decimal string.
         expectMoneyEq(dash.exchangeRate!, 15000);
+    });
+
+    it("2a-ii. invoiceCount is event-dated: a later void cannot change it", async () => {
+        const before = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        // Tomorrow a void is issued against today's INV_T1. In the append-only
+        // ledger that is a NEW row dated TOMORROW — it is outside today's
+        // window, and today's original row is untouched.
+        const TOMORROW = D("2026-10-06T08:00:00.000Z");
+        invoiceRows.push({ totalSYP: "-10000", totalUSD: "-10", status: "VOIDED", createdAt: TOMORROW });
+        try {
+            const after = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+            expect(after.kpis.invoiceCount).toBe(before.kpis.invoiceCount);
+            expectMoneyEq(after.kpis.salesSYP, before.kpis.salesSYP);
+        } finally {
+            invoiceRows.pop();
+        }
+    });
+
+    it("2a-iii. the invoice read no longer selects the voidedBy relation", async () => {
+        await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        const select = fakeDb.invoice.findMany.mock.calls[0][0].select;
+        expect(select).not.toHaveProperty("voidedBy");
+        expect(Object.keys(select).sort()).toEqual(["createdAt", "status", "totalSYP", "totalUSD"]);
     });
 
     it("2b. a KPI card and the trend's last bucket derive from the SAME rows", async () => {
@@ -343,6 +459,18 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
         fakeDb.tenant.findUnique.mockResolvedValueOnce({ dailyExchangeRate: "0" });
         const zero = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
         expect(zero.exchangeRate).toBeNull();
+    });
+
+    it("2d. unit conversion factors are requested ONCE, for the distinct sold units", async () => {
+        await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        // One batched call (the N+1 fix) — never one call per line or per unit.
+        expect(mockListFactors).toHaveBeenCalledTimes(1);
+        const [, tenantArg, unitIdsArg] = mockListFactors.mock.calls[0];
+        expect(tenantArg).toBe(TENANT_ID);
+        expect([...unitIdsArg].sort()).toEqual(
+            ["unit-carton", "unit-case", "unit-edge", "unit-lux", "unit-piece"]
+        );
     });
 });
 
@@ -390,6 +518,76 @@ describe("T4h — windows & tenant-local (UTC+3) day bucketing", () => {
         expect(dash.trend.find((p) => p.date === "2026-09-01")).toBeUndefined();
         // …and KPI "today" is window-invariant: one window, one truth.
         expectMoneyEq(dash.kpis.salesSYP, 10600);
+    });
+});
+
+describe("T4h — range=1 (today): hourly trend over the same rows", () => {
+    it("7a. buckets run from local hour 00 to the CURRENT hour — future hours are omitted", async () => {
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 1, now: NOW });
+
+        expect(dash.range).toBe(1);
+        expect(dash.trendGranularity).toBe("hour");
+        // NOW = 15:00 local → hours 00..15 inclusive.
+        expect(dash.trend).toHaveLength(16);
+        expect(dash.trend[0].date).toBe("2026-10-05T00");
+        expect(dash.trend[15].date).toBe("2026-10-05T15");
+    });
+
+    it("7b. each sale lands in its LOCAL hour (UTC+3), and the buckets sum to the KPI", async () => {
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 1, now: NOW });
+        const at = (key: string) => dash.trend.find((p) => p.date === key)!;
+
+        // 22:30 UTC yesterday = 01:30 local today → hour 01.
+        expectMoneyEq(at("2026-10-05T01").salesSYP, 600);
+        expectMoneyEq(at("2026-10-05T01").profitSYP, 100);
+        // 09:00Z → 12:00 local; 10:00Z → 13:00; 11:00Z (the void mirror) → 14:00.
+        expectMoneyEq(at("2026-10-05T12").salesSYP, 10000);
+        expectMoneyEq(at("2026-10-05T12").profitSYP, 1400);
+        expectMoneyEq(at("2026-10-05T13").salesSYP, 1000);
+        expectMoneyEq(at("2026-10-05T14").salesSYP, -1000);
+        expectMoneyEq(at("2026-10-05T14").profitSYP, -50);
+
+        // Every other hour exists and is exactly zero.
+        const busy = new Set(["01", "12", "13", "14"]);
+        for (const p of dash.trend) {
+            if (busy.has(p.date.slice(11))) continue;
+            expectMoneyEq(p.salesSYP, 0);
+            expectMoneyEq(p.profitSYP, 0);
+        }
+
+        const sumSales = dash.trend.reduce((acc, p) => acc.plus(p.salesSYP), new Decimal(0));
+        const sumProfit = dash.trend.reduce((acc, p) => acc.plus(p.profitSYP), new Decimal(0));
+        expectMoneyEq(sumSales.toString(), dash.kpis.salesSYP);
+        expectMoneyEq(sumProfit.toString(), dash.kpis.netProfitSYP);
+    });
+
+    it("7c. KPIs are identical to the 7-day window's; rankings cover TODAY only", async () => {
+        const one = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 1, now: NOW });
+        const seven = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        expect(one.kpis).toEqual(seven.kpis);
+
+        const ids = (list: { productId: string }[]) => list.map((a) => a.productId);
+        // The 3-days-ago sale (prod-value × 10) is outside a one-day window:
+        // prod-value nets to ZERO today (sold 1, voided 1).
+        expect(ids(one.topProducts.bySalesValue)).toEqual(["prod-profit", "prod-volume", "prod-edge", "prod-value"]);
+        expect(ids(one.topProducts.byQuantity)).toEqual(["prod-volume", "prod-profit", "prod-edge", "prod-value"]);
+        expect(ids(one.topProducts.byProfit)).toEqual(["prod-profit", "prod-volume", "prod-edge", "prod-value"]);
+        const value = one.topProducts.bySalesValue.find((a) => a.productId === "prod-value")!;
+        expectMoneyEq(value.salesSYP, 0);
+        expectMoneyEq(value.quantity, 0);
+    });
+
+    it("7d. at local 00:30 the chart has exactly one bucket (hour 00)", async () => {
+        const justAfterMidnight = D("2026-10-04T21:30:00.000Z"); // 00:30 local on 10-05
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 1, now: justAfterMidnight });
+
+        expect(dash.trend.map((p) => p.date)).toEqual(["2026-10-05T00"]);
+    });
+
+    it("7e. daily ranges stay daily", async () => {
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+        expect(dash.trendGranularity).toBe("day");
     });
 });
 
@@ -471,6 +669,27 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
         }
     });
 
+    it("5b-ii. if base-unit names cannot be resolved, figures survive, unit labels go blank, and it is LOGGED", async () => {
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => { });
+        fakeDb.product.findMany.mockImplementation(async () => {
+            throw new Error("base unit lookup failed");
+        });
+
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        // The dashboard still renders every figure…
+        expectMoneyEq(dash.kpis.salesSYP, 10600);
+        const volume = dash.topProducts.byQuantity.find((a) => a.productId === "prod-volume")!;
+        expectMoneyEq(volume.quantity, 100);
+        // …with an empty label rather than a failed request…
+        for (const list of [dash.topProducts.bySalesValue, dash.topProducts.byQuantity, dash.topProducts.byProfit]) {
+            for (const a of list) expect(a.baseUnitName).toBe("");
+        }
+        // …and the data-integrity problem is no longer silent.
+        expect(warnSpy).toHaveBeenCalled();
+        warnSpy.mockRestore();
+    });
+
     it("5c. a missing unit factor is a data-integrity error — it THROWS", () => {
         const factors = new Map(UNIT_FACTORS);
         factors.delete("unit-carton");
@@ -483,69 +702,78 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
         ).toThrow(/no conversion factor/);
     });
 
-    it("5d. a product deleted after sale falls back to a non-empty placeholder", () => {
+    it("5d. a product deleted after sale falls back to the shared placeholder constant", () => {
         const aggregates = buildProductAggregates(
             [line("prod-ghost", "unit-piece", "10", "10", "50", INV_T1)],
             PRODUCT_NAMES,
             UNIT_FACTORS
         );
         expect(aggregates).toHaveLength(1);
-        expect(aggregates[0].productName.length).toBeGreaterThan(0);
+        expect(aggregates[0].productName).toBe(UNKNOWN_PRODUCT_NAME);
         expectMoneyEq(aggregates[0].salesSYP, 100);
         expectMoneyEq(aggregates[0].profitSYP, 50);
     });
 });
 
-describe("T4h — alerts (classification, ordering, caps, no deadlines)", () => {
-    it("6a. batches split into needs-reconciliation vs expiring, worst first", async () => {
-        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+describe("T4h — alerts (gateway contract, ordering, counts, no deadlines)", () => {
+    it("6a. the gateway is asked for the EXACT horizon and a capped page", async () => {
+        await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
-        // The ONE right horizon is requested (60 local days + rounding slack),
-        // measured from the tenant-local start of today — not from `now`.
-        expect(mockListBatchRows).toHaveBeenCalledWith(fakeDb, TENANT_ID, {
-            expiringBefore: new Date(startOfLocalDay(NOW).getTime() + (EXPIRING_SOON_DAYS + 1) * DAY_MS),
+        // `expiryDate < start of the local day EXPIRING_SOON_DAYS from today`
+        // is precisely "fewer than N calendar days to go" — no +1 slack, and
+        // measured from the tenant-local start of today, not from `now`.
+        expect(mockListBatchSets).toHaveBeenCalledTimes(1);
+        expect(mockListBatchSets).toHaveBeenCalledWith(fakeDb, TENANT_ID, {
+            expiringBefore: new Date(startOfLocalDay(NOW).getTime() + EXPIRING_SOON_DAYS * DAY_MS),
+            limit: ALERT_LIST_LIMIT,
         });
+    });
+
+    it("6b. gateway rows are reshaped and presented worst-first", async () => {
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
         const rec = dash.alerts.needsReconciliation;
         expect(rec.count).toBe(2);
         expect(rec.items.map((a) => a.batchId)).toEqual(["b-neg2", "b-neg"]); // −10 before −3
+        expect(rec.items[0]).toEqual({
+            productId: "prod-volume",
+            productName: "زيت دوار الشمس",
+            batchId: "b-neg2",
+            batchNumber: "BN-2",
+            quantity: "-10",
+            unitName: "لتر",
+        });
 
         const exp = dash.alerts.expiringSoon;
         expect(exp.count).toBe(2);
-        expect(exp.items.map((a) => a.batchId)).toEqual(["b-old", "b-soon"]);
+        expect(exp.items.map((a) => a.batchId)).toEqual(["b-old", "b-soon"]); // expired first
         expect(exp.items[0].daysToExpiry).toBe(-2);
         expect(exp.items[0].isExpired).toBe(true);
         expect(exp.items[1].daysToExpiry).toBe(10);
         expect(exp.items[1].isExpired).toBe(false);
-
-        // Zero stock and the 200-days-out batch are never alerts, even if a
-        // gateway handed them over — analytics re-checks every condition.
-        const shown = new Set([...rec.items, ...exp.items].map((a) => a.batchId));
-        expect(shown.has("b-zero")).toBe(false);
-        expect(shown.has("b-far")).toBe(false);
     });
 
-    it("6b. long alert lists are capped at ALERT_LIST_LIMIT with the full count", async () => {
-        mockListBatchRows.mockImplementation(async () =>
-            Array.from({ length: 7 }, (_, i) => ({
-                id: `neg-${i}`,
-                batchNumber: `N-${i}`,
-                quantity: `-${i + 1}`,
-                expiryDate: null,
-                productId: "prod-volume",
-                productName: "زيت دوار الشمس",
-                unitName: "لتر",
-            }))
-        );
+    it("6c. `count` is the gateway's exact DB count — NOT the length of the capped page", async () => {
+        mockListBatchSets.mockImplementation(async () => ({
+            needsReconciliation: {
+                count: 42,
+                rows: Array.from({ length: ALERT_LIST_LIMIT }, (_, i) =>
+                    batchRow(`neg-${i}`, `N-${i}`, `-${i + 1}`, null, "prod-volume", "زيت دوار الشمس", "لتر")
+                ),
+            },
+            expiringSoon: { count: 0, rows: [] },
+        }));
+
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
-        expect(dash.alerts.needsReconciliation.count).toBe(7);
+        expect(dash.alerts.needsReconciliation.count).toBe(42);
         expect(dash.alerts.needsReconciliation.items).toHaveLength(ALERT_LIST_LIMIT);
-        // Most-under first, even when capped.
-        expect(dash.alerts.needsReconciliation.items[0].quantity).toBe("-7");
+        // Most-under first, even within the page.
+        expect(dash.alerts.needsReconciliation.items[0].quantity).toBe("-5");
+        expect(dash.alerts.expiringSoon).toEqual({ count: 0, items: [] });
     });
 
-    it("6c. large balances: positive net balances only, ranked descending", async () => {
+    it("6d. large balances: positive net balances only, ranked descending", async () => {
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
         const large = dash.alerts.largeBalances;
@@ -555,6 +783,32 @@ describe("T4h — alerts (classification, ordering, caps, no deadlines)", () => 
         expectMoneyEq(large.items[0].balanceSYP, 30000);
         // The alert body carries NO payment-deadline concept — exactly three keys.
         expect(Object.keys(large.items[0]).sort()).toEqual(["balanceSYP", "customerId", "customerName"]);
+    });
+
+    it("6e. large balances are capped at ALERT_LIST_LIMIT with the FULL count", async () => {
+        const many = Array.from({ length: 7 }, (_, i) => ({
+            id: `c-${i}`,
+            name: `زبون ${i}`,
+            isActive: true,
+        }));
+        fakeDb.customer.findMany.mockImplementation(async () => many);
+        fakeDb.invoice.groupBy.mockImplementation(async () =>
+            many.map((c, i) => ({ customerId: c.id, _sum: { debtAmountSYP: String((i + 1) * 1000) } }))
+        );
+        fakeDb.customerPayment.groupBy.mockImplementation(async () => []);
+
+        const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        expect(dash.alerts.largeBalances.count).toBe(7);
+        expect(dash.alerts.largeBalances.items).toHaveLength(ALERT_LIST_LIMIT);
+        expect(dash.alerts.largeBalances.items.map((a) => a.customerId)).toEqual([
+            "c-6",
+            "c-5",
+            "c-4",
+            "c-3",
+            "c-2",
+        ]);
+        expectMoneyEq(dash.alerts.largeBalances.items[0].balanceSYP, 7000);
     });
 });
 
@@ -630,6 +884,3 @@ describe("T4h — static scan: no payment-deadline concept (criterion 6)", () =>
         }
     });
 });
-
-
-

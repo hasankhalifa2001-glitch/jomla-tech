@@ -34,26 +34,39 @@ import { getAnalyticsDashboard, type AnalyticsRange } from "@/lib/data/analytics
  * block). Neither layer is a substitute for the other — middleware is a
  * browser convenience, this check is the security boundary.
  *
+ * [ACCOUNT STATE] This route trusts auth() to reject a deactivated
+ * (isActive: false) user per T2c ("blocks on the very next request"). If
+ * auth() does not re-check isActive against the database on every call, that
+ * must be fixed centrally there — not patched route by route.
+ *
  * [tenant scoping] Every read below goes through getTenantDb(tenantId), the
  * T1 tenant-scope Prisma Client Extension. No raw SQL: this route and
  * lib/data/analytics.ts contain no $queryRaw / tenantScopedRawQuery call —
  * the one sanctioned raw-query site in this codebase remains T4c's batch lock.
  *
- * [query] `?range=7` (default) or `?range=30` — the chart window. The trend,
+ * [query] `?range=1` (today, hourly chart), `?range=7` (default) or
+ * `?range=30` — the chart window. The trend,
  * the KPI "today" figures and the product rankings are all derived from that
  * SAME window (lib/data/analytics.ts's WINDOWS contract), so the Top-5 lists
  * re-rank with the range instead of silently disagreeing with the chart.
+ * Absent -> 7; any other present value -> 400 (never a silent fallback).
+ *
+ * [caching] The response is financial data, so it is `private` (never stored
+ * by a shared cache/CDN) and kept for at most 30 seconds in the browser to
+ * absorb repeated dashboard loads. Consequence: a sale made in the last 30
+ * seconds may not appear until then. Set max-age to 0 (or drop the header) if
+ * instant freshness matters more than load.
  */
 
 export const dynamic = "force-dynamic";
 
+const CACHE_CONTROL = "private, max-age=30";
+
 const querySchema = z.object({
-    // `?range` is optional (defaults to 7) — the default is applied when the
-    // param is ABSENT, before coercion; a present-but-unsupported value is a
-    // 400 rather than a silent fallback.
-    range: z.coerce.number().refine((v) => v === 7 || v === 30, {
-        message: "range must be 7 or 30.",
-    }),
+    range: z
+        .enum(["1", "7", "30"])
+        .default("7")
+        .transform((v): AnalyticsRange => (v === "1" ? 1 : v === "7" ? 7 : 30)),
 });
 
 export async function GET(req: NextRequest) {
@@ -74,10 +87,9 @@ export async function GET(req: NextRequest) {
         throw error;
     }
 
-    const { searchParams } = new URL(req.url);
-    const params = Object.fromEntries(searchParams);
-    if (params.range === undefined) params.range = "7";
-    const parsed = querySchema.safeParse(params);
+    const parsed = querySchema.safeParse({
+        range: new URL(req.url).searchParams.get("range") ?? undefined,
+    });
 
     if (!parsed.success) {
         return NextResponse.json(
@@ -94,11 +106,14 @@ export async function GET(req: NextRequest) {
 
     try {
         const dashboard = await getAnalyticsDashboard(db, tenantId, {
-            range: parsed.data.range as AnalyticsRange,
+            range: parsed.data.range,
             now: new Date(),
         });
 
-        return NextResponse.json({ success: true, ...dashboard });
+        return NextResponse.json(
+            { success: true, ...dashboard },
+            { headers: { "Cache-Control": CACHE_CONTROL } }
+        );
     } catch (error) {
         console.error("Error building analytics dashboard:", error);
         return NextResponse.json(

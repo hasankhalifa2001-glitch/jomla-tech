@@ -38,14 +38,23 @@
  *                         EVERY InvoiceItem of those invoices. costAmountSYP is
  *                         non-nullable (T4g), so this is ALWAYS computable.
  *
- * invoiceCount(today)   = COUNT of invoices created today that are COMPLETED
- *                         and have NO void against them. Invoice is append-only
- *                         — a voided ORIGINAL stays COMPLETED forever, and the
- *                         void is a separate VOIDED row — so "status !==
- *                         VOIDED" alone would still count a reversed sale.
- *                         Deliberately a DIFFERENT row set from salesSYP:
- *                         revenue nets the reversal (accounting), the count
- *                         reports live sale documents (operations).
+ * invoiceCount(today)   = COUNT of invoices created today with status
+ *                         COMPLETED. Void mirror rows are VOIDED, so they are
+ *                         never counted. [T4h fix] The count is EVENT-DATED
+ *                         exactly like salesSYP: it is a function of rows
+ *                         created today and nothing else, so a void issued
+ *                         TOMORROW can never change today's already-displayed
+ *                         figure. (The previous definition also excluded sales
+ *                         that had a void against them, which made today's
+ *                         count drop retroactively while today's sales did
+ *                         not.) Consequence, stated plainly: a sale made AND
+ *                         voided today still counts as one issued sale, while
+ *                         salesSYP nets it to zero. The count answers "how many
+ *                         sale documents were issued today"; salesSYP answers
+ *                         "what is today's net revenue". To get the stricter
+ *                         "live sales only" reading back, add `voidedBy` to the
+ *                         invoice select and skip rows where it is non-null —
+ *                         at the cost of that retroactive drift.
  *
  * outstandingDebtSYP    = SUM over active customers of computeBalanceSYP(
  *                         [SUM(invoice.debtAmountSYP)], [SUM(independent
@@ -59,9 +68,13 @@
  * append-only and event-dated), not a bug.
  *
  * WINDOWS
- *   One window, `range` days (7 or 30), ending today. The trend, the KPI
+ *   One window, `range` days (1, 7 or 30), ending today. The trend, the KPI
  *   "today" figures and the product rankings are all derived from that same
  *   set of rows, so they can never disagree.
+ *   range = 1 ("today"): a one-point daily chart draws nothing, so the trend
+ *   is bucketed BY LOCAL HOUR instead — hour 00 through the CURRENT local
+ *   hour (future hours are omitted, never shown as a misleading drop to
+ *   zero). `trendGranularity` tells the client which one it received.
  *   DAY BOUNDARIES use the tenant's local day: Syria is a fixed UTC+3
  *   (TENANT_TZ_OFFSET_HOURS). Tenant carries no timezone field, so this is a
  *   platform-wide constant — the market is Syria. A sale at 23:30 UTC belongs
@@ -71,6 +84,17 @@
  * so summing it raw would rank 1000 pieces above 50 cartons of 24. The
  * by-quantity figure is therefore converted to BASE units with each line's
  * OWN sold unit factor (never the base unit's, which is always 1).
+ *
+ * ALERTS [T4h fix]: the batch alerts are two capped, separately COUNTED
+ * database queries (lib/data/products.ts's listBatchAlertSets()). The
+ * "expiring" boundary is exact — `expiryDate < start of the local day that is
+ * EXPIRING_SOON_DAYS from today` — so the DB count and the displayed list use
+ * the same definition; nothing is fetched just to be thrown away.
+ *
+ * KNOWN LIMIT: the invoice and invoiceItem reads cover the whole window
+ * (up to 30 days) because per-day, per-line profit needs row-level math that
+ * Prisma cannot aggregate without raw SQL. Fine at small-merchant scale; the
+ * route sets a short private Cache-Control to absorb repeated loads.
  *
  * LINT NOTE (eslint.config.mjs's BACKEND_ONLY_FILES block): this file may not
  * name `product`/`productUnit` as a select/include/where key or as a member
@@ -84,10 +108,11 @@ import type { InvoiceStatus } from "@prisma/client";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
 import Decimal from "decimal.js";
 import {
-    listBatchAlertRows,
+    UNKNOWN_PRODUCT_NAME,
+    listBatchAlertSets,
     listProductNamesByIds,
     listUnitConversionFactors,
-    type AlertBatchRow,
+    type BatchAlertSets,
 } from "@/lib/data/products";
 import { requireBaseUnits } from "@/lib/inventory/base-unit";
 import { toBaseUnit } from "@/lib/inventory/units";
@@ -108,7 +133,7 @@ import {
 } from "@/lib/utils/money";
 
 /** The chart's window toggle. Anything else is rejected by the route. */
-export type AnalyticsRange = 7 | 30;
+export type AnalyticsRange = 1 | 7 | 30;
 
 /**
  * A Decimal column's shape as returned by Prisma — always reduced to a string
@@ -134,14 +159,19 @@ export interface AnalyticsKpis {
     salesUSD: string;
     /** Today's net profit, SYP — always fully computable (costAmountSYP is non-nullable). */
     netProfitSYP: string;
-    /** Live (COMPLETED, not voided) invoices issued today. */
+    /** COMPLETED invoices issued today (event-dated; see the definition above). */
     invoiceCount: number;
     /** T4e's ledger equation, summed across every active customer. */
     outstandingDebtSYP: string;
 }
 
+export type TrendGranularity = "hour" | "day";
+
 export interface TrendPoint {
-    /** Local (UTC+3) day, "YYYY-MM-DD". */
+    /**
+     * Bucket key in local (UTC+3) time: "YYYY-MM-DD" for a daily trend, or
+     * "YYYY-MM-DDTHH" (hour 00–23) when `trendGranularity` is "hour".
+     */
     date: string;
     salesSYP: string;
     profitSYP: string;
@@ -200,6 +230,8 @@ export interface AnalyticsDashboard {
     range: AnalyticsRange;
     /** The `now` this payload was computed against (ISO) — echoed for tests/caching. */
     generatedAt: string;
+    /** "hour" only for range 1 (today); "day" for 7 and 30. */
+    trendGranularity: TrendGranularity;
     /** Tenant's current daily rate, as a Decimal string. null when unset (informational only). */
     exchangeRate: string | null;
     kpis: AnalyticsKpis;
@@ -249,6 +281,17 @@ export {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+
+/** Local (Syria) hour 0–23 of `instant`. Fixed offset → plain arithmetic. */
+function localHour(instant: Date): number {
+    return Math.floor((instant.getTime() - startOfLocalDay(instant).getTime()) / HOUR_MS);
+}
+
+/** "YYYY-MM-DDTHH" — the hourly bucket key (local time). */
+function hourBucketKey(instant: Date): string {
+    return `${localDayKey(instant)}T${String(localHour(instant)).padStart(2, "0")}`;
+}
 
 /**
  * Calendar days from `now`'s local day to `target`'s local day. Negative when
@@ -294,8 +337,9 @@ export function lineProfitSYP(
  * than silently ranking on a wrong number.
  *
  * `nameById` supplies display names; an id with no surviving product falls
- * back to a placeholder so one historical row can never break the dashboard.
- * `baseUnitName` is filled in later, for the products that actually surface.
+ * back to UNKNOWN_PRODUCT_NAME so one historical row can never break the
+ * dashboard. `baseUnitName` is filled in later, for the products that
+ * actually surface.
  */
 export function buildProductAggregates(
     items: Array<{
@@ -341,7 +385,7 @@ export function buildProductAggregates(
     for (const [productId, entry] of acc) {
         aggregates.push({
             productId,
-            productName: nameById.get(productId) ?? "منتج غير متوفر",
+            productName: nameById.get(productId) ?? UNKNOWN_PRODUCT_NAME,
             salesSYP: entry.sales,
             quantity: entry.baseQuantity.toFixed(4),
             baseUnitName: "",
@@ -399,8 +443,6 @@ interface RawInvoiceRow {
     totalUSD: DecimalLike;
     status: InvoiceStatus;
     createdAt: Date;
-    /** The void row reversing this invoice, if any (Invoice.voidedBy). */
-    voidedBy: { id: string } | null;
 }
 
 interface RawItemRow {
@@ -459,13 +501,16 @@ export async function getAnalyticsDashboard(
     const windowStart = addLocalDays(todayStart, -(range - 1));
     const todayKey = localDayKey(todayStart);
 
-    // Every batch with stock that could expire within the horizon (+1 day of
-    // slack for the calendar-day rounding below, re-checked precisely later).
-    const expiringBefore = addLocalDays(todayStart, EXPIRING_SOON_DAYS + 1);
+    // EXACT expiry boundary: a batch has "fewer than EXPIRING_SOON_DAYS days to
+    // go" (calendarDaysUntil < N) if and only if its expiry instant is strictly
+    // before the local start-of-day N days from today. The DB filter and the
+    // displayed definition are therefore the same thing — no padding, no
+    // second app-side re-check.
+    const expiringBefore = addLocalDays(todayStart, EXPIRING_SOON_DAYS);
 
     // Independent reads, one batch. Every `where` carries an explicit
     // `tenantId` as well as relying on the extension. No raw SQL.
-    const [invoices, items, activeCustomers, debtGroups, repaymentGroups, tenant, batchRows] =
+    const [invoices, items, activeCustomers, debtGroups, repaymentGroups, tenant, alertSets] =
         await Promise.all([
             db.invoice.findMany({
                 where: { tenantId, createdAt: { gte: windowStart, lt: windowEnd } },
@@ -474,7 +519,6 @@ export async function getAnalyticsDashboard(
                     totalUSD: true,
                     status: true,
                     createdAt: true,
-                    voidedBy: { select: { id: true } },
                 },
             }) as Promise<RawInvoiceRow[]>,
 
@@ -521,7 +565,10 @@ export async function getAnalyticsDashboard(
                 select: { dailyExchangeRate: true },
             }),
 
-            listBatchAlertRows(db, tenantId, { expiringBefore }),
+            listBatchAlertSets(db, tenantId, {
+                expiringBefore,
+                limit: ALERT_LIST_LIMIT,
+            }),
         ]);
 
     // Names + unit factors only for what the window actually sold.
@@ -539,44 +586,61 @@ export async function getAnalyticsDashboard(
     for (const inv of invoices) {
         if (localDayKey(inv.createdAt) !== todayKey) continue;
         // Revenue SUMS every status (a void mirror row is negative, so it
-        // already nets out). The COUNT below counts live sale documents only.
+        // already nets out). The COUNT is event-dated: COMPLETED rows created
+        // today, independent of any later void.
         todaySalesSYP = addMoney(todaySalesSYP, dstr(inv.totalSYP));
         todaySalesUSD = addMoney(todaySalesUSD, dstr(inv.totalUSD));
-        if (inv.status === "COMPLETED" && inv.voidedBy === null) invoiceCount += 1;
+        if (inv.status === "COMPLETED") invoiceCount += 1;
     }
 
-    // === TREND: exactly `range` local days, oldest → newest, ending today ===
-    const trendDays: string[] = [];
-    for (let i = range - 1; i >= 0; i--) {
-        trendDays.push(localDayKey(addLocalDays(todayStart, -i)));
+    // === TREND ===
+    // range 1 → hourly buckets 00..current local hour; otherwise exactly
+    // `range` local days, oldest → newest, ending today.
+    const trendGranularity: TrendGranularity = range === 1 ? "hour" : "day";
+    const bucketOf = (instant: Date): string =>
+        trendGranularity === "hour" ? hourBucketKey(instant) : localDayKey(instant);
+
+    const trendKeys: string[] = [];
+    if (trendGranularity === "hour") {
+        const lastHour = localHour(now);
+        for (let h = 0; h <= lastHour; h++) {
+            trendKeys.push(`${todayKey}T${String(h).padStart(2, "0")}`);
+        }
+    } else {
+        for (let i = range - 1; i >= 0; i--) {
+            trendKeys.push(localDayKey(addLocalDays(todayStart, -i)));
+        }
     }
 
-    const salesByDay = new Map<string, string>(trendDays.map((d) => [d, "0.0000"]));
-    const profitByDay = new Map<string, string>(trendDays.map((d) => [d, "0.0000"]));
+    const salesByBucket = new Map<string, string>(trendKeys.map((k) => [k, "0.0000"]));
+    const profitByBucket = new Map<string, string>(trendKeys.map((k) => [k, "0.0000"]));
 
     for (const inv of invoices) {
-        const key = localDayKey(inv.createdAt);
-        const prev = salesByDay.get(key);
+        const key = bucketOf(inv.createdAt);
+        const prev = salesByBucket.get(key);
         if (prev === undefined) continue;
-        salesByDay.set(key, addMoney(prev, dstr(inv.totalSYP)));
+        salesByBucket.set(key, addMoney(prev, dstr(inv.totalSYP)));
     }
 
     let todayProfitSYP = "0.0000";
     for (const item of items) {
         const profit = lineProfitSYP(item.unitPriceSYP, item.quantity, item.costAmountSYP);
 
-        const key = localDayKey(item.invoice.createdAt);
-        const prev = profitByDay.get(key);
-        if (prev !== undefined) profitByDay.set(key, addMoney(prev, profit));
-        if (key === todayKey) todayProfitSYP = addMoney(todayProfitSYP, profit);
+        const key = bucketOf(item.invoice.createdAt);
+        const prev = profitByBucket.get(key);
+        if (prev !== undefined) profitByBucket.set(key, addMoney(prev, profit));
+        // The KPI is always the whole local DAY, whatever the trend granularity.
+        if (localDayKey(item.invoice.createdAt) === todayKey) {
+            todayProfitSYP = addMoney(todayProfitSYP, profit);
+        }
     }
 
-    // Today's KPI figures and the trend's last bucket come from the SAME rows
-    // and the SAME arithmetic, so a KPI card and the chart cannot disagree.
-    const trend: TrendPoint[] = trendDays.map((date) => ({
+    // Today's KPI figures and the trend's buckets come from the SAME rows and
+    // the SAME arithmetic, so a KPI card and the chart cannot disagree.
+    const trend: TrendPoint[] = trendKeys.map((date) => ({
         date,
-        salesSYP: salesByDay.get(date)!,
-        profitSYP: profitByDay.get(date)!,
+        salesSYP: salesByBucket.get(date)!,
+        profitSYP: profitByBucket.get(date)!,
     }));
 
     // === TOP PRODUCTS (same window as the chart's selected range) ===
@@ -587,7 +651,9 @@ export async function getAnalyticsDashboard(
 
     // Base-unit NAMES, only for the (≤ 15) products that actually surface. A
     // label is not money: if one product's base unit cannot be resolved, show
-    // the figure without a unit name rather than failing the whole dashboard.
+    // the figure without a unit name rather than failing the whole dashboard —
+    // but LOG it, since a missing base unit is a data-integrity bug that must
+    // not disappear silently.
     const surfacedIds = Array.from(
         new Set([...bySalesValue, ...byQuantity, ...byProfit].map((a) => a.productId))
     );
@@ -597,8 +663,11 @@ export async function getAnalyticsDashboard(
         for (const [productId, unit] of baseUnits) {
             baseUnitNameByProduct.set(productId, unit.unitName);
         }
-    } catch {
-        // intentionally empty — see the comment above.
+    } catch (error) {
+        console.warn(
+            "Analytics: could not resolve base-unit names; showing figures without a unit label.",
+            { tenantId, error }
+        );
     }
     const withUnitName = (list: ProductAggregate[]): ProductAggregate[] =>
         list.map((a) => ({ ...a, baseUnitName: baseUnitNameByProduct.get(a.productId) ?? "" }));
@@ -646,6 +715,7 @@ export async function getAnalyticsDashboard(
     return {
         range,
         generatedAt: now.toISOString(),
+        trendGranularity,
         exchangeRate: hasValidRate ? rateRaw : null,
         kpis: {
             salesSYP: todaySalesSYP,
@@ -660,7 +730,7 @@ export async function getAnalyticsDashboard(
             byQuantity: withUnitName(byQuantity),
             byProfit: withUnitName(byProfit),
         },
-        alerts: buildAlerts(batchRows, balances, now),
+        alerts: buildAlerts(alertSets, balances, now),
     };
 }
 
@@ -672,40 +742,32 @@ export async function getAnalyticsDashboard(
  *
  * Batch alerts use the same definitions as T3c's inventory filters:
  * `needs_reconciliation` = negative quantity; `expiring` = fewer than
- * EXPIRING_SOON_DAYS to go (and an already-expired batch with stock is the
- * extreme case of that, flagged `isExpired`).
+ * EXPIRING_SOON_DAYS to go (an already-expired batch with stock is the
+ * extreme case of that, flagged `isExpired`). Selection, ordering, the cap and
+ * the exact COUNT were all done in the database by listBatchAlertSets(); this
+ * function only reshapes the rows and derives the display-only
+ * `daysToExpiry`.
  */
 function buildAlerts(
-    batchRows: AlertBatchRow[],
+    alertSets: BatchAlertSets,
     balances: LargeBalanceAlert[],
     now: Date
 ): AnalyticsDashboard["alerts"] {
-    const needsReconciliation: NeedsReconciliationAlert[] = [];
+    const needsReconciliation: NeedsReconciliationAlert[] =
+        alertSets.needsReconciliation.rows.map((b) => ({
+            productId: b.productId,
+            productName: b.productName,
+            batchId: b.id,
+            batchNumber: b.batchNumber,
+            quantity: b.quantity,
+            unitName: b.unitName,
+        }));
+
     const expiringSoon: ExpiringSoonAlert[] = [];
-
-    for (const b of batchRows) {
-        const qty = new Decimal(b.quantity);
-
-        if (qty.isNegative()) {
-            needsReconciliation.push({
-                productId: b.productId,
-                productName: b.productName,
-                batchId: b.id,
-                batchNumber: b.batchNumber,
-                quantity: b.quantity,
-                unitName: b.unitName,
-            });
-            // A negative batch is a reconciliation matter only.
-            continue;
-        }
-
+    for (const b of alertSets.expiringSoon.rows) {
+        // The DB filter guarantees a non-null expiryDate; this only narrows the type.
         if (!b.expiryDate) continue;
-        // Only stock that can actually be lost is worth flagging.
-        if (!qty.greaterThan(0)) continue;
-
         const daysToExpiry = calendarDaysUntil(b.expiryDate, now);
-        if (daysToExpiry >= EXPIRING_SOON_DAYS) continue;
-
         expiringSoon.push({
             productId: b.productId,
             productName: b.productName,
@@ -720,6 +782,7 @@ function buildAlerts(
     }
 
     // Most-under first — the worst discrepancy is the one to reconcile first.
+    // (Already DB-ordered; kept so the Arabic name tie-break is deterministic.)
     needsReconciliation.sort((a, b) => {
         const cmp = compareMoney(a.quantity, b.quantity);
         if (cmp !== 0) return cmp;
@@ -733,12 +796,12 @@ function buildAlerts(
 
     return {
         needsReconciliation: {
-            count: needsReconciliation.length,
-            items: needsReconciliation.slice(0, ALERT_LIST_LIMIT),
+            count: alertSets.needsReconciliation.count,
+            items: needsReconciliation,
         },
         expiringSoon: {
-            count: expiringSoon.length,
-            items: expiringSoon.slice(0, ALERT_LIST_LIMIT),
+            count: alertSets.expiringSoon.count,
+            items: expiringSoon,
         },
         // `balances` is already ranked descending and holds only customers with
         // a positive net balance.

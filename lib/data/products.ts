@@ -55,13 +55,24 @@
  * union). A `create` operation has no `where` to scope against — the
  * ONLY way tenantId ends up on the row is either the Client Extension's
  * auto-injection (which requires a real getTenantDb()-derived client) or
- * writing it explicitly. Previously this function relied solely on
- * auto-injection while accepting a client type that doesn't guarantee
- * that injection happens — a real gap, inconsistent with this file's own
- * belt-and-suspenders posture on every UPDATE below (each of which scopes
- * tenantId via its own `where`, not the extension alone). Fixed by
- * writing `tenantId` explicitly in the `data` object, closing the gap
- * regardless of which client shape is actually passed in.
+ * writing it explicitly. Fixed by writing `tenantId` explicitly in the
+ * `data` object, closing the gap regardless of which client shape is
+ * actually passed in.
+ *
+ * [T4h review fixes — dashboard gateways]
+ *  1. listUnitConversionFactors() was an N+1 (one getUnitConversionFactor()
+ *     round-trip per sold unit, on every dashboard load). It now makes ONE
+ *     batched call to units.ts's getUnitConversionFactors().
+ *     REQUIRES adding that function to lib/inventory/units.ts — see
+ *     units.getUnitConversionFactors.snippet.ts.
+ *  2. listBatchAlertRows() fetched EVERY at-risk batch of the tenant and let
+ *     the caller discard most of them. Replaced by listBatchAlertSets():
+ *     two independent, capped (`take: limit`) queries — negative-stock and
+ *     expiring — each with its OWN exact COUNT, so neither list can crowd the
+ *     other out and the dashboard's "full count" is exact, not a guess made
+ *     from a truncated page.
+ *  3. The "unknown product" placeholder is now ONE exported constant
+ *     (UNKNOWN_PRODUCT_NAME), shared with lib/data/analytics.ts.
  */
 
 import type { Prisma, Product, ProductUnit, ProductUnitBarcode } from "@prisma/client";
@@ -74,7 +85,7 @@ import {
 } from "@/lib/inventory/base-unit";
 import {
     buildConversionFactorField,
-    getUnitConversionFactor,
+    getUnitConversionFactors,
     isReservedBaseUnitFactor,
     BASE_UNIT_CONVERSION_FACTOR,
     type DisplayUnit,
@@ -82,6 +93,13 @@ import {
 } from "@/lib/inventory/units";
 
 export type { DisplayUnitWithBaseFlag };
+
+/**
+ * Display name used when a historical row references a product that no
+ * longer has a catalog row to name it. ONE constant for every dashboard
+ * surface (batch alerts and the Top-5 lists).
+ */
+export const UNKNOWN_PRODUCT_NAME = "منتج غير متوفر";
 
 // ----------------------------------------------------------------------------
 // Safe types — excess-property checking on object literals typed as these
@@ -1007,6 +1025,7 @@ export async function findProductByNameCategory(
     if (!product) return null;
     return toSafeProductWithUnits(product);
 }
+
 // ----------------------------------------------------------------------------
 // [T4h] DASHBOARD SUPPORT GATEWAYS
 //
@@ -1019,7 +1038,7 @@ export async function findProductByNameCategory(
 // WHY NOT REUSE listProductsWithInventoryDetails():
 // that function fetches EVERY product with EVERY unit AND EVERY batch (plus
 // their barcode lists and adjustment histories) — correct for the inventory
-// screen, far too heavy to run on every /dashboard load. These three helpers
+// screen, far too heavy to run on every /dashboard load. These helpers
 // read exactly what the analytics screen needs and nothing else.
 // ----------------------------------------------------------------------------
 
@@ -1052,11 +1071,13 @@ function requireIdList(ids: readonly string[], caller: string): void {
 
 /**
  * Resolves a set of SOLD unit ids (an InvoiceItem's `unitId`) to that unit's
- * conversion factor, in ONE batch of reads.
+ * conversion factor, in ONE query.
  *
- * - The factor is read ONLY through units.ts's getUnitConversionFactor() — the
- *   one sanctioned reader — never by naming `conversionFactor` in a select
- *   here (banned in this file too; see CONVERSION_FACTOR_RULES).
+ * - The factor is read ONLY through units.ts's getUnitConversionFactors() —
+ *   the one sanctioned reader — never by naming `conversionFactor` in a
+ *   select here (banned in this file too; see CONVERSION_FACTOR_RULES).
+ * - [T4h fix] Previously this issued one getUnitConversionFactor() round-trip
+ *   PER unit (N+1) on every dashboard load. Now: one batched call.
  * - The BASE-UNIT NAME deliberately does NOT travel with the factor: the
  *   analytics layer resolves the (at most 15) surfaced products' base-unit
  *   names itself via base-unit.ts's fail-loud requireBaseUnits(), degrading a
@@ -1074,21 +1095,8 @@ export async function listUnitConversionFactors(
     requireTenantId(tenantId, "listUnitConversionFactors");
     requireIdList(unitIds, "listUnitConversionFactors");
 
-    const unique = [...new Set(unitIds)];
-    const result = new Map<string, string>();
-    if (unique.length === 0) return result;
-
-    const unitRows = await tx.productUnit.findMany({
-        where: { tenantId, id: { in: unique } },
-        select: { id: true },
-    });
-
-    for (const row of unitRows) {
-        const factor = await getUnitConversionFactor(tx, tenantId, row.id);
-        result.set(row.id, factor.toString());
-    }
-
-    return result;
+    if (unitIds.length === 0) return new Map<string, string>();
+    return getUnitConversionFactors(tx, tenantId, unitIds);
 }
 
 /** One stock-risk batch row, flattened for the dashboard alerts. */
@@ -1102,74 +1110,132 @@ export interface AlertBatchRow {
     unitName: string;
 }
 
+/** `count` is the EXACT number of matches in the DB; `rows` is capped at `limit`. */
+export interface BatchAlertList {
+    count: number;
+    rows: AlertBatchRow[];
+}
+
+export interface BatchAlertSets {
+    /** Negative-stock batches (T3c's "needs reconciliation"), most-under first. */
+    needsReconciliation: BatchAlertList;
+    /** Real stock (quantity > 0) expiring BEFORE `expiringBefore`, soonest first. */
+    expiringSoon: BatchAlertList;
+}
+
+type RawBatchAlert = {
+    id: string;
+    batchNumber: string;
+    quantity: { toString(): string };
+    expiryDate: Date | null;
+    productId: string;
+    unit: { unitName: string };
+};
+
 /**
- * The ONLY batches worth alerting on: negative-stock batches, and real stock
- * (`quantity > 0`) expiring BEFORE `expiringBefore`. Filtered IN THE DATABASE
- * (a single indexed read), not by fetching a tenant's whole batch table and
- * discarding most of it in application code.
+ * The ONLY batches worth alerting on, as TWO independent, capped queries:
+ *
+ *   needsReconciliation: quantity < 0                      (orderBy quantity asc)
+ *   expiringSoon:        quantity > 0 AND expiryDate < expiringBefore
+ *                                                          (orderBy expiryDate asc)
+ *
+ * [T4h fix] Each list has its own `take: limit` and its own exact COUNT, all
+ * in the database. The previous single query returned EVERY at-risk batch of
+ * the tenant on every dashboard load, and the app discarded most of them;
+ * worse, a flood of one kind could never be told apart from the other once
+ * merged. `count` is now exact regardless of `limit`.
+ *
+ * `expiringBefore` is an EXACT boundary, not a padded one: the caller passes
+ * the local start-of-day that is EXPIRING_SOON_DAYS after today, so
+ * `expiryDate < expiringBefore` is precisely "fewer than N calendar days to
+ * go" (already-expired batches with stock included) — no second app-side
+ * re-filter is needed.
  *
  * Product names are fetched separately by id — this file may not name
- * `product` as an `include`/`select`/`where` KEY (PRODUCT_MODEL_RULES bans
- * `include: { product: ... }` outside this file, and cleanup-by-inlining it
- * here would defeat the point of the ban), so a second tiny keyed read stands
- * in for the join (listProductNamesByIds below).
+ * `product` as an `include`/`select`/`where` KEY for this purpose
+ * (PRODUCT_MODEL_RULES), so a second tiny keyed read stands in for the join
+ * (listProductNamesByIds below).
  *
- * The rows come back FLAT and UNCLASSIFIED: splitting them into
- * "needs reconciliation" vs "expiring soon", the calendar-day math and the
- * list caps all belong to lib/data/analytics.ts's buildAlerts(), which owns
- * the dashboard's alert semantics.
+ * Rows come back FLAT and UNCLASSIFIED beyond the two lists; calendar-day math
+ * for display belongs to lib/data/analytics.ts's buildAlerts().
  */
-export async function listBatchAlertRows(
+export async function listBatchAlertSets(
     tx: TxOrClient,
     tenantId: string,
-    options: { expiringBefore: Date }
-): Promise<AlertBatchRow[]> {
-    requireTenantId(tenantId, "listBatchAlertRows");
+    options: { expiringBefore: Date; limit: number }
+): Promise<BatchAlertSets> {
+    requireTenantId(tenantId, "listBatchAlertSets");
 
-    const rows = await tx.productBatch.findMany({
-        where: {
-            tenantId,
-            OR: [
-                { quantity: { lt: 0 } },
-                { quantity: { gt: 0 }, expiryDate: { not: null, lt: options.expiringBefore } },
-            ],
-        },
-        select: {
-            id: true,
-            batchNumber: true,
-            quantity: true,
-            expiryDate: true,
-            productId: true,
-            unit: { select: { unitName: true } },
-        },
-        orderBy: { expiryDate: "asc" },
-    });
+    const { expiringBefore, limit } = options;
+    if (!Number.isInteger(limit) || limit < 1) {
+        throw new Error("lib/data/products.ts: listBatchAlertSets() requires a positive integer limit.");
+    }
 
-    const productIds = [...new Set(rows.map((row) => row.productId))];
+    const negativeWhere = { tenantId, quantity: { lt: 0 } };
+    const expiringWhere = {
+        tenantId,
+        quantity: { gt: 0 },
+        expiryDate: { not: null, lt: expiringBefore },
+    };
+    const batchSelect = {
+        id: true,
+        batchNumber: true,
+        quantity: true,
+        expiryDate: true,
+        productId: true,
+        unit: { select: { unitName: true } },
+    } satisfies Prisma.ProductBatchSelect;
+
+    const [negativeCount, negativeRows, expiringCount, expiringRows] = await Promise.all([
+        tx.productBatch.count({ where: negativeWhere }),
+        tx.productBatch.findMany({
+            where: negativeWhere,
+            select: batchSelect,
+            orderBy: [{ quantity: "asc" }, { id: "asc" }],
+            take: limit,
+        }) as Promise<RawBatchAlert[]>,
+        tx.productBatch.count({ where: expiringWhere }),
+        tx.productBatch.findMany({
+            where: expiringWhere,
+            select: batchSelect,
+            orderBy: [{ expiryDate: "asc" }, { id: "asc" }],
+            take: limit,
+        }) as Promise<RawBatchAlert[]>,
+    ]);
+
+    const productIds = [
+        ...new Set([...negativeRows, ...expiringRows].map((row) => row.productId)),
+    ];
     const nameById =
         productIds.length > 0
             ? await listProductNamesByIds(tx, tenantId, productIds)
             : new Map<string, string>();
 
-    return rows.map((row) => ({
-        id: row.id,
-        batchNumber: row.batchNumber,
-        quantity: row.quantity.toString(),
-        expiryDate: row.expiryDate,
-        productId: row.productId,
-        productName: nameById.get(row.productId) ?? "منتج غير متوفر",
-        unitName: row.unit.unitName,
-    }));
+    const toRows = (rows: RawBatchAlert[]): AlertBatchRow[] =>
+        rows.map((row) => ({
+            id: row.id,
+            batchNumber: row.batchNumber,
+            quantity: row.quantity.toString(),
+            expiryDate: row.expiryDate,
+            productId: row.productId,
+            productName: nameById.get(row.productId) ?? UNKNOWN_PRODUCT_NAME,
+            unitName: row.unit.unitName,
+        }));
+
+    return {
+        needsReconciliation: { count: negativeCount, rows: toRows(negativeRows) },
+        expiringSoon: { count: expiringCount, rows: toRows(expiringRows) },
+    };
 }
 
-// [T4h] THE narrowest of the dashboard's three reads from this gateway: just
+// [T4h] THE narrowest of the dashboard's reads from this gateway: just
 // id → display name for the products the analytics window actually touched.
 // The Top-5 lists are built from InvoiceItem rows, so a product soft-deleted
-// after it was sold has no catalog row to name it; this lookup substitutes a
-// placeholder for exactly those, and is the ONLY thing the analytics data layer
-// needs from the catalog — listProductsWithInventoryDetails() would be the
-// wrong call here for the reason listBatchAlertRows() gives (same heavy-read
-// rationale as the gateway section above).
+// after it was sold has no catalog row to name it; callers substitute
+// UNKNOWN_PRODUCT_NAME for exactly those, and this lookup is the ONLY thing
+// the analytics data layer needs from the catalog — listProductsWithInventoryDetails()
+// would be the wrong call here (same heavy-read rationale as the gateway
+// section above).
 export async function listProductNamesByIds(
     tx: TxOrClient,
     tenantId: string,

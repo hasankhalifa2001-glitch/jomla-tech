@@ -387,3 +387,42 @@ export function batchCostDisplayLines(
         return [];
     }
 }
+
+
+/**
+ * ADD THIS to lib/inventory/units.ts (it is the only file allowed to name
+ * `conversionFactor` in a select). It is NOT a standalone file.
+ *
+ * [T4h] Batch version of getUnitConversionFactor(): ONE query for any number
+ * of sold-unit ids instead of one query per unit. Used by
+ * lib/data/products.ts's listUnitConversionFactors() on every /dashboard load.
+ *
+ * NOTE: written without access to the current units.ts. If
+ * getUnitConversionFactor() performs extra validation (e.g. rejects a
+ * non-positive factor, or throws on a missing unit), mirror that validation
+ * inside the loop below so both readers behave identically. TxOrClient is
+ * already imported in units.ts per the existing getUnitConversionFactor()
+ * signature.
+ *
+ * A unit id with no row for this tenant simply has no map entry; the caller
+ * decides what that means.
+ */
+export async function getUnitConversionFactors(
+    tx: TxOrClient,
+    tenantId: string,
+    unitIds: readonly string[]
+): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    const unique = [...new Set(unitIds)];
+    if (unique.length === 0) return result;
+
+    const rows = await tx.productUnit.findMany({
+        where: { tenantId, id: { in: unique } },
+        select: { id: true, conversionFactor: true },
+    });
+
+    for (const row of rows) {
+        result.set(row.id, row.conversionFactor.toString());
+    }
+    return result;
+}
