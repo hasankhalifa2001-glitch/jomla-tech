@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { auth } from "@/auth";
 import {
   assertTenantWritable,
@@ -26,6 +27,7 @@ import { getUnitConversionFactor, toBaseUnit, fromBaseUnit } from "@/lib/invento
 import {
   compareMoney,
   convertCurrency,
+  deriveUsd,
   multiplyMoney,
   serializeMoney,
   subtractMoney,
@@ -58,9 +60,9 @@ import { z } from "zod";
  *
  * This file now mirrors app/api/sync/route.ts's sale path step for step:
  *   lock batches (ORDER BY id ASC) → per item: resolve the ORDERED unit's
- *   conversionFactor → toBaseUnit() → commitFifoAllocation() → create the
- *   Invoice + one InvoiceItem per FIFO allocation → decrement each
- *   ProductBatch → optionally record a CustomerPayment → set
+ *   conversionFactor → toBaseUnit() → commitFifoAllocation() → deduct the
+ *   planned batches IMMEDIATELY → create the Invoice + one InvoiceItem per
+ *   allocation → optionally record a CustomerPayment → set
  *   resultingInvoiceId. ALL of it inside the ONE transaction that performs the
  *   status change, so a failure anywhere leaves the status, the stock, the
  *   ledger and the order row exactly as they were.
@@ -96,14 +98,65 @@ import { z } from "zod";
  *      rejected (400) only when the request carries no usable retailer name to
  *      build that Customer from. Debt directed at the tenant's system-generated
  *      "cash" customer is refused too, mirroring the sync engine's guard.
- *   3. INSUFFICIENT STOCK — mirrored from the sync engine: the sale is never
- *      blocked, and a shortfall is allocated against the last candidate batch
- *      (which is exactly how an offline sale syncs when stock ran out).
- *      Change here if approval should instead hard-fail.
+ *   3. INSUFFICIENT STOCK — [v4.9 follow-up: now IDENTICAL to the sync
+ *      engine's shortfall policy, see below]. The approval is never blocked
+ *      for lack of recorded stock.
  *   4. PRICING / FX — line prices come from the frozen
- *      priceWholesaleSnapshot + pricingCurrencySnapshot of each order item,
- *      converted via the tenant's dailyExchangeRate (the same fallback source
- *      the sync engine uses).
+ *      priceWholesaleSnapshot + pricingCurrencySnapshot of each order item.
+ *      [v4.9] The exchange rate is the tenant's CURRENT dailyExchangeRate,
+ *      read inside the transaction — acceptable HERE (unlike the offline sync
+ *      path) because the moment of approval IS the moment of the transaction:
+ *      no cashier ever fixed a different rate. It is OPTIONAL: see v4.9 (6).
+ * ============================================================================
+ *
+ * ============================================================================
+ * [v4.9 FOLLOW-UP — aligning this route with the v4.8 sync-engine fixes]
+ * The v4.8 schema/sync changes were never applied to this file. Fixed here:
+ *
+ * (1) InvoiceItem.baseQuantity (REQUIRED since v4.8) was not written, so every
+ * approval would fail type-checking / at runtime, and the goods-receiving
+ * reconciliation identity (remaining = initialQuantity − SUM(baseQuantity) +
+ * SUM(adjustments)) and any later void would be wrong for B2B invoices. Every
+ * InvoiceItem now stores the exact base-unit amount deducted from its batch,
+ * copied straight from the FIFO allocation (never derived by division).
+ * `quantity` stays the sale-unit figure and is display-only.
+ *
+ * (2) PER-ITEM STOCK DEDUCTION. commitFifoAllocation() only READS batches. The
+ * decrement used to run after ALL lines were planned, so two lines of the same
+ * product (e.g. 1 طرد + 5 قطع) planned against the same snapshot and drew from
+ * the same batch (driving it negative while the next batch stayed untouched).
+ * Each line's decrement is now applied right after that line is planned.
+ *
+ * (3) SHORTFALL POLICY now matches app/api/sync/route.ts exactly: whatever the
+ * positive batches cannot cover is booked on an "overdraw" batch (the last
+ * batch the FIFO plan drew from, or the newest batch when none had stock),
+ * with that batch's own cost. The only hard failure is a product with no
+ * batch at all. (Previously a product whose batches were all at zero blocked
+ * the whole approval.)
+ *
+ * (4) requestedQty is passed to FIFO as toFixed(4) — never toString(), which
+ * can emit exponent notation.
+ *
+ * (5) ERROR HANDLING. Malformed JSON is a 400 (not an unhandled throw).
+ * Unexpected Prisma/infrastructure errors are no longer echoed to the client
+ * (generic message, 500); only this file's own Arabic business messages are
+ * returned (400). "Already reviewed" outcomes are 409 with code
+ * ALREADY_REVIEWED.
+ *
+ * (6) NULLABLE USD (schema v4.9). The daily exchange rate is NOT required to
+ * approve an order any more. It is required ONLY when at least one order item
+ * is priced in USD (without a rate there is no way to produce its SYP price —
+ * the approval is then rejected with a clear Arabic message). When every item
+ * is SYP-priced and the tenant has no usable rate, the approval succeeds with
+ * exchangeRateUsed and EVERY USD figure (invoice totals, item unit prices,
+ * payment amountUSD/exchangeRate) persisted as NULL — never a sentinel 0/1.
+ * USD is derived ONLY through deriveUsd() (the single place that decides
+ * "USD unavailable"); the one remaining convertCurrency() is the USD→SYP
+ * conversion of a USD-priced item, which is guarded by the rule above.
+ *
+ * TODO (not done here): the shortfall block is now duplicated between this
+ * route and app/api/sync/route.ts. Extract it into a shared helper under
+ * lib/inventory/ so the two cannot drift again.
  * ============================================================================
  */
 
@@ -138,6 +191,10 @@ const orderStatusSchema = z
 // payment legitimately run longer than Prisma's 5s default.
 const TX_OPTIONS = { maxWait: 10_000, timeout: 20_000 } as const;
 
+// [v4.9] Thrown when the order was already reviewed (by someone else, or a
+// concurrent request). Mapped to 409 ALREADY_REVIEWED.
+class OrderAlreadyReviewedError extends Error { }
+
 interface OrderItemRow {
   productId: string;
   unitId: string;
@@ -150,18 +207,30 @@ interface OrderItemRow {
 
 /**
  * Resolves an order item's FROZEN wholesale price into BOTH invoice
- * currencies. Invoice rows carry SYP and USD side by side (T1), and the
- * snapshot may be denominated in either — so exactly one direction of
+ * currencies. The snapshot may be denominated in either, so at most one
  * conversion is needed per item. The live ProductUnit price is deliberately
  * never re-read here: priceWholesaleSnapshot exists precisely because the
  * retailer's agreed price must survive later price changes.
+ *
+ * [v4.9] unitPriceUSD is NULLABLE:
+ *   - USD-priced item: unitPriceUSD IS the snapshot; unitPriceSYP needs the
+ *     rate (USD→SYP). Without a usable rate this item cannot be priced at all,
+ *     so it throws a clear Arabic error (the handler also checks this up front
+ *     — this is the defensive backstop).
+ *   - SYP-priced item: unitPriceSYP IS the snapshot; unitPriceUSD is derived
+ *     through deriveUsd() and is null when there is no usable rate.
  */
 function resolveItemUnitPrices(
   item: OrderItemRow,
-  exchangeRateUsed: string
-): { unitPriceSYP: string; unitPriceUSD: string } {
+  exchangeRateUsed: string | null
+): { unitPriceSYP: string; unitPriceUSD: string | null } {
   const snapshot = serializeMoney(item.priceWholesaleSnapshot.toString());
   if (item.pricingCurrencySnapshot === "USD") {
+    if (!exchangeRateUsed) {
+      throw new Error(
+        "هذا الطلب فيه أصناف مسعّرة بالدولار ولا يمكن قبوله قبل تحديد سعر الصرف اليومي."
+      );
+    }
     return {
       unitPriceUSD: snapshot,
       unitPriceSYP: convertCurrency(snapshot, exchangeRateUsed, "USD", "SYP"),
@@ -169,8 +238,20 @@ function resolveItemUnitPrices(
   }
   return {
     unitPriceSYP: snapshot,
-    unitPriceUSD: convertCurrency(snapshot, exchangeRateUsed, "SYP", "USD"),
+    unitPriceUSD: deriveUsd(snapshot, exchangeRateUsed),
   };
+}
+
+// [v4.9] Unexpected database/infrastructure errors must never be echoed to
+// the client (internal Prisma text), unlike this file's own Arabic messages.
+function isInternalDbError(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError ||
+    error instanceof Prisma.PrismaClientUnknownRequestError ||
+    error instanceof Prisma.PrismaClientValidationError ||
+    error instanceof Prisma.PrismaClientInitializationError ||
+    error instanceof Prisma.PrismaClientRustPanicError
+  );
 }
 
 export async function PATCH(
@@ -193,7 +274,8 @@ export async function PATCH(
     await assertTenantWritable(tenantId);
 
     const { id } = await params;
-    const body = await req.json();
+    // [v4.9] Malformed JSON → 400 instead of an unhandled throw.
+    const body = await req.json().catch(() => null);
     const validation = orderStatusSchema.safeParse(body);
 
     if (!validation.success) {
@@ -231,7 +313,7 @@ export async function PATCH(
       });
 
       if (!order) {
-        throw new Error("الطلب غير موجود أو تمت مراجعته مسبقاً.");
+        throw new OrderAlreadyReviewedError("الطلب غير موجود أو تمت مراجعته مسبقاً.");
       }
 
       if (status !== "APPROVED") {
@@ -246,7 +328,7 @@ export async function PATCH(
           },
         });
         if (rejected.count !== 1) {
-          throw new Error("تمت مراجعة الطلب من قِبل مستخدم آخر.");
+          throw new OrderAlreadyReviewedError("تمت مراجعة الطلب من قِبل مستخدم آخر.");
         }
         return { orderId: id, status: "REJECTED" as const, invoiceId: null, itemsCount: 0 };
       }
@@ -307,7 +389,7 @@ export async function PATCH(
         },
       });
       if (claimed.count !== 1) {
-        throw new Error("تمت مراجعة الطلب من قِبل مستخدم آخر.");
+        throw new OrderAlreadyReviewedError("تمت مراجعة الطلب من قِبل مستخدم آخر.");
       }
 
       // 4. The order's line items — tenant-scoped, deterministic order.
@@ -327,26 +409,32 @@ export async function PATCH(
         throw new Error("لا يمكن قبول طلب بلا بنود — هذا الطلب فارغ.");
       }
 
-      // 5. Exchange rate: the tenant's daily rate, exactly as the sync engine
-      //    falls back to. A missing/zero rate is a real configuration error,
-      //    never something to paper over with an un-converted figure.
+      // 5. Exchange rate (OPTIONAL — v4.9 (6)). The tenant's current daily
+      //    rate is read here; the moment of approval IS the moment of the
+      //    transaction, so using it is correct (unlike the offline sync path).
+      //    A missing/zero/negative rate is simply "no rate" (null). It only
+      //    blocks the approval when some item is priced in USD, because that
+      //    item's SYP price cannot be produced without it.
       const tenantRow = await tx.tenant.findUnique({
         where: { id: tenantId },
         select: { dailyExchangeRate: true },
       });
-      if (!tenantRow?.dailyExchangeRate) {
+      const rateCandidate = tenantRow?.dailyExchangeRate
+        ? serializeMoney(tenantRow.dailyExchangeRate.toString())
+        : null;
+      const exchangeRateUsed: string | null =
+        rateCandidate !== null && compareMoney(rateCandidate, 0) > 0 ? rateCandidate : null;
+
+      if (exchangeRateUsed === null && items.some((i) => i.pricingCurrencySnapshot === "USD")) {
         throw new Error(
-          "لا يمكن قبول هذا الطلب: لم يتم تحديد سعر الصرف اليومي لهذا المتجر بعد. " +
-            "يرجى ضبط سعر الصرف من الإعدادات ثم إعادة المحاولة."
+          "هذا الطلب فيه أصناف مسعّرة بالدولار ولا يمكن قبوله قبل تحديد سعر الصرف اليومي. " +
+          "يرجى ضبط سعر الصرف من الإعدادات ثم إعادة المحاولة."
         );
-      }
-      const exchangeRateUsed = serializeMoney(tenantRow.dailyExchangeRate.toString());
-      if (compareMoney(exchangeRateUsed, 0) <= 0) {
-        throw new Error("سعر الصرف المستخدم يجب أن يكون أكبر من الصفر.");
       }
 
       // 6. Price every line from its FROZEN snapshot (assumption 4 in the
-      //    header) and total the invoice in SYP, with USD derived once.
+      //    header) and total the invoice in SYP (authoritative). USD figures
+      //    are derived once, via deriveUsd(), and are null without a rate.
       const pricedItems = items.map((item) => {
         const { unitPriceSYP, unitPriceUSD } = resolveItemUnitPrices(item, exchangeRateUsed);
         return {
@@ -358,7 +446,7 @@ export async function PATCH(
       });
 
       const totalSYP = sumMoney(pricedItems.map((p) => p.lineTotalSYP));
-      const totalUSD = convertCurrency(totalSYP, exchangeRateUsed, "SYP", "USD");
+      const totalUSD = deriveUsd(totalSYP, exchangeRateUsed);
 
       // 7. Optional payment capture. Omitted → fully unpaid credit invoice,
       //    byte-identical to what every order did before this fix.
@@ -369,9 +457,9 @@ export async function PATCH(
       if (compareMoney(paidSYP, totalSYP) > 0) {
         throw new Error("المبلغ المدفوع لا يمكن أن يتجاوز إجمالي قيمة الطلب.");
       }
-      const paidUSD = convertCurrency(paidSYP, exchangeRateUsed, "SYP", "USD");
+      const paidUSD = deriveUsd(paidSYP, exchangeRateUsed);
       const debtSYP = subtractMoney(totalSYP, paidSYP);
-      const debtUSD = convertCurrency(debtSYP, exchangeRateUsed, "SYP", "USD");
+      const debtUSD = deriveUsd(debtSYP, exchangeRateUsed);
 
       // 8. The same guard the sync engine applies: no debt may be parked on
       //    the tenant's system-generated "cash" customer.
@@ -396,8 +484,13 @@ export async function PATCH(
         unitId: string;
         batchId: string;
         unitPriceSYP: string;
-        unitPriceUSD: string;
+        // [v4.9] null when there is no rate for a SYP-priced item.
+        unitPriceUSD: string | null;
+        // sale-unit quantity — DISPLAY ONLY (rounded by construction)
         quantitySold: string;
+        // [v4.9] exact base-unit amount deducted from batchId; copied
+        // straight from the FIFO allocation, written to
+        // InvoiceItem.baseQuantity, never derived by division.
         deductQtyInBaseUnit: string;
         // [v4.4, T4g] Frozen cost basis for this invoice line:
         //   multiplyMoney(allocatedQty, batch.costPricePerBaseUnit)
@@ -413,70 +506,102 @@ export async function PATCH(
       //     the ORDERED unit's own conversionFactor — never requireBaseUnit()'s
       //     (whose factor is 1 by definition) — then allocate FIFO.
       for (const { item, unitPriceSYP, unitPriceUSD } of pricedItems) {
-        let baseUnit;
+        let baseUnit: Awaited<ReturnType<typeof requireBaseUnit>>;
         try {
           baseUnit = await requireBaseUnit(tx, tenantId, item.productId);
         } catch (e) {
           if (e instanceof MissingBaseUnitError) {
             throw new Error(
               `المنتج ${item.productId} بدون وحدة أساسية محددة (بيانات قديمة تحتاج ` +
-                "تصحيح) — الرجاء التواصل مع الدعم الفني."
+              "تصحيح) — الرجاء التواصل مع الدعم الفني."
             );
           }
           throw e;
         }
 
         const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, item.unitId);
-        const baseQtyRequested = toBaseUnit(item.quantity.toString(), soldUnitFactor);
+        // [v4.9] toFixed(4), never toString() (exponent notation risk).
+        const baseQtyRequested = toBaseUnit(item.quantity.toString(), soldUnitFactor).toFixed(4);
 
         const resolution = await commitFifoAllocation(tx, {
           tenantId,
           productId: item.productId,
           unitId: baseUnit.id,
-          requestedQty: baseQtyRequested.toString(),
+          requestedQty: baseQtyRequested,
         });
 
-        if (resolution.allocations.length === 0) {
-          throw new Error(`لا توجد أي دفعة متاحة لـ ${item.productId}/${item.unitId}.`);
-        }
+        const itemAllocations: ResolvedAllocation[] = resolution.allocations.map((alloc) => ({
+          productId: item.productId,
+          unitId: item.unitId,
+          batchId: alloc.batchId,
+          unitPriceSYP,
+          unitPriceUSD,
+          // Sold-unit figure for the InvoiceItem (display/ledger facing),
+          // distinct from the base-unit figure applied to the batch.
+          quantitySold: fromBaseUnit(alloc.allocatedQty, soldUnitFactor).toFixed(4),
+          deductQtyInBaseUnit: alloc.allocatedQty,
+          // [v4.4, T4g] Frozen here, once — see the interface note.
+          costAmountSYP: multiplyMoney(alloc.allocatedQty, alloc.costPricePerBaseUnit),
+        }));
 
-        for (const alloc of resolution.allocations) {
-          resolvedAllocations.push({
+        // [v4.9] SHORTFALL POLICY — identical to app/api/sync/route.ts.
+        // Whatever the positive batches could not cover is booked on an
+        // "overdraw" batch (negative stock, surfaces under the reconciliation
+        // filter). Only a product with no batch at all is a hard failure.
+        const shortfall =
+          resolution.allocations.length === 0 ? baseQtyRequested : resolution.remainingQty;
+
+        if (compareMoney(shortfall, 0) > 0) {
+          let overdrawBatchId: string;
+          let overdrawCost: string;
+
+          if (resolution.allocations.length > 0) {
+            const last = resolution.allocations[resolution.allocations.length - 1];
+            overdrawBatchId = last.batchId;
+            overdrawCost = last.costPricePerBaseUnit;
+          } else {
+            const newest = await tx.productBatch.findFirst({
+              where: { tenantId, productId: item.productId },
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              select: { id: true, costPricePerBaseUnit: true },
+            });
+            if (!newest) {
+              throw new Error(
+                `لا توجد أي دفعة مسجلة للمنتج ${item.productId} — أضف دفعة (استلام بضاعة) قبل قبول الطلب.`
+              );
+            }
+            overdrawBatchId = newest.id;
+            overdrawCost = newest.costPricePerBaseUnit.toString();
+          }
+
+          itemAllocations.push({
             productId: item.productId,
             unitId: item.unitId,
-            batchId: alloc.batchId,
+            batchId: overdrawBatchId,
             unitPriceSYP,
             unitPriceUSD,
-            // Sold-unit figure for the InvoiceItem (display/ledger facing),
-            // distinct from the base-unit figure applied to the batch.
-            quantitySold: fromBaseUnit(alloc.allocatedQty, soldUnitFactor).toFixed(4),
-            deductQtyInBaseUnit: alloc.allocatedQty,
-            // [v4.4, T4g] Frozen here, once — see the interface note.
-            costAmountSYP: multiplyMoney(alloc.allocatedQty, alloc.costPricePerBaseUnit),
+            quantitySold: fromBaseUnit(shortfall, soldUnitFactor).toFixed(4),
+            deductQtyInBaseUnit: shortfall,
+            // [v4.4, T4g] Uses the overdraw batch's own cost per base unit.
+            costAmountSYP: multiplyMoney(shortfall, overdrawCost),
           });
         }
 
-        // Shortfall — mirrored from the sync engine (assumption 3 in the
-        // header): the remaining quantity is drawn against the last candidate
-        // batch instead of blocking the approval.
-        if (!resolution.isSufficient && compareMoney(resolution.remainingQty, 0) > 0) {
-          const last = resolution.allocations[resolution.allocations.length - 1];
-          resolvedAllocations.push({
-            productId: item.productId,
-            unitId: item.unitId,
-            batchId: last.batchId,
-            unitPriceSYP,
-            unitPriceUSD,
-            quantitySold: fromBaseUnit(resolution.remainingQty, soldUnitFactor).toFixed(4),
-            deductQtyInBaseUnit: resolution.remainingQty,
-            // [v4.4, T4g] Drawn against the SAME last batch, so it uses that
-            // batch's own cost per base unit.
-            costAmountSYP: multiplyMoney(resolution.remainingQty, last.costPricePerBaseUnit),
+        // [v4.9] Deduct NOW, before planning the next line, so a later line
+        // (possibly the same product in another unit) plans against the
+        // already-updated quantities. (Previously done after ALL lines.)
+        for (const alloc of itemAllocations) {
+          await tx.productBatch.update({
+            where: { id: alloc.batchId, tenantId },
+            data: { quantity: { decrement: alloc.deductQtyInBaseUnit } },
           });
         }
+
+        resolvedAllocations.push(...itemAllocations);
       }
 
       // 11. The real Invoice — same shape the sync engine writes for a sale.
+      //     [v4.9] exchangeRateUsed and every USD field may be null.
       const invoice = await tx.invoice.create({
         data: {
           tenantId,
@@ -498,7 +623,8 @@ export async function PATCH(
       });
 
       // 12. One InvoiceItem per FIFO allocation — top-level calls only, never
-      //     nested writes (tenant-scope rule 2).
+      //     nested writes (tenant-scope rule 2). (Stock was already deducted
+      //     per line in step 10 — there is no separate decrement step.)
       for (const alloc of resolvedAllocations) {
         await tx.invoiceItem.create({
           data: {
@@ -508,7 +634,11 @@ export async function PATCH(
             unitId: alloc.unitId,
             batchId: alloc.batchId,
             quantity: alloc.quantitySold,
+            // [v4.9] REQUIRED since schema v4.8: the exact base-unit amount
+            // deducted from this batch in step 10.
+            baseQuantity: alloc.deductQtyInBaseUnit,
             unitPriceSYP: alloc.unitPriceSYP,
+            // [v4.9] nullable
             unitPriceUSD: alloc.unitPriceUSD,
             // [v4.4, T4g] REQUIRED, non-nullable — the frozen cost basis for
             // this line. See ResolvedAllocation's note above.
@@ -517,15 +647,8 @@ export async function PATCH(
         });
       }
 
-      // 13. Decrement the batches this approval actually drew from.
-      for (const alloc of resolvedAllocations) {
-        await tx.productBatch.update({
-          where: { id: alloc.batchId, tenantId },
-          data: { quantity: { decrement: alloc.deductQtyInBaseUnit } },
-        });
-      }
-
-      // 14. Optional payment row (1:1 with the invoice via invoiceId @unique).
+      // 13. Optional payment row (1:1 with the invoice via invoiceId @unique).
+      //     [v4.9] amountUSD / exchangeRate are null when there is no rate.
       if (compareMoney(paidSYP, 0) > 0) {
         if (!paymentMethod) {
           throw new Error("يجب تحديد طريقة الدفع عند تسجيل مبلغ مدفوع.");
@@ -547,7 +670,7 @@ export async function PATCH(
         });
       }
 
-      // 15. Link the invoice back to the request — the field that previously
+      // 14. Link the invoice back to the request — the field that previously
       //     had no writer in the entire codebase.
       await tx.b2BOrderRequest.update({
         where: { id, tenantId },
@@ -579,6 +702,15 @@ export async function PATCH(
     if (error instanceof SubscriptionLockedError) {
       return subscriptionLockedResponse(error);
     }
+    // [v4.9] The order was already approved/rejected (by someone else or a
+    // concurrent request) — 409 so the UI can refresh the queue instead of
+    // showing a generic error.
+    if (error instanceof OrderAlreadyReviewedError) {
+      return NextResponse.json(
+        { error: "ALREADY_REVIEWED", message: error.message },
+        { status: 409 }
+      );
+    }
     // A malformed/empty monetary figure (from the request or from a stale
     // tenant exchange rate) is a client-actionable validation problem, not a
     // server fault — mapped to its own error code so the caller can tell the
@@ -590,8 +722,17 @@ export async function PATCH(
         { status: 400 }
       );
     }
+    // [v4.9] Unexpected database/infrastructure errors: log, never echo.
+    if (isInternalDbError(error)) {
+      console.error("Database error while reviewing an order:", error);
+      return NextResponse.json(
+        { error: "SERVER_ERROR", message: "حدث خطأ أثناء تحديث حالة الطلب." },
+        { status: 500 }
+      );
+    }
+    // This file's own Arabic business-rule messages (plain Errors) → 400.
     const message = error instanceof Error ? error.message : "حدث خطأ أثناء تحديث حالة الطلب.";
     console.error("Error updating order status:", error);
-    return NextResponse.json({ error: "SERVER_ERROR", message }, { status: 400 });
+    return NextResponse.json({ error: "VALIDATION_ERROR", message }, { status: 400 });
   }
 }

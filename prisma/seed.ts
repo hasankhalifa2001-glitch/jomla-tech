@@ -157,6 +157,14 @@ async function createInvoiceAtomic(
              * with the seeded batches.
              */
             costAmountSYP: number;
+            /**
+             * [v4.8] The exact base-unit amount deducted for this seeded
+             * line. Pre-v4.8 seed-style rows sold in the base unit, so
+             * callers pass quantity here (base unit factor is 1 by
+             * definition); kept explicit so the write below stays
+             * byte-identical to every live T4c/T5 write path.
+             */
+            baseQuantity: number;
         }>;
         batchAdjustments: Array<{ batchId: string; delta: number }>;
         payment?: {
@@ -195,6 +203,8 @@ async function createInvoiceAtomic(
                 unitId: item.unitId,
                 batchId: item.batchId,
                 quantity: item.quantity,
+                // [v4.8] Exact base-unit amount, never derived by division.
+                baseQuantity: item.baseQuantity,
                 unitPriceUSD: item.unitPriceUSD,
                 unitPriceSYP: item.unitPriceSYP,
                 // [v4.4, T4g] Required, non-nullable — see the item type note.
@@ -408,14 +418,33 @@ async function main() {
     // (rather than today's) so repeated seed runs are byte-identical —
     // this is demo data written directly by prisma/seed.ts, never through
     // an API route, so no server-clock rule applies to it.
+    // [v4.7] ONE demo receipt for both seeded batches (goods "bought" on the
+    // same fixed demo day as their batchNumber prefixes). Written with a
+    // plain top-level prisma.productReceipt.create — seed.ts is demo data,
+    // never an API path; the API path is lib/data/receipts.ts's
+    // createReceiptWithBatches().
+    const demoReceipt = await prisma.productReceipt.create({
+        data: {
+            tenantId: tenantAlBaraka.id,
+            createdByUserId: adminAlBaraka.id,
+            supplierName: "موردون محليون (بيانات تجريبية)",
+            purchaseDate: new Date(Date.UTC(2026, 0, 15)),
+        },
+    });
+
     const riceBatch = await prisma.productBatch.create({
         data: {
             tenantId: tenantAlBaraka.id,
             productId: rice.id,
             unitId: riceUnit.id,
             batchNumber: "2026-01-15-RICE-001",
+            receiptId: demoReceipt.id,
             quantity: 40,
+            // [v4.7] Write-once snapshots: received quantity (base units) and
+            // the TOTAL paid for this line (120,000 SYP x 40 = 4,800,000).
+            initialQuantity: 40,
             costPricePerBaseUnit: riceCostPerBaseUnitSYP,
+            totalCostSYP: 4800000,
             expiryDate: new Date(Date.now() + 20 * 24 * 60 * 60 * 1000),
         },
     });
@@ -453,8 +482,12 @@ async function main() {
             productId: oil.id,
             unitId: oilUnit.id,
             batchNumber: "2026-01-15-OIL-001",
+            receiptId: demoReceipt.id,
             quantity: 15,
+            // [v4.7] Write-once snapshots (225,000 SYP x 15 = 3,375,000).
+            initialQuantity: 15,
             costPricePerBaseUnit: oilCostPerBaseUnitSYP,
+            totalCostSYP: 3375000,
             expiryDate: null,
         },
     });
@@ -490,6 +523,8 @@ async function main() {
                     unitId: riceUnit.id,
                     batchId: riceBatch.id,
                     quantity: 2,
+                    // [v4.8] Base-unit sale: base quantity equals quantity.
+                    baseQuantity: 2,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
                     // [v4.4, T4g] Frozen cost basis for this line:
@@ -542,6 +577,8 @@ async function main() {
                     unitId: riceUnit.id,
                     batchId: riceBatch.id,
                     quantity: 1,
+                    // [v4.8] Base-unit sale: base quantity equals quantity.
+                    baseQuantity: 1,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
                     // [v4.4, T4g] Frozen cost basis for this line.
@@ -573,6 +610,8 @@ async function main() {
                     unitId: riceUnit.id,
                     batchId: riceBatch.id,
                     quantity: -1,
+                    // [v4.8] Void mirror restores the exact base-unit amount.
+                    baseQuantity: -1,
                     unitPriceUSD: 20,
                     unitPriceSYP: usdToSyp(20, rate1),
                     // [v4.4, T4d/T4g] A voided line always carries the NEGATED
@@ -607,6 +646,8 @@ async function main() {
                     unitId: oilUnit.id,
                     batchId: oilBatch.id,
                     quantity: 1,
+                    // [v4.8] Base-unit sale: base quantity equals quantity.
+                    baseQuantity: 1,
                     unitPriceUSD: 18.5,
                     unitPriceSYP: usdToSyp(18.5, rate1),
                     // [v4.4, T4g] Frozen cost basis for this line.

@@ -1,9 +1,21 @@
 /**
  * lib/utils/syria-time.ts
  *
- * T4h - THE single shared definition of "a day" for every merchant-facing
- * date boundary in the system: the dashboard's "today" KPI window, its 7/30
- * day trend buckets, and app/api/invoices/route.ts's default date range.
+ * T4h - THE single shared definition of "a day" for merchant-facing date
+ * boundaries: the dashboard's "today" KPI window and its 7/30 day trend
+ * buckets, and (since v4.7) the goods-receiving dates through
+ * lib/inventory/date-utils.ts.
+ *
+ * WHO USES IT TODAY, AND WHO DOES NOT YET
+ * Used by: lib/data/analytics.ts (dashboard) and lib/inventory/date-utils.ts
+ * (batchNumber prefix, receipt purchase dates).
+ * NOT yet used by the sales log (T4c2): app/api/invoices/route.ts still derives
+ * its default "today" range in UTC (defaultTodayRangeUTC) and
+ * components/sales-log/sales-log-utils.ts derives it in the BROWSER's local
+ * zone, so a sale rung up at 00:30 Damascus time can still be filed under the
+ * previous day there. That is a known gap, deliberately left for a separate
+ * task; localDayRange() below is the drop-in replacement when it is fixed.
+ * Update this paragraph when that happens.
  *
  * WHY THIS EXISTS
  * Tenant carries NO timezone column (schema.prisma), so every "today" in this
@@ -15,15 +27,20 @@
  * SYRIA IS A FIXED UTC+3 OFFSET
  * Syria has observed a permanent UTC+3 since October 2022 - there is no DST
  * transition to model, so a FIXED offset is exactly correct (and, unlike Intl
- * zone conversion, it is deterministic, dependency-free and cheap). If Syria
- * ever reintroduces DST, this ONE constant is what must change; nothing else
- * in the codebase encodes an offset.
+ * zone conversion, it is deterministic, dependency-free and cheap). Every
+ * function below assumes a local day is exactly 24 hours at a constant
+ * offset (addLocalDays is plain millisecond arithmetic). If Syria ever
+ * reintroduces DST, changing SYRIA_UTC_OFFSET_HOURS is NOT enough: this
+ * module's arithmetic must be rewritten around real zone conversion.
  *
- * (lib/inventory/batch-number.ts's buildServerDatePrefix() also uses the
- * Asia/Damascus calendar, for a batchNumber's date prefix. It is deliberately
- * left as-is: it formats ONE date into a stored, immutable string rather than
- * building a query range. This module is the one to use for any RANGE
- * boundary.)
+ * ([v4.7] lib/inventory/date-utils.ts's getBusinessDate() DELEGATES to
+ * localDayKey() below: the batchNumber date prefix, the receipt form's default
+ * purchase date, and the purchase-date "not in the future" / "not too old"
+ * rules all read that one function - so this module remains the single
+ * definition of "a day" for both instants and ranges, with no second
+ * derivation anywhere. localDayKey() itself does not guard against an Invalid
+ * Date (it would return "NaN-NaN-NaN"); business code should call it through
+ * date-utils.ts, whose getBusinessDate()/getMinPurchaseDate() do.)
  */
 
 /** Syria's permanent offset from UTC, in hours. Change here only. */

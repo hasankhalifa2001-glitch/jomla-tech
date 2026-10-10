@@ -14,6 +14,13 @@ import { Camera, RefreshCw, ScanLine } from "lucide-react";
 import { toast } from "sonner";
 import m from "./modals.module.css";
 
+/**
+ * In continuous mode, a DIFFERENT barcode is accepted this soon after the
+ * previous accepted scan — so two different items can be scanned back-to-back
+ * without waiting out the full cooldown.
+ */
+const DIFFERENT_BARCODE_DEBOUNCE_MS = 400;
+
 interface BarcodeScannerModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -25,20 +32,32 @@ interface BarcodeScannerModalProps {
    * "continuous": the modal stays open and the camera keeps running after
    * a successful scan, so a cashier can scan item after item without
    * reopening this dialog each time. Guards against re-firing on the SAME
-   * still-visible barcode via a short cooldown instead of a permanent
-   * one-shot lock.
+   * still-visible barcode (see `continuousCooldownMs` and `repeatGapMs`).
    */
   mode?: "single" | "continuous";
   /**
    * "toast" (default): show this modal's own generic "تم مسح الباركود
-   * بنجاح: X" confirmation. "silent": suppress it and let the caller show
-   * its own, more contextual feedback (e.g. POS's "تمت إضافة X إلى
-   * السلة" from handleAddToCart) — avoids two stacked toasts per scan
-   * during rapid continuous scanning.
+   * بنجاح: X" confirmation AND its own beep. "silent": suppress BOTH and let
+   * the caller give its own, more contextual feedback (e.g. POS's per-scan
+   * banner + sound) — avoids doubled toasts/beeps during rapid continuous
+   * scanning.
    */
   feedback?: "toast" | "silent";
-  /** Cooldown between accepted scans in continuous mode, ms. */
+  /**
+   * Continuous mode: minimum time before the SAME barcode can be accepted
+   * again after it was accepted, ms.
+   */
   continuousCooldownMs?: number;
+  /**
+   * Continuous mode: the same barcode only counts again after it has been OUT
+   * of the camera's view for at least this long, ms. This is what stops a box
+   * that is simply still held in front of the camera from being added twice
+   * (the cooldown alone would let it through the moment it expired), while
+   * still letting a cashier scan two identical items one after the other.
+   * Raise it if a steady hand still double-counts; lower it if scanning
+   * identical items back-to-back feels sluggish.
+   */
+  repeatGapMs?: number;
   /**
    * Optional heading override. Defaults to the generic per-mode title, so
    * existing callers (POS, Inventory search) are unchanged.
@@ -51,6 +70,12 @@ interface BarcodeScannerModalProps {
    * passes its own wording here.
    */
   description?: string;
+  /**
+   * Optional label for the bottom button. Defaults to "إنهاء المسح"
+   * (continuous) / "إغلاق" (single). POS uses it to show the running
+   * "5 أصناف · 450,000 ل.س" on the button that finishes the session.
+   */
+  finishLabel?: string;
   /**
    * Optional caller content rendered directly under the video frame — e.g. a
    * live list of what has been scanned so far in this session.
@@ -65,8 +90,10 @@ export function BarcodeScannerModal({
   mode = "single",
   feedback = "toast",
   continuousCooldownMs = 1200,
+  repeatGapMs = 1000,
   title,
   description,
+  finishLabel,
   children,
 }: BarcodeScannerModalProps) {
   // Was `useRef<HTMLVideoElement | null>(null)` read as
@@ -138,17 +165,26 @@ export function BarcodeScannerModal({
     const codeReader = new BrowserMultiFormatReader();
     readerRef.current = codeReader;
 
-    // Was a permanent one-shot `hasScannedRef.current = true` that never
-    // reset for the lifetime of a scan session — meaning a "continuous"
-    // mode built on top of the old version would have gone dead after
-    // exactly one successful scan (the camera keeps running visually, but
-    // the callback becomes a permanent no-op). Replaced with a `locked`
-    // flag that DOES reset after `continuousCooldownMs` — but only when
-    // mode === "continuous". In "single" mode the behavior is
-    // byte-for-byte identical to before: lock forever, reset+close on the
-    // first hit.
+    // "single" mode: byte-for-byte the original behavior — lock forever,
+    // reset + close on the first hit.
     let locked = false;
+
+    // "continuous" mode bookkeeping.
+    //  - lastSeen*: the most recent barcode the decoder reported, whether or
+    //    not it was accepted — so we know whether a barcode is STILL in view.
+    //  - accepted*: the most recent barcode that was actually reported out.
+    //
+    // Rules (see the callback): the SAME barcode is accepted again only when
+    // the cooldown has passed AND it left the camera's view for `repeatGapMs`;
+    // a DIFFERENT barcode only needs a short debounce. Before this, a plain
+    // timer unlocked everything after the cooldown, so a box held steady in
+    // front of the camera was added a second time.
+    let lastSeenText: string | null = null;
+    let lastSeenAt = 0;
+    let acceptedText: string | null = null;
+    let acceptedAt = 0;
     let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+
     // Guards against state updates / retries after this effect was cleaned up
     // (StrictMode double-invoke, modal closed mid-startup, etc.).
     let cancelled = false;
@@ -170,45 +206,67 @@ export function BarcodeScannerModal({
         constraints,
         videoEl, // real, mounted element instead of videoRef.current!
         (result) => {
-          if (!result || locked || cancelled) return;
-          locked = true;
+          if (!result || cancelled) return;
 
           const currentMode = modeRef.current;
           const currentFeedback = feedbackRef.current;
+          const now = Date.now();
+          const barcodeText = result.getText();
+
+          // Was this exact barcode ALSO reported a moment ago (i.e. it has not
+          // left the frame)? Computed before lastSeen* is refreshed below.
+          const stillInView = barcodeText === lastSeenText && now - lastSeenAt < repeatGapMs;
+          lastSeenText = barcodeText;
+          lastSeenAt = now;
 
           if (currentMode === "single") {
+            if (locked) return;
+            locked = true;
             // Unchanged original behavior: stop immediately, this is the
             // only scan this session will accept.
             if (readerRef.current) readerRef.current.reset();
           } else {
-            // Continuous: keep the reader running. Show the cooldown
-            // indicator, then unlock after continuousCooldownMs so the
-            // NEXT distinct item can be scanned.
+            const sinceAccepted = now - acceptedAt;
+            if (barcodeText === acceptedText) {
+              // Same item: it must have left the frame AND the cooldown passed.
+              if (stillInView || sinceAccepted < continuousCooldownMs) return;
+            } else if (sinceAccepted < DIFFERENT_BARCODE_DEBOUNCE_MS) {
+              // A different item, but suspiciously soon — likely a half-read.
+              return;
+            }
+
+            acceptedText = barcodeText;
+            acceptedAt = now;
+
+            // Continuous: keep the reader running; flash the indicator for the
+            // cooldown window so the cashier can see the scan registered.
             setAwaitingCooldown(true);
+            if (cooldownTimer) clearTimeout(cooldownTimer);
             cooldownTimer = setTimeout(() => {
-              locked = false;
               setAwaitingCooldown(false);
             }, continuousCooldownMs);
           }
 
-          const barcodeText = result.getText();
-          try {
-            const AudioCtx =
-              window.AudioContext ||
-              (window as unknown as { webkitAudioContext: typeof AudioContext })
-                .webkitAudioContext;
-            const ctx = new AudioCtx();
-            const osc = ctx.createOscillator();
-            osc.connect(ctx.destination);
-            osc.frequency.value = 800;
-            osc.start();
-            osc.stop(ctx.currentTime + 0.1);
-            osc.onended = () => ctx.close();
-          } catch {
-            // ignore
-          }
-
+          // Own beep + toast only in the default "toast" feedback mode. With
+          // "silent" the caller supplies its own (POS plays its own tone), so
+          // two beeps never stack on one scan.
           if (currentFeedback === "toast") {
+            try {
+              const AudioCtx =
+                window.AudioContext ||
+                (window as unknown as { webkitAudioContext: typeof AudioContext })
+                  .webkitAudioContext;
+              const ctx = new AudioCtx();
+              const osc = ctx.createOscillator();
+              osc.connect(ctx.destination);
+              osc.frequency.value = 800;
+              osc.start();
+              osc.stop(ctx.currentTime + 0.1);
+              osc.onended = () => ctx.close();
+            } catch {
+              // ignore
+            }
+
             toast.success(`تم مسح الباركود بنجاح: ${barcodeText}`, {
               duration: 1200,
             });
@@ -256,7 +314,7 @@ export function BarcodeScannerModal({
         readerRef.current = null;
       }
     };
-  }, [open, videoEl, retryToken, handleOpenChange, continuousCooldownMs]);
+  }, [open, videoEl, retryToken, handleOpenChange, continuousCooldownMs, repeatGapMs]);
 
   const resolvedTitle =
     title ?? (mode === "continuous" ? "مسح مستمر للأصناف" : "مسح الباركود بالكاميرا");
@@ -267,9 +325,14 @@ export function BarcodeScannerModal({
       ? "وجّه الكاميرا نحو كل صنف بالتتابع — سيُضاف تلقائياً إلى السلة عند كل مسح ناجح."
       : "وجه كاميرا الجهاز نحو الباركود المطبوع على المنتج للمسح التلقائي.");
 
+  const resolvedFinishLabel = finishLabel ?? (mode === "continuous" ? "إنهاء المسح" : "إغلاق");
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-md p-6 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl">
+      {/* [UX] Capped at 92% of the dynamic viewport height and scrollable, so
+          video + caller content (e.g. the POS cart strip) + the finish button
+          can never push the dialog off a short phone screen. */}
+      <DialogContent className="max-w-md max-h-[92dvh] overflow-y-auto p-6 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl">
         <div className={m.m}>
           <DialogHeader>
             <DialogTitle className="text-base font-bold flex items-center gap-2">
@@ -298,7 +361,7 @@ export function BarcodeScannerModal({
             {isScanning && awaitingCooldown && (
               <div className={m.cooldownOverlay}>
                 <ScanLine size={40} color="#6ee7b7" aria-hidden />
-                <span className={m.cooldownCaption}>تمت الإضافة — جاهز للصنف التالي...</span>
+                <span className={m.cooldownCaption}>تم المسح — جاهز للصنف التالي...</span>
               </div>
             )}
 
@@ -316,9 +379,11 @@ export function BarcodeScannerModal({
           {/* Caller-supplied content (e.g. the list scanned so far). */}
           {children}
 
-          <DialogFooter>
+          {/* Sticky: stays reachable at the bottom while the content above
+              scrolls on a small screen. */}
+          <DialogFooter className="sticky bottom-0 -mx-6 mt-3 bg-white px-6 pt-2 pb-1 dark:bg-zinc-900">
             <button type="button" onClick={() => handleOpenChange(false)} className={`${m.btn} ${m.btnOutline} ${m.btnFull}`}>
-              {mode === "continuous" ? "إنهاء المسح" : "إغلاق"}
+              {resolvedFinishLabel}
             </button>
           </DialogFooter>
         </div>

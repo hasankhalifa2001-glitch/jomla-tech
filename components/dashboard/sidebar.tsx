@@ -15,6 +15,7 @@ import {
     BookOpen,
     Receipt,
     ScrollText,
+    ClipboardList,
     Settings,
     Users,
     ChevronRight,
@@ -40,6 +41,12 @@ const navItems = [
     // and the "filter by staff member" control being ADMIN-only inside the
     // screen itself.
     { href: "/dashboard/sales-log", label: "سجل المبيعات", icon: ScrollText },
+    // [ADDED — v4.7 Phase 7] The goods-receiving history (receipts log).
+    // adminOnly: the screen shows purchase-cost figures, so it rides the
+    // same ADMIN-only capability as receiving itself (inventory:mutate) —
+    // hidden here for a CASHIER client-side, and independently enforced
+    // server-side by GET/PATCH /api/receipts (403 before any query).
+    { href: "/receipts", label: "سجل الاستلام", icon: ClipboardList, adminOnly: true },
     { href: "/ledger", label: "دفتر الديون", icon: BookOpen },
     { href: "/orders", label: "الطلبات", icon: Receipt },
     { href: "/settings/staff", label: "طاقم العمل", icon: Users, adminOnly: true },

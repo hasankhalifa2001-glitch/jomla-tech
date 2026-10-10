@@ -85,6 +85,8 @@ datasource db {
 // derived/informational only, computed via the frozen exchangeRateUsed/
 // exchangeRate — never validated against, never gate any action. The one
 // exception is Subscription.amountUSD (the platform's own SaaS revenue).
+// [v4.9] USD counterparts are now NULLABLE when no rate existed at
+// transaction time — see the [v4.9] note below.
 // ============================================================================
 
 // ============================================================================
@@ -223,6 +225,161 @@ datasource db {
 // undefined on devices whose cache predates the next refreshProductCache.
 // ============================================================================
 
+// ============================================================================
+// [v4.7] GOODS-RECEIVING HISTORY — a merchant must be able to look back at
+// every receiving operation: when it happened, who received it, which
+// products and how much of each. Two gaps made that impossible before:
+//
+//  1. There was no "receipt" entity. The multi-product receipt screen wrote
+//     several ProductBatch rows sharing one batchNumber, and nothing else.
+//     Grouping by batchNumber is unreliable because the merchant-typed
+//     suffix is never validated for uniqueness (two receipts on the same
+//     day with suffix "1" would merge), and nothing recorded who received.
+//  2. The RECEIVED quantity was not stored anywhere: ProductBatch.quantity
+//     is the LIVE quantity, decremented by sales and moved by
+//     reconciliations/voids, so a week later it no longer says what arrived.
+//
+// THE FIX:
+//   - ProductReceipt: one row per receiving operation (who, the merchant's
+//     real purchaseDate, optional supplier; createdAt records when it was
+//     entered). Every batch-creation path writes exactly one receipt and
+//     links its batches through ProductBatch.receiptId, as separate
+//     top-level calls inside the same $transaction (nested-write ban).
+//   - ProductBatch.initialQuantity: the quantity received, in the base unit,
+//     written once at creation and NEVER updated afterwards (not by sales,
+//     reconciliation, voids, or B2B approval). The history screen shows it
+//     next to the live `quantity` ("received" vs "remaining now").
+//   - ProductBatch.totalCostSYP: the TOTAL the merchant actually paid for
+//     this line, written once at creation and never updated. It is stored
+//     rather than derived because costPricePerBaseUnit is itself derived by
+//     division (total / base quantity) and cannot reproduce a non-terminating
+//     total exactly (100,000 SYP over 3 pieces x 3 = 99,999.99999999). A
+//     receipt's total is the SUM of the stored line totals of its LIVE
+//     batches, so it returns the typed amount to the lira. CSV import
+//     supplies a per-unit price instead of a total, so there it is computed
+//     and rounded once at write time.
+//
+// DECISIONS (deliberate, not gaps):
+//   - Cost corrections (CostPriceChangeLog) change only costPricePerBaseUnit,
+//     i.e. FUTURE profit. The history keeps showing what was originally paid
+//     (totalCostSYP, frozen like InvoiceItem.costAmountSYP). A line whose
+//     batch has a CostPriceChangeLog row is flagged "cost adjusted" in the UI.
+//   - A hard-deleted batch (T3c, zero sales history) disappears from its
+//     receipt, but BatchDeletionLog snapshots receiptId, the received
+//     quantity and the total cost, so the history screen still shows it as a
+//     greyed "deleted" line with its reason. A deleted line is shown for
+//     transparency only: its cost is NOT included in the receipt total,
+//     because that stock never legitimately entered the inventory. A receipt
+//     left with no live batches stays visible with an explanatory row.
+//   - initialQuantity is NEVER editable (that is what makes it a record). A
+//     wrong entry on a batch with no sales is fixed by delete + re-enter; on
+//     a batch with sales, StockAdjustment moves the live quantity.
+//
+// RECONCILIATION IDENTITY (the history screen shows all four numbers, and
+// T7 asserts the identity for every batch):
+//     quantity (remaining) = initialQuantity
+//                            - netSold
+//                            + SUM(StockAdjustment.quantityDelta)
+//   where netSold = SUM over every InvoiceItem of this batch (POS, B2B and
+//   VOIDED rows alike; voids are stored negative so they net out) of
+//   toBaseUnit(item.quantity, item.unit.conversionFactor). InvoiceItem.quantity
+//   is in the SALE unit, so netSold MUST be computed through
+//   lib/inventory/units.ts, never in SQL and never by multiplying
+//   conversionFactor elsewhere. A batch that fails the identity indicates a
+//   quantity-drift bug, not a display problem.
+//   >>> SUPERSEDED BY [v4.8] BELOW: netSold is now SUM(InvoiceItem.baseQuantity).
+//
+// The history screen and its GET endpoint are ADMIN-only (cost is visible).
+// No data migration: all data is test data; the baseline migration is edited
+// in place followed by `prisma migrate reset`. Offline (Dexie): receiving is
+// online-only, so no cache change.
+// ============================================================================
+
+// ============================================================================
+// [v4.8] InvoiceItem.baseQuantity — closes a real quantity-drift bug found in
+// manual testing of the sync engine (T4c) and the void flow (T4d).
+//
+// THE BUG: a sale of 1 طرد (factor 24) whose FIFO allocation spans two
+// batches (20 pieces from batch A, 4 from batch B) was stored as two
+// InvoiceItem rows whose `quantity` — expressed in the SALE unit — was
+// derived by DIVIDING the base-unit allocation back: 20/24 = 0.8333 and
+// 4/24 = 0.1667. A void then multiplied those rounded figures by 24 again:
+// 0.8333 x 24 = 19.9992 restored to A and 0.1667 x 24 = 4.0008 to B, i.e. the
+// exact "21.9984 قطعة" class of error the v4.0 base-unit architecture exists
+// to eliminate, re-entering through the back door (batches ended at 19.9992
+// and 100.0008 instead of 20 and 100). It also made a full void of a
+// 3-way-split sale (8/8/8, stored as 0.3333 x 3 = 0.9999) permanently
+// impossible, because "void quantity == original quantity" could never
+// hold.
+//
+// THE FIX: every InvoiceItem row also stores the quantity ACTUALLY DEDUCTED
+// from its batch, in the product's BASE unit, written once at commit time
+// straight from the FIFO allocation (allocatedQty) — never derived by
+// dividing. `quantity` stays in the sale unit, but is now DISPLAY-ONLY
+// (receipts, the sales-log detail); nothing in the system may convert it
+// back into base units. Consequences:
+//   - A void restores `baseQuantity` to the same batchId (negated onto the
+//     void row via subtractMoney("0", …)); no conversionFactor lookup at all.
+//   - "Is this void a full reversal?" compares SUM(baseQuantity) per
+//     product/unit, not `quantity`.
+//   - The v4.7 reconciliation identity becomes:
+//         remaining = initialQuantity - SUM(InvoiceItem.baseQuantity)
+//                     + SUM(StockAdjustment.quantityDelta)
+//     (voids carry negative baseQuantity, so they net out). No
+//     lib/inventory/units.ts call, no per-item factor lookup.
+//   - Every write path creating an InvoiceItem (T4c sync sale + void, T4d
+//     online void, T5 B2B approval, seed.ts, test fixtures) must supply it.
+//
+// No data migration: all data is test data; edit the baseline migration in
+// place (add "baseQuantity" DECIMAL(18,4) NOT NULL to "InvoiceItem")
+// followed by `prisma migrate reset`.
+// ============================================================================
+
+// ============================================================================
+// [v4.9] NULLABLE USD / FROZEN EXCHANGE RATE — closes a real bug found in
+// manual testing: a SYP-only sale made while NO exchange rate was set was
+// persisted with exchangeRateUsed = 1, and the sales-log invoice detail then
+// displayed fabricated USD figures ("≈ 5,800.00$") and a line "exchange rate
+// used: 1 SYP / $". Because these columns were required, the offline
+// factory had to invent a number whenever no rate was cached.
+//
+// THE FIX (Option A — nullable, never a sentinel): every USD figure and the
+// frozen rate on a persisted record is now NULLABLE and is written as NULL
+// when no rate existed at the moment of the transaction:
+//   - Invoice.totalUSD, paidAmountUSD, debtAmountUSD, exchangeRateUsed
+//   - InvoiceItem.unitPriceUSD
+//   - CustomerPayment.amountUSD, exchangeRate
+// No sentinel value is ever stored (no 0, no 1). SYP stays authoritative and
+// REQUIRED everywhere; USD stays derived/informational and never gates any
+// action. A null exchangeRateUsed means "no rate was available when this
+// record was created": every screen, receipt and statement omits the
+// secondary "≈ $" figure and the exchange-rate line entirely (no
+// placeholder, no "N/A").
+//
+// RULES (application layer):
+//   - USD is derived ONLY through one helper in lib/utils/money.ts
+//     (deriveUsd(amountSYP, rate): string | null), which returns null when
+//     the rate is null/empty/<= 0. Nothing else decides "USD unavailable".
+//   - The sync engine NEVER substitutes the tenant's CURRENT
+//     dailyExchangeRate for a null payload rate (that would stamp a rate the
+//     cashier never used at sale time), and never throws for a missing rate.
+//   - A VOID row copies exchangeRateUsed from the ORIGINAL invoice and
+//     negates the original's stored USD fields (null stays null), on both
+//     the online void route and the sync void path. It never takes the rate
+//     from the payload or from the tenant's current rate.
+//   - USD aggregates (dashboard) are computed per invoice from its own
+//     frozen rate; null-rate invoices contribute nothing to them.
+//
+// UNCHANGED: Subscription.amountUSD stays required USD (the platform's own
+// SaaS revenue). Dexie: the mirrored offline USD/rate fields are
+// non-indexed value fields and must be able to hold null; no version bump is
+// expected (verify).
+//
+// No data migration: all data is test data; edit the baseline migration in
+// place (drop NOT NULL on the seven columns above) followed by
+// `prisma migrate reset`.
+// ============================================================================
+
 enum UserRole {
   ADMIN
   CASHIER
@@ -299,6 +456,8 @@ model Tenant {
   // [v4.5] tenant-scoped, per T1's isolation rules
   productUnitBarcodes   ProductUnitBarcode[]
   productBatches        ProductBatch[]
+  // [v4.7]
+  productReceipts       ProductReceipt[]
   customers             Customer[]
   invoices              Invoice[]
   invoiceItems          InvoiceItem[]
@@ -340,6 +499,8 @@ model User {
   baseUnitChangeLogs       BaseUnitChangeLog[]
   // [v4.2]
   costPriceChangeLogs      CostPriceChangeLog[]
+  // [v4.7]
+  productReceipts          ProductReceipt[]
 
   @@index([tenantId])
 }
@@ -562,9 +723,31 @@ model ProductBatch {
   // on every batch-creation path (single-batch entry, the multi-product
   // receipt screen, CSV import) — no schema change, since this field was
   // already a plain String.
-  quantity    Decimal   @db.Decimal(18, 4)
-  expiryDate  DateTime?
-  createdAt   DateTime  @default(now())
+  quantity    Decimal @db.Decimal(18, 4)
+
+  // [v4.7] The quantity RECEIVED, in the product's base unit — written once
+  // when the batch is created and never updated afterwards (sales,
+  // reconciliations, voids and B2B approvals only ever touch `quantity`
+  // above). Powers the goods-receiving history ("received" vs "remaining").
+  initialQuantity Decimal @db.Decimal(18, 4)
+
+  // [v4.7] The TOTAL cost paid for this line, in SYP (what the merchant
+  // typed, or per-unit price x quantity rounded once for CSV). Written once
+  // at creation, NEVER updated — a later cost correction changes
+  // costPricePerBaseUnit (future profit) and writes a CostPriceChangeLog row
+  // but does not rewrite this historical figure. Stored, not derived, so a
+  // receipt's total sums exactly to what was paid (see the [v4.7] header).
+  totalCostSYP Decimal @db.Decimal(18, 4)
+
+  // [v4.7] The receiving operation this batch belongs to. REQUIRED: every
+  // batch-creation path (single add-batch, the multi-product receipt screen,
+  // step 3 of add-product, CSV import, seed) creates/links exactly one
+  // ProductReceipt. Restrict: a receipt row is never deleted; a batch's own
+  // hard-delete (T3c, zero sales history) simply removes the line from it.
+  receiptId String
+
+  expiryDate DateTime?
+  createdAt  DateTime  @default(now())
 
   // [v4.2] T4g's batch purchase-cost figure. Always SYP, always expressed
   // per unit of the product's base unit (same principle as `quantity`).
@@ -589,9 +772,10 @@ model ProductBatch {
   // the stored figure would stop reconciling with what was actually paid.
   costPricePerBaseUnit Decimal @db.Decimal(18, 8)
 
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  product      Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
-  unit         ProductUnit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product      Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit         ProductUnit    @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  receipt      ProductReceipt @relation(fields: [receiptId], references: [id], onDelete: Restrict)
   invoiceItems InvoiceItem[]
 
   // [v4.3] REMOVED — `adjustments StockAdjustment[]` used to be here. It is
@@ -613,6 +797,73 @@ model ProductBatch {
   @@index([unitId])
   @@index([expiryDate])
   @@index([tenantId, quantity])
+  // [v4.7] receipt history: "all batches of this receipt"
+  @@index([receiptId])
+}
+
+// ============================================================================
+// [v4.7] ProductReceipt — one row per goods-receiving operation. Written by
+// every batch-creation path inside the same $transaction as its batches
+// (top-level calls only). ADMIN-only to read/create, per T2b's Role
+// Capability Matrix.
+//
+// NOT append-only (changed from the first v4.7 draft): purchaseDate and
+// supplierName are DESCRIPTIVE metadata — they affect no stock and no money —
+// and a wrong date from a date picker is the most likely data-entry mistake,
+// so both are editable by an ADMIN only (T2b matrix row), as a plain
+// top-level update. The FINANCIAL fields live on ProductBatch
+// (initialQuantity, totalCostSYP) and stay frozen: nothing edits them. An
+// edit never touches any batch. updatedAt records that an edit happened; if
+// purchases-by-period reporting is ever built on purchaseDate, revisit
+// whether edits then need their own change log.
+//
+// supplierName is OPTIONAL free text ("who did we buy this from"); delete
+// this one field if supplier tracking is not wanted.
+//
+// TWO DIFFERENT DATES, deliberately both kept:
+//   - purchaseDate — the day the merchant actually bought/received the
+//     goods. REQUIRED (no null state, consistent with the rest of this
+//     schema): the receiving screens and the CSV upload screen show a date
+//     picker that DEFAULTS to the business "today", so a merchant who enters
+//     goods the same day types nothing. A date calendar value (no time of
+//     day, hence @db.Date), supplied by the merchant, validated at the API
+//     layer: never in the future. This is what the history screen sorts and
+//     filters by.
+//     TIME ZONE: "today" and the not-in-the-future check use the BUSINESS
+//     calendar day (Asia/Damascus), never the server's UTC day — one shared
+//     function in date-utils.ts, the same one that builds batchNumber's date
+//     prefix. Compare as 'YYYY-MM-DD' strings, no Date arithmetic. Prisma
+//     round-trips @db.Date as UTC midnight, so DISPLAY it with
+//     timeZone: "UTC" (formatting in the browser's zone can show the
+//     previous day).
+//   - createdAt — the moment the receipt was ENTERED (server clock). Audit
+//     only; also the tie-break when two receipts share a purchaseDate.
+// ProductBatch.batchNumber's date prefix is UNRELATED to purchaseDate: it is
+// always the business date (Asia/Damascus) at creation (T4g section 10), so a receipt entered
+// today for goods bought three days ago has batchNumber "<today>-..." and
+// purchaseDate = three days ago. Both are correct; do not derive one from
+// the other.
+// ============================================================================
+model ProductReceipt {
+  id              String   @id @default(cuid())
+  tenantId        String
+  createdByUserId String
+  supplierName    String?
+  purchaseDate    DateTime @db.Date
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdByUser User           @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+  batches       ProductBatch[]
+
+  // the history screen's real query: this tenant's receipts by purchase
+  // date, newest first (createdAt breaks ties in application ordering), and
+  // date-range filtering on the same column. The composite also serves any
+  // tenant-only lookup (leading column), so no separate @@index([tenantId])
+  // is declared — same reasoning as the [v4.5, review fix] note on
+  // ProductCatalogEntryBarcode.
+  @@index([tenantId, purchaseDate])
 }
 
 model Customer {
@@ -730,24 +981,36 @@ model ProductCatalogEntryReport {
 }
 
 model Invoice {
-  id               String        @id @default(cuid())
-  tenantId         String
-  userId           String
-  customerId       String
-  totalSYP         Decimal       @db.Decimal(18, 4)
-  totalUSD         Decimal       @db.Decimal(18, 4)
-  exchangeRateUsed Decimal       @db.Decimal(18, 4)
-  paidAmountSYP    Decimal       @db.Decimal(18, 4)
-  paidAmountUSD    Decimal       @db.Decimal(18, 4)
-  debtAmountSYP    Decimal       @db.Decimal(18, 4)
-  debtAmountUSD    Decimal       @db.Decimal(18, 4)
-  isPaid           Boolean       @default(false)
-  status           InvoiceStatus @default(COMPLETED)
-  isSynced         Boolean       @default(true)
-  offlineId        String?       @unique
-  syncedAt         DateTime?
-  receiptPdfUrl    String?
-  createdAt        DateTime      @default(now())
+  id         String @id @default(cuid())
+  tenantId   String
+  userId     String
+  customerId String
+
+  // SYP is authoritative and REQUIRED.
+  totalSYP Decimal @db.Decimal(18, 4)
+
+  // [v4.9] NULLABLE — the four fields below are NULL whenever no exchange
+  // rate existed when the transaction was created (never a sentinel 0/1).
+  // totalUSD / paidAmountUSD / debtAmountUSD are derived from the SYP figure
+  // and exchangeRateUsed ONLY via lib/utils/money.ts's deriveUsd(). A void
+  // row copies exchangeRateUsed from the ORIGINAL invoice and negates the
+  // original's stored USD fields (null stays null).
+  totalUSD         Decimal? @db.Decimal(18, 4)
+  exchangeRateUsed Decimal? @db.Decimal(18, 4)
+
+  paidAmountSYP Decimal  @db.Decimal(18, 4)
+  paidAmountUSD Decimal? @db.Decimal(18, 4)
+
+  debtAmountSYP Decimal  @db.Decimal(18, 4)
+  debtAmountUSD Decimal? @db.Decimal(18, 4)
+
+  isPaid        Boolean       @default(false)
+  status        InvoiceStatus @default(COMPLETED)
+  isSynced      Boolean       @default(true)
+  offlineId     String?       @unique
+  syncedAt      DateTime?
+  receiptPdfUrl String?
+  createdAt     DateTime      @default(now())
 
   voidsInvoiceId String?  @unique
   voidsInvoice   Invoice? @relation("InvoiceVoid", fields: [voidsInvoiceId], references: [id], onDelete: Restrict)
@@ -799,22 +1062,36 @@ model InvoiceItem {
   // "حدود بالمنتج نفسو" section).
   unitId String
 
-  batchId      String
+  batchId  String
   // Quantity SOLD, expressed in `unitId` above (the unit the customer
-  // actually bought) — e.g. "3" meaning 3 طرد. NOT automatically the same
-  // number as how much was deducted from ProductBatch.quantity, which is
-  // always in the batch's base unit. The relationship between the two is
-  // always: batchQuantityDeducted = quantity × unitId.conversionFactor,
-  // computed once via decimal.js at commit time and never re-derived
-  // afterward from anything other than this stored quantity + unit.
-  quantity     Decimal @db.Decimal(18, 4)
-  unitPriceSYP Decimal @db.Decimal(18, 4)
-  unitPriceUSD Decimal @db.Decimal(18, 4)
+  // actually bought) — e.g. "3" meaning 3 طرد.
+  //
+  // [v4.8] DISPLAY-ONLY. When a sale's FIFO allocation spans several
+  // batches this row holds only that batch's share, derived by dividing the
+  // base-unit allocation by the sold unit's factor (20/24 = 0.8333) — a
+  // ROUNDED figure. Nothing may multiply it back into base units (voids,
+  // reconciliation identity, reports): use `baseQuantity` below.
+  quantity Decimal @db.Decimal(18, 4)
+
+  // [v4.8] The quantity ACTUALLY DEDUCTED from ProductBatch.quantity for this
+  // row, in the product's BASE unit. Written once at commit time straight
+  // from the FIFO allocation (allocatedQty) — never derived by division, so
+  // it is exact. A VOIDED row carries the negated value (via
+  // subtractMoney("0", …)), and a void restores exactly this amount to
+  // `batchId`. SUM(baseQuantity) per batch is the "net sold" term of the
+  // goods-receiving reconciliation identity (see the [v4.8] header).
+  baseQuantity Decimal @db.Decimal(18, 4)
+
+  unitPriceSYP Decimal  @db.Decimal(18, 4)
+  // [v4.9] NULLABLE — null when the parent invoice has no frozen
+  // exchangeRateUsed (sale and void rows alike). Derived only via deriveUsd().
+  unitPriceUSD Decimal? @db.Decimal(18, 4)
 
   // [v4.2] T4g's frozen cost basis for this line, computed once at commit
   // time (T4c sync or T5 B2B approval):
-  //   costAmountSYP = toBaseUnit(quantity, soldUnit.conversionFactor)
-  //                   × batch.costPricePerBaseUnit
+  //   costAmountSYP = baseQuantity × batch.costPricePerBaseUnit
+  // (v4.8: expressed through baseQuantity, equivalent to the original
+  // toBaseUnit(quantity, soldUnit.conversionFactor) × cost but exact.)
   // Once written, this value is frozen forever — a later edit to the
   // batch's cost price never touches an already-written InvoiceItem,
   // mirroring how exchangeRateUsed is frozen at sale time.
@@ -840,12 +1117,19 @@ model InvoiceItem {
 }
 
 model CustomerPayment {
-  id            String        @id @default(cuid())
-  tenantId      String
-  customerId    String
-  amountSYP     Decimal       @db.Decimal(18, 4)
-  amountUSD     Decimal       @db.Decimal(18, 4)
-  exchangeRate  Decimal       @db.Decimal(18, 4)
+  id         String @id @default(cuid())
+  tenantId   String
+  customerId String
+
+  // SYP is authoritative and REQUIRED.
+  amountSYP Decimal @db.Decimal(18, 4)
+
+  // [v4.9] NULLABLE — null when no exchange rate existed when the payment
+  // was recorded (never a sentinel 0/1). amountUSD derived only via
+  // deriveUsd(amountSYP, exchangeRate).
+  amountUSD    Decimal? @db.Decimal(18, 4)
+  exchangeRate Decimal? @db.Decimal(18, 4)
+
   paymentMethod PaymentMethod
   receiptNo     String?
   notes         String?
@@ -1055,7 +1339,7 @@ model BatchDeletionLog {
   batchNumber         String
   // [v4.0] NOTE — snapshot is in the base unit, consistent with the batch's
   // own quantity field at the moment it existed.
-  quantityAtDeletion  Decimal  @db.Decimal(18, 4)
+  quantityAtDeletion  Decimal @db.Decimal(18, 4)
   // [v4.2] Snapshot of the batch's cost price at the moment of deletion.
   // Keeps this log's existing promise ("prove what was lost, not just that
   // a deletion happened") consistent now that a batch carries a cost figure
@@ -1064,16 +1348,30 @@ model BatchDeletionLog {
   // [v4.4] REQUIRED (non-nullable) — every batch always has a real cost
   // price by the time it could be deleted, since costPricePerBaseUnit can
   // never be null.
-  costPriceAtDeletion Decimal  @db.Decimal(18, 8)
-  deletedByUserId     String
-  reason              String
-  createdAt           DateTime @default(now())
+  costPriceAtDeletion Decimal @db.Decimal(18, 8)
+
+  // [v4.7] Receipt-history snapshots, plain fields like batchId above (NOT
+  // live relations — the batch row is deleted in the same operation, and a
+  // live FK to ProductReceipt would add nothing: the receipt is never
+  // deleted). They let the goods-receiving history still show what was
+  // received and what it cost after the batch is gone. The T3c delete path
+  // must READ receiptId / initialQuantity / totalCostSYP from the batch
+  // BEFORE issuing the delete, inside the same $transaction.
+  receiptId                 String
+  initialQuantityAtDeletion Decimal @db.Decimal(18, 4)
+  totalCostAtDeletion       Decimal @db.Decimal(18, 4)
+
+  deletedByUserId String
+  reason          String
+  createdAt       DateTime @default(now())
 
   tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   deletedByUser User   @relation(fields: [deletedByUserId], references: [id], onDelete: Restrict)
 
   @@index([tenantId])
   @@index([batchId])
+  // [v4.7] "deleted lines of this receipt" for the history screen
+  @@index([tenantId, receiptId])
 }
 
 // ============================================================================

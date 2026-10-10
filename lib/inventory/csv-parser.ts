@@ -1,9 +1,22 @@
 import Papa from "papaparse";
+import Decimal from "decimal.js";
+import { ZodError } from "zod";
 import { Prisma, type BarcodeSource } from "@prisma/client";
 import type { getTenantDb } from "@/lib/db/tenant-scope";
 // [FIX] validatePackagingUnits now lives in units.ts (merged in), not the
 // deleted packaging-unit-validation.ts.
-import { validatePackagingUnits, toBaseUnit, BASE_UNIT_CONVERSION_FACTOR, type PackagingUnit } from "./units";
+//
+// [v4.7 review] AMOUNT_REGEX / COST_PER_BASE_UNIT_REGEX are the ONE shared
+// column-shaped patterns (Decimal(18,4) and Decimal(18,8)). The preview below
+// now validates the SAME shapes the receiving gateway enforces at commit time,
+// so a row can no longer pass the preview and then fail the commit.
+import {
+  validatePackagingUnits,
+  AMOUNT_REGEX,
+  COST_PER_BASE_UNIT_REGEX,
+  InvalidCostInputError,
+  type PackagingUnit,
+} from "./units";
 // [FIX — critical] This file previously called rowTx.product.*/
 // rowTx.productUnit.*/db.product.*/db.productUnit.* directly everywhere —
 // exactly the model-level access eslint.config.mjs's PRODUCT_MODEL_RULES
@@ -25,11 +38,7 @@ import {
   listAllProductsWithUnitsForPackagingCheck,
   listAllUnitsForTenantWithProductName,
   // [v4.5] The barcode model's two sanctioned write/decision gateways.
-  // `createUnitBarcode()` is the ONLY way a barcode row is attached to a unit
-  // (this file previously passed a `barcode` scalar straight into
-  // createProductWithBaseUnit()/createAdditionalUnit()'s `data` — a key that
-  // no longer exists on those Safe types, and that could never have
-  // represented more than one barcode per unit anyway).
+  // `createUnitBarcode()` is the ONLY way a barcode row is attached to a unit.
   // `resolveSharedCatalogForBarcode()` owns the whole GS1 shared-catalog
   // decision, exactly as it does for the two product PATCH/POST routes.
   createUnitBarcode,
@@ -38,18 +47,32 @@ import {
 // [FIX — critical] Resolves the product's REAL base unit before writing a
 // batch for an additional (non-base) packaging unit — see the
 // commitCsvImport doc comment below for the full bug this closes.
-import { requireBaseUnit, type TxOrClient } from "@/lib/inventory/base-unit";
-// [v4.4, Spec Addendum Section 10.2] The ONE sanctioned batchNumber
-// construction module. This import path is exactly why it exists: the CSV
-// import must NOT write the initialBatchNumber column verbatim into
-// ProductBatch.batchNumber, and must NOT re-implement the date-prefix
-// concatenation locally either — it calls the identical shared function
-// T3a's screens call.
-import { constructBatchNumber } from "@/lib/inventory/batch-number";
+import type { TxOrClient } from "@/lib/inventory/base-unit";
+// [v4.7] The receiving gateway — THE one path that writes a ProductReceipt.
+// Both batch-creation branches below route their ProductBatch write through
+// it, so batchNumber construction (the SAME shared constructBatchNumber()
+// T3a's screens call), base-unit conversion and the cost derivation all
+// live in ONE shared writer instead of two copies in this file.
+// purchaseDateSchema / supplierNameSchema are used to validate the file-level
+// receipt parameters ONCE, before the row loop.
+import {
+  createReceiptWithBatches,
+  purchaseDateSchema,
+  supplierNameSchema,
+} from "@/lib/data/receipts";
 // [FIX] Real calendar-date check (rejects 2027-02-30, 2026-13-45). A bare
 // `new Date(str)` + isNaN check can silently roll an impossible date over
 // into the next month depending on the JS engine.
 import { isRealCalendarDate } from "./date-utils";
+// [v4.7 review] The typed errors createBatchRow() throws for user-caused
+// problems (their messages are Arabic and safe to show a merchant), plus the
+// shared suffix rule so the preview applies the same limits as the gateway.
+import {
+  batchNumberSuffixSchema,
+  InactiveEntryUnitError,
+  InvalidBatchNumberError,
+  InvalidExpiryDateError,
+} from "./batch-creation";
 
 export interface CsvRowRaw {
   [key: string]: string | undefined;
@@ -96,6 +119,11 @@ export interface NewProductImportData {
    * initialBatchNumber is empty is rejected and named in the import report,
    * exactly like a missing unitName/conversionFactor/initialQuantity/
    * costPrice.
+   *
+   * NOTE: the date prefix is built per ROW at the moment that row is
+   * processed, so a file whose processing crosses Damascus midnight can carry
+   * two different prefixes. Accepted: the receipt's purchaseDate (one value
+   * per file) is what groups the file, not the batchNumber prefix.
    */
   initialBatchNumber: string;
   initialQuantity: string | number;
@@ -221,6 +249,22 @@ export function parseBarcodeSourceCell(raw: string | undefined): BarcodeSource |
   if (value === "GS1") return "GS1";
   if (value === "INTERNAL") return "INTERNAL";
   return null;
+}
+
+/**
+ * [v4.7 review] Four-way classification of a strictly-positive amount cell, so
+ * the preview can tell "the cell is empty" apart from "it has a value that is
+ * not allowed" (and, for a zero, say WHY). `pattern` is the shape of the
+ * COLUMN the value will land in (AMOUNT_REGEX for Decimal(18,4) quantities,
+ * COST_PER_BASE_UNIT_REGEX for Decimal(18,8) costs) — the same pattern the
+ * receiving gateway applies, so preview and commit cannot disagree.
+ */
+type AmountCheck = "ok" | "missing" | "invalid" | "zero";
+
+function checkPositiveAmount(raw: string, pattern: RegExp): AmountCheck {
+  if (!raw) return "missing";
+  if (!pattern.test(raw)) return "invalid";
+  return new Decimal(raw).gt(0) ? "ok" : "zero";
 }
 
 /**
@@ -461,29 +505,63 @@ export async function validateAndPreviewCsv(
       pricingCurrency = rawCurrency;
     }
 
+    // [v4.7 review] `missingFields` = the cell is EMPTY. `invalidReasons` = the
+    // cell has a value the commit would reject, with a message that says why
+    // (a zero cost, a too-wide number, an over-long batch suffix...). Both are
+    // reported together on one line so the merchant fixes the row in one pass.
     const missingFields: string[] = [];
+    const invalidReasons: string[] = [];
+
     if (!name) missingFields.push("اسم المنتج");
     if (!unitName) missingFields.push("اسم الوحدة");
     if (!rawFactor || !DECIMAL_STRING_REGEX.test(rawFactor) || Number(rawFactor) <= 0) {
       missingFields.push("معامل التحويل");
     }
-    if (!rawQuantity || !DECIMAL_STRING_REGEX.test(rawQuantity) || Number(rawQuantity) < 0) {
+
+    // Quantity: strictly positive (a zero-quantity batch can never yield a
+    // per-base-unit cost — the receiving gateway rejects it), and shaped like
+    // the Decimal(18,4) column. Previously `< 0` let 0 through the preview and
+    // failed at commit.
+    const qtyCheck = checkPositiveAmount(rawQuantity, AMOUNT_REGEX);
+    if (qtyCheck === "missing") {
       missingFields.push("الكمية الأولية");
+    } else if (qtyCheck !== "ok") {
+      invalidReasons.push(
+        "الكمية الأولية يجب أن تكون رقماً أكبر من صفر (حتى 14 خانة صحيحة و4 عشرية)"
+      );
     }
+
     if (!rawBatchNumber) {
       missingFields.push("رقم الدفعة الأولى");
+    } else {
+      // Same suffix rules the receiving gateway applies (length, no control
+      // characters) — so an over-long suffix is reported here, not at commit.
+      const suffixCheck = batchNumberSuffixSchema.safeParse(rawBatchNumber);
+      if (!suffixCheck.success) {
+        invalidReasons.push(suffixCheck.error.issues[0]?.message ?? "رقم الدفعة الأولى غير صالح");
+      }
     }
+
     // [v4.4, T4g] Required for every row that reaches this point — this
     // code path only runs for rows that will create a NEW ProductBatch
     // (either a genuinely new product, or a new additional packaging unit
     // on an existing one). A row that merely updates an existing,
     // barcode-matched unit returned earlier above and never gets here.
-    // Validated with the same positivity rule as every other cost input:
-    // a zero/negative/malformed value is "missing" for this purpose, so it
-    // is named in the report the same way rather than silently accepted.
-    if (!rawCostPrice || !DECIMAL_STRING_REGEX.test(rawCostPrice) || Number(rawCostPrice) <= 0) {
+    //
+    // [v4.7 review] Validated against the COLUMN's own pattern
+    // (COST_PER_BASE_UNIT_REGEX: 10 integer + 8 decimal digits), not the
+    // 14.4 amount pattern — a 12-digit price used to pass the preview and
+    // fail at commit. A ZERO cost gets its own explanatory message: zero-cost
+    // lines are not accepted (no profit can be derived from one).
+    const costCheck = checkPositiveAmount(rawCostPrice, COST_PER_BASE_UNIT_REGEX);
+    if (costCheck === "missing") {
       missingFields.push("سعر التكلفة");
+    } else if (costCheck === "zero") {
+      invalidReasons.push("سعر التكلفة لا يمكن أن يكون صفراً — لا تُقبل أسطر بتكلفة صفر");
+    } else if (costCheck === "invalid") {
+      invalidReasons.push("سعر التكلفة غير صالح (حتى 10 خانات صحيحة و8 خانات عشرية)");
     }
+
     // [v4.5] The `barcodeSource` column is MANDATORY for any row that supplies
     // one or more barcodes: a barcode value and its human-confirmed source
     // always travel together, and the source is NEVER inferred from the value's
@@ -497,11 +575,16 @@ export async function validateAndPreviewCsv(
       missingFields.push("مصدر الباركود (GS1 أو INTERNAL)");
     }
 
-    if (missingFields.length > 0) {
+    if (missingFields.length > 0 || invalidReasons.length > 0) {
+      const parts: string[] = [];
+      if (missingFields.length > 0) {
+        parts.push(`الحقول التالية مطلوبة للمنتجات الجديدة: ${missingFields.join("، ")}`);
+      }
+      parts.push(...invalidReasons);
       rejectedRows.push({
         lineNumber,
         rowContent: rowContentSummary,
-        reason: `السطر ${lineNumber}: الحقول التالية مطلوبة للمنتجات الجديدة: ${missingFields.join("، ")}.`,
+        reason: `السطر ${lineNumber}: ${parts.join(" — ")}.`,
       });
       continue;
     }
@@ -590,6 +673,74 @@ export interface CommitCsvImportResult {
 }
 
 /**
+ * [v4.7 review] Thrown BEFORE the row loop when the file-level receipt
+ * parameters (purchase date / supplier) are unusable. One clear error for the
+ * whole request — the alternative was every new-product row failing, one by
+ * one, with the same message. The route maps it to a 400.
+ */
+export class InvalidReceiptParametersError extends Error {
+  readonly code = "INVALID_RECEIPT_PARAMETERS";
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidReceiptParametersError";
+  }
+}
+
+/**
+ * [v4.7 review] The file-level receipt parameters, validated ONCE. Only
+ * enforced when the file actually creates batches (`hasNewRows`): a
+ * price-update-only file never writes a receipt and needs no purchase date.
+ */
+function assertReceiptParameters(
+  receipt: { purchaseDate?: string | null; supplierName?: string | null },
+  hasNewRows: boolean
+): void {
+  if (!hasNewRows) return;
+
+  if (!receipt.purchaseDate) {
+    throw new InvalidReceiptParametersError(
+      "تاريخ الشراء مطلوب عند استيراد منتجات جديدة — اختر تاريخ الاستلام ثم أعد المحاولة."
+    );
+  }
+  const date = purchaseDateSchema.safeParse(receipt.purchaseDate);
+  if (!date.success) {
+    throw new InvalidReceiptParametersError(date.error.issues[0]?.message ?? "تاريخ الشراء غير صالح.");
+  }
+  const supplier = supplierNameSchema.safeParse(receipt.supplierName ?? undefined);
+  if (!supplier.success) {
+    throw new InvalidReceiptParametersError(supplier.error.issues[0]?.message ?? "اسم المورد غير صالح.");
+  }
+}
+
+/**
+ * [v4.7 review] ONE place that turns a per-row failure into the merchant-facing
+ * reason line.
+ *
+ *  - ZodError (the receiving gateway's own validation): the readable Arabic
+ *    issue messages — never the raw JSON `error.message` of a ZodError.
+ *  - The typed errors createBatchRow()/validatePackagingUnits() throw for
+ *    user-caused problems: their messages are Arabic and intentional.
+ *  - Anything else (Prisma internals, a bug): LOGGED server-side, and the
+ *    merchant sees a generic line — never an internal error string.
+ */
+function describeRowFailure(error: unknown, lineNumber: number, action: string): string {
+  if (error instanceof ZodError) {
+    return `السطر ${lineNumber}: ${error.issues.map((issue) => issue.message).join("، ")}`;
+  }
+  if (
+    error instanceof PackagingConsistencyError ||
+    error instanceof InvalidCostInputError ||
+    error instanceof InvalidBatchNumberError ||
+    error instanceof InvalidExpiryDateError ||
+    error instanceof InactiveEntryUnitError
+  ) {
+    return `السطر ${lineNumber}: ${error.message}`;
+  }
+  console.error(`CSV import: unexpected failure on line ${lineNumber} (${action}):`, error);
+  return `السطر ${lineNumber}: تعذّر ${action} بسبب خطأ غير متوقع.`;
+}
+
+/**
  * Import Confirmation (Pass 2): Strictly sequential per-row execution.
  *
  * [FIX — critical, two real v4.0 bugs closed]
@@ -610,19 +761,21 @@ export interface CommitCsvImportResult {
  * directly against the newly-created (non-base) unit, with no conversion
  * — reopening the historical "21.9984 قطعة" rounding bug via the CSV path.
  * Fixed: the new unit is created via createAdditionalUnit() (never as the
- * base unit), the product's REAL base unit is resolved via
- * requireBaseUnit(), and the entered quantity is converted into the base
- * unit via toBaseUnit() — using the NEWLY-ENTERED unit's own
- * conversionFactor (trusted here because it's the exact value used to
- * create that same unit within this same transaction, not a
- * separately-submitted later payload — contrast with T4c/T5, which must
- * re-fetch the factor from the DB instead of trusting a client payload)
- * — before the ProductBatch row is ever written.
+ * base unit), and the whole batch write now rides the [v4.7] receiving
+ * gateway (createReceiptWithBatches -> createBatchRow), which resolves the
+ * product's REAL base unit and converts the entered quantity using the
+ * NEWLY-ENTERED unit's own conversionFactor — re-fetched from that unit's DB
+ * row inside the same transaction — before the ProductBatch row is written.
  *
  * [FIX] Result counters (created/updated/skipped) are now incremented AFTER
  * the per-row $transaction resolves, from the value the callback returns —
  * never from inside the callback. A commit failure after the callback ran
  * therefore can no longer leave a row counted as created/updated.
+ *
+ * [v4.7 review] The receipt parameters are validated ONCE up front
+ * (assertReceiptParameters — throws InvalidReceiptParametersError), and every
+ * per-row failure is rendered through describeRowFailure(), so the import
+ * report never contains raw ZodError JSON or internal error strings.
  *
  * All model access now goes through lib/data/products.ts /
  * lib/inventory/base-unit.ts — this file no longer calls
@@ -697,13 +850,37 @@ export async function commitCsvImport(
   payload: {
     newProducts: NewProductImportData[];
     priceUpdates: PriceUpdateImportData[];
+    // [v4.7] ONE receipt per import file — the business date + optional
+    // supplier picked on the upload screen (never a per-row column) and the
+    // user running the import. The receipt row itself is created inside the
+    // FIRST batch-creating row's transaction and reused by later rows.
+    //
+    // [v4.7 review] purchaseDate is OPTIONAL at the type level: a
+    // price-update-only file never creates a receipt and needs none. It is
+    // REQUIRED (and validated once, up front) whenever newProducts is
+    // non-empty — see assertReceiptParameters().
+    receipt: {
+      userId: string;
+      purchaseDate?: string | null;
+      supplierName?: string | null;
+    };
   }
 ): Promise<CommitCsvImportResult> {
+  // [v4.7 review] ONE up-front check instead of the same failure repeated on
+  // every row. Throws InvalidReceiptParametersError (the route returns 400).
+  assertReceiptParameters(payload.receipt, payload.newProducts.length > 0);
+  const receiptPurchaseDate = payload.receipt.purchaseDate ?? undefined;
+
   let updatedPricesCount = 0;
   let createdProductsCount = 0;
   const skippedPriceUpdates: CommitCsvImportResult["skippedPriceUpdates"] = [];
   const failedNewProducts: CommitCsvImportResult["failedNewProducts"] = [];
   const failedPriceUpdates: CommitCsvImportResult["failedPriceUpdates"] = [];
+
+  // [v4.7] ONE receipt per import file: adopted after the FIRST
+  // batch-creating row's transaction commits, then passed as
+  // existingReceiptId to every later batch-creating row (see writeLine).
+  let receiptId: string | null = null;
 
   type QueueItem =
     | { type: "new"; data: NewProductImportData }
@@ -754,15 +931,11 @@ export async function commitCsvImport(
           updatedPricesCount++;
         }
       } catch (error) {
-        const reason =
-          error instanceof Error
-            ? `السطر ${update.lineNumber}: تعذّر تحديث السعر (${error.message}).`
-            : `السطر ${update.lineNumber}: تعذّر تحديث السعر بسبب خطأ غير متوقع.`;
         failedPriceUpdates.push({
           lineNumber: update.lineNumber,
           barcode: update.barcode,
           unitName: update.unitName,
-          reason,
+          reason: describeRowFailure(error, update.lineNumber, "تحديث السعر"),
         });
       }
     } else {
@@ -812,16 +985,58 @@ export async function commitCsvImport(
           }
 
           const batchQty = (np.initialQuantity !== undefined ? np.initialQuantity : np.quantity)!.toString();
-          const expDate = np.expiryDate ? new Date(np.expiryDate) : null;
+          // [v4.7] The expiry travels to the shared writer as the raw
+          // 'YYYY-MM-DD' string (expiryDateSchema's shape); createBatchRow
+          // converts it to the Date the column stores.
+          const expiry = np.expiryDate ?? null;
           // [v4.4, Sections 10.2 + T4g] The column holds the MERCHANT-SUPPLIED
           // SUFFIX only — the stored value always carries the server-date
           // prefix, built through the same shared constructBatchNumber() the
           // single-batch and multi-product screens use. The column's raw
           // value is NEVER written verbatim into ProductBatch.batchNumber.
-          const batchNum = constructBatchNumber((np.initialBatchNumber || np.batchNumber)!.trim());
+          // [v4.7] The construction itself moved into the receiving gateway
+          // (createReceiptWithBatches), which runs it exactly ONCE per row —
+          // this file never concatenates a date prefix itself.
+          const batchSuffix = (np.initialBatchNumber || np.batchNumber)!.trim();
           // Always SYP, always per the product's BASE unit, taken as-is — no
           // conversionFactor division (unlike the quantity below).
           const costPricePerBaseUnit = np.costPrice.toString();
+
+          // [v4.7] ONE receipt per import file, created inside the FIRST
+          // row's transaction that reaches this point and reused by later
+          // rows via existingReceiptId — a file that creates no batch never
+          // reaches here, so it creates no receipt at all. totalCostSYP is
+          // derived from the column's per-base-unit price ONCE (price x base
+          // quantity, rounded to 4 dp) inside the shared batch writer.
+          const writeLine = async (productId: string, entryUnitId: string) => {
+            // assertReceiptParameters() guaranteed purchaseDate exists for any
+            // file that has new rows; this is the type-narrowing backstop.
+            if (!receiptPurchaseDate) {
+              throw new InvalidReceiptParametersError("تاريخ الشراء مطلوب لإنشاء الدفعة.");
+            }
+            const receiptOutcome = await createReceiptWithBatches(rowTx, {
+              tenantId,
+              userId: payload.receipt.userId,
+              purchaseDate: receiptPurchaseDate,
+              supplierName: payload.receipt.supplierName,
+              batchNumberSuffix: batchSuffix,
+              // Adopted by commitCsvImport ONLY after this transaction
+              // commits — a rolled-back row never leaks its receipt id.
+              existingReceiptId: receiptId ?? undefined,
+              lines: [
+                {
+                  productId,
+                  entryUnitId,
+                  quantity: batchQty,
+                  // The column's per-base-unit price, taken VERBATIM (note
+                  // above) — the gateway derives totalCostSYP from it.
+                  costPricePerBaseUnit,
+                  expiryDate: expiry,
+                },
+              ],
+            });
+            return { kind: "created" as const, receiptId: receiptOutcome.receiptId };
+          };
 
           if (!existingProduct) {
             // [FIX — BUG 1] Genuinely new product: created atomically with
@@ -851,27 +1066,14 @@ export async function commitCsvImport(
             // its own top-level row via the model's single sanctioned gateway.
             await attachRowBarcodes(rowTx, tenantId, createdBaseUnit.id, np);
 
-            // The base unit's own factor is always exactly 1 — no
-            // conversion changes the quantity, but toBaseUnit() is still
-            // called for consistency/auditability with every other write
-            // path in this codebase.
-            const baseQty = toBaseUnit(batchQty, BASE_UNIT_CONVERSION_FACTOR);
-
-            await rowTx.productBatch.create({
-              data: {
-                tenantId,
-                productId: createdProduct.id,
-                unitId: createdBaseUnit.id,
-                batchNumber: batchNum,
-                quantity: baseQty.toString(),
-                // [v4.4, T4g] Required, non-nullable — see the field's own note
-                // above this transaction.
-                costPricePerBaseUnit,
-                expiryDate: expDate,
-              },
-            });
-
-            return "created" as const;
+            // [v4.7] The ProductBatch write itself happens in writeLine()
+            // below: batchNumber construction, base-unit conversion (the
+            // factor comes from the ENTERED unit's own DB row) and the cost
+            // derivation live in ONE shared writer — this branch only
+            // resolves WHICH product/unit the line belongs to. For a
+            // brand-new product the entered unit IS the base unit (factor 1,
+            // guaranteed by validatePackagingUnits above).
+            return writeLine(createdProduct.id, createdBaseUnit.id);
           }
 
           // [FIX — BUG 2] Additional packaging unit on an existing
@@ -898,40 +1100,23 @@ export async function commitCsvImport(
           // [v4.5] Same per-barcode treatment as the base-unit branch.
           await attachRowBarcodes(rowTx, tenantId, createdUnit.id, np);
 
-          const baseUnit = await requireBaseUnit(rowTx, tenantId, existingProduct.id);
-          const baseQty = toBaseUnit(batchQty, np.conversionFactor.toString());
-
-          await rowTx.productBatch.create({
-            data: {
-              tenantId,
-              productId: existingProduct.id,
-              unitId: baseUnit.id,
-              batchNumber: batchNum,
-              quantity: baseQty.toString(),
-              // [v4.4, T4g] Required, non-nullable — see the field's own note
-              // above this transaction.
-              costPricePerBaseUnit,
-              expiryDate: expDate,
-            },
-          });
-
-          return "created" as const;
+          // [v4.7] Same shared-writer routing as the base-unit branch —
+          // conversion uses the newly-created unit's own factor, read back
+          // from its DB row inside createBatchRow.
+          return writeLine(existingProduct.id, createdUnit.id);
         });
 
         // [FIX] Counted only after the transaction has actually resolved.
-        if (outcome === "created") createdProductsCount++;
-        else updatedPricesCount++;
-      } catch (error) {
-        if (error instanceof PackagingConsistencyError) {
-          failedNewProducts.push({
-            lineNumber: np.lineNumber,
-            name: np.name,
-            barcode: barcodeSummary(np),
-            reason: `السطر ${np.lineNumber}: ${error.message}`,
-          });
-          continue;
+        // [v4.7] The receipt id is adopted ONLY once the transaction has
+        // committed — a rolled-back row never leaks its receipt id to later
+        // rows, and a file that created no batch never adopts one.
+        if (typeof outcome === "object") {
+          createdProductsCount++;
+          if (!receiptId) receiptId = outcome.receiptId;
+        } else {
+          updatedPricesCount++;
         }
-
+      } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
           failedNewProducts.push({
             lineNumber: np.lineNumber,
@@ -942,16 +1127,11 @@ export async function commitCsvImport(
           continue;
         }
 
-        const reason =
-          error instanceof Error
-            ? `السطر ${np.lineNumber}: تعذّر إنشاء المنتج (${error.message}).`
-            : `السطر ${np.lineNumber}: تعذّر إنشاء المنتج بسبب خطأ غير متوقع.`;
-
         failedNewProducts.push({
           lineNumber: np.lineNumber,
           name: np.name,
           barcode: barcodeSummary(np),
-          reason,
+          reason: describeRowFailure(error, np.lineNumber, "إنشاء المنتج"),
         });
       }
     }

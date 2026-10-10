@@ -57,9 +57,10 @@ export interface InvoiceLogRow {
     createdAt: Date;
     status: InvoiceStatus;
     totalSYP: string;
-    totalUSD: string;
+    // [v4.9] Nullable — null when no rate existed at sale time (never 1).
+    totalUSD: string | null;
     paidAmountSYP: string;
-    exchangeRateUsed: string;
+    exchangeRateUsed: string | null;
     paymentStatus: PaymentStatusBadge;
     voidsInvoiceId: string | null;
     voidedByInvoiceId: string | null;
@@ -94,9 +95,10 @@ function toLogRow(row: RawInvoiceLogRow): InvoiceLogRow {
         createdAt: row.createdAt,
         status: row.status,
         totalSYP: row.totalSYP.toString(),
-        totalUSD: row.totalUSD.toString(),
+        // [v4.9] Null-safe: Decimal? arrives as null, never .toString() on null.
+        totalUSD: row.totalUSD?.toString() ?? null,
         paidAmountSYP: row.paidAmountSYP.toString(),
-        exchangeRateUsed: row.exchangeRateUsed.toString(),
+        exchangeRateUsed: row.exchangeRateUsed?.toString() ?? null,
         paymentStatus: derivePaymentStatus(row.totalSYP.toString(), row.paidAmountSYP.toString()),
         voidsInvoiceId: row.voidsInvoiceId,
         voidedByInvoiceId: row.voidedBy?.id ?? null,
@@ -248,7 +250,8 @@ export interface InvoiceDetailItem {
     batchId: string;
     quantity: string;
     unitPriceSYP: string;
-    unitPriceUSD: string;
+    // [v4.9] Nullable — null when the parent invoice has no frozen rate.
+    unitPriceUSD: string | null;
     /**
      * [v4.4, T4c2] Per-line profit, in SYP, present ONLY when the caller
      * passed `includeProfit: true` (i.e. the session is an ADMIN).
@@ -274,12 +277,13 @@ export interface InvoiceDetail {
     createdAt: Date;
     status: InvoiceStatus;
     totalSYP: string;
-    totalUSD: string;
-    exchangeRateUsed: string;
+    // [v4.9] Nullable USD + frozen rate — null when no rate at sale time.
+    totalUSD: string | null;
+    exchangeRateUsed: string | null;
     paidAmountSYP: string;
-    paidAmountUSD: string;
+    paidAmountUSD: string | null;
     debtAmountSYP: string;
-    debtAmountUSD: string;
+    debtAmountUSD: string | null;
     /**
      * [T4f] The cached, server-generated receipt PDF for this invoice, if one
      * has ever been generated. Null until the FIRST share (see
@@ -377,12 +381,13 @@ export async function findInvoiceDetail(
         createdAt: invoice.createdAt,
         status: invoice.status,
         totalSYP: invoice.totalSYP.toString(),
-        totalUSD: invoice.totalUSD.toString(),
-        exchangeRateUsed: invoice.exchangeRateUsed.toString(),
+        // [v4.9] Null-safe: Decimal? arrives as null for SYP-only sales.
+        totalUSD: invoice.totalUSD?.toString() ?? null,
+        exchangeRateUsed: invoice.exchangeRateUsed?.toString() ?? null,
         paidAmountSYP: invoice.paidAmountSYP.toString(),
-        paidAmountUSD: invoice.paidAmountUSD.toString(),
+        paidAmountUSD: invoice.paidAmountUSD?.toString() ?? null,
         debtAmountSYP: invoice.debtAmountSYP.toString(),
-        debtAmountUSD: invoice.debtAmountUSD.toString(),
+        debtAmountUSD: invoice.debtAmountUSD?.toString() ?? null,
         // [T4f]
         receiptPdfUrl: invoice.receiptPdfUrl,
         voidReason: invoice.voidReason,
@@ -418,7 +423,8 @@ export async function findInvoiceDetail(
                 batchId: item.batchId,
                 quantity: item.quantity.toString(),
                 unitPriceSYP: item.unitPriceSYP.toString(),
-                unitPriceUSD: item.unitPriceUSD.toString(),
+                // [v4.9] Null-safe per-line USD for SYP-only sales.
+                unitPriceUSD: item.unitPriceUSD?.toString() ?? null,
                 ...(profitSYP !== undefined ? { profitSYP } : {}),
             };
         }),

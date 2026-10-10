@@ -26,12 +26,24 @@
  *     this same transaction (so a merged-away customer's repayment lands on
  *     the survivor, never on the deactivated row), then checked for
  *     isActive / !isSystemGenerated.
- *   - exchangeRate: optional params.frozenRate (sync path) is validated > 0
- *     and frozen onto the row — the same rule the Invoice pass uses for a
- *     non-null exchangeRateUsed. When frozenRate is omitted (online path),
- *     the rate is read FRESH from the DB inside this transaction — never from
- *     the JWT/session. amountUSD is DERIVED as amountSYP ÷ exchangeRate
- *     (display-only).
+ *   - exchangeRate / amountUSD are NULLABLE (schema v4.9) and never a
+ *     sentinel. params.frozenRate has THREE meanings:
+ *       * a usable number (> 0)  -> frozen onto the row (sync path, same rule
+ *                                   as Invoice.exchangeRateUsed);
+ *       * null                   -> the record was created while NO rate
+ *                                   existed: exchangeRate and amountUSD are
+ *                                   persisted as NULL. The tenant's CURRENT
+ *                                   rate is NEVER substituted (it would stamp
+ *                                   a rate nobody used when the money moved);
+ *       * undefined (omitted)    -> online path: "now" IS the moment of the
+ *                                   transaction, so today's
+ *                                   Tenant.dailyExchangeRate is read FRESH
+ *                                   inside this transaction (never from the
+ *                                   JWT/session). If the tenant has none,
+ *                                   the result is NULL — never an error.
+ *     A supplied rate that is unusable (empty, non-numeric, <= 0) is treated
+ *     exactly like a missing one (null), matching deriveUsd(). amountUSD is
+ *     derived ONLY through deriveUsd() (display-only; SYP stays authoritative).
  *   - Exactly ONE top-level `customerPayment.create` with `invoiceId: null` —
  *     no nested writes anywhere (see lib/db/tenant-scope.ts's rule #2).
  *   - `offlineId`, when supplied, is an idempotency key: a repeated offlineId
@@ -66,7 +78,7 @@ import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
 import {
   addMoney,
   compareMoney,
-  divideMoney,
+  deriveUsd,
   formatMoney,
   serializeMoney,
   subtractMoney,
@@ -78,7 +90,7 @@ import { getCustomerBalanceSYP } from "./balance";
 export type RepaymentErrorCode =
   /** The amount is larger than the customer's current balance. */
   | "EXCEEDS_BALANCE"
-  /** Any other rejection (validation, unknown/inactive/system customer, no rate...). */
+  /** Any other rejection (validation, unknown/inactive/system customer...). */
   | "REJECTED";
 
 /**
@@ -114,9 +126,15 @@ export interface RecordRepaymentParams {
   /** Sync-time replay: when this row was actually pushed to the server. */
   syncedAt?: Date | null;
   /**
-   * Sync path: the offline record's own stored exchangeRate. When provided,
-   * validated > 0 and frozen onto the row (mirrors Invoice.exchangeRateUsed).
-   * When omitted, the online path reads today's Tenant.dailyExchangeRate.
+   * [v4.9] The rate frozen on the record when it was created.
+   *   - usable number (> 0): frozen onto the row.
+   *   - null: no rate existed then -> persisted as NULL (NEVER replaced by the
+   *     tenant's current rate). The sync path passes the offline record's
+   *     exchangeRate as-is, so a null stays null.
+   *   - undefined (omit the key): online path — today's
+   *     Tenant.dailyExchangeRate is read fresh inside the transaction; if the
+   *     tenant has none the result is NULL (never an error).
+   * An unusable value (empty / non-numeric / <= 0) behaves like null.
    */
   frozenRate?: string | number | null;
 }
@@ -126,8 +144,9 @@ export interface RecordedRepayment {
   /** The RESOLVED (survivor) customer this row was written against. */
   customerId: string;
   amountSYP: string;
-  amountUSD: string;
-  exchangeRate: string;
+  // [v4.9] Nullable — null when no rate existed at record time.
+  amountUSD: string | null;
+  exchangeRate: string | null;
   balanceBeforeSYP: string;
   balanceAfterSYP: string;
   /** true when `offlineId` was already on record — nothing was written. */
@@ -211,8 +230,9 @@ async function recordedFromExistingRow(
     id: string;
     customerId: string;
     amountSYP: { toString(): string };
-    amountUSD: { toString(): string };
-    exchangeRate: { toString(): string };
+    // [v4.9] Nullable — null for repayments recorded with no rate.
+    amountUSD: { toString(): string } | null;
+    exchangeRate: { toString(): string } | null;
   }
 ): Promise<RecordedRepayment> {
   const balanceAfterSYP = await getCustomerBalanceSYP(db, tenantId, existing.customerId);
@@ -221,47 +241,59 @@ async function recordedFromExistingRow(
     paymentId: existing.id,
     customerId: existing.customerId,
     amountSYP,
-    amountUSD: existing.amountUSD.toString(),
-    exchangeRate: existing.exchangeRate.toString(),
+    amountUSD: existing.amountUSD?.toString() ?? null,
+    exchangeRate: existing.exchangeRate?.toString() ?? null,
     balanceBeforeSYP: addMoney(balanceAfterSYP, amountSYP),
     balanceAfterSYP,
     alreadyRecorded: true,
   };
 }
 
+/** A rate is usable only when it parses and is > 0 (same rule as deriveUsd). */
+function usableRateOrNull(raw: string | number): string | null {
+  if (typeof raw === "string" && raw.trim() === "") return null;
+  let rate: string;
+  try {
+    rate = serializeMoney(raw);
+  } catch (error) {
+    if (error instanceof MoneyError) return null;
+    throw error;
+  }
+  return compareMoney(rate, 0) > 0 ? rate : null;
+}
+
+/**
+ * [v4.9] Resolves the rate to freeze on the row — NEVER throws for a missing
+ * or unusable rate, returns null instead. See RecordRepaymentParams.frozenRate
+ * for the three-way meaning of undefined / null / value.
+ */
 async function resolveExchangeRate(
   tx: TxOrClient,
   tenantId: string,
   frozenRate: RecordRepaymentParams["frozenRate"]
-): Promise<string> {
-  if (frozenRate != null && String(frozenRate).trim() !== "") {
-    let rate: string;
-    try {
-      rate = serializeMoney(frozenRate);
-    } catch (error) {
-      if (error instanceof MoneyError) {
-        throw new RepaymentError("سعر الصرف المستخدم يجب أن يكون أكبر من الصفر.");
-      }
-      throw error;
-    }
-    if (compareMoney(rate, 0) <= 0) {
-      throw new RepaymentError("سعر الصرف المستخدم يجب أن يكون أكبر من الصفر.");
-    }
-    return rate;
+): Promise<string | null> {
+  // Sync path, record created with no rate: stays null. Do NOT fall through
+  // to the tenant's current rate.
+  if (frozenRate === null) {
+    return null;
   }
 
+  // Sync path, record carried a rate: freeze it (unusable -> null).
+  if (frozenRate !== undefined) {
+    return usableRateOrNull(frozenRate);
+  }
+
+  // Online path (key omitted): the moment of this transaction is "now", so
+  // today's tenant rate is the right one — read fresh, never from the JWT.
+  // Optional: no rate configured -> null.
   const tenantRow = await tx.tenant.findUnique({
     where: { id: tenantId },
     select: { dailyExchangeRate: true },
   });
   if (!tenantRow?.dailyExchangeRate) {
-    throw new RepaymentError("حدّد سعر الصرف أولاً");
+    return null;
   }
-  const exchangeRate = serializeMoney(tenantRow.dailyExchangeRate.toString());
-  if (compareMoney(exchangeRate, 0) <= 0) {
-    throw new RepaymentError("حدّد سعر الصرف أولاً");
-  }
-  return exchangeRate;
+  return usableRateOrNull(tenantRow.dailyExchangeRate.toString());
 }
 
 /**
@@ -347,10 +379,12 @@ export async function recordRepayment(
   }
 
   // ---- Exchange rate: frozenRate (sync) or fresh DB (online). Never JWT. ----
+  // [v4.9] May be null (no rate existed) — that is valid, never an error.
   const exchangeRate = await resolveExchangeRate(tx, tenantId, params.frozenRate);
 
-  // Derived, display-only — SYP stays authoritative.
-  const amountUSD = divideMoney(amountSYP, exchangeRate);
+  // Derived, display-only — SYP stays authoritative. deriveUsd() is the ONLY
+  // place that decides "USD unavailable" (returns null for a null/<=0 rate).
+  const amountUSD = deriveUsd(amountSYP, exchangeRate);
 
   const paymentMethod = isPaymentMethod(params.paymentMethod)
     ? params.paymentMethod

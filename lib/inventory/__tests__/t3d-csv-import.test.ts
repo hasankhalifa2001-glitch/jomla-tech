@@ -6,6 +6,7 @@ import { validateAndPreviewCsv, commitCsvImport } from "../csv-parser";
 // [v4.4, Sections 10.2 + T4g] Used to assert the server-date prefix the
 // parser (not the CSV column) supplies for every newly created batch.
 import { buildServerDatePrefix } from "../batch-number";
+import { addLocalDays, localDayKey } from "@/lib/utils/syria-time";
 
 describe("T3d — Bulk CSV Import", () => {
   const tenantId = "tenant-test-1";
@@ -13,6 +14,18 @@ describe("T3d — Bulk CSV Import", () => {
   // Shared header for the compact fixtures in sections 6–8.
   const HEADER =
     "name,unitName,conversionFactor,initialQuantity,initialBatchNumber,costPrice,priceWholesale,barcodes,barcodeSource";
+
+  // [v4.7] commitCsvImport's shared receipt parameters — ONE receipt per
+  // import file. purchaseDate is 30 days BEFORE the current business date —
+  // a real, past business date that always sits inside the gateway's
+  // MAX_BACKDATE_DAYS (730) window, so the suite holds whenever it runs.
+  // (A fixed date like "2020-01-01" now violates the backdate rule — the
+  // gateway would reject every batch-creating row.)
+  const TEST_RECEIPT = {
+    userId: "admin-user-1",
+    purchaseDate: localDayKey(addLocalDays(new Date(), -30)),
+    supplierName: null as string | null,
+  };
 
   // Mock DB collections
   let mockUnitsInDb: any[] = [];
@@ -29,6 +42,9 @@ describe("T3d — Bulk CSV Import", () => {
   // resolveSharedCatalogForBarcode() gateway the two product routes use.
   let mockCatalogEntriesInDb: any[] = [];
   let mockCatalogBarcodesInDb: any[] = [];
+  // [v4.7] ProductReceipt rows written by the receiving gateway — one per
+  // import file (existingReceiptId reuse means later rows never add one).
+  let mockReceiptsInDb: any[] = [];
 
   const createMockDb = () => {
     // [v4.5] A unit's barcode rows, resolved at call time so a mock read always
@@ -37,6 +53,15 @@ describe("T3d — Bulk CSV Import", () => {
       mockBarcodesInDb.filter((b) => b.unitId === unitId);
 
     const db: any = {
+      // [v4.7] The receiving gateway writes ONE receipt per import file;
+      // createReceiptWithBatches() calls this top-level create first, then
+      // every batch of the file carries the returned id.
+      productReceipt: {
+        create: vi.fn(async ({ data }: any) => {
+          mockReceiptsInDb.push(data);
+          return { id: `receipt-${mockReceiptsInDb.length}` };
+        }),
+      },
       product: {
         // Mirrors the real query's `include: { units: { select: { unitName,
         // conversionFactor } } }` shape: each returned product carries its
@@ -92,6 +117,13 @@ describe("T3d — Bulk CSV Import", () => {
         create: vi.fn(async ({ data }: any) => {
           const newProduct = {
             id: `prod-${mockProductsInDb.length + 1}`,
+            // [v4.7] A product created through createProductWithBaseUnit() gets
+            // its tenantId from the Prisma Client Extension in the real DB,
+            // which a plain mock object cannot emulate. Inject it here (exactly
+            // like productUnit.create below) so requireBaseUnit()'s
+            // tenant-scoped product.findUniqueOrThrow() and the packaging-check
+            // reads can find the row.
+            tenantId: data.tenantId || tenantId,
             ...data,
           };
           mockProductsInDb.push(newProduct);
@@ -313,6 +345,7 @@ describe("T3d — Bulk CSV Import", () => {
     mockBarcodesInDb = [];
     mockCatalogEntriesInDb = [];
     mockCatalogBarcodesInDb = [];
+    mockReceiptsInDb = [];
     mockDb = createMockDb();
   });
 
@@ -347,6 +380,7 @@ describe("T3d — Bulk CSV Import", () => {
       const commitResult = await commitCsvImport(mockDb, tenantId, {
         newProducts: preview.newProducts,
         priceUpdates: preview.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(commitResult.createdProductsCount).toBe(1);
@@ -388,7 +422,9 @@ describe("T3d — Bulk CSV Import", () => {
       expect(batch.batchNumber).not.toBe("BATCH-2026-01");
       expect(batch.batchNumber).toBe(`${buildServerDatePrefix()}-BATCH-2026-01`);
       expect(batch.batchNumber).toMatch(/^\d{4}-\d{2}-\d{2}-BATCH-2026-01$/);
-      expect(batch.quantity).toBe("20");
+      // Base quantity stored at 4dp (the Decimal(18,4) column), via the shared
+      // createBatchRow() writer every creation path now routes through.
+      expect(batch.quantity).toBe("20.0000");
       // [v4.4, T4g] Required, non-nullable — stored from creation onward.
       expect(batch.costPricePerBaseUnit).toBe("120000");
     });
@@ -465,6 +501,7 @@ describe("T3d — Bulk CSV Import", () => {
       await commitCsvImport(mockDb, tenantId, {
         newProducts: preview.newProducts,
         priceUpdates: preview.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       // One row per DISTINCT barcode — not three, and not one.
@@ -494,6 +531,7 @@ describe("T3d — Bulk CSV Import", () => {
       const commitResult = await commitCsvImport(mockDb, tenantId, {
         newProducts: preview.newProducts,
         priceUpdates: preview.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(commitResult.createdProductsCount).toBe(1);
@@ -539,6 +577,7 @@ describe("T3d — Bulk CSV Import", () => {
       await commitCsvImport(mockDb, tenantId, {
         newProducts: preview1.newProducts,
         priceUpdates: preview1.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(mockProductsInDb).toHaveLength(1);
@@ -558,6 +597,7 @@ describe("T3d — Bulk CSV Import", () => {
       const commit2 = await commitCsvImport(mockDb, tenantId, {
         newProducts: preview2.newProducts,
         priceUpdates: preview2.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(commit2.createdProductsCount).toBe(0);
@@ -585,6 +625,7 @@ describe("T3d — Bulk CSV Import", () => {
       const commitResult = await commitCsvImport(mockDb, tenantId, {
         newProducts: preview.newProducts,
         priceUpdates: preview.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(commitResult.createdProductsCount).toBe(1);
@@ -622,6 +663,7 @@ describe("T3d — Bulk CSV Import", () => {
           },
         ],
         priceUpdates: [],
+        receipt: TEST_RECEIPT,
       });
 
       expect(commitResult.createdProductsCount).toBe(0);
@@ -674,6 +716,7 @@ describe("T3d — Bulk CSV Import", () => {
       const commitResult = await commitCsvImport(mockDb, tenantId, {
         newProducts: preview.newProducts,
         priceUpdates: preview.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(commitResult.createdProductsCount).toBe(1);
@@ -698,8 +741,9 @@ describe("T3d — Bulk CSV Import", () => {
       const newBatch = mockBatchesInDb.find((b) => b.unitId === "unit-existing-1");
       expect(newBatch).toBeDefined();
       expect(newBatch.productId).toBe(existingProduct.id);
-      // 15 كرتونة × conversionFactor 24 = 360 in the base unit (قطعة).
-      expect(newBatch.quantity).toBe("360");
+      // 15 كرتونة × conversionFactor 24 = 360 in the base unit (قطعة); the
+      // shared writer stores base quantities at 4dp (the Decimal(18,4) column).
+      expect(newBatch.quantity).toBe("360.0000");
       // [v4.4, T4g] The cost price is stored per BASE unit, taken as-is from
       // the column — never divided by the entry unit's conversionFactor (24).
       expect(newBatch.costPricePerBaseUnit).toBe("85000");
@@ -746,6 +790,7 @@ describe("T3d — Bulk CSV Import", () => {
       await commitCsvImport(mockDb, tenantId, {
         newProducts: [np],
         priceUpdates: [],
+        receipt: TEST_RECEIPT,
       });
 
       // The NEW unit is resolved through its barcode row.
@@ -761,8 +806,9 @@ describe("T3d — Bulk CSV Import", () => {
       const batch = mockBatchesInDb.find((b) => b.unitId === "unit-sugar-base");
       expect(batch).toBeDefined();
       expect(batch.productId).toBe(existingProduct.id);
-      // 123.4567 × 50.25 = 6203.699175 (base unit: كيلو).
-      expect(batch.quantity).toBe("6203.699175");
+      // 123.4567 × 50.25 = 6203.699175 (base unit: كيلو); stored at 4dp as the
+      // Decimal(18,4) column requires, via the shared createBatchRow() writer.
+      expect(batch.quantity).toBe("6203.6992");
       // Cost is per BASE unit, stored as-is with exact decimal-string precision.
       expect(batch.costPricePerBaseUnit).toBe("9876.5432");
     });
@@ -803,6 +849,7 @@ describe("T3d — Bulk CSV Import", () => {
       await commitCsvImport(mockDb, tenantId, {
         newProducts: preview.newProducts,
         priceUpdates: preview.priceUpdates,
+        receipt: TEST_RECEIPT,
       });
 
       expect(mockBatchesInDb).toHaveLength(1);
@@ -896,7 +943,8 @@ describe("T3d — Bulk CSV Import", () => {
         })
       );
 
-      const result = await commitCsvImport(mockDb, tenantId, { newProducts, priceUpdates: [] });
+      const result = await commitCsvImport(mockDb, tenantId, { newProducts, priceUpdates: [] ,
+        receipt: TEST_RECEIPT});
 
       expect(result.createdProductsCount).toBe(0);
       expect(result.failedNewProducts).toHaveLength(1);
@@ -912,7 +960,8 @@ describe("T3d — Bulk CSV Import", () => {
         throw new Error("commit failed");
       });
 
-      const result = await commitCsvImport(mockDb, tenantId, { newProducts, priceUpdates: [] });
+      const result = await commitCsvImport(mockDb, tenantId, { newProducts, priceUpdates: [] ,
+        receipt: TEST_RECEIPT});
 
       expect(result.createdProductsCount).toBe(0);
       expect(result.failedNewProducts).toHaveLength(1);

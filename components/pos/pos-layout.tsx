@@ -6,7 +6,6 @@ import { useExchangeRateStore } from "@/lib/store/useExchangeRateStore";
 import {
   getOfflineProducts,
   submitOfflineSale,
-  seedSampleOfflineData,
   syncProductsFromServer,
   calculateCartTotals,
   getSystemCashCustomer,
@@ -53,7 +52,6 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  Sparkles,
   RefreshCw,
   CloudOff,
   Keyboard,
@@ -63,9 +61,196 @@ import {
   ChevronUp,
   ScanLine,
   PackageSearch,
+  Minus,
+  X,
+  Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { serializeMoney, formatMoney, compareMoney } from "@/lib/utils/money";
+
+/** Where a barcode came from: the camera dialog, or a keyboard-wedge scanner. */
+type ScanSource = "camera" | "keyboard";
+
+/** What the camera dialog shows after each scan (instead of a toast over the video). */
+interface ScanBanner {
+  kind: "ok" | "error" | "info";
+  text: string;
+  /** The cart line a successful scan landed on — its LIVE quantity is shown. */
+  cartId?: string;
+  /** Changes on every scan so the banner re-mounts (and re-animates). */
+  nonce: number;
+}
+
+type AddToCartResult = { ok: true; cartId: string } | { ok: false; message: string };
+
+// ---------------------------------------------------------------------------
+// [UX] Audible + haptic confirmation for each scan. The cashier is looking at
+// the product, not the screen: a short high beep = added, a low buzz = rejected.
+// The AudioContext is created lazily (the scanner is opened by a tap, which is
+// the user gesture browsers require) and every call is wrapped so a device
+// without audio/vibration support simply stays silent.
+// ---------------------------------------------------------------------------
+let scanAudioCtx: AudioContext | null = null;
+
+function playScanFeedback(kind: "ok" | "error") {
+  try {
+    if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+      navigator.vibrate(kind === "ok" ? 30 : [60, 40, 60]);
+    }
+
+    const Ctx =
+      typeof window !== "undefined"
+        ? window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+        : undefined;
+    if (!Ctx) return;
+    if (!scanAudioCtx) scanAudioCtx = new Ctx();
+    const ctx = scanAudioCtx;
+    if (ctx.state === "suspended") void ctx.resume();
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = kind === "ok" ? "sine" : "sawtooth";
+    osc.frequency.value = kind === "ok" ? 880 : 200;
+    const duration = kind === "ok" ? 0.09 : 0.22;
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + duration + 0.02);
+  } catch {
+    /* feedback is best-effort — never let it break a scan */
+  }
+}
+
+/**
+ * [UX] The live panel under the camera video while a scan session is running:
+ * the result of the LAST scan (with the line's current quantity), the most
+ * recent cart lines with − / × so a wrong scan can be fixed WITHOUT closing the
+ * scanner, the running total, and an undo button.
+ */
+function ScanSessionPanel({
+  banner,
+  bannerQty,
+  items,
+  totalLabel,
+  canUndo,
+  onUndo,
+  onDecrement,
+  onRemove,
+}: {
+  banner: ScanBanner | null;
+  bannerQty: number | null;
+  items: CartLineItem[];
+  totalLabel: string;
+  canUndo: boolean;
+  onUndo: () => void;
+  onDecrement: (cartId: string) => void;
+  onRemove: (cartId: string) => void;
+}) {
+  const recent = [...items].reverse().slice(0, 3);
+  const hiddenCount = items.length - recent.length;
+
+  return (
+    <div className="mt-3 space-y-2.5" dir="rtl">
+      {banner ? (
+        <div
+          key={banner.nonce}
+          aria-live="polite"
+          className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-sm font-semibold animate-in fade-in zoom-in-95 duration-150 ${banner.kind === "ok"
+            ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+            : banner.kind === "error"
+              ? "border-red-300 bg-red-50 text-red-800"
+              : "border-zinc-200 bg-zinc-50 text-zinc-700"
+            }`}
+        >
+          <span className="min-w-0 truncate">
+            {banner.kind === "ok" ? "✓ " : banner.kind === "error" ? "✕ " : ""}
+            {banner.text}
+          </span>
+          {banner.kind === "ok" && bannerQty !== null && (
+            <span
+              dir="ltr"
+              className="shrink-0 rounded-full bg-emerald-600 px-2.5 py-0.5 text-xs font-bold tabular-nums text-white"
+            >
+              × {bannerQty}
+            </span>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-xl border border-dashed border-zinc-200 px-3 py-2.5 text-center text-xs text-zinc-500">
+          وجّه الكاميرا نحو الباركود — كل مسحة بتنضاف للسلة مباشرة.
+        </div>
+      )}
+
+      {recent.length > 0 && (
+        <div className="space-y-1.5">
+          {recent.map((item) => (
+            <div
+              key={item.id}
+              className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-zinc-900">{item.product.name}</p>
+                <p className="text-[11px] text-zinc-500">{item.unitName}</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => onDecrement(item.id)}
+                  aria-label="إنقاص الكمية"
+                  className="h-9 w-9"
+                >
+                  <Minus className="h-4 w-4" />
+                </Button>
+                <span dir="ltr" className="min-w-8 text-center text-sm font-bold tabular-nums">
+                  {item.quantity}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => onRemove(item.id)}
+                  aria-label="حذف الصنف من السلة"
+                  className="h-9 w-9 text-red-600 hover:bg-red-50 hover:text-red-700"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          ))}
+          {hiddenCount > 0 && (
+            <p className="text-center text-[11px] text-zinc-500">
+              و {hiddenCount} {hiddenCount === 1 ? "صنف" : "أصناف"} تانية بالسلة
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-zinc-600">
+          {items.length} أصناف ·{" "}
+          <span className="font-bold text-zinc-900">{totalLabel}</span>
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={!canUndo}
+          onClick={onUndo}
+          className="h-9 gap-1.5 text-xs"
+        >
+          <Undo2 className="h-3.5 w-3.5" />
+          تراجع عن آخر مسحة
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 export function PosLayout() {
   const { data: session } = useSessionWithOfflineFallback();
@@ -123,6 +308,11 @@ export function PosLayout() {
   const [reopenPaymentAfterCustomer, setReopenPaymentAfterCustomer] = useState(false);
   // [ADDED] Camera barcode scanner modal open/close state.
   const [barcodeScannerOpen, setBarcodeScannerOpen] = useState(false);
+  // [UX] State of the CURRENT camera scan session: the banner for the last scan,
+  // and the cart-line ids added by camera scans (newest last) so "undo last
+  // scan" knows what to take back. Both reset every time the scanner opens.
+  const [scanBanner, setScanBanner] = useState<ScanBanner | null>(null);
+  const [scanStack, setScanStack] = useState<string[]>([]);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -132,30 +322,6 @@ export function PosLayout() {
   // otherwise resolve AFTER a faster response for a later keystroke and
   // silently overwrite it.
   const productsRequestIdRef = useRef(0);
-
-  // Full reload of products (exchange rate + product catalog) — intentionally
-  // used ONLY after an action that can invalidate all of it at once
-  // (seeding demo data). Everyday product search and the exchange-rate
-  // refresh are each handled by their own narrower effect below.
-  //
-  // [FIX] The exchange-rate hydrate is wrapped in its OWN try/catch so a
-  // missing/failed rate can never prevent the product catalog from loading.
-  const loadData = useCallback(async () => {
-    if (!isDbOpen) return;
-    try {
-      try {
-        await hydrateExchangeRate(tenantId);
-      } catch (err) {
-        console.error("Failed to hydrate exchange rate (non-fatal):", err);
-      }
-      const prods = await getOfflineProducts(tenantId, searchQuery);
-      setProducts(prods);
-    } catch (err) {
-      console.error("Failed to load POS offline data:", err);
-    } finally {
-      setIsLoadingProducts(false);
-    }
-  }, [isDbOpen, hydrateExchangeRate, tenantId, searchQuery]);
 
   // 1a. Exchange rate — loads once per tenant/DB-open change.
   // Deliberately does NOT depend on searchQuery.
@@ -286,6 +452,12 @@ export function PosLayout() {
     products.length === 0 &&
     searchQuery.trim() === "";
 
+  // [UX] The quantity shown on the scan banner is read LIVE from the cart, so
+  // scanning the same product again visibly turns "× 1" into "× 2".
+  const scanBannerQty = scanBanner?.cartId
+    ? (cartItems.find((item) => item.id === scanBanner.cartId)?.quantity ?? null)
+    : null;
+
   // 2. Keyboard Shortcuts (F2: Search, F4: Customer, F9: Checkout, Esc: Close)
   useEffect(() => {
     function handleGlobalKeyDown(e: KeyboardEvent) {
@@ -335,10 +507,23 @@ export function PosLayout() {
   // `unitPriceSYP: string` since the v3.6 re-anchoring. Both prices (SYP
   // authoritative, USD derived/nullable) are now captured and stored,
   // matching resolveCartLinePrices()'s real return shape.
-  function handleAddToCart(product: PosProductItem, unit: CachedProductUnit) {
+  //
+  // [UX] Now RETURNS the outcome, and takes `silent` for the camera scanner:
+  // while scanning, toasts would pile up on top of the video, so the camera
+  // path reports through its own banner instead. Every other caller (the
+  // catalog's add buttons, the hardware scanner) keeps the toasts as before.
+  function handleAddToCart(
+    product: PosProductItem,
+    unit: CachedProductUnit,
+    opts: { silent?: boolean } = {}
+  ): AddToCartResult {
+    const fail = (message: string): AddToCartResult => {
+      if (!opts.silent) toast.error(message);
+      return { ok: false, message };
+    };
+
     if (unit.isActive === false) {
-      toast.error("لا يمكن بيع وحدة غير نشطة.");
-      return;
+      return fail("لا يمكن بيع وحدة غير نشطة.");
     }
     const cartItemId = `${product.id}-${unit.id}`;
 
@@ -351,12 +536,11 @@ export function PosLayout() {
       unitPriceUSD = prices.unitPriceUSD;
       pricingCurrency = prices.pricingCurrency;
     } catch (err) {
-      toast.error(
+      return fail(
         err instanceof Error
           ? err.message
           : "لا يمكن إضافة هذا الصنف إلى السلة بدون سعر جملة أو سعر صرف صالح."
       );
-      return;
     }
 
     setCartItems((prev) => {
@@ -386,9 +570,12 @@ export function PosLayout() {
       return [...prev, newItem];
     });
 
-    toast.success(`تمت إضافة ${product.name} (${unit.unitName}) إلى السلة`, {
-      duration: 1200,
-    });
+    if (!opts.silent) {
+      toast.success(`تمت إضافة ${product.name} (${unit.unitName}) إلى السلة`, {
+        duration: 1200,
+      });
+    }
+    return { ok: true, cartId: cartItemId };
   }
 
   // [ADDED — barcode -> cart bridge]
@@ -405,9 +592,24 @@ export function PosLayout() {
   // "this was recognized as a barcode" (found, or found-but-rejected) from
   // "this wasn't a barcode at all" (falls through to plain text-search
   // behavior there).
+  //
+  // [UX] `source: "camera"` switches the reporting from toasts to the scan
+  // banner under the video (see ScanSessionPanel). Both sources get the beep /
+  // vibration, so a hardware-scanner cashier also hears success vs. failure.
   const handleBarcodeScan = useCallback(
-    async (barcode: string): Promise<boolean> => {
+    async (barcode: string, opts?: { source?: ScanSource }): Promise<boolean> => {
       if (!tenantId) return false;
+
+      const fromCamera = opts?.source === "camera";
+
+      const reject = (text: string) => {
+        playScanFeedback("error");
+        if (fromCamera) {
+          setScanBanner({ kind: "error", text, nonce: Date.now() });
+        } else {
+          toast.error(text);
+        }
+      };
 
       let result = await findProductUnitByBarcode(tenantId, barcode);
 
@@ -431,23 +633,40 @@ export function PosLayout() {
       }
 
       if (result.status === "found") {
-        handleAddToCart(result.product, result.unit);
+        const added = handleAddToCart(result.product, result.unit, { silent: fromCamera });
+        if (!added.ok) {
+          // handleAddToCart already toasted for the non-camera path.
+          playScanFeedback("error");
+          if (fromCamera) {
+            setScanBanner({ kind: "error", text: added.message, nonce: Date.now() });
+          }
+          return true; // recognized as a real barcode — rejected, not "unmatched text"
+        }
+
+        playScanFeedback("ok");
+        if (fromCamera) {
+          setScanBanner({
+            kind: "ok",
+            text: `${result.product.name} — ${result.unit.unitName}`,
+            cartId: added.cartId,
+            nonce: Date.now(),
+          });
+          setScanStack((prev) => [...prev, added.cartId]);
+        }
         return true;
       }
 
       if (result.status === "unit_inactive") {
         // [FIX — previously silent when matched via the hardware-scanner
-        // Enter path] Now a clear Arabic toast on every entry point.
-        toast.error(
-          `الصنف "${result.product.name}" (${result.unit.unitName}) غير نشط ولا يمكن بيعه.`
-        );
+        // Enter path] Now a clear Arabic message on every entry point.
+        reject(`الصنف "${result.product.name}" (${result.unit.unitName}) غير نشط ولا يمكن بيعه.`);
         return true; // recognized as a real barcode — rejected, not "unmatched text"
       }
 
       // not_found — offline with no local match, or genuinely nonexistent.
-      toast.error(
+      reject(
         typeof navigator !== "undefined" && navigator.onLine
-          ? "لم يتم العثور على منتج مرتبط بهذا الباركود."
+          ? "الباركود غير مسجّل — لم يتم العثور على منتج مرتبط به."
           : "لم يتم العثور على هذا الباركود محلياً — تحقق من الاتصال بالإنترنت والمزامنة."
       );
       return false;
@@ -527,6 +746,24 @@ export function PosLayout() {
     toast.info("تم إفراغ السلة");
   }
 
+  // [UX] Camera scan session helpers.
+  function openBarcodeScanner() {
+    setScanBanner(null);
+    setScanStack([]);
+    setBarcodeScannerOpen(true);
+  }
+
+  // Takes back the newest camera scan: one unit off that cart line (the line
+  // disappears if that was its only unit). A line already removed by hand is
+  // simply a no-op.
+  function handleUndoLastScan() {
+    const lastCartId = scanStack[scanStack.length - 1];
+    if (!lastCartId) return;
+    setScanStack((prev) => prev.slice(0, -1));
+    handleUpdateQuantity(lastCartId, -1);
+    setScanBanner({ kind: "info", text: "تم التراجع عن آخر مسحة", nonce: Date.now() });
+  }
+
   // 4. Offline Checkout Submission
   //
   // [v3.6] Takes paidAmountSYP/debtAmountSYP from the payment step and
@@ -542,21 +779,14 @@ export function PosLayout() {
     paymentMethod?: PaymentMethod;
   }) {
     // [T4b] If any cart item is priced in USD, a valid dailyExchangeRate is mandatory.
-    // For SYP-only carts, an exchange rate is optional; if none is cached, fallback to "1.0000"
-    // so the Dexie offline invoice record can be durably saved.
-    //
-    // KNOWN CONCERN (reported to the maintainer, intentionally NOT changed
-    // here): with the "1.0000" fallback the persisted invoice freezes
-    // exchangeRateUsed = 1, so its derived USD figures equal the SYP
-    // figures. See the review notes accompanying this file.
+    // [v4.9] For SYP-only carts the rate stays null — USD fields are persisted
+    // as null (never a "1.0000" fallback) and omitted from the UI.
     const effectiveRate =
       dailyExchangeRate && compareMoney(dailyExchangeRate, 0) > 0
         ? dailyExchangeRate
-        : rateRequired
-          ? null
-          : "1.0000";
+        : null;
 
-    if (!effectiveRate) {
+    if (rateRequired && !effectiveRate) {
       throw new Error("سعر الصرف غير محدد في الذاكرة المحلية (مطلوب للأصناف المسعرة بالدولار).");
     }
 
@@ -574,7 +804,9 @@ export function PosLayout() {
       customer,
       items: cartItems,
       totalSYP,
-      exchangeRateUsed: serializeMoney(effectiveRate),
+      // [v4.9] effectiveRate is null for SYP-only carts with no cached rate —
+      // passed through as null (never serializeMoney(null), never "1.0000").
+      exchangeRateUsed: effectiveRate,
       paidAmountSYP: paymentData.paidAmountSYP,
       debtAmountSYP: paymentData.debtAmountSYP,
       paymentMethod: paymentData.paymentMethod,
@@ -621,31 +853,6 @@ export function PosLayout() {
     searchInputRef.current?.focus();
   }
 
-  async function handleSeedDemoData() {
-    // [FIX — TS2345] `seedSampleOfflineData` deliberately requires a
-    // strict `tenantId: string` (it performs bulk durable writes), so
-    // "no tenant context" is made a compile-time error here. The guard
-    // below narrows `tenantId` to `string` for the rest of this function
-    // and gives the user a clear Arabic explanation.
-    if (!tenantId) {
-      toast.error("لا يمكن تحميل بيانات تجريبية دون تحديد هوية المتجر (تسجيل الدخول مطلوب).");
-      return;
-    }
-
-    try {
-      await seedSampleOfflineData(tenantId);
-      await loadData();
-      const system = await getSystemCashCustomer(tenantId);
-      if (system) {
-        setSelectedCustomer((prev) => prev ?? system);
-      }
-      toast.success("تم تجهيز بيانات الأصناف والزبائن وسعر الصرف في الذاكرة المحلية بنجاح!");
-    } catch (err) {
-      console.error("Failed to seed demo data:", err);
-      toast.error("حدث خطأ أثناء تحميل البيانات التجريبية.");
-    }
-  }
-
   // Manual product sync (server -> Dexie). Unlike the opportunistic effect
   // above (1d), this surfaces success/failure to the cashier/admin
   // explicitly — meant to be used right after adding/editing a product in
@@ -689,7 +896,9 @@ export function PosLayout() {
         4. Secondary buttons collapse to icon-only below lg.
         5. Hover states on secondary buttons are neutral zinc so emerald
            reads consistently as "primary".
-        6. A "مسح باركود" scan button, same pattern as sync/seed.
+        6. A labeled "مسح باركود" button on lg+. On mobile the scan action is
+           the floating button above the cart bar (see below) — it is the most
+           used control on a phone, so it is not tucked in this bar.
       */}
       <div className="flex items-center justify-between gap-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 sm:p-3 dark:border-zinc-800 dark:bg-zinc-900 shadow-xs shrink-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -761,23 +970,13 @@ export function PosLayout() {
             </Badge>
           )}
 
-          {/* [ADDED] Camera barcode scan — icon-only under lg, labeled on lg+,
-              same pattern as the sync/seed buttons beside it. */}
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={() => setBarcodeScannerOpen(true)}
-            className="h-8 w-8 lg:hidden text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-            title="مسح باركود بالكاميرا"
-          >
-            <ScanLine className="h-3.5 w-3.5 text-emerald-600" />
-          </Button>
+          {/* [ADDED] Camera barcode scan — labeled button on lg+ only (mobile
+              uses the floating scan button). */}
           <Button
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => setBarcodeScannerOpen(true)}
+            onClick={openBarcodeScanner}
             className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
             title="مسح باركود بالكاميرا وإضافة للسلة مباشرة"
           >
@@ -812,29 +1011,6 @@ export function PosLayout() {
               className={`h-3.5 w-3.5 text-emerald-600 ${isSyncingProducts ? "animate-spin" : ""}`}
             />
             <span>{isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}</span>
-          </Button>
-
-          {/* Seed demo data — icon-only under lg, labeled button on lg+ */}
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={handleSeedDemoData}
-            className="h-8 w-8 lg:hidden text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-            title="تهيئة بيانات تجريبية"
-          >
-            <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleSeedDemoData}
-            className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-            title="تحميل أصناف وزبائن تجريبية في Dexie للاختبار بدون اتصال"
-          >
-            <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
-            <span>تهيئة بيانات تجريبية</span>
           </Button>
 
           {/*
@@ -925,7 +1101,6 @@ export function PosLayout() {
             onSearchChange={setSearchQuery}
             exchangeRate={dailyExchangeRate}
             onAddToCart={handleAddToCart}
-            onSeedDemoData={handleSeedDemoData}
             searchInputRef={searchInputRef}
             // [ADDED] Hardware keyboard-wedge scanner support — see
             // handleBarcodeScan above and product-catalog.tsx's prop doc.
@@ -948,6 +1123,22 @@ export function PosLayout() {
             onOpenPaymentModal={() => setIsPaymentModalOpen(true)}
           />
         </div>
+      </div>
+
+      {/*
+        [UX] Mobile floating scan button. Scanning adds straight to the cart, so
+        on a phone it is THE primary action: a large round button within thumb
+        reach (right side in RTL), just above the cart bar.
+      */}
+      <div className="lg:hidden fixed bottom-36 start-3 z-30">
+        <Button
+          type="button"
+          onClick={openBarcodeScanner}
+          aria-label="مسح باركود بالكاميرا وإضافة للسلة"
+          className="h-14 w-14 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-600/30"
+        >
+          <ScanLine className="h-6 w-6" />
+        </Button>
       </div>
 
       {/*
@@ -1121,20 +1312,36 @@ export function PosLayout() {
       {/*
         [ADDED] Camera barcode scanner — continuous mode so the cashier can
         scan multiple items back-to-back without reopening this dialog per
-        item. feedback="silent" because handleBarcodeScan / handleAddToCart
-        already produce their own contextual toasts (item added / inactive /
-        not found) — showing this modal's own generic "تم مسح الباركود
-        بنجاح" toast on top would double up during rapid scanning.
+        item. feedback="silent" because this screen produces its own
+        feedback: a beep/vibration per scan, plus the live panel below the
+        video (last result with the line's quantity, the latest cart lines
+        with − / ×, the running total and an undo button) — see
+        ScanSessionPanel. Toasts are deliberately NOT used on the camera path:
+        they would pile up over the video.
       */}
       <BarcodeScannerModal
         open={barcodeScannerOpen}
         onOpenChange={setBarcodeScannerOpen}
         onScan={(barcode) => {
-          void handleBarcodeScan(barcode);
+          void handleBarcodeScan(barcode, { source: "camera" });
         }}
         mode="continuous"
         feedback="silent"
-      />
+        continuousCooldownMs={1200}
+        title="مسح المنتجات للسلة"
+        description="وجّه الكاميرا نحو الباركود — كل مسحة بتنضاف للسلة مباشرة. اضغط «إنهاء المسح» لما تخلص."
+      >
+        <ScanSessionPanel
+          banner={scanBanner}
+          bannerQty={scanBannerQty}
+          items={cartItems}
+          totalLabel={`${formatMoney(cartTotals.totalSYP, "SYP")} ل.س`}
+          canUndo={scanStack.length > 0}
+          onUndo={handleUndoLastScan}
+          onDecrement={(cartId) => handleUpdateQuantity(cartId, -1)}
+          onRemove={handleRemoveItem}
+        />
+      </BarcodeScannerModal>
     </div>
   );
 }

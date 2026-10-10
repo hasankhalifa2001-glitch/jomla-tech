@@ -16,7 +16,6 @@ import {
 import Decimal from "decimal.js";
 import { Prisma } from "@prisma/client";
 import {
-  createBatchRow,
   findClientComputedBatchField,
   batchNumberSuffixSchema,
   expiryDateSchema,
@@ -27,8 +26,9 @@ import {
 } from "@/lib/inventory/batch-creation";
 import { InvalidCostInputError } from "@/lib/inventory/units";
 import { MissingBaseUnitError } from "@/lib/inventory/base-unit";
-// The ONE sanctioned construction path for a batchNumber (Section 10).
-import { constructBatchNumber } from "@/lib/inventory/batch-number";
+// [v4.7] The receiving gateway — THE one path that writes a ProductReceipt;
+// it also constructs the ONE shared batchNumber for the whole submission.
+import { createReceiptWithBatches, purchaseDateSchema, supplierNameSchema } from "@/lib/data/receipts";
 import { z } from "zod";
 
 // Each line costs ~4 sequential queries inside ONE transaction; Prisma's
@@ -59,7 +59,7 @@ const receiptItemSchema = z.object({
     .refine(isPositiveAmount, { message: "الكمية يجب أن تكون أكبر من صفر في كل سطر." }),
   totalCost: z.string().trim()
     .regex(AMOUNT_REGEX, "صيغة إجمالي التكلفة غير صالحة (مثال: 9000 أو 9000.5).")
-    .refine(isPositiveAmount, { message: "إجمالي تكلفة الشراء يجب أن يكون أكبر من صفر في كل سطر." }),
+    .refine(isPositiveAmount, { message: "لا يمكن قبول سطر بتكلفة صفر — إجمالي تكلفة الشراء يجب أن يكون أكبر من صفر في كل سطر." }),
   // [FIX] Shared schema: real calendar dates only ("2026-02-31" is rejected).
   expiryDate: expiryDateSchema,
 });
@@ -91,12 +91,12 @@ const createReceiptSchema = z.object({
         seen.add(key);
       }
     }),
-  /**
-   * TRANSIENT, DISPLAY-ONLY. Never persisted, never read below, and it never
-   * influences the server-generated date prefix. Accepted only so a client
-   * that submits it is not rejected.
-   */
-  purchaseDateNote: z.string().trim().optional().nullable(),
+  // [v4.7] Replaces the old TRANSIENT `purchaseDateNote` (display-only, never
+  // persisted): a REAL persisted goods-receiving date — a Damascus business
+  // day, required, never in the future — plus an optional supplier (≤120
+  // chars). Both are stored on the ProductReceipt this submission creates.
+  purchaseDate: purchaseDateSchema,
+  supplierName: supplierNameSchema,
 });
 
 export async function POST(req: Request) {
@@ -169,53 +169,29 @@ export async function POST(req: Request) {
       );
     }
 
-    const { batchNumberSuffix, items } = validation.data;
+    const { batchNumberSuffix, items, purchaseDate, supplierName } = validation.data;
 
-    // ONE transaction for the whole submission: a failure partway through
-    // leaves NO partial batches. constructBatchNumber() is called exactly
-    // ONCE, so every row shares one identical batchNumber / date prefix.
+    // ONE transaction for the whole submission: the receiving gateway writes
+    // the ProductReceipt FIRST, then each line's ProductBatch — all top-level
+    // calls, so a failure on any line leaves NO receipt and NO partial
+    // batches. The gateway constructs the batchNumber exactly ONCE, so every
+    // row shares one identical date prefix (business date, not purchaseDate).
     const result = await db.$transaction(
-      async (tx) => {
-        const batchNumber = constructBatchNumber(batchNumberSuffix);
-
-        const created: Array<{
-          batchId: string;
-          batchNumber: string;
-          resolvedBaseUnitId: string;
-          resolvedBaseUnitName: string;
-          baseQuantity: string;
-          enteredUnitName: string;
-          productId: string;
-          costPricePerBaseUnit: string;
-          expiryDate: string | null;
-        }> = [];
-
-        for (const item of items) {
-          const row = await createBatchRow(tx, {
-            tenantId,
+      async (tx) =>
+        createReceiptWithBatches(tx, {
+          tenantId,
+          userId: session.user.id,
+          purchaseDate,
+          supplierName,
+          batchNumberSuffix,
+          lines: items.map((item) => ({
             productId: item.productId,
             entryUnitId: item.unitId,
-            batchNumber,
-            quantityInEntryUnit: item.quantity,
+            quantity: item.quantity,
             totalCost: item.totalCost,
             expiryDate: item.expiryDate ?? null,
-          });
-
-          created.push({
-            batchId: row.batchId,
-            batchNumber: row.batchNumber,
-            resolvedBaseUnitId: row.resolvedBaseUnitId,
-            resolvedBaseUnitName: row.resolvedBaseUnitName,
-            baseQuantity: row.baseQuantity,
-            enteredUnitName: row.enteredUnitName,
-            productId: item.productId,
-            costPricePerBaseUnit: row.costPricePerBaseUnit,
-            expiryDate: item.expiryDate ?? null,
-          });
-        }
-
-        return { batchNumber, created };
-      },
+          })),
+        }),
       { timeout: RECEIPT_TRANSACTION_TIMEOUT_MS }
     );
 
@@ -223,22 +199,35 @@ export async function POST(req: Request) {
       success: true,
       batchNumber: result.batchNumber,
       createdCount: result.created.length,
-      batches: result.created.map((row) => ({
+      receiptId: result.receiptId,
+      batches: result.created.map((row, index) => ({
         id: row.batchId,
-        productId: row.productId,
+        receiptId: result.receiptId,
+        // The gateway returns batch rows only — the per-line product/expiry
+        // come straight back off the validated request items (same order).
+        productId: items[index].productId,
         // Always the base unit the batch is counted in.
         unitId: row.resolvedBaseUnitId,
         batchNumber: row.batchNumber,
         // [FIX] Decimal strings, as stored — never Number().
         quantity: row.baseQuantity,
         costPricePerBaseUnit: row.costPricePerBaseUnit,
-        expiryDate: row.expiryDate ? new Date(row.expiryDate) : null,
+        totalCostSYP: row.totalCostSYP,
+        expiryDate: items[index].expiryDate ? new Date(items[index].expiryDate as string) : null,
         baseUnitName: row.resolvedBaseUnitName,
         enteredUnitName: row.enteredUnitName,
       })),
       message: `تم تسجيل استلام ${result.created.length} دفعة بنجاح تحت رقم الدفعة ${result.batchNumber}.`,
     });
   } catch (error) {
+    // [v4.7] Backstop: the route schema validates first, but the receiving
+    // gateway re-validates — a ZodError escaping it is a 400, not a 500.
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: "VALIDATION_ERROR", message: error.issues[0]?.message || "بيانات الاستلام غير صالحة." },
+        { status: 400 }
+      );
+    }
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse(error);
     }

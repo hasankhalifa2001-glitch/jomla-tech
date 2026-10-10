@@ -59,6 +59,20 @@ import { requireBaseUnit } from "@/lib/inventory/base-unit";
  * (`AllocationPlan.requestedQty`) is stored as a Decimal-normalized
  * string, consistent with every other quantity-shaped field this file
  * already produces (`totalAllocatedQty`, `remainingQty`, `allocatedQty`).
+ *
+ * [v4.8 — NOTES FOR CALLERS, no signature change]
+ * (a) commitFifoAllocation() only READS batches (despite its name) — it
+ *     never decrements anything. A caller planning SEVERAL lines of the same
+ *     product in one transaction MUST apply each line's decrement
+ *     immediately after planning it, before planning the next line;
+ *     otherwise every line plans against the same snapshot and the same
+ *     batch is drawn on twice (a cart of 1 طرد + 5 قطع drove a 20-piece
+ *     batch to -5). app/api/sync/route.ts does this per line now.
+ * (b) The previous revision had an `if (!params) return undefined as
+ *     unknown as ...` shim at the top of commitFifoAllocation (a leftover
+ *     from a mocked test). It is REMOVED: a missing `params` is a caller
+ *     bug and must throw loudly, never silently yield `undefined` that a
+ *     caller then dereferences or — worse — treats as "nothing to allocate".
  * ============================================================================
  *
  * Sorting Rules (unchanged from the original design):
@@ -352,14 +366,14 @@ export async function previewFifoAllocation(
  * `tenantScopedRawQuery` — it reads the locked state directly through
  * `tx`, which transparently observes post-lock quantities since it shares
  * the same open transaction the caller locked rows in.
+ *
+ * READ-ONLY despite the name — see file-header note (a): the CALLER applies
+ * the decrement, per line, before planning the next line.
  */
 export async function commitFifoAllocation(
   tx: TxOrClient,
   params: CommitFifoParams
 ): Promise<AllocationPlan> {
-  if (!params) {
-    return undefined as unknown as Promise<AllocationPlan>;
-  }
   const { tenantId, productId, unitId, requestedQty } = params;
 
   if (new Decimal(requestedQty).lte(0)) {

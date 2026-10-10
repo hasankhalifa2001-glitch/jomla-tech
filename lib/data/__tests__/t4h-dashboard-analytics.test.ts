@@ -124,6 +124,11 @@ function money(v: string | number): string {
 function expectMoneyEq(actual: string, expected: string | number): void {
     expect(money(actual)).toBe(money(expected));
 }
+function expectNullableMoneyEq(actual: string | null, expected: string | number): void {
+    // [v4.9] USD aggregates are null when no rated invoice exists today.
+    expect(actual).not.toBeNull();
+    expect(money(actual as string)).toBe(money(expected));
+}
 
 // === SEEDS — one fixed calendar; every date is chosen deliberately ===
 const D = (iso: string) => new Date(iso);
@@ -336,13 +341,12 @@ describe("T4h — GET /api/analytics: route guards", () => {
             expect(new Decimal(point.salesSYP).isFinite()).toBe(true);
             expect(new Decimal(point.profitSYP).isFinite()).toBe(true);
         }
-        expect(body.kpis).toEqual({
-            salesSYP: expect.any(String),
-            salesUSD: expect.any(String),
-            netProfitSYP: expect.any(String),
-            invoiceCount: expect.any(Number),
-            outstandingDebtSYP: expect.any(String),
-        });
+        expect(typeof body.kpis.salesSYP).toBe("string");
+        // [v4.9] Null when no rated invoice exists today.
+        expect(body.kpis.salesUSD === null || typeof body.kpis.salesUSD === "string").toBe(true);
+        expect(typeof body.kpis.netProfitSYP).toBe("string");
+        expect(typeof body.kpis.invoiceCount).toBe("number");
+        expect(typeof body.kpis.outstandingDebtSYP).toBe("string");
         // Alert COUNTS come straight from the (mocked) gateway — clock-independent.
         expect(body.alerts.needsReconciliation.count).toBe(2);
         expect(body.alerts.expiringSoon.count).toBe(2);
@@ -402,7 +406,7 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
         // Today (local): 10000 + 1000 − 1000 (void mirror) + 600 (22:30 UTC
         // yesterday → local today) = 10600. Out-of-window rows must not add up.
         expectMoneyEq(dash.kpis.salesSYP, 10600);
-        expectMoneyEq(dash.kpis.salesUSD, 16);
+        expectNullableMoneyEq(dash.kpis.salesUSD, 16);
         // EVENT-DATED count: COMPLETED invoices created today = T1, T2, T7.
         // T2 was later voided, but the count does not move for a void (the VOID
         // mirror row is VOIDED, so it is never counted either) — salesSYP above

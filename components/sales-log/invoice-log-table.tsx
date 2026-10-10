@@ -86,9 +86,12 @@ function TotalsCell({ row }: { row: InvoiceLogRow }) {
             >
                 {formatMoney(row.totalSYP, "SYP")} ل.س
             </span>
-            <span className="text-[11px] font-semibold text-purple-600">
-                ≈ ${formatMoney(row.totalUSD, "USD")}
-            </span>
+            {/* [v4.9] Omit secondary USD entirely when no rate was frozen. */}
+            {row.totalUSD !== null && (
+                <span className="text-[11px] font-semibold text-purple-600">
+                    ≈ ${formatMoney(row.totalUSD, "USD")}
+                </span>
+            )}
         </div>
     );
 }

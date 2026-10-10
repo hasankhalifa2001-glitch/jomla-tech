@@ -71,6 +71,12 @@ export const TENANT_SCOPED_MODELS = new Set([
   // Tenant relation) — see the file-header FIX note above.
   "ProductUnitBarcode",
   "ProductBatch",
+  // [v4.7] The goods-receiving header row. Denormalized tenantId + Tenant
+  // relation, exactly like ProductBatch above — the receiving gateway
+  // (lib/data/receipts.ts) writes it, and every history read/list/mutate
+  // must be tenant-scoped, so it belongs in this set for the same reason
+  // StockAdjustment/BatchDeletionLog/CostPriceChangeLog do.
+  "ProductReceipt",
   "Customer",
   "Invoice",
   "InvoiceItem",

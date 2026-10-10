@@ -41,10 +41,15 @@
  * converted to `Number` ONLY for chart geometry / bar widths — display-only,
  * never fed back into a calculation; margins and averages use decimal.js.
  *
+ * [MOTION] Entrance/ count-up animation is presentational only — see the
+ * "motion" block below. It never touches the authoritative Decimal strings;
+ * it only drives what's painted on screen while a value tweens toward it,
+ * and the component always lands on the exact formatMoney() output.
+ *
  * NO dark-mode classes (light-only shell styling, matching the sales log).
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import Decimal from "decimal.js";
 import {
@@ -85,8 +90,8 @@ type Granularity = "hour" | "day";
 
 interface Kpis {
     salesSYP: string;
-    /** Sum of each invoice's own frozen-rate USD figure — always sent. */
-    salesUSD: string;
+    // [v4.9] Null when no rated invoice exists today — caption omitted then.
+    salesUSD: string | null;
     netProfitSYP: string;
     invoiceCount: number;
     outstandingDebtSYP: string;
@@ -273,6 +278,105 @@ async function fetchDashboard(range: Range, signal: AbortSignal): Promise<Dashbo
 }
 
 // ---------------------------------------------------------------------------
+// Motion — a single ease-out count-up used only by the four KPI hero
+// numbers. Pure presentation: it tweens a plain `number` for painting, while
+// every OTHER figure in the tree (chart, lists, captions) still goes through
+// formatMoney() on the exact Decimal string, unchanged. On finish the hook's
+// own display value lands exactly on `Number(target)`, and the caller still
+// runs ITS OWN formatMoney/Intl call on the real string for the settled
+// frame, so no rounding drift from the tween can reach the screen.
+// ---------------------------------------------------------------------------
+
+const REDUCED_MOTION =
+    typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+function useCountUp(target: number, duration = 650): number {
+    const [display, setDisplay] = useState(target);
+    const prevRef = useRef(target);
+    const firstRun = useRef(true);
+
+    useEffect(() => {
+        if (firstRun.current) {
+            // No tween on first paint — avoids a 0 → value flash on load.
+            firstRun.current = false;
+            prevRef.current = target;
+            setDisplay(target);
+            return;
+        }
+        const start = prevRef.current;
+        if (start === target || REDUCED_MOTION) {
+            prevRef.current = target;
+            setDisplay(target);
+            return;
+        }
+        let raf = 0;
+        const startTime = performance.now();
+        const tick = (now: number) => {
+            const t = Math.min(1, (now - startTime) / duration);
+            const eased = 1 - Math.pow(1 - t, 3);
+            setDisplay(start + (target - start) * eased);
+            if (t < 1) {
+                raf = requestAnimationFrame(tick);
+            } else {
+                prevRef.current = target;
+                setDisplay(target);
+            }
+        };
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [target, duration]);
+
+    return display;
+}
+
+/** The animated hero figure for a SYP KPI. Mid-tween frames use a plain
+ *  grouped-integer format (cheap, display-only); the settled frame always
+ *  re-renders through <Money>, so the authoritative string is what the user
+ *  reads at rest. */
+function AnimatedMoneySYP({ value, className }: { value: string; className?: string }) {
+    const target = Number(value);
+    const safeTarget = Number.isFinite(target) ? target : 0;
+    const display = useCountUp(safeTarget);
+    const settled = display === safeTarget;
+
+    if (settled) {
+        return <Money value={value} currency="SYP" className={className} />;
+    }
+    return (
+        <span className={cn("tabular-nums", className)}>
+            {intFormatter.format(Math.round(display))} <span className="text-[0.62em] font-semibold text-slate-500">ل.س</span>
+        </span>
+    );
+}
+
+function AnimatedInt({ value, className }: { value: number; className?: string }) {
+    const display = useCountUp(value);
+    return (
+        <span className={cn("tabular-nums", className)}>{intFormatter.format(Math.round(display))}</span>
+    );
+}
+
+/** One-time global keyframes for the card entrance. Scoped by class name
+ *  only (no styled-jsx dependency), injected once from the page root. */
+function MotionStyles() {
+    return (
+        <style>{`
+            @keyframes dashCardIn {
+                from { opacity: 0; transform: translateY(8px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .dash-card-in {
+                animation: dashCardIn .45s cubic-bezier(.16,.84,.44,1) both;
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .dash-card-in { animation: none; }
+            }
+        `}</style>
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -350,45 +454,57 @@ export function DashboardAnalyticsClient() {
 
     return (
         <section className="space-y-6">
-            {/* ------------------------------------------------------ header */}
-            <header className="flex flex-wrap items-start justify-between gap-3">
-                <div className="space-y-1.5">
-                    <p className="text-xs font-medium text-slate-500">{todayLabel}</p>
-                    <h2 className="text-xl font-bold text-slate-900 sm:text-2xl">ملخص أداء المتجر</h2>
-                    {data?.exchangeRate && (
-                        <div className="flex flex-wrap items-center gap-2">
-                            <span className="inline-flex items-center gap-1.5 rounded-full border border-purple-200 bg-purple-50 px-3 py-1 text-xs font-semibold text-purple-700">
-                                <DollarSign className="size-3.5" aria-hidden />
-                                <bdi dir="ltr">$1</bdi>
-                                <span aria-hidden>=</span>
-                                <span className="tabular-nums">{formatMoney(data.exchangeRate, "SYP")} ل.س</span>
-                            </span>
-                            <span className="text-[11px] text-slate-400">
-                                مبالغ الدولار تقريبية، بسعر كل فاتورة وقت إصدارها.
-                            </span>
-                        </div>
-                    )}
+            <MotionStyles />
+            {/* ------------------------------------------------------ header
+                Mobile: title row and the refresh button stay on ONE line
+                (button goes icon-only, no wrap-to-its-own-row), the date
+                shrinks to a single small line, and the exchange-rate hint
+                sentence is desktop-only — it's nice-to-know, not essential,
+                and was the single biggest line-count contributor on a phone.
+                Everything that previously forced 5 stacked lines above the
+                first KPI card now fits in 2. */}
+            <header className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                        <p className="truncate text-[11px] font-medium text-slate-500 sm:text-xs">{todayLabel}</p>
+                        <h2 className="truncate text-lg font-bold text-slate-900 sm:text-2xl">ملخص أداء المتجر</h2>
+                    </div>
+
+                    <div className="flex shrink-0 items-center gap-2">
+                        {updatedLabel && !isLoading && (
+                            <span className="hidden text-xs text-slate-400 lg:inline">آخر تحديث {updatedLabel}</span>
+                        )}
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={refresh}
+                            disabled={isLoading}
+                            aria-label="تحديث"
+                            className="h-8 gap-1.5 bg-white px-2.5 transition-transform active:scale-95 sm:h-9 sm:px-3"
+                        >
+                            {isLoading ? (
+                                <Loader2 className="size-4 animate-spin" aria-hidden />
+                            ) : (
+                                <RefreshCw className="size-4" aria-hidden />
+                            )}
+                            <span className="hidden sm:inline">تحديث</span>
+                        </Button>
+                    </div>
                 </div>
 
-                <div className="flex items-center gap-2">
-                    {updatedLabel && !isLoading && (
-                        <span className="hidden text-xs text-slate-400 sm:inline">آخر تحديث {updatedLabel}</span>
-                    )}
-                    <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={refresh}
-                        disabled={isLoading}
-                        className="h-9 gap-1.5 bg-white"
-                    >
-                        {isLoading ? (
-                            <Loader2 className="size-4 animate-spin" aria-hidden />
-                        ) : (
-                            <RefreshCw className="size-4" aria-hidden />
-                        )}
-                        تحديث
-                    </Button>
-                </div>
+                {data?.exchangeRate && (
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 rounded-full border border-purple-200 bg-purple-50 px-2.5 py-0.5 text-[11px] font-semibold text-purple-700 sm:px-3 sm:py-1 sm:text-xs">
+                            <DollarSign className="size-3.5" aria-hidden />
+                            <bdi dir="ltr">$1</bdi>
+                            <span aria-hidden>=</span>
+                            <span className="tabular-nums">{formatMoney(data.exchangeRate, "SYP")} ل.س</span>
+                        </span>
+                        <span className="hidden text-[11px] text-slate-400 sm:inline">
+                            مبالغ الدولار تقريبية، بسعر كل فاتورة وقت إصدارها.
+                        </span>
+                    </div>
+                )}
             </header>
 
             {error && (
@@ -476,8 +592,20 @@ function ForbiddenPanel() {
 
 /** shadcn Card with its built-in vertical padding/gap neutralised, so every
  *  panel below controls its own spacing regardless of the Card version. */
-function Panel({ children, className }: { children: React.ReactNode; className?: string }) {
-    return <Card className={cn("gap-0 overflow-hidden border-slate-200 bg-white py-0 shadow-sm", className)}>{children}</Card>;
+function Panel({
+    children,
+    className,
+    style,
+}: {
+    children: React.ReactNode;
+    className?: string;
+    style?: React.CSSProperties;
+}) {
+    return (
+        <Card style={style} className={cn("gap-0 overflow-hidden border-slate-200 bg-white py-0 shadow-sm", className)}>
+            {children}
+        </Card>
+    );
 }
 
 function PanelHeader({
@@ -534,13 +662,28 @@ const TONE_CHIP: Record<Tone, string> = {
     slate: "bg-slate-100 text-slate-600",
 };
 
+/** Accent-card wash — ONLY applied when `accent` is true, so color still
+ *  encodes meaning (profit = positive, debt = attention) instead of being
+ *  sprayed across every KPI the way the four cards used to look identical. */
+const TONE_CARD: Partial<Record<Tone, string>> = {
+    emerald: "border-emerald-200 bg-emerald-50/60",
+    red: "border-red-200 bg-red-50/60",
+};
+
+const TONE_CAPTION: Partial<Record<Tone, string>> = {
+    emerald: "text-emerald-700/80",
+    red: "text-red-700/80",
+};
+
 function KpiCard({
     title,
     tag,
     icon,
     tone,
+    accent = false,
     hero,
     className,
+    style,
     caption,
     children,
 }: {
@@ -548,39 +691,60 @@ function KpiCard({
     tag: string;
     icon: React.ReactNode;
     tone: Tone;
+    /** Tints the whole card (not just the icon chip) — reserve for the one
+     *  or two KPIs whose color genuinely carries meaning. */
+    accent?: boolean;
     hero?: boolean;
     className?: string;
+    style?: React.CSSProperties;
     caption?: React.ReactNode;
     children: React.ReactNode;
 }) {
     return (
-        <Panel className={className}>
-            <div className="flex h-full flex-col gap-3 p-4 sm:p-5">
+        <Panel style={style} className={cn("dash-card-in", accent && TONE_CARD[tone], className)}>
+            <div className="flex h-full flex-col gap-2 p-3.5 sm:gap-3 sm:p-5">
+                {/* Icon and the "اليوم" tag share the top row; the title gets
+                    its OWN full-width row below so it never has to compete
+                    for space and fight `truncate` down to "الفوا...". */}
                 <div className="flex items-center justify-between gap-2">
-                    <div className="flex min-w-0 items-center gap-2.5">
-                        <span
-                            className={cn("flex size-9 shrink-0 items-center justify-center rounded-xl", TONE_CHIP[tone])}
-                            aria-hidden
-                        >
-                            {icon}
-                        </span>
-                        <p className="truncate text-sm font-semibold text-slate-600">{title}</p>
-                    </div>
-                    <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-500">
+                    <span
+                        className={cn(
+                            "flex size-7 shrink-0 items-center justify-center rounded-lg sm:size-9 sm:rounded-xl",
+                            accent ? "bg-white shadow-sm" : TONE_CHIP[tone],
+                            accent && (tone === "red" ? "text-red-600" : "text-emerald-600")
+                        )}
+                        aria-hidden
+                    >
+                        {icon}
+                    </span>
+                    <span className="shrink-0 rounded-full bg-white/70 px-2 py-0.5 text-[10px] font-semibold text-slate-500 sm:text-[11px]">
                         {tag}
                     </span>
                 </div>
 
+                <p
+                    className={cn(
+                        "line-clamp-2 text-[13px] font-semibold leading-tight sm:text-sm",
+                        accent ? "text-slate-700" : "text-slate-600"
+                    )}
+                >
+                    {title}
+                </p>
+
                 <div
                     className={cn(
                         "font-extrabold leading-tight tracking-tight text-slate-900",
-                        hero ? "text-3xl" : "text-xl sm:text-2xl"
+                        hero ? "text-2xl sm:text-3xl" : "text-lg sm:text-2xl"
                     )}
                 >
                     {children}
                 </div>
 
-                {caption && <div className="text-xs leading-relaxed text-slate-500">{caption}</div>}
+                {caption && (
+                    <div className={cn("text-xs leading-relaxed", accent ? TONE_CAPTION[tone] : "text-slate-500")}>
+                        {caption}
+                    </div>
+                )}
             </div>
         </Panel>
     );
@@ -597,26 +761,31 @@ function KpiCards({ kpis }: { kpis: Kpis }) {
             <KpiCard
                 title="المبيعات"
                 tag="اليوم"
-                tone="emerald"
+                tone="sky"
                 hero
                 className="col-span-2 sm:col-span-1"
+                style={{ animationDelay: "0ms" }}
                 icon={<ShoppingBag className="size-5" />}
                 // SYP is authoritative; USD is the secondary figure, summed from
-                // each invoice's own frozen-rate USD value (always sent).
+                // each invoice's own frozen-rate USD value (omitted when null).
                 caption={
-                    <span className="inline-flex items-center gap-1">
-                        <span aria-hidden>≈</span>
-                        <Money value={kpis.salesUSD} currency="USD" className="font-semibold text-slate-700" />
-                    </span>
+                    kpis.salesUSD !== null ? (
+                        <span className="inline-flex items-center gap-1">
+                            <span aria-hidden>≈</span>
+                            <Money value={kpis.salesUSD} currency="USD" className="font-semibold text-slate-700" />
+                        </span>
+                    ) : undefined
                 }
             >
-                <Money value={kpis.salesSYP} currency="SYP" />
+                <AnimatedMoneySYP value={kpis.salesSYP} />
             </KpiCard>
 
             <KpiCard
                 title="صافي الربح"
                 tag="اليوم"
-                tone="sky"
+                tone="emerald"
+                accent
+                style={{ animationDelay: "40ms" }}
                 icon={<TrendingUp className="size-5" />}
                 caption={
                     margin === null ? (
@@ -624,18 +793,19 @@ function KpiCards({ kpis }: { kpis: Kpis }) {
                     ) : (
                         <>
                             هامش الربح{" "}
-                            <span className="font-semibold text-slate-700">{percentFormatter.format(margin)}</span>
+                            <span className="font-semibold text-emerald-800">{percentFormatter.format(margin)}</span>
                         </>
                     )
                 }
             >
-                <Money value={kpis.netProfitSYP} currency="SYP" />
+                <AnimatedMoneySYP value={kpis.netProfitSYP} className="text-emerald-900" />
             </KpiCard>
 
             <KpiCard
                 title="الفواتير"
                 tag="اليوم"
                 tone="slate"
+                style={{ animationDelay: "80ms" }}
                 icon={<Receipt className="size-5" />}
                 caption={
                     average === null ? (
@@ -648,18 +818,20 @@ function KpiCards({ kpis }: { kpis: Kpis }) {
                     )
                 }
             >
-                <span className="tabular-nums">{fmtInt(kpis.invoiceCount)}</span>
+                <AnimatedInt value={kpis.invoiceCount} />
             </KpiCard>
 
             <KpiCard
                 title="ديون الزبائن"
                 tag="الإجمالي"
                 tone="red"
+                accent
                 className="col-span-2 sm:col-span-1"
+                style={{ animationDelay: "120ms" }}
                 icon={<Wallet className="size-5" />}
                 caption="صافي المستحقات حسب دفتر الديون"
             >
-                <Money value={kpis.outstandingDebtSYP} currency="SYP" />
+                <AnimatedMoneySYP value={kpis.outstandingDebtSYP} className="text-red-900" />
             </KpiCard>
         </div>
     );
@@ -735,7 +907,7 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
     } as const;
 
     return (
-        <Panel>
+        <Panel className="dash-card-in" style={{ animationDelay: "80ms" }}>
             <PanelHeader
                 title={granularity === "hour" ? "المبيعات والأرباح بالساعة" : "اتجاه المبيعات والأرباح"}
                 action={
@@ -782,6 +954,9 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
                     // The chart itself stays LTR (time runs left to right, the
                     // value axis on the left) so it is identical regardless of
                     // page direction; the tooltip re-asserts RTL for its text.
+                    // Recharts animates Area/Bar paths in on mount by default
+                    // (isAnimationActive), which is the "draws itself" motion —
+                    // left as-is rather than reimplemented.
                     <div dir="ltr">
                         <ChartContainer config={chartConfig} className="aspect-auto h-64 w-full">
                             {granularity === "hour" ? (
@@ -790,8 +965,8 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
                                     <XAxis dataKey="date" tickFormatter={axisLabel} interval="preserveStartEnd" minTickGap={20} {...axisProps} />
                                     <YAxis width={64} tickFormatter={(v: number) => compactFormatter.format(v)} {...axisProps} />
                                     <ChartTooltip cursor={{ fill: "#f1f5f9" }} content={<TrendTooltip />} />
-                                    <Bar dataKey="sales" fill="var(--color-sales)" radius={[4, 4, 0, 0]} maxBarSize={26} />
-                                    <Bar dataKey="profit" fill="var(--color-profit)" radius={[4, 4, 0, 0]} maxBarSize={26} />
+                                    <Bar dataKey="sales" fill="var(--color-sales)" radius={[4, 4, 0, 0]} maxBarSize={26} animationDuration={500} />
+                                    <Bar dataKey="profit" fill="var(--color-profit)" radius={[4, 4, 0, 0]} maxBarSize={26} animationDuration={500} />
                                 </BarChart>
                             ) : (
                                 <AreaChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
@@ -817,6 +992,7 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
                                         fill="url(#fillSales)"
                                         dot={false}
                                         activeDot={{ r: 4 }}
+                                        animationDuration={700}
                                     />
                                     <Area
                                         dataKey="profit"
@@ -826,6 +1002,7 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
                                         fill="url(#fillProfit)"
                                         dot={false}
                                         activeDot={{ r: 4 }}
+                                        animationDuration={700}
                                     />
                                 </AreaChart>
                             )}
@@ -901,10 +1078,14 @@ function RankList({ rows, metric, days }: { rows: ProductAggregate[]; metric: Ra
                     );
 
                 return (
-                    <li key={row.productId} className="relative overflow-hidden rounded-lg border border-slate-100 bg-white">
+                    <li
+                        key={row.productId}
+                        className="dash-card-in relative overflow-hidden rounded-lg border border-slate-100 bg-white transition-colors hover:border-slate-200"
+                        style={{ animationDelay: `${120 + index * 40}ms` }}
+                    >
                         {/* start-0 = the right edge in RTL, so the bar grows toward the left. */}
                         <div
-                            className={cn("absolute inset-y-0 start-0", BAR_TONE[metric])}
+                            className={cn("absolute inset-y-0 start-0 transition-[width] duration-500 ease-out", BAR_TONE[metric])}
                             style={{ width: `${pct}%` }}
                             aria-hidden
                         />
@@ -937,7 +1118,7 @@ function TopSellingCard({ rows, days }: { rows: DashboardPayload["topProducts"];
     const list = metric === "value" ? rows.bySalesValue : rows.byQuantity;
 
     return (
-        <Panel>
+        <Panel className="dash-card-in" style={{ animationDelay: "160ms" }}>
             <PanelHeader
                 title="الأكثر مبيعاً"
                 subtitle={windowLabel(days)}
@@ -966,7 +1147,7 @@ function TopSellingCard({ rows, days }: { rows: DashboardPayload["topProducts"];
 
 function TopProfitableCard({ rows, days }: { rows: ProductAggregate[]; days: number }) {
     return (
-        <Panel>
+        <Panel className="dash-card-in" style={{ animationDelay: "200ms" }}>
             <PanelHeader title="الأكثر ربحاً" subtitle={`حسب صافي الربح — ${windowLabel(days)}`} />
             <div className="p-4 sm:p-5">
                 <RankList rows={rows} metric="profit" days={days} />
@@ -981,10 +1162,10 @@ function TopProfitableCard({ rows, days }: { rows: ProductAggregate[]; days: num
 
 type AlertTone = "red" | "amber" | "slate";
 
-const ALERT_STYLES: Record<AlertTone, { chip: string; badge: string }> = {
-    red: { chip: "bg-red-50 text-red-600", badge: "bg-red-100 text-red-700" },
-    amber: { chip: "bg-amber-50 text-amber-600", badge: "bg-amber-100 text-amber-800" },
-    slate: { chip: "bg-slate-100 text-slate-600", badge: "bg-slate-200 text-slate-700" },
+const ALERT_STYLES: Record<AlertTone, { chip: string; badge: string; ring: string }> = {
+    red: { chip: "bg-red-50 text-red-600", badge: "bg-red-100 text-red-700", ring: "ring-red-100" },
+    amber: { chip: "bg-amber-50 text-amber-600", badge: "bg-amber-100 text-amber-800", ring: "ring-amber-100" },
+    slate: { chip: "bg-slate-100 text-slate-600", badge: "bg-slate-200 text-slate-700", ring: "ring-slate-100" },
 };
 
 function AlertColumn({
@@ -1007,9 +1188,12 @@ function AlertColumn({
     children: React.ReactNode;
 }) {
     const styles = ALERT_STYLES[tone];
+    // Only columns with something open get a tinted frame — an empty column
+    // stays neutral so the open ones are what draw the eye first.
+    const frame = count > 0 ? cn("ring-1", styles.ring, "bg-white") : "bg-slate-50/60";
 
     return (
-        <div className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+        <div className={cn("flex flex-col gap-3 rounded-xl border border-slate-200 p-4", frame)}>
             <div className="flex items-center justify-between gap-2">
                 <span className="flex min-w-0 items-center gap-2.5">
                     <span className={cn("flex size-8 shrink-0 items-center justify-center rounded-lg", styles.chip)} aria-hidden>
@@ -1062,7 +1246,7 @@ function AlertsCard({ alerts }: { alerts: DashboardPayload["alerts"] }) {
         alerts.needsReconciliation.count + alerts.expiringSoon.count + alerts.largeBalances.count;
 
     return (
-        <Panel>
+        <Panel className="dash-card-in" style={{ animationDelay: "240ms" }}>
             <PanelHeader
                 title="تنبيهات تحتاج انتباهك"
                 subtitle={total === 0 ? "كل شيء على ما يرام." : `${fmtInt(total)} تنبيه مفتوح`}

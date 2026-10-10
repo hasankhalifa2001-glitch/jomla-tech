@@ -30,7 +30,11 @@ import { requireBaseUnits } from "@/lib/inventory/base-unit";
 // bulk/non-interactive, with no live-derivation UI to show, so it is the
 // only caller of createBatchRow() still permitted to supply
 // costPricePerBaseUnit directly.
-import { createBatchRow, findClientComputedBatchField, InactiveEntryUnitError } from "@/lib/inventory/batch-creation";
+import { findClientComputedBatchField, InactiveEntryUnitError } from "@/lib/inventory/batch-creation";
+// [v4.7] The receiving gateway — THE one path that writes a ProductReceipt;
+// the initialBatch below rides it so product, receipt and batch share ONE
+// atomic, top-level-write transaction.
+import { createReceiptWithBatches, purchaseDateSchema, supplierNameSchema } from "@/lib/data/receipts";
 // Sole gateway for tx.product.* / tx.productUnit.* — see that file's
 // header and eslint.config.mjs's model-level rule. Neither this route
 // nor any other route outside lib/data/products.ts (or
@@ -178,7 +182,7 @@ const createProductSchema = z.object({
       // costPricePerBaseUnit directly is rejected on the RAW body, before
       // this schema even runs — see the guard in POST below.
       totalCost: positiveDecimalString(
-        "إجمالي تكلفة الشراء يجب أن يكون رقماً موجباً أكبر من صفر"
+        "لا يمكن قبول دفعة بتكلفة صفر — إجمالي تكلفة الشراء يجب أن يكون رقماً موجباً أكبر من صفر"
       ),
       // [Batch cost entry — FIX] Was nonNegativeDecimalString (allowed 0).
       // A zero quantity can never yield a per-base-unit cost — costFromTotal()
@@ -186,6 +190,12 @@ const createProductSchema = z.object({
       // rule every other interactive batch-creation screen already enforces.
       quantity: positiveDecimalString("الكمية يجب أن تكون أكبر من صفر"),
       expiryDate: z.string().optional().nullable(),
+      // [v4.7] Required goods-receiving date for the receipt this batch is
+      // written under — a Damascus business day, required and never in the
+      // future — plus an optional supplier (≤120 chars). Both persist on the
+      // ProductReceipt the gateway creates inside this route's transaction.
+      purchaseDate: purchaseDateSchema,
+      supplierName: supplierNameSchema,
     })
     .optional()
     .nullable(),
@@ -688,14 +698,24 @@ export async function POST(req: Request) {
           );
         }
 
-        await createBatchRow(tx, {
+        // [v4.7] Step 3 rides the receiving gateway: ONE ProductReceipt
+        // written first, then the batch under it — top-level calls only, so
+        // a failure rolls back product, receipt and batch together.
+        await createReceiptWithBatches(tx, {
           tenantId,
-          productId: product.id,
-          entryUnitId: enteredUnit.id,
+          userId: session.user.id,
+          purchaseDate: initialBatch.purchaseDate,
+          supplierName: initialBatch.supplierName,
           batchNumberSuffix: initialBatch.batchNumberSuffix,
-          quantityInEntryUnit: initialBatch.quantity,
-          totalCost: initialBatch.totalCost,
-          expiryDate: initialBatch.expiryDate ?? null,
+          lines: [
+            {
+              productId: product.id,
+              entryUnitId: enteredUnit.id,
+              quantity: initialBatch.quantity,
+              totalCost: initialBatch.totalCost,
+              expiryDate: initialBatch.expiryDate ?? null,
+            },
+          ],
         });
       }
 
@@ -759,6 +779,14 @@ export async function POST(req: Request) {
       message: "تم إنشاء المنتج بنجاح.",
     });
   } catch (error) {
+    // [v4.7] Backstop: the route schema validates first, but the receiving
+    // gateway re-validates — a ZodError escaping it is a 400, not a 500.
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: "VALIDATION_ERROR", message: error.issues[0]?.message || "بيانات الطلب غير صالحة." },
+        { status: 400 }
+      );
+    }
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse(error);
     }

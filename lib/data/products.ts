@@ -1255,3 +1255,75 @@ export async function listProductNamesByIds(
     for (const row of rows) names.set(row.id, row.name);
     return names;
 }
+
+// [v4.7 — Phase 6] The unit-name twin of listProductNamesByIds() above, for
+// the goods-receiving history: BatchDeletionLog stores only a plain unitId
+// (snapshot field — no relation), so naming a DELETED line's unit needs a
+// batched id → unitName lookup. ProductBatch's live `unit` relation covers
+// the surviving lines, but a deleted line has no row left to join against.
+// Same narrow-read posture: ONE query for any number of ids, id → display
+// name only (never conversionFactor — that stays confined to
+// lib/inventory/units.ts's getUnitConversionFactors()).
+export async function listUnitNamesByIds(
+    tx: TxOrClient,
+    tenantId: string,
+    unitIds: readonly string[]
+): Promise<Map<string, string>> {
+    requireTenantId(tenantId, "listUnitNamesByIds");
+    requireIdList(unitIds, "listUnitNamesByIds");
+
+    const names = new Map<string, string>();
+    if (unitIds.length === 0) return names;
+
+    const rows = await tx.productUnit.findMany({
+        where: { tenantId, id: { in: [...unitIds] } },
+        select: { id: true, unitName: true },
+    });
+
+    for (const row of rows) names.set(row.id, row.unitName);
+    return names;
+}
+
+// ----------------------------------------------------------------------------
+// [v4.7 — Round B] The unit-set reader behind the receiving history's per-line
+// quantity breakdown: "initialQuantity = 10 كرتونة + 4 قطعة".
+//
+// SHAPE: ONE findMany for ANY number of products (productId IN (...)) — never
+// one query per product — grouped into a productId → DisplayUnit[] map before
+// it leaves this file, so receipt-history.ts never sees a raw ProductUnit row
+// and never names `.conversionFactor` (the field stays confined to units.ts,
+// which is where the caller feeds this map: breakdownForDisplay()).
+//
+// `barcodes` is included for the same reason every other units read here does
+// it ([v4.5]): toDisplayUnits() builds a complete DisplayUnit, and a missing
+// relation would silently render an empty barcode list on the row.
+// ----------------------------------------------------------------------------
+export async function listDisplayUnitsForProducts(
+    tx: TxOrClient,
+    tenantId: string,
+    productIds: readonly string[]
+): Promise<Map<string, DisplayUnit[]>> {
+    requireTenantId(tenantId, "listDisplayUnitsForProducts");
+    requireIdList(productIds, "listDisplayUnitsForProducts");
+
+    const byProductId = new Map<string, DisplayUnit[]>();
+    if (productIds.length === 0) return byProductId;
+
+    const rows = await tx.productUnit.findMany({
+        where: { tenantId, productId: { in: [...productIds] } },
+        include: {
+            barcodes: {
+                select: { id: true, barcode: true, barcodeSource: true, createdAt: true },
+                orderBy: { createdAt: "asc" as const },
+            },
+        },
+    });
+
+    for (const row of rows) {
+        const display = toDisplayUnits([row])[0];
+        const list = byProductId.get(row.productId);
+        if (list) list.push(display);
+        else byProductId.set(row.productId, [display]);
+    }
+    return byProductId;
+}

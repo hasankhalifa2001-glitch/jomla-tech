@@ -92,6 +92,7 @@ export function CartPanel({
   // not yet entered a rate, even for SYP-only carts — contradicting T4b.
   const rateRequired = useMemo(() => cartNeedsExchangeRate(items), [items]);
   const isRateBlocking = rateRequired && isRateMissing;
+  const isCheckoutDisabled = isCartEmpty || isRateBlocking;
 
   // [v3.6] Map item IDs to their calculated line totals for fast lookup.
   // `syp` is authoritative (never null); `usd` is derived/display-only
@@ -169,7 +170,7 @@ export function CartPanel({
             variant="outline"
             size="sm"
             onClick={onOpenCustomerModal}
-            className="text-xs h-8 gap-1 border-zinc-300 dark:border-zinc-700 shrink-0"
+            className="text-xs h-9 gap-1 border-zinc-300 dark:border-zinc-700 shrink-0"
             title="تحديد أو تسجيل زبون (F4)"
           >
             <UserPlus className="h-3.5 w-3.5 text-emerald-600" />
@@ -210,7 +211,7 @@ export function CartPanel({
                 {/* Top Row: Name, Price, and Delete Button */}
                 <div className="flex items-start justify-between gap-2">
                   <div className="space-y-0.5 truncate flex-1">
-                    <p className="text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate">
+                    <p className="text-sm font-bold text-zinc-900 dark:text-zinc-100 truncate">
                       {item.product.name}
                     </p>
                     {/*
@@ -220,9 +221,9 @@ export function CartPanel({
                       rate was cached. Reading a nullable field as if it
                       were always present would call formatMoney(null, …).
                     */}
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-400">
+                    <div className="flex items-center gap-2 text-[11px] text-zinc-400">
                       <span className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">
-                        سعر الجملة: {formatMoney(item.unitPriceSYP, "SYP")} ل.س
+                        سعر الجملة: <span dir="ltr">{formatMoney(item.unitPriceSYP, "SYP")}</span> ل.س
                       </span>
                     </div>
                   </div>
@@ -232,14 +233,15 @@ export function CartPanel({
                     variant="ghost"
                     size="icon"
                     onClick={() => onRemoveItem(item.id)}
-                    // [FIX — touch target] 32px on mobile (down to the
-                    // original 28px from `sm:` up) to keep this a
-                    // comfortable, deliberate tap — it's a destructive
-                    // action sitting right next to the product name.
-                    className="h-8 w-8 sm:h-7 sm:w-7 text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 shrink-0"
+                    // [UX — touch target] 40px on mobile, 32px from `sm:` up:
+                    // a deliberate, comfortable tap for a destructive action
+                    // next to the product name. (A hasty delete can be undone
+                    // from the toast the POS screen shows.)
+                    className="h-10 w-10 sm:h-8 sm:w-8 text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 shrink-0"
                     title="حذف من السلة"
+                    aria-label="حذف من السلة"
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    <Trash2 className="h-4 w-4" />
                   </Button>
                 </div>
 
@@ -260,7 +262,7 @@ export function CartPanel({
                           onChangeUnit(item.id, newUnitId)
                         }
                       >
-                        <SelectTrigger className="h-8 sm:h-7 text-[11px] px-2 bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700">
+                        <SelectTrigger className="h-10 sm:h-8 text-xs px-2 bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700">
                           <SelectValue placeholder="الوحدة" />
                         </SelectTrigger>
                         <SelectContent dir="rtl">
@@ -283,35 +285,42 @@ export function CartPanel({
                       </Select>
                     </div>
 
-                    {/* Quantity Stepper — 32px targets on mobile, 28px from sm: up */}
+                    {/* Quantity Stepper — 40px targets on mobile, 32px from sm: up */}
                     <div className="flex items-center rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 shrink-0">
                       <button
                         type="button"
                         onClick={() => onUpdateQuantity(item.id, -1)}
-                        className="flex h-8 w-8 sm:h-7 sm:w-7 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                        className="flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
                         title="إنقاص الكمية"
+                        aria-label="إنقاص الكمية"
                       >
-                        <Minus className="h-3 w-3" />
+                        <Minus className="h-4 w-4" />
                       </button>
                       <input
                         type="number"
                         min="1"
+                        inputMode="numeric"
                         value={item.quantity}
+                        // Select the whole number on focus so typing REPLACES it
+                        // (the field ignores an empty value, so it can't be
+                        // cleared by backspacing).
+                        onFocus={(e) => e.target.select()}
                         onChange={(e) => {
                           const val = parseInt(e.target.value, 10);
                           if (!isNaN(val) && val >= 1) {
                             onSetQuantity(item.id, val);
                           }
                         }}
-                        className="h-8 sm:h-7 w-9 text-center font-bold text-xs bg-transparent border-0 focus:outline-none"
+                        className="h-10 sm:h-8 w-10 text-center font-bold text-sm bg-transparent border-0 focus:outline-none tabular-nums"
                       />
                       <button
                         type="button"
                         onClick={() => onUpdateQuantity(item.id, 1)}
-                        className="flex h-8 w-8 sm:h-7 sm:w-7 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                        className="flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
                         title="زيادة الكمية"
+                        aria-label="زيادة الكمية"
                       >
-                        <Plus className="h-3 w-3" />
+                        <Plus className="h-4 w-4" />
                       </button>
                     </div>
                   </div>
@@ -322,12 +331,14 @@ export function CartPanel({
                     not null.
                   */}
                   <div className="flex items-baseline justify-end gap-2">
-                    <p className="text-xs font-extrabold text-emerald-600 dark:text-emerald-400">
-                      {formatMoney(lineTotal.syp, "SYP")} ل.س
+                    <p className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400">
+                      <span dir="ltr">{formatMoney(lineTotal.syp, "SYP")}</span> ل.س
                     </p>
                     {lineTotal.usd !== null && (
-                      <p className="text-[10px] text-purple-600 dark:text-purple-400 font-semibold">
-                        ≈ ${formatMoney(lineTotal.usd, "USD")}
+                      <p className="text-[11px] text-purple-600 dark:text-purple-400 font-semibold">
+                        <span dir="ltr" className="inline-block">
+                          ≈ ${formatMoney(lineTotal.usd, "USD")}
+                        </span>
                       </p>
                     )}
                   </div>
@@ -372,41 +383,40 @@ export function CartPanel({
         </div>
       )}
 
-      {/* 4. Dual-Currency Totals & Checkout Actions */}
+      {/* 4. Totals & Checkout Actions */}
       <div className="p-3.5 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50/80 dark:bg-zinc-850/60 space-y-3 shrink-0">
-        {/* Live Dual-Currency Summary */}
-        <div className="rounded-xl border border-zinc-200 bg-white p-3 dark:border-zinc-750 dark:bg-zinc-900 space-y-1.5 shadow-2xs">
-          <div className="flex items-center justify-between text-xs text-zinc-500">
-            <span>
-              عدد الأصناف في السلة ({totals.itemCount} قطعة):
+        {/*
+          [UX] The grand total is THE number on this panel: one big SYP figure,
+          with the counts above it as a quiet single line (the old
+          "عدد الأصناف في السلة (N قطعة)" row said the same thing twice) and the
+          USD equivalent below as secondary information.
+          [v3.6] SYP is authoritative; USD may be null (no cached rate).
+        */}
+        <div className="rounded-xl border border-zinc-200 bg-white p-3.5 dark:border-zinc-750 dark:bg-zinc-900 space-y-1.5 shadow-2xs">
+          <p className="text-[11px] text-zinc-500">
+            {items.length} أصناف · {totals.itemCount} قطعة
+          </p>
+
+          <div className="flex items-end justify-between gap-3">
+            <span className="text-xs font-bold text-zinc-600 dark:text-zinc-400">
+              المجموع الإجمالي
             </span>
-            <span className="font-mono text-zinc-700 dark:text-zinc-300 font-semibold">
-              {items.length} أصناف
+            <span className="text-2xl font-extrabold leading-none text-emerald-600 dark:text-emerald-400 tabular-nums">
+              <span dir="ltr">{formatMoney(totals.totalSYP, "SYP")}</span>{" "}
+              <span className="text-sm font-bold">ل.س</span>
             </span>
           </div>
 
-          {/*
-            [v3.6] SYP is the primary "المجموع الإجمالي" row; USD is the
-            "المعادل" secondary row and guards against totals.totalUSD
-            being null (no cached rate).
-          */}
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
-              المجموع الإجمالي (SYP):
-            </span>
-            <span className="text-lg font-extrabold text-emerald-600 dark:text-emerald-400">
-              {formatMoney(totals.totalSYP, "SYP")} ل.س
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between pt-1 border-t border-zinc-100 dark:border-zinc-800">
-            <span className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
-              المعادل بالدولار:
-            </span>
-            <span className="text-base font-extrabold text-purple-600 dark:text-purple-400">
-              {totals.totalUSD !== null
-                ? `$${formatMoney(totals.totalUSD, "USD")}`
-                : "غير متاح (لا يوجد سعر صرف)"}
+          <div className="flex items-center justify-between pt-1.5 border-t border-zinc-100 dark:border-zinc-800">
+            <span className="text-xs text-zinc-500">المعادل بالدولار</span>
+            <span className="text-sm font-bold text-purple-600 dark:text-purple-400 tabular-nums">
+              {totals.totalUSD !== null ? (
+                <span dir="ltr" className="inline-block">
+                  ${formatMoney(totals.totalUSD, "USD")}
+                </span>
+              ) : (
+                <span className="text-xs font-medium text-zinc-400">غير متاح (لا يوجد سعر صرف)</span>
+              )}
             </span>
           </div>
         </div>
@@ -419,19 +429,22 @@ export function CartPanel({
               variant="outline"
               size="sm"
               onClick={onClearCart}
-              className="h-11 px-3 text-xs text-zinc-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 border-zinc-300 dark:border-zinc-700 shrink-0"
+              className="h-12 px-3 text-xs text-zinc-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 border-zinc-300 dark:border-zinc-700 shrink-0"
               title="إفراغ السلة بالكامل"
+              aria-label="إفراغ السلة بالكامل"
             >
               <Trash2 className="h-4 w-4" />
             </Button>
           )}
 
+          {/* [UX] The button always says WHY it is disabled, instead of just
+              fading out. */}
           <Button
             type="button"
-            disabled={isCartEmpty || isRateBlocking}
+            disabled={isCheckoutDisabled}
             onClick={onOpenPaymentModal}
-            className={`flex-1 h-11 text-xs font-bold shadow-md rounded-xl transition-all ${isRateBlocking
-              ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
+            className={`flex-1 h-12 text-sm font-bold shadow-md rounded-xl transition-all ${isCheckoutDisabled
+              ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed shadow-none"
               : "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20"
               }`}
           >
@@ -440,11 +453,13 @@ export function CartPanel({
                 <CreditCard className="h-4 w-4" />
                 {isRateBlocking
                   ? "يلزم سعر صرف لصنف مسعّر بالدولار"
-                  : "إتمام البيع والدفع (F9)"}
+                  : isCartEmpty
+                    ? "أضف أصنافاً للسلة أولاً"
+                    : "إتمام البيع والدفع (F9)"}
               </span>
-              {!isRateBlocking && !isCartEmpty && (
+              {!isCheckoutDisabled && (
                 <span className="text-xs font-mono font-extrabold bg-emerald-700/50 px-2 py-0.5 rounded-lg">
-                  {formatMoney(totals.totalSYP, "SYP")} ل.س
+                  <span dir="ltr">{formatMoney(totals.totalSYP, "SYP")}</span> ل.س
                 </span>
               )}
             </div>

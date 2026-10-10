@@ -27,12 +27,12 @@
  *                         app/api/ledger/voids/route.ts), so summing all
  *                         statuses already nets a void back out.
  *
- * salesUSD(today)       = SUM(Invoice.totalUSD) over the same rows. Each
- *                         invoice carries the USD figure derived from ITS OWN
- *                         frozen exchangeRateUsed, so the total is never
- *                         re-converted at today's rate (T4c2's "no live rate"
- *                         rule). Always present — an invoice's USD figure is
- *                         always derivable once persisted.
+ * salesUSD(today)       = SUM(Invoice.totalUSD) over the same rows, skipping
+ *                         nulls. Each invoice carries the USD figure derived
+ *                         from ITS OWN frozen exchangeRateUsed, so the total
+ *                         is never re-converted at today's rate (T4c2's "no
+ *                         live rate" rule). Null when no rated invoice exists
+ *                         today — null-rate invoices contribute nothing.
  *
  * netProfitSYP(window)  = SUM(unitPriceSYP × quantity − costAmountSYP) over
  *                         EVERY InvoiceItem of those invoices. costAmountSYP is
@@ -155,8 +155,12 @@ type DecimalInstance = InstanceType<typeof Decimal>;
 export interface AnalyticsKpis {
     /** Today's net sales, SYP (voids already netted out). */
     salesSYP: string;
-    /** Sum of each invoice's own frozen-rate USD figure — never re-converted. */
-    salesUSD: string;
+    /**
+     * [v4.9] Sum of each invoice's own frozen-rate USD figure — never
+     * re-converted. Null when no rated invoice exists today (null-rate
+     * invoices contribute nothing, never today's rate).
+     */
+    salesUSD: string | null;
     /** Today's net profit, SYP — always fully computable (costAmountSYP is non-nullable). */
     netProfitSYP: string;
     /** COMPLETED invoices issued today (event-dated; see the definition above). */
@@ -440,7 +444,8 @@ export function rankTopByProfit(
 
 interface RawInvoiceRow {
     totalSYP: DecimalLike;
-    totalUSD: DecimalLike;
+    // [v4.9] Nullable — null for SYP-only sales with no frozen rate.
+    totalUSD: DecimalLike | null;
     status: InvoiceStatus;
     createdAt: Date;
 }
@@ -581,7 +586,9 @@ export async function getAnalyticsDashboard(
 
     // === TODAY'S KPIs ===
     let todaySalesSYP = "0.0000";
-    let todaySalesUSD = "0.0000";
+    // [v4.9] Null-rate invoices contribute nothing to USD aggregates and are
+    // never converted using today's rate. Null until a rated invoice appears.
+    let todaySalesUSD: string | null = null;
     let invoiceCount = 0;
     for (const inv of invoices) {
         if (localDayKey(inv.createdAt) !== todayKey) continue;
@@ -589,7 +596,9 @@ export async function getAnalyticsDashboard(
         // already nets out). The COUNT is event-dated: COMPLETED rows created
         // today, independent of any later void.
         todaySalesSYP = addMoney(todaySalesSYP, dstr(inv.totalSYP));
-        todaySalesUSD = addMoney(todaySalesUSD, dstr(inv.totalUSD));
+        if (inv.totalUSD !== null) {
+            todaySalesUSD = addMoney(todaySalesUSD ?? "0.0000", dstr(inv.totalUSD));
+        }
         if (inv.status === "COMPLETED") invoiceCount += 1;
     }
 

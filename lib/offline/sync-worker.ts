@@ -280,8 +280,9 @@ function buildPaymentPayload(p: {
   invoiceId?: string;
   offlineInvoiceId?: string;
   amountSYP: string;
-  amountUSD: string;
-  exchangeRate: string;
+  // [v4.9] Nullable — null when no rate existed on the device.
+  amountUSD: string | null;
+  exchangeRate: string | null;
   paymentMethod: string;
   receiptNo?: string;
   notes?: string;

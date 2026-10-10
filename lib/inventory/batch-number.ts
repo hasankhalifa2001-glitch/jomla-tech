@@ -13,21 +13,26 @@
  * construct this format through ONE identical, shared implementation,
  * never three independent ones.
  *
- * [FIX — business timezone] The date prefix used to be read from the
- * server's LOCAL clock (getFullYear/getMonth/getDate). On a UTC host
- * (Vercel, Docker) a batch received at 01:00 in Syria therefore got
- * YESTERDAY's date. The prefix is now always the calendar date in
- * BATCH_DATE_TIME_ZONE, independent of where the server runs. Syria has
- * used a permanent UTC+3 since 2022, so there is no DST edge case.
- * Still always the SERVER's clock instant — never client-supplied, never
- * re-derived later.
+ * [FIX — business timezone] The date prefix is the merchant's BUSINESS
+ * date (the Asia/Damascus calendar day), never the server's local clock
+ * and never a client-supplied value. Since [v4.7] it is computed by
+ * lib/inventory/date-utils.ts's getBusinessDate() — the ONE shared
+ * business-date implementation that also drives the receipt form's default
+ * purchase date and the purchase-date "not in the future" / "not too old"
+ * rules — so the batchNumber prefix and a receipt's purchase-date default
+ * can never disagree. getBusinessDate() delegates to lib/utils/syria-time.ts's
+ * localDayKey() (fixed UTC+3, deliberately not Intl-based — the same "day"
+ * the dashboard and the sales log use), so this feature never introduces a
+ * second definition of a day. Still always the SERVER's clock instant —
+ * never client-supplied, never re-derived later.
  */
 
-import { isRealCalendarDate } from "./date-utils";
+import { isRealCalendarDate, BUSINESS_TIME_ZONE, getBusinessDate } from "./date-utils";
 
-
-/** The merchant's business timezone. Change here only — nowhere else. */
-export const BATCH_DATE_TIME_ZONE = "Asia/Damascus";
+/** The merchant's business timezone. [v4.7] Alias of date-utils's
+ *  BUSINESS_TIME_ZONE — kept under this historical name for existing
+ *  importers; the single source of truth lives in date-utils.ts. */
+export const BATCH_DATE_TIME_ZONE = BUSINESS_TIME_ZONE;
 
 const DATE_PREFIX_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -39,23 +44,16 @@ const BATCH_NUMBER_PATTERN = /^(\d{4}-\d{2}-\d{2})-(.+)$/;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
-const dateFormatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: BATCH_DATE_TIME_ZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-});
-
 /**
  * The calendar date of `date` in BATCH_DATE_TIME_ZONE, as YYYY-MM-DD —
  * the ONLY sanctioned source for a batchNumber's date prefix. Never taken
  * from the client device, a request body, or a "purchase date" note.
+ *
+ * [v4.7] Delegates to getBusinessDate() so the prefix and every other
+ * business-date calculation share one implementation.
  */
 export function buildServerDatePrefix(date: Date = new Date()): string {
-    const parts = dateFormatter.formatToParts(date);
-    const get = (type: "year" | "month" | "day") =>
-        parts.find((p) => p.type === type)?.value ?? "";
-    return `${get("year")}-${get("month")}-${get("day")}`;
+    return getBusinessDate(date);
 }
 
 /**

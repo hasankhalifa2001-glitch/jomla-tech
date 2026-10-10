@@ -26,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ImageCropModal } from "@/components/inventory/ImageCropModal";
+import { DecimalInput } from "@/components/inventory/DecimalInput";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
 import {
   BarcodeSourceModal,
@@ -65,15 +66,13 @@ const toDecimalString = (value: number): string => {
   return value.toFixed(4);
 };
 
-// [v4.4, Spec Addendum Section 10] Today's date, DISPLAY ONLY — a cosmetic
-// preview of the date prefix the server prepends to the batchNumber at save
-// time. NEVER sent to the server; the real prefix is generated server-side by
-// lib/inventory/batch-number.ts's buildServerDatePrefix().
-function todaysDatePrefix(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-    d.getDate()
-  ).padStart(2, "0")}`;
+// [v4.7] The SERVER-supplied receiving defaults — { businessDate, minDate }
+// from GET /api/receipts/defaults. Step 3's batchNumber date-prefix preview
+// and its default purchase date come from HERE, never the device clock; if
+// the request fails, saving an initial batch is disabled (no fallback).
+interface ReceivingDefaults {
+  businessDate: string;
+  minDate: string;
 }
 
 /** One CONFIRMED barcode on a unit — `barcodeSource` is never empty here. */
@@ -150,6 +149,13 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
   const [totalCost, setTotalCost] = useState<string>("");
   const [expiryDate, setExpiryDate] = useState("");
 
+  // [v4.7] Step-3 initialBatch: the PERSISTED goods-receiving date (required
+  // when a batch is created) + optional supplier, and the SERVER defaults
+  // that bound them — never the device clock.
+  const [receivingDefaults, setReceivingDefaults] = useState<ReceivingDefaults | null>(null);
+  const [purchaseDate, setPurchaseDate] = useState("");
+  const [supplierName, setSupplierName] = useState("");
+
   const [loading, setLoading] = useState(false);
 
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -193,6 +199,32 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     };
   }, []);
 
+  // [v4.7] Fetch the server's receiving defaults whenever the modal is open
+  // (the purchase date only matters once step 3's initial batch is checked,
+  // but fetching early means the picker is ready by the time it is shown).
+  // On failure: null defaults → initial-batch saving is disabled; there is
+  // deliberately NO device-clock fallback.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/receipts/defaults");
+        if (!res.ok) throw new Error("defaults unavailable");
+        const data: ReceivingDefaults = await res.json();
+        if (cancelled) return;
+        setReceivingDefaults(data);
+        setPurchaseDate((prev) => prev || data.businessDate);
+      } catch {
+        if (cancelled) return;
+        setReceivingDefaults(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   const resetForm = () => {
     setName("");
     setCategory("");
@@ -205,6 +237,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
     setBatchQuantity("");
     setTotalCost("");
     setExpiryDate("");
+    // [v4.7] Drop server defaults + receipt fields so a reopen refetches them.
+    setReceivingDefaults(null);
+    setPurchaseDate("");
+    setSupplierName("");
     setCatalogInfo(null);
     setStep(1);
     setPendingQuickScanBarcode("");
@@ -708,6 +744,27 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
       return;
     }
 
+    // [v4.7] The purchase date must exist and be within the SERVER-provided
+    // window (minDate..businessDate). Bounds are plain string comparisons
+    // against the server's own values — the device clock is never consulted.
+    // If the defaults request failed, saving an initial batch is blocked:
+    // there is deliberately no device-clock fallback (products WITHOUT an
+    // initial batch can still be saved).
+    if (hasInitialBatch && (!receivingDefaults || !purchaseDate)) {
+      toast.error(
+        "تعذّر تحميل تاريخ الاستلام من الخادم — لا يمكن حفظ دفعة بدونه (لا يُستخدم تاريخ الجهاز أبداً)."
+      );
+      return;
+    }
+    if (hasInitialBatch && purchaseDate > receivingDefaults!.businessDate) {
+      toast.error("لا يمكن تسجيل استلام بتاريخ في المستقبل.");
+      return;
+    }
+    if (hasInitialBatch && purchaseDate < receivingDefaults!.minDate) {
+      toast.error("لا يمكن تسجيل استلام بتاريخ أقدم من سنتين (730 يوماً).");
+      return;
+    }
+
     if (isPublic) {
       // [v4.6] Image is at the product level.
       const gate = checkProductPublishable({
@@ -758,6 +815,10 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
             quantity: batchQuantity.trim(),
             totalCost: totalCost.trim(),
             expiryDate: expiryDate || null,
+            // [v4.7] PERSISTED receiving date + optional supplier, both from
+            // the SERVER defaults above — never the device clock.
+            purchaseDate,
+            ...(supplierName.trim() ? { supplierName: supplierName.trim() } : {}),
           }
           : null,
       };
@@ -840,7 +901,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                   key="next-btn"
                   type="button"
                   onClick={goNext}
-                  className="flex-[2] bg-emerald-600 hover:bg-emerald-700 sm:min-w-28 sm:flex-none"
+                  className="flex-2 bg-emerald-600 hover:bg-emerald-700 sm:min-w-28 sm:flex-none"
                 >
                   التالي
                 </Button>
@@ -849,7 +910,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                   key="submit-btn"
                   type="submit"
                   disabled={loading}
-                  className="flex-[2] bg-emerald-600 hover:bg-emerald-700 sm:min-w-28 sm:flex-none"
+                  className="flex-2 bg-emerald-600 hover:bg-emerald-700 sm:min-w-28 sm:flex-none"
                 >
                   {loading ? "جاري الحفظ..." : "حفظ المنتج"}
                 </Button>
@@ -1076,6 +1137,9 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
             {units.map((unit, idx) => {
               const isPendingClassification = barcodeGate.unitIndex === idx;
               const unitLabel = unit.unitName.trim() || "الوحدة";
+              // "كرتونة" → "الكرتونة"; a name already starting with "ال" is
+              // left alone, so the label never doubles the article.
+              const unitLabelDefinite = unitLabel.startsWith("ال") ? unitLabel : `ال${unitLabel}`;
               return (
                 <section key={idx} className="space-y-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                   <div className="flex items-start justify-between gap-2">
@@ -1125,24 +1189,17 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                         label={`${unitLabel} الواحدة تساوي كم ${baseUnitName}؟`}
                         htmlFor={`unit-factor-${idx}`}
                         required
-                        hint={`مثال: الكرتونة = 24 ${baseUnitName}`}
+                        hint={`مثال: ${unitLabelDefinite} = 24 ${baseUnitName}`}
                       >
-                        <Input
+                        <DecimalInput
                           id={`unit-factor-${idx}`}
-                          type="number"
-                          step="any"
-                          min="0.0001"
-                          inputMode="decimal"
+                          placeholder="مثال: 24"
+                          // Typed text lives inside DecimalInput, so the field can
+                          // be cleared and retyped freely (80, 0.5, 0.25 ...).
+                          // validatePackagingUnits() and the step-2 check reject a
+                          // submitted value <= 0.
                           value={unit.conversionFactor}
-                          onChange={(e) => {
-                            // Only fall back when the parsed value isn't a real
-                            // number at all (an empty string); `|| 1` used to
-                            // snap a typed "0" (on the way to "0.25") back to 1.
-                            // validatePackagingUnits() rejects a submitted
-                            // value <= 0 anyway.
-                            const parsed = parseFloat(e.target.value);
-                            handleUnitChange(idx, "conversionFactor", Number.isFinite(parsed) ? parsed : 0);
-                          }}
+                          onValueChange={(v) => handleUnitChange(idx, "conversionFactor", v)}
                           required
                         />
                       </Field>
@@ -1161,26 +1218,20 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                     </Field>
 
                     <Field
-                      label={idx === 0 ? `سعر بيع ${unitLabel} (POS)` : "سعر الجملة للوحدة (POS)"}
+                      label={idx === 0 ? `سعر بيع ${unitLabelDefinite} (POS)` : `سعر ${unitLabelDefinite} (POS)`}
                       htmlFor={`unit-price-${idx}`}
                       required
                     >
                       <div className="relative">
-                        <Input
+                        <DecimalInput
                           id={`unit-price-${idx}`}
-                          type="number"
-                          step="any"
-                          min="0.01"
-                          inputMode="decimal"
-                          value={unit.priceWholesale === 0 ? "" : unit.priceWholesale}
-                          onChange={(e) => {
-                            const raw = e.target.value;
-                            handleUnitChange(idx, "priceWholesale", raw === "" ? 0 : parseFloat(raw));
-                          }}
+                          placeholder="0"
+                          value={unit.priceWholesale}
+                          onValueChange={(v) => handleUnitChange(idx, "priceWholesale", v)}
                           className="pe-12 font-semibold tabular-nums"
                           required
                         />
-                        <span className="pointer-events-none absolute end-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-slate-500">
+                        <span className="pointer-events-none absolute inset-e-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-slate-500">
                           {unit.pricingCurrency === "USD" ? "$" : "ل.س"}
                         </span>
                       </div>
@@ -1441,10 +1492,58 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                   />
                 </Field>
 
+                {/* [v4.7] The PERSISTED goods-receiving date + optional
+                    supplier (ProductReceipt.purchaseDate / supplierName).
+                    Defaults and bounds come from GET /api/receipts/defaults —
+                    the device clock is never consulted; while defaults are
+                    unavailable the picker stays disabled and saving an initial
+                    batch is blocked (no device-date fallback). */}
+                <Field
+                  label="تاريخ الشراء (يوم الاستلام)"
+                  htmlFor="batch-purchase-date"
+                  required
+                >
+                  <Input
+                    id="batch-purchase-date"
+                    type="date"
+                    dir="ltr"
+                    value={purchaseDate}
+                    min={receivingDefaults?.minDate}
+                    max={receivingDefaults?.businessDate}
+                    onChange={(e) => setPurchaseDate(e.target.value)}
+                    className="bg-white"
+                    disabled={!receivingDefaults}
+                    required
+                  />
+                </Field>
+
+                <Field
+                  label="المورّد (اختياري)"
+                  htmlFor="batch-supplier"
+                >
+                  <Input
+                    id="batch-supplier"
+                    type="text"
+                    maxLength={120}
+                    placeholder="مثال: مورد الشام"
+                    value={supplierName}
+                    onChange={(e) => setSupplierName(e.target.value)}
+                    className="bg-white"
+                  />
+                </Field>
+
+                {!receivingDefaults && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 sm:col-span-2">
+                    تعذّر تحميل تاريخ الاستلام من الخادم — أعد فتح النموذج للمحاولة مجدداً (لا يُستخدم تاريخ الجهاز أبداً).
+                  </p>
+                )}
+
                 {/* [v4.4, Section 10] The date prefix is generated server-side
-                    at save time and shown here read-only (cosmetic preview from
-                    the browser clock) — the ADMIN types only the
-                    merchant-supplied suffix. The group is LTR so it reads in
+                    at save time and shown here read-only — the ADMIN types only
+                    the merchant-supplied suffix. The prefix preview is the
+                    SERVER business date (GET /api/receipts/defaults), NEVER the
+                    browser clock; while defaults are unavailable a "—"
+                    placeholder is shown. The group is LTR so it reads in
                     the same order as the stored value: 2026-10-05-1. */}
                 <Field
                   label="رقم الدفعة الخاص بك"
@@ -1458,7 +1557,7 @@ export function AddProductModal({ open, onOpenChange, onSuccess }: AddProductMod
                       aria-label="بادئة التاريخ التي يضيفها النظام"
                       className="shrink-0 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 font-mono text-sm font-semibold text-emerald-700"
                     >
-                      {todaysDatePrefix()}
+                      {receivingDefaults ? `${receivingDefaults.businessDate}-` : "—-"}
                     </span>
                     <span className="text-slate-400" aria-hidden>
                       -

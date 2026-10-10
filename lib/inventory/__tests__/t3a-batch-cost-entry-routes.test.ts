@@ -51,6 +51,13 @@ const { mockDb, mockState, mockSessionState } = vi.hoisted(() => {
     costPriceChangeLog: { create: vi.fn(), count: vi.fn(), findMany: vi.fn() },
     stockAdjustment: { create: vi.fn(), findMany: vi.fn(), count: vi.fn() },
     batchDeletionLog: { create: vi.fn() },
+    // [v4.7] The receiving gateway writes the ProductReceipt FIRST, then each
+    // batch under it. The route's own atomicity is what this file asserts, so
+    // the receipt write is a thin stub that succeeds.
+    productReceipt: {
+      create: vi.fn(async ({ data }: any) => ({ id: "receipt-1", ...data })),
+      findFirst: vi.fn(),
+    },
     invoiceItem: { count: vi.fn() },
   };
 
@@ -147,6 +154,9 @@ import {
 } from "@/app/api/inventory/batches/[id]/route";
 import { costFromTotal } from "@/lib/inventory/units";
 import { multiplyMoney } from "@/lib/utils/money";
+// [v4.7] The multi-product receipt body now carries a persisted purchaseDate
+// (the gateway requires a real, non-future, in-window business date).
+import { getBusinessDate } from "@/lib/inventory/date-utils";
 
 function jsonRequest(url: string, method: string, body: unknown): Request {
   return new Request(url, {
@@ -239,6 +249,9 @@ describe("1. Interactive creation routes reject a client-supplied cost figure", 
 describe("2. Multi-product receipt atomicity", () => {
   const twoItemBody = {
     batchNumberSuffix: "INV1",
+    // [v4.7] A persisted goods-receiving date is now required on the whole
+    // submission. "Today" in the merchant's business calendar is always valid.
+    purchaseDate: getBusinessDate(),
     items: [
       { productId: "p1", unitId: "u1", quantity: "6", totalCost: "54000" },
       { productId: "p2", unitId: "u2", quantity: "6", totalCost: "54000" },

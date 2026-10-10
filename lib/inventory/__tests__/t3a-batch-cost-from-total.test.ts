@@ -82,6 +82,9 @@ function makeTx(options: FakeTxOptions = {}) {
         },
       })),
     },
+    // [v4.7] createBatchRow must NEVER create a receipt (only the receiving
+    // gateway does). The spy lets a test prove it.
+    productReceipt: { create: vi.fn() },
     productBatch: {
       create: vi.fn(async ({ data }: any) => {
         created.push(data);
@@ -98,6 +101,11 @@ const baseInput = {
   productId: PRODUCT_ID,
   entryUnitId: ENTRY_UNIT_ID,
   batchNumber: "2026-09-28-INV4471",
+  // [v4.7] createBatchRow requires the receipt it writes under. In
+  // production that id comes from lib/data/receipts.ts's receiving gateway
+  // (the ONLY code that creates a ProductReceipt); this unit test passes it
+  // directly because it exercises the batch writer alone.
+  receiptId: "receipt-1",
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +129,12 @@ describe("createBatchRow — totalCost path (T3a + T4g)", () => {
       quantity: "36.0000", // 6 x factor 6
       costPricePerBaseUnit: "1500.00000000", // 54,000 / 36
     });
+
+    // [v4.7] toMatchObject above ignores the write-once receipt fields, so
+    // they are asserted explicitly here.
+    expect(created[0].receiptId).toBe("receipt-1");
+    expect(created[0].initialQuantity).toBe("36.0000"); // base units, not 6 طرد
+    expect(new Decimal(String(created[0].totalCostSYP)).eq(54000)).toBe(true);
 
     expect(row.baseQuantity).toBe("36.0000");
     expect(row.costPricePerBaseUnit).toBe("1500.00000000");
@@ -518,5 +532,97 @@ describe("createBatchRow — batchNumber input", () => {
 
     await expect(createBatchRow(tx as any, both)).rejects.toThrow();
     expect(created).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [v4.7] Receipt-history write-once fields. These are the values the
+// reconciliation identity (remaining = initialQuantity - netSold + sum of
+// adjustments) and the receipt history screens depend on, so each one is
+// asserted on the row actually handed to productBatch.create.
+describe("createBatchRow — [v4.7] receipt-history write-once fields", () => {
+  const dec = (v: unknown) => new Decimal(String(v));
+
+  it("writes initialQuantity in BASE units (qty x the ENTERED unit's own factor), equal to quantity", async () => {
+    const { tx, created } = makeTx({ factor: "12" });
+
+    await createBatchRow(tx as any, {
+      ...baseInput,
+      quantityInEntryUnit: "7",
+      totalCost: "123456",
+    });
+
+    expect(created[0].quantity).toBe("84.0000"); // 7 x 12
+    expect(created[0].initialQuantity).toBe("84.0000");
+    expect(created[0].initialQuantity).toBe(created[0].quantity);
+  });
+
+  it("passes receiptId through untouched and never creates a receipt itself", async () => {
+    const { tx, created } = makeTx();
+
+    await createBatchRow(tx as any, {
+      ...baseInput,
+      receiptId: "receipt-XYZ",
+      quantityInEntryUnit: "6",
+      totalCost: "54000",
+    });
+
+    expect(created[0].receiptId).toBe("receipt-XYZ");
+    expect((tx as any).productReceipt.create).not.toHaveBeenCalled();
+  });
+
+  it("stores totalCostSYP as the EXACT typed total, not perBase x qty (100,000 over 3 pieces)", async () => {
+    const { tx, created } = makeTx({ factor: "1" });
+
+    await createBatchRow(tx as any, {
+      ...baseInput,
+      quantityInEntryUnit: "3",
+      totalCost: "100000",
+    });
+
+    // The per-unit cost is the lossy, derived value...
+    expect(created[0].costPricePerBaseUnit).toBe("33333.33333333");
+    const rebuilt = dec(created[0].costPricePerBaseUnit).times(created[0].quantity);
+    expect(rebuilt.eq(100000)).toBe(false); // 99999.99999999
+
+    // ...the total is the source of truth and must not drift.
+    expect(dec(created[0].totalCostSYP).eq(100000)).toBe(true);
+  });
+
+  it("CSV path (costPricePerBaseUnit): totalCostSYP = perBase x baseQuantity rounded once to 4 dp", async () => {
+    const { tx, created } = makeTx({ factor: "1" });
+
+    await createBatchRow(tx as any, {
+      ...baseInput,
+      quantityInEntryUnit: "3",
+      costPricePerBaseUnit: "33.33333333",
+    } as any);
+
+    // 33.33333333 x 3 = 99.99999999 -> 100.0000 under any rounding mode.
+    expect(dec(created[0].totalCostSYP).eq(100)).toBe(true);
+    expect(created[0].initialQuantity).toBe("3.0000");
+    expect(created[0].receiptId).toBe("receipt-1");
+  });
+
+  it("writes the same three fields on every call (one row per call, no shared state)", async () => {
+    const { tx, created } = makeTx({ factor: "1" });
+
+    await createBatchRow(tx as any, {
+      ...baseInput,
+      receiptId: "receipt-A",
+      quantityInEntryUnit: "2",
+      totalCost: "500",
+    });
+    await createBatchRow(tx as any, {
+      ...baseInput,
+      receiptId: "receipt-B",
+      batchNumber: "2026-09-28-INV4472",
+      quantityInEntryUnit: "5",
+      totalCost: "1250",
+    });
+
+    expect(created.map((c) => c.receiptId)).toEqual(["receipt-A", "receipt-B"]);
+    expect(created.map((c) => c.initialQuantity)).toEqual(["2.0000", "5.0000"]);
+    expect(created.map((c) => dec(c.totalCostSYP).toNumber())).toEqual([500, 1250]);
   });
 });

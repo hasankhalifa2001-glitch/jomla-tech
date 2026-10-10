@@ -117,12 +117,13 @@ export interface ServerReceiptDetail {
   voidsInvoiceId: string | null;
   voidReason: string | null;
   totalSYP: string;
-  totalUSD: string;
+  // [v4.9] Nullable — null for SYP-only sales with no frozen rate.
+  totalUSD: string | null;
   paidAmountSYP: string;
-  paidAmountUSD: string;
+  paidAmountUSD: string | null;
   debtAmountSYP: string;
-  debtAmountUSD: string;
-  exchangeRateUsed: string;
+  debtAmountUSD: string | null;
+  exchangeRateUsed: string | null;
   /**
    * [Rule 3 reuse] Invoice.receiptPdfUrl as it arrives on the InvoiceDetail wire
    * DTO (lib/data/invoices.ts) / as returned by by-offline-id. OPTIONAL, because
@@ -274,11 +275,14 @@ function saleTotalBlocks(
     });
   }
 
-  blocks.push({
-    type: "row",
-    label: "سعر الصرف المعتمد",
-    value: exchangeRateUsed === null ? "—" : `${sypLabel(exchangeRateUsed)} / $`,
-  });
+  // [v4.9] Omit the rate line entirely when null — no placeholder, no "—".
+  if (exchangeRateUsed !== null) {
+    blocks.push({
+      type: "row",
+      label: "سعر الصرف المعتمد",
+      value: `${sypLabel(exchangeRateUsed)} / $`,
+    });
+  }
 
   return blocks;
 }
@@ -323,11 +327,14 @@ function voidTotalBlocks(
     });
   }
 
-  blocks.push({
-    type: "row",
-    label: "سعر الصرف المعتمد (فاتورة البيع الأصلية)",
-    value: exchangeRateUsed === null ? "—" : `${sypLabel(exchangeRateUsed)} / $`,
-  });
+  // [v4.9] Omit the rate line entirely when null — no placeholder, no "—".
+  if (exchangeRateUsed !== null) {
+    blocks.push({
+      type: "row",
+      label: "سعر الصرف المعتمد (فاتورة البيع الأصلية)",
+      value: `${sypLabel(exchangeRateUsed)} / $`,
+    });
+  }
 
   return blocks;
 }

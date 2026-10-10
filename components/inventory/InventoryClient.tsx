@@ -21,10 +21,12 @@ import {
   Clock,
   Scale,
   Archive,
+  ClipboardList,
   SlidersHorizontal,
   WifiOff,
   type LucideIcon,
 } from "lucide-react";
+import Link from "next/link";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -573,6 +575,25 @@ export function InventoryClient() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+        )}
+
+        {/* [v4.7 Phase 7] Goods-receiving history. Hidden for CASHIER
+            client-side (isAdmin) — the real boundary is server-side: every
+            GET/PATCH /api/receipts* asserts receipts:view/receipts:edit
+            (403 before any query), and the page component redirects a
+            CASHIER away from /inventory/receipts too. */}
+        {isAdmin && (
+          <Link href="/receipts" className="shrink-0">
+            <Button
+              type="button"
+              variant="outline"
+              aria-label="سجل الاستلام"
+              className="h-11 gap-1.5 border-emerald-200 bg-emerald-50/60 px-3 text-emerald-700 hover:bg-emerald-100 sm:h-10 sm:px-4"
+            >
+              <ClipboardList className="size-5 sm:size-4" aria-hidden />
+              <span className="hidden whitespace-nowrap text-xs font-bold sm:inline">سجل الاستلام</span>
+            </Button>
+          </Link>
         )}
 
         <DropdownMenu dir="rtl" modal={false}>

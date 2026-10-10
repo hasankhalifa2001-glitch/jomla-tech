@@ -19,7 +19,6 @@ import {
 import Decimal from "decimal.js";
 import { Prisma } from "@prisma/client";
 import {
-  createBatchRow,
   findClientComputedBatchField,
   batchNumberSuffixSchema,
   expiryDateSchema,
@@ -28,6 +27,9 @@ import {
   InvalidExpiryDateError,
   UnitNotBelongingToProductError,
 } from "@/lib/inventory/batch-creation";
+// [v4.7] The receiving gateway — THE one path that writes a ProductReceipt
+// (and, through it, this screen's single-line receipt + batch).
+import { createReceiptWithBatches, purchaseDateSchema, supplierNameSchema } from "@/lib/data/receipts";
 import { InvalidCostInputError } from "@/lib/inventory/units";
 import { MissingBaseUnitError } from "@/lib/inventory/base-unit";
 import { z } from "zod";
@@ -62,8 +64,13 @@ const createBatchSchema = z.object({
     .string()
     .trim()
     .regex(AMOUNT_REGEX, "صيغة إجمالي التكلفة غير صالحة (مثال: 9000 أو 9000.5).")
-    .refine(isPositiveAmount, { message: "إجمالي تكلفة الشراء يجب أن يكون أكبر من صفر." }),
+    .refine(isPositiveAmount, { message: "لا يمكن قبول سطر بتكلفة صفر — إجمالي تكلفة الشراء يجب أن يكون أكبر من صفر." }),
   expiryDate: expiryDateSchema,
+  // [v4.7] Required goods-receiving date (a Damascus business day, never in
+  // the future) and optional supplier — persisted on the ProductReceipt this
+  // batch is written under.
+  purchaseDate: purchaseDateSchema,
+  supplierName: supplierNameSchema,
 });
 
 export async function POST(req: Request) {
@@ -128,33 +135,46 @@ export async function POST(req: Request) {
       );
     }
 
-    const { productId, unitId, batchNumberSuffix, quantity, totalCost, expiryDate } = validation.data;
+    const { productId, unitId, batchNumberSuffix, quantity, totalCost, expiryDate, purchaseDate, supplierName } =
+      validation.data;
 
+    // [v4.7] ONE receipt for this submission, written by the receiving
+    // gateway in the SAME transaction as the batch — one atomic, single-line
+    // receipt. createBatchRow never creates receipts itself.
     const result = await db.$transaction(async (tx) =>
-      createBatchRow(tx, {
+      createReceiptWithBatches(tx, {
         tenantId,
-        productId,
-        entryUnitId: unitId,
+        userId: session.user.id,
+        purchaseDate,
+        supplierName,
         batchNumberSuffix,
-        quantityInEntryUnit: quantity,
-        totalCost,
-        expiryDate: expiryDate ?? null,
+        lines: [
+          {
+            productId,
+            entryUnitId: unitId,
+            quantity,
+            totalCost,
+            expiryDate: expiryDate ?? null,
+          },
+        ],
       })
     );
+    const row = result.created[0];
 
     const responseBatch = {
-      id: result.batchId,
+      id: row.batchId,
+      receiptId: result.receiptId,
       productId,
-      unitId: result.resolvedBaseUnitId,
-      batchNumber: result.batchNumber,
+      unitId: row.resolvedBaseUnitId,
+      batchNumber: row.batchNumber,
       // [FIX] Decimal string, as stored — never Number(): a Decimal(18,4)
       // value can exceed what a JS double represents exactly.
-      quantity: result.baseQuantity,
-      costPricePerBaseUnit: result.costPricePerBaseUnit, // decimal string, as stored
+      quantity: row.baseQuantity,
+      costPricePerBaseUnit: row.costPricePerBaseUnit, // decimal string, as stored
       expiryDate: expiryDate ? new Date(expiryDate) : null,
       createdAt: new Date(),
-      baseUnitName: result.resolvedBaseUnitName,
-      enteredUnitName: result.enteredUnitName,
+      baseUnitName: row.resolvedBaseUnitName,
+      enteredUnitName: row.enteredUnitName,
     };
 
     return NextResponse.json({
@@ -163,6 +183,14 @@ export async function POST(req: Request) {
       message: "تمت إضافة الدفعة الجديدة بنجاح.",
     });
   } catch (error) {
+    // [v4.7] Backstop: the route schema above validates first, but the
+    // receiving gateway re-validates — a ZodError escaping it is a 400, not a 500.
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: "VALIDATION_ERROR", message: error.issues[0]?.message || "بيانات الدفعة غير صالحة." },
+        { status: 400 }
+      );
+    }
     if (error instanceof ForbiddenRoleError) {
       return forbiddenRoleResponse(error);
     }

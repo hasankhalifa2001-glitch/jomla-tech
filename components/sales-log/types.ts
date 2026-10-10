@@ -26,9 +26,10 @@ export interface InvoiceLogRow {
     createdAt: string;
     status: InvoiceStatusValue;
     totalSYP: string;
-    totalUSD: string;
+    // [v4.9] Nullable — null for SYP-only sales with no frozen rate.
+    totalUSD: string | null;
     paidAmountSYP: string;
-    exchangeRateUsed: string;
+    exchangeRateUsed: string | null;
     paymentStatus: PaymentStatusBadgeValue;
     /** Set only when THIS row is itself a void — points at the original it reverses. */
     voidsInvoiceId: string | null;
@@ -52,7 +53,8 @@ export interface InvoiceDetailItem {
     batchId: string;
     quantity: string;
     unitPriceSYP: string;
-    unitPriceUSD: string;
+    // [v4.9] Nullable per-line USD.
+    unitPriceUSD: string | null;
     /** [v4.4, T4c2] ADMIN-only profit in SYP. Omitted for a CASHIER. */
     profitSYP?: string;
 }
@@ -62,12 +64,13 @@ export interface InvoiceDetail {
     createdAt: string;
     status: InvoiceStatusValue;
     totalSYP: string;
-    totalUSD: string;
-    exchangeRateUsed: string;
+    // [v4.9] Nullable USD + frozen rate — omitted from UI when null.
+    totalUSD: string | null;
+    exchangeRateUsed: string | null;
     paidAmountSYP: string;
-    paidAmountUSD: string;
+    paidAmountUSD: string | null;
     debtAmountSYP: string;
-    debtAmountUSD: string;
+    debtAmountUSD: string | null;
     receiptPdfUrl: string | null;
     voidReason: string | null;
     voidsInvoiceId: string | null;

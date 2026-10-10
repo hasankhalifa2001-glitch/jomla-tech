@@ -33,6 +33,8 @@ import {
   forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { z } from "zod";
+// [v4.7] The receiving gateway's schemas — ONE receipt per import FILE.
+import { purchaseDateSchema, supplierNameSchema } from "@/lib/data/receipts";
 
 const positiveDecimalSchema = z
   .union([z.string(), z.number()])
@@ -218,6 +220,11 @@ const priceUpdateRowSchema = z.object({
 const commitImportSchema = z.object({
   newProducts: z.array(newProductRowSchema).default([]),
   priceUpdates: z.array(priceUpdateRowSchema).default([]),
+  // [v4.7] ONE receipt per FILE (never a per-row column): the goods-receiving
+  // date — a Damascus business day, required, never in the future — plus an
+  // optional supplier, both picked on the upload screen.
+  purchaseDate: purchaseDateSchema,
+  supplierName: supplierNameSchema,
 });
 
 export async function POST(req: Request) {
@@ -248,7 +255,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const { newProducts, priceUpdates } = validation.data;
+    const { newProducts, priceUpdates, purchaseDate, supplierName } = validation.data;
 
     if (newProducts.length === 0 && priceUpdates.length === 0) {
       return NextResponse.json(
@@ -269,6 +276,14 @@ export async function POST(req: Request) {
     const result = await commitCsvImport(db, tenantId, {
       newProducts,
       priceUpdates,
+      // [v4.7] The shared receipt parameters. commitCsvImport creates the
+      // receipt inside the FIRST batch-creating row's transaction and reuses
+      // it for later rows; a file that creates no batch creates no receipt.
+      receipt: {
+        userId: session.user.id,
+        purchaseDate,
+        supplierName,
+      },
     });
 
     // [FIX #1 — critical] `skippedPriceUpdates` and `failedPriceUpdates` are

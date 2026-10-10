@@ -7,7 +7,7 @@ import {
   subtractMoney,
   multiplyMoney,
   sumMoney,
-  convertCurrency,
+  deriveUsd,
   type MoneyInput,
 } from "../utils/money";
 
@@ -114,9 +114,17 @@ export interface OfflinePayment {
   offlineInvoiceId?: string;
   /** AUTHORITATIVE. */
   amountSYP: string;
-  /** Derived/informational. */
-  amountUSD: string;
-  exchangeRate: string;
+  /**
+   * Derived/informational — amountSYP converted at exchangeRate.
+   * Nullable: null whenever no rate was cached when the payment was queued
+   * (never a sentinel 0/1).
+   */
+  amountUSD: string | null;
+  /**
+   * [v4.9] Nullable — null when no cached rate existed when the payment was
+   * queued. An explicit rate <= 0 still throws in the factory below.
+   */
+  exchangeRate: string | null;
   paymentMethod: PaymentMethod;
   receiptNo?: string;
   notes?: string;
@@ -677,11 +685,9 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("debtAmountSYP must equal totalSYP − paidAmountSYP (SYP is authoritative).");
   }
 
-  const totalUSD = rateUsed !== null ? convertCurrency(totalSYP, rateUsed, "SYP", "USD") : null;
-  const paidAmountUSD =
-    rateUsed !== null ? convertCurrency(paidSYP, rateUsed, "SYP", "USD") : null;
-  const debtAmountUSD =
-    rateUsed !== null ? convertCurrency(debtSYP, rateUsed, "SYP", "USD") : null;
+  const totalUSD = deriveUsd(totalSYP, rateUsed);
+  const paidAmountUSD = deriveUsd(paidSYP, rateUsed);
+  const debtAmountUSD = deriveUsd(debtSYP, rateUsed);
 
   return {
     tenantId: data.tenantId,
@@ -693,8 +699,8 @@ export function createOfflineInvoiceRecord(data: {
       unitId: item.unitId,
       quantity: item.quantity,
       unitPriceSYP: item.unitPriceSYP,
-      unitPriceUSD:
-        rateUsed !== null ? convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD") : null,
+      // [v4.9] Single helper decides "USD unavailable" — null when no rate.
+      unitPriceUSD: deriveUsd(item.unitPriceSYP, rateUsed),
     })),
     totalSYP,
     totalUSD,
@@ -853,11 +859,9 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
-  const totalUSD = rateUsed !== null ? convertCurrency(totalSYP, rateUsed, "SYP", "USD") : null;
-  const paidAmountUSD =
-    rateUsed !== null ? convertCurrency(paidSYP, rateUsed, "SYP", "USD") : null;
-  const debtAmountUSD =
-    rateUsed !== null ? convertCurrency(debtSYP, rateUsed, "SYP", "USD") : null;
+  const totalUSD = deriveUsd(totalSYP, rateUsed);
+  const paidAmountUSD = deriveUsd(paidSYP, rateUsed);
+  const debtAmountUSD = deriveUsd(debtSYP, rateUsed);
 
   return {
     tenantId: data.tenantId,
@@ -869,8 +873,8 @@ export function createOfflineVoidRecord(data: {
       unitId: item.unitId,
       quantity: item.quantity,
       unitPriceSYP: item.unitPriceSYP,
-      unitPriceUSD:
-        rateUsed !== null ? convertCurrency(item.unitPriceSYP, rateUsed, "SYP", "USD") : null,
+      // [v4.9] Null stays null on void rows via the single helper.
+      unitPriceUSD: deriveUsd(item.unitPriceSYP, rateUsed),
     })),
     totalSYP,
     totalUSD,
@@ -929,7 +933,7 @@ export function createOfflinePaymentRecord(data: {
     throw new Error("amountSYP must be strictly greater than 0 for a payment record.");
   }
 
-  const amountUSD = convertCurrency(amountSYP, rate, "SYP", "USD");
+  const amountUSD = deriveUsd(amountSYP, rate);
 
   return {
     tenantId: data.tenantId,

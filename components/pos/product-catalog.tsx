@@ -10,7 +10,6 @@ import {
   Package,
   Plus,
   Info,
-  Sparkles,
   RefreshCw,
   AlertTriangle,
 } from "lucide-react";
@@ -22,6 +21,7 @@ import {
   formatStockBreakdown,
 } from "@/lib/offline";
 import { formatMoney } from "@/lib/utils/money";
+import Image from "next/image";
 
 interface ProductCatalogProps {
   products: PosProductItem[];
@@ -30,7 +30,6 @@ interface ProductCatalogProps {
   onSearchChange: (query: string) => void;
   exchangeRate: number | null;
   onAddToCart: (product: PosProductItem, unit: CachedProductUnit) => void;
-  onSeedDemoData: () => void;
   searchInputRef: React.RefObject<HTMLInputElement | null>;
   /**
    * [ADDED — hardware keyboard-wedge scanner support]
@@ -83,7 +82,6 @@ export function ProductCatalog({
   onSearchChange,
   exchangeRate,
   onAddToCart,
-  onSeedDemoData,
   searchInputRef,
   onBarcodeEnter,
 }: ProductCatalogProps) {
@@ -139,13 +137,13 @@ export function ProductCatalog({
           <Input
             ref={searchInputRef}
             type="text"
-            placeholder="ابحث بالاسم، الباركود، أو الوحدة... (F2 للتركيز، Enter للإضافة السريعة)"
+            placeholder="ابحث بالاسم أو الباركود أو الوحدة…"
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
             onKeyDown={(e) => void handleKeyDown(e)}
-            className="pr-9 pl-16 text-xs h-10 rounded-xl bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 shadow-xs"
+            className="pr-9 pl-16 text-sm h-11 rounded-xl bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 shadow-xs"
           />
-          <div className="absolute left-2.5 top-2.5 flex items-center gap-1">
+          <div className="absolute left-2.5 top-3 flex items-center gap-1">
             <kbd className="hidden sm:inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono text-zinc-400 bg-zinc-100 dark:bg-zinc-800 rounded border border-zinc-200 dark:border-zinc-700">
               F2
             </kbd>
@@ -159,7 +157,7 @@ export function ProductCatalog({
             variant="ghost"
             size="sm"
             onClick={() => onSearchChange("")}
-            className="text-xs h-10 px-3 text-zinc-500 hover:text-zinc-800 shrink-0"
+            className="text-xs h-11 px-3 text-zinc-500 hover:text-zinc-800 shrink-0"
           >
             مسح
           </Button>
@@ -189,20 +187,9 @@ export function ProductCatalog({
               <p className="text-xs text-zinc-400 max-w-sm mt-1">
                 {searchQuery
                   ? "جرب البحث بكلمات أخرى أو تحقق من قراءة الباركود بشكل صحيح."
-                  : "يمكنك تحميل بيانات تجريبية فوراً لاختبار نقطة البيع في وضع عدم الاتصال بالكامل."}
+                  : "استخدم زر «مزامنة الأصناف» لتحميل أصناف متجرك، أو أضفها أولاً من صفحة المخزون."}
               </p>
             </div>
-
-            {!searchQuery && (
-              <Button
-                type="button"
-                onClick={onSeedDemoData}
-                className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold gap-2 rounded-xl shadow-md shadow-emerald-600/20"
-              >
-                <Sparkles className="h-4 w-4" />
-                تحميل بيانات تجريبية للمخزن المحلي
-              </Button>
-            )}
           </div>
         ) : (
           // [FIX — responsive grid] The catalog only ever occupies
@@ -218,7 +205,12 @@ export function ProductCatalog({
           // wide enough to hold a 4th column comfortably.
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3 pb-2">
             {products.map((product) => {
-              const defaultUnit = product.units?.find((u) => u.isActive !== false);
+              const activeUnits = product.units?.filter((u) => u.isActive !== false) ?? [];
+              const defaultUnit = activeUnits[0];
+              // The base unit (factor 1) — used only to word each other unit's
+              // size ("= 80 قطعة") so the cashier sees what a carton contains.
+              const baseUnit = product.units?.find((u) => Number(u.conversionFactor) === 1);
+
               // [v3.6] Primary — SYP, authoritative, never requires a rate
               // for a SYP-priced unit.
               const wholesalePriceSYP = defaultUnit
@@ -241,6 +233,12 @@ export function ProductCatalog({
                 breakdownStockByUnits(product.totalCachedStock, product.units || [])
               );
 
+              // [UX] Stock stays INFORMATIONAL (it deliberately never blocks a
+              // sale — see the badge tooltip), but an empty shelf is now
+              // visible at a glance instead of reading like any other number.
+              const stockNumber = Number(product.totalCachedStock);
+              const isOutOfStock = Number.isFinite(stockNumber) && stockNumber <= 0;
+
               return (
                 <Card
                   key={product.id}
@@ -248,65 +246,78 @@ export function ProductCatalog({
                 >
                   <CardContent className="p-3.5 space-y-2.5">
                     {/* Header: Name and Informational Stock Badge */}
-                    <div className="space-y-1">
+                    <div className="space-y-1.5">
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex items-center gap-2 min-w-0">
                           {product.imageUrl && (
-                            <img
+                            <Image
                               src={product.imageUrl}
                               alt={product.name}
-                              className="w-7 h-7 rounded object-cover shrink-0 border border-zinc-200 dark:border-zinc-800"
+                              width={36}
+                              height={36}
+                              className="w-9 h-9 rounded-lg object-cover shrink-0 border border-zinc-200 dark:border-zinc-800"
                             />
                           )}
-                          <h3 className="text-xs font-bold text-zinc-900 dark:text-zinc-100 line-clamp-1 group-hover:text-emerald-600 transition-colors">
+                          <h3 className="text-sm font-bold text-zinc-900 dark:text-zinc-100 line-clamp-2 group-hover:text-emerald-600 transition-colors">
                             {product.name}
                           </h3>
                         </div>
-                        <Badge
-                          variant="secondary"
-                          className="shrink-0 text-[10px] font-mono px-1.5 py-0 bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
-                          title="مستوى المخزون المخزن محلياً (معلوماتي فقط ولا يقيد البيع)"
-                        >
-                          <Info className="h-2.5 w-2.5 ml-1 text-zinc-400" />
-                          المخزون: {stockLabel}
-                        </Badge>
                       </div>
 
-                      <div className="flex items-baseline justify-between gap-2">
-                        <div className="flex items-baseline flex-wrap gap-x-2 gap-y-0.5 min-w-0">
-                          {wholesalePriceSYP !== null ? (
-                            <>
-                              <span className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 font-mono">
-                                {formatMoney(wholesalePriceSYP, "SYP")} ل.س
-                              </span>
-                              {wholesalePriceUSD !== null && (
-                                <span className="text-[11px] font-semibold text-purple-600 dark:text-purple-400">
-                                  ≈ ${formatMoney(wholesalePriceUSD, "USD")}
-                                </span>
-                              )}
-                            </>
-                          ) : (
-                            <Badge
-                              variant="outline"
-                              className="text-[10px] gap-1 text-amber-700 border-amber-300 bg-amber-50 dark:bg-amber-950/50 dark:text-amber-300"
-                            >
-                              <AlertTriangle className="h-3 w-3" />
-                              يتطلب تحديد سعر الصرف اليومي
-                            </Badge>
-                          )}
-                        </div>
-                      </div>
+                      <Badge
+                        variant="secondary"
+                        className={`text-[10px] font-mono px-1.5 py-0.5 ${isOutOfStock
+                          ? "bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/50 dark:text-red-300 dark:border-red-900"
+                          : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                          }`}
+                        title="مستوى المخزون المخزن محلياً (معلوماتي فقط ولا يقيد البيع)"
+                      >
+                        {isOutOfStock ? (
+                          <AlertTriangle className="h-2.5 w-2.5 ml-1 text-red-500" />
+                        ) : (
+                          <Info className="h-2.5 w-2.5 ml-1 text-zinc-400" />
+                        )}
+                        {isOutOfStock ? "نفد المخزون" : `المخزون: ${stockLabel}`}
+                      </Badge>
+
+                      {wholesalePriceSYP === null && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] gap-1 text-amber-700 border-amber-300 bg-amber-50 dark:bg-amber-950/50 dark:text-amber-300"
+                        >
+                          <AlertTriangle className="h-3 w-3" />
+                          يتطلب تحديد سعر الصرف اليومي
+                        </Badge>
+                      )}
+                      {wholesalePriceSYP !== null && wholesalePriceUSD !== null && (
+                        <p className="text-[11px] font-semibold text-purple-600 dark:text-purple-400">
+                          <span dir="ltr" className="inline-block">
+                            ≈ ${formatMoney(wholesalePriceUSD, "USD")}
+                          </span>{" "}
+                          <span className="text-zinc-400 font-normal">للوحدة الأولى</span>
+                        </p>
+                      )}
                     </div>
 
-                    {/* Available Units Grid / Buttons */}
-                    <div className="space-y-1 pt-1 border-t border-zinc-100 dark:border-zinc-800">
-                      <span className="text-[10px] font-semibold text-zinc-400 block">
-                        الوحدات المتوفرة (اختر لإضافة السلة):
+                    {/* [UX] Units as full-width rows (≥44px tall): name on the
+                        right, price on the left in bold. A whole row is the tap
+                        target — much easier with a thumb than small chips. */}
+                    <div className="space-y-1.5 pt-2 border-t border-zinc-100 dark:border-zinc-800">
+                      <span className="text-[11px] font-semibold text-zinc-400 block">
+                        اختر الوحدة لإضافتها للسلة:
                       </span>
-                      <div className="flex flex-wrap gap-1.5">
-                        {product.units?.filter((u) => u.isActive !== false).map((unit) => {
+
+                      {activeUnits.length === 0 && (
+                        <p className="text-xs text-zinc-400">لا توجد وحدة فعّالة لهذا الصنف.</p>
+                      )}
+
+                      <div className="space-y-1.5">
+                        {activeUnits.map((unit) => {
                           const unitPriceSYP = resolveSYPOrNull(unit, product, exchangeRate);
                           const isDisabled = unitPriceSYP === null;
+                          const factor = Number(unit.conversionFactor);
+                          const showFactor =
+                            !!baseUnit && unit.id !== baseUnit.id && Number.isFinite(factor);
                           return (
                             <button
                               key={unit.id}
@@ -320,22 +331,32 @@ export function ProductCatalog({
                                   ? "لا يمكن إضافة هذه الوحدة بدون تحديد سعر الصرف اليومي أولاً"
                                   : undefined
                               }
-                              // [FIX — touch target] py-1.5 on mobile
-                              // (dropping to the original py-1 from `sm:`
-                              // up) so these buttons stay comfortably
-                              // tappable with a thumb on a phone without
-                              // making them bulkier on desktop/mouse use.
-                              className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 sm:py-1 text-right text-[11px] font-medium transition-all ${isDisabled
+                              className={`flex w-full min-h-11 items-center justify-between gap-3 rounded-xl border px-3 py-2 text-right transition-all ${isDisabled
                                 ? "border-zinc-200 bg-zinc-100 text-zinc-400 cursor-not-allowed dark:border-zinc-800 dark:bg-zinc-800/50 dark:text-zinc-600"
-                                : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:border-emerald-600 hover:bg-emerald-50 hover:text-emerald-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-emerald-950/60 dark:hover:text-emerald-300"
+                                : "border-zinc-200 bg-zinc-50 text-zinc-800 hover:border-emerald-600 hover:bg-emerald-50 hover:text-emerald-900 active:scale-[0.99] dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-emerald-950/60 dark:hover:text-emerald-300"
                                 }`}
                             >
-                              <Plus className={`h-3 w-3 shrink-0 ${isDisabled ? "text-zinc-400" : "text-emerald-600"}`} />
-                              <span className="font-semibold">{unit.unitName}</span>
-                              <span className="text-[10px] font-mono opacity-80">
-                                {unitPriceSYP !== null
-                                  ? `(${formatMoney(unitPriceSYP, "SYP")} ل.س)`
-                                  : "(يتطلب سعر الصرف)"}
+                              <span className="flex min-w-0 items-center gap-2">
+                                <Plus
+                                  className={`h-4 w-4 shrink-0 ${isDisabled ? "text-zinc-400" : "text-emerald-600"}`}
+                                />
+                                <span className="min-w-0">
+                                  <span className="block truncate text-sm font-bold">{unit.unitName}</span>
+                                  {showFactor && (
+                                    <span className="block text-[10px] opacity-70">
+                                      = {factor} {baseUnit.unitName}
+                                    </span>
+                                  )}
+                                </span>
+                              </span>
+                              <span className="shrink-0 text-sm font-extrabold tabular-nums">
+                                {unitPriceSYP !== null ? (
+                                  <>
+                                    <span dir="ltr">{formatMoney(unitPriceSYP, "SYP")}</span> ل.س
+                                  </>
+                                ) : (
+                                  <span className="text-[11px] font-medium">يتطلب سعر الصرف</span>
+                                )}
                               </span>
                             </button>
                           );

@@ -113,11 +113,27 @@ CREATE TABLE "ProductBatch" (
     "unitId" TEXT NOT NULL,
     "batchNumber" TEXT NOT NULL,
     "quantity" DECIMAL(18,4) NOT NULL,
+    "initialQuantity" DECIMAL(18,4) NOT NULL,
+    "totalCostSYP" DECIMAL(18,4) NOT NULL,
+    "receiptId" TEXT NOT NULL,
     "expiryDate" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "costPricePerBaseUnit" DECIMAL(18,8) NOT NULL,
 
     CONSTRAINT "ProductBatch_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProductReceipt" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "createdByUserId" TEXT NOT NULL,
+    "supplierName" TEXT,
+    "purchaseDate" DATE NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "ProductReceipt_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -193,12 +209,12 @@ CREATE TABLE "Invoice" (
     "userId" TEXT NOT NULL,
     "customerId" TEXT NOT NULL,
     "totalSYP" DECIMAL(18,4) NOT NULL,
-    "totalUSD" DECIMAL(18,4) NOT NULL,
-    "exchangeRateUsed" DECIMAL(18,4) NOT NULL,
+    "totalUSD" DECIMAL(18,4),
+    "exchangeRateUsed" DECIMAL(18,4),
     "paidAmountSYP" DECIMAL(18,4) NOT NULL,
-    "paidAmountUSD" DECIMAL(18,4) NOT NULL,
+    "paidAmountUSD" DECIMAL(18,4),
     "debtAmountSYP" DECIMAL(18,4) NOT NULL,
-    "debtAmountUSD" DECIMAL(18,4) NOT NULL,
+    "debtAmountUSD" DECIMAL(18,4),
     "isPaid" BOOLEAN NOT NULL DEFAULT false,
     "status" "InvoiceStatus" NOT NULL DEFAULT 'COMPLETED',
     "isSynced" BOOLEAN NOT NULL DEFAULT true,
@@ -221,8 +237,9 @@ CREATE TABLE "InvoiceItem" (
     "unitId" TEXT NOT NULL,
     "batchId" TEXT NOT NULL,
     "quantity" DECIMAL(18,4) NOT NULL,
+    "baseQuantity" DECIMAL(18,4) NOT NULL,
     "unitPriceSYP" DECIMAL(18,4) NOT NULL,
-    "unitPriceUSD" DECIMAL(18,4) NOT NULL,
+    "unitPriceUSD" DECIMAL(18,4),
     "costAmountSYP" DECIMAL(18,4) NOT NULL,
 
     CONSTRAINT "InvoiceItem_pkey" PRIMARY KEY ("id")
@@ -234,8 +251,8 @@ CREATE TABLE "CustomerPayment" (
     "tenantId" TEXT NOT NULL,
     "customerId" TEXT NOT NULL,
     "amountSYP" DECIMAL(18,4) NOT NULL,
-    "amountUSD" DECIMAL(18,4) NOT NULL,
-    "exchangeRate" DECIMAL(18,4) NOT NULL,
+    "amountUSD" DECIMAL(18,4),
+    "exchangeRate" DECIMAL(18,4),
     "paymentMethod" "PaymentMethod" NOT NULL,
     "receiptNo" TEXT,
     "notes" TEXT,
@@ -346,6 +363,9 @@ CREATE TABLE "BatchDeletionLog" (
     "batchNumber" TEXT NOT NULL,
     "quantityAtDeletion" DECIMAL(18,4) NOT NULL,
     "costPriceAtDeletion" DECIMAL(18,8) NOT NULL,
+    "receiptId" TEXT NOT NULL,
+    "initialQuantityAtDeletion" DECIMAL(18,4) NOT NULL,
+    "totalCostAtDeletion" DECIMAL(18,4) NOT NULL,
     "deletedByUserId" TEXT NOT NULL,
     "reason" TEXT NOT NULL,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -431,6 +451,12 @@ CREATE INDEX "ProductBatch_expiryDate_idx" ON "ProductBatch"("expiryDate");
 
 -- CreateIndex
 CREATE INDEX "ProductBatch_tenantId_quantity_idx" ON "ProductBatch"("tenantId", "quantity");
+
+-- CreateIndex
+CREATE INDEX "ProductBatch_receiptId_idx" ON "ProductBatch"("receiptId");
+
+-- CreateIndex
+CREATE INDEX "ProductReceipt_tenantId_purchaseDate_idx" ON "ProductReceipt"("tenantId", "purchaseDate");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Customer_offlineId_key" ON "Customer"("offlineId");
@@ -574,6 +600,9 @@ CREATE INDEX "BatchDeletionLog_tenantId_idx" ON "BatchDeletionLog"("tenantId");
 CREATE INDEX "BatchDeletionLog_batchId_idx" ON "BatchDeletionLog"("batchId");
 
 -- CreateIndex
+CREATE INDEX "BatchDeletionLog_tenantId_receiptId_idx" ON "BatchDeletionLog"("tenantId", "receiptId");
+
+-- CreateIndex
 CREATE INDEX "BaseUnitChangeLog_tenantId_idx" ON "BaseUnitChangeLog"("tenantId");
 
 -- CreateIndex
@@ -620,6 +649,15 @@ ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_productId_fkey" FOREIGN 
 
 -- AddForeignKey
 ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_unitId_fkey" FOREIGN KEY ("unitId") REFERENCES "ProductUnit"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductBatch" ADD CONSTRAINT "ProductBatch_receiptId_fkey" FOREIGN KEY ("receiptId") REFERENCES "ProductReceipt"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductReceipt" ADD CONSTRAINT "ProductReceipt_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductReceipt" ADD CONSTRAINT "ProductReceipt_createdByUserId_fkey" FOREIGN KEY ("createdByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Customer" ADD CONSTRAINT "Customer_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;

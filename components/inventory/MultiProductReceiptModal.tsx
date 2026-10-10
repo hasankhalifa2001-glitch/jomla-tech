@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,15 +25,21 @@ import type { ProductItem } from "@/components/inventory/ProductTable";
 //
 // The three steps the spec defines:
 //   1. Shared batch info — the merchant-supplied part of the batchNumber
-//      (Section 10) plus an OPTIONAL purchase-date note.
+//      (Section 10) plus the REQUIRED purchase date and an optional supplier.
 //   2. A repeatable line-item table — one row per product.
 //   3. Review & save — a short summary, then one "Save batch" action.
+//
+// [v4.7] The purchase date is PERSISTED on the ProductReceipt this
+// submission creates (it used to be a transient, never-saved note — that
+// note and its wording are gone). Its default and bounds come from the
+// SERVER (GET /api/receipts/defaults), never the device clock: if that
+// request fails the preview shows a placeholder and saving stays disabled.
 //
 // The server owns both the date prefix and the transaction:
 //   - batchNumber is built ONCE, server-side, as
 //     "{server-date}-{merchant-supplied part}" (lib/inventory/batch-number.ts).
-//     The date preview rendered in Step 1 below is COSMETIC ONLY — it is
-//     never sent to the server and never influences the stored value.
+//     The date preview rendered in Step 1 is the SERVER's business date —
+//     informational only; it is never sent as the batchNumber itself.
 //   - Every line item becomes its own ProductBatch row inside ONE
 //     $transaction (app/api/inventory/batches/receipt/route.ts), so a
 //     failure partway through leaves no partial batches.
@@ -77,20 +83,13 @@ function isPositiveAmount(value: string): boolean {
 // see lib/inventory/units.ts's identical alias).
 type DecimalInstance = InstanceType<typeof Decimal>;
 
-/**
- * Today's date, DISPLAY ONLY — a cosmetic preview of the date prefix the
- * server will generate at save time, read from the browser's own clock.
- * Never sent to the server; the real prefix always comes from the server's
- * clock at the moment of creation (batch/inventory entry is online-only and
- * admin-facing, so there is no offline-clock-drift concern here — see
- * lib/inventory/batch-number.ts's header).
- */
-function todaysDatePreview(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+// [v4.7] The SERVER-supplied receiving defaults — { businessDate, minDate }
+// from GET /api/receipts/defaults. The default purchase date AND the
+// batchNumber date-prefix preview come from HERE, never from the device
+// clock; when unavailable, saving is disabled rather than falling back.
+interface ReceivingDefaults {
+  businessDate: string;
+  minDate: string;
 }
 
 interface ReceiptItemRow {
@@ -148,19 +147,45 @@ export function MultiProductReceiptModal({
   // [v4.4, Section 10] Only the merchant-supplied SUFFIX is collected — the
   // server builds "{server-date}-{suffix}" once for the whole submission.
   const [batchNumberSuffix, setBatchNumberSuffix] = useState<string>("");
-  // [v4.4, Section 11] TRANSIENT, DISPLAY-ONLY. Shown back to the ADMIN on
-  // the review step as a memory aid. It is never persisted to any database
-  // column and never influences the stored batchNumber's date prefix — the
-  // wording below the field says so explicitly, so the UI cannot imply that
-  // this note is "saved" or "recorded" in a persistent sense.
-  const [purchaseDateNote, setPurchaseDateNote] = useState<string>("");
+  // [v4.7] The PERSISTED goods-receiving date (ProductReceipt.purchaseDate,
+  // required) + optional supplier, and the SERVER defaults that bound them.
+  // Replaces the old transient `purchaseDateNote` (display-only, never
+  // saved) — this field IS saved, and its default comes from
+  // GET /api/receipts/defaults, never the device clock.
+  const [receivingDefaults, setReceivingDefaults] = useState<ReceivingDefaults | null>(null);
+  const [purchaseDate, setPurchaseDate] = useState<string>("");
+  const [supplierName, setSupplierName] = useState<string>("");
   const [items, setItems] = useState<ReceiptItemRow[]>(() => [emptyRow()]);
   const [loading, setLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/receipts/defaults");
+        if (!res.ok) throw new Error("defaults unavailable");
+        const data: ReceivingDefaults = await res.json();
+        if (cancelled) return;
+        setReceivingDefaults(data);
+        setPurchaseDate((prev) => prev || data.businessDate);
+      } catch {
+        if (cancelled) return;
+        // No device-clock fallback: null defaults disable saving entirely.
+        setReceivingDefaults(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   const resetForm = () => {
     setStep(1);
     setBatchNumberSuffix("");
-    setPurchaseDateNote("");
+    setReceivingDefaults(null);
+    setPurchaseDate("");
+    setSupplierName("");
     setItems([emptyRow()]);
   };
 
@@ -248,6 +273,28 @@ export function MultiProductReceiptModal({
       return;
     }
 
+    // [v4.7] The persisted purchase date must exist and sit inside the
+    // SERVER-provided window (string comparisons only — the device clock is
+    // never consulted). Failed defaults ⇒ saving disabled, no fallback.
+    if (!receivingDefaults || !purchaseDate) {
+      toast.error(
+        "تعذّر تحميل تاريخ الاستلام من الخادم — لا يمكن الحفظ بدونه (لا يُستخدم تاريخ الجهاز أبداً)."
+      );
+      return;
+    }
+    if (purchaseDate > receivingDefaults.businessDate) {
+      toast.error("لا يمكن تسجيل استلام بتاريخ في المستقبل.");
+      return;
+    }
+    if (purchaseDate < receivingDefaults.minDate) {
+      toast.error("لا يمكن تسجيل استلام بتاريخ أقدم من سنتين (730 يوماً).");
+      return;
+    }
+    if (!batchNumberSuffix.trim()) {
+      toast.error("يرجى إدخال الجزء الخاص برقم الدفعة.");
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -256,6 +303,10 @@ export function MultiProductReceiptModal({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           batchNumberSuffix: batchNumberSuffix.trim(),
+          // [v4.7] PERSISTED on the ProductReceipt this submission creates —
+          // required business date + optional supplier (≤120 chars).
+          purchaseDate,
+          ...(supplierName.trim() ? { supplierName: supplierName.trim() } : {}),
           items: items.map((row) => ({
             productId: row.productId,
             unitId: row.unitId,
@@ -269,9 +320,6 @@ export function MultiProductReceiptModal({
             // server never receives an empty-string date.
             ...(row.expiryDate ? { expiryDate: row.expiryDate } : {}),
           })),
-          // Sent when present, and deliberately IGNORED server-side (never
-          // persisted to any column) — see the field's note in the route.
-          ...(purchaseDateNote.trim() ? { purchaseDateNote: purchaseDateNote.trim() } : {}),
         }),
       });
 
@@ -349,9 +397,15 @@ export function MultiProductReceiptModal({
                 <span
                   className="h-9 shrink-0 rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800 px-3 text-sm text-zinc-500 flex items-center"
                   dir="ltr"
-                  title="التاريخ الفعلي المخزَّن يُولَّد من خادم النظام وقت الحفظ — هذا عرض تقريبي فقط."
+                  title={
+                    receivingDefaults
+                      ? "تاريخ الخادم (يوم العمل الحالي) — التاريخ الفعلي يُولَّد من الخادم وقت الحفظ."
+                      : "تعذّر تحميل تاريخ الخادم — الحفظ معطّل حتى يعود التحميل."
+                  }
                 >
-                  {todaysDatePreview()}-
+                  {/* [v4.7] Server business date — NEVER the device clock;
+                      placeholder while the defaults request is unavailable. */}
+                  {receivingDefaults ? `${receivingDefaults.businessDate}-` : "—-"}
                 </span>
                 <Input
                   placeholder="مثال: 1 أو INV4471"
@@ -365,19 +419,45 @@ export function MultiProductReceiptModal({
               </p>
             </div>
 
-            <div className="space-y-2">
-              <Label>ملاحظة تاريخ الشراء (اختياري)</Label>
-              <Input
-                type="date"
-                value={purchaseDateNote}
-                onChange={(e) => setPurchaseDateNote(e.target.value)}
-              />
-              {/* The note must never read as something the system stores. */}
-              <p className="text-xs text-zinc-500">
-                للتنبيه فقط — لا يُحفظ في النظام ولا يؤثر على تاريخ الدفعة المسجَّل. يُستخدم لتذكيرك أثناء المراجعة،
-                ورقم الدفعة يحمل دائماً تاريخ الحفظ الفعلي من الخادم.
-              </p>
+            {/* [v4.7] The PERSISTED purchase date + optional supplier
+                (ProductReceipt.purchaseDate / supplierName) — replaces the
+                old transient "purchase-date note" that was never saved.
+                Defaults/bounds come from GET /api/receipts/defaults; the
+                device clock is never consulted. */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>تاريخ الشراء (يوم الاستلام) *</Label>
+                <Input
+                  type="date"
+                  value={purchaseDate}
+                  min={receivingDefaults?.minDate}
+                  max={receivingDefaults?.businessDate}
+                  onChange={(e) => setPurchaseDate(e.target.value)}
+                  required
+                  disabled={!receivingDefaults}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>المورّد (اختياري)</Label>
+                <Input
+                  type="text"
+                  maxLength={120}
+                  placeholder="مثال: مورد الشام"
+                  value={supplierName}
+                  onChange={(e) => setSupplierName(e.target.value)}
+                />
+              </div>
             </div>
+            <p className="text-xs text-zinc-500">
+              يُحفظ تاريخ الشراء في سجل الاستلام فعلياً (مع هذه العملية)، ويُستخدم لاحقاً في سجل
+              الاستلامات. النطاق: من {receivingDefaults?.minDate || "—"} حتى{" "}
+              {receivingDefaults?.businessDate || "—"} (من الخادم).
+            </p>
+            {!receivingDefaults && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                تعذّر تحميل تاريخ الاستلام من الخادم — أعد فتح النافذة للمحاولة مجدداً.
+              </p>
+            )}
           </div>
         )}
 
@@ -607,11 +687,17 @@ export function MultiProductReceiptModal({
                 </span>{" "}
                 (يُبنى عند الحفظ من تاريخ الخادم الفعلي).
               </p>
-              {purchaseDateNote.trim() !== "" && (
+              {/* [v4.7] These ARE persisted on the ProductReceipt — shown
+                  back as a fact, not as a transient memory aid. */}
+              <p>
+                تاريخ الشراء المسجَّل:{" "}
+                <span className="font-mono text-zinc-800 dark:text-zinc-200">{purchaseDate || "—"}</span>
+                {" — "}
+                <span className="text-zinc-500">يُحفظ في سجل الاستلام مع هذه العملية.</span>
+              </p>
+              {supplierName.trim() && (
                 <p>
-                  {/* Shown back as a memory aid ONLY — never persisted. */}
-                  ملاحظة الشراء: {purchaseDateNote.trim()} —{" "}
-                  <span className="text-zinc-500">للتنبيه فقط ولا تُحفظ في النظام.</span>
+                  المورّد: <span className="text-zinc-800 dark:text-zinc-200">{supplierName.trim()}</span>
                 </p>
               )}
             </div>

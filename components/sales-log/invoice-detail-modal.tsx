@@ -87,7 +87,8 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
             <div className="divide-y divide-zinc-100 dark:divide-zinc-800/60">
                 {detail.items.map((item) => {
                     const lineSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
-                    const lineUSD = multiplyMoney(item.unitPriceUSD, item.quantity);
+                    // [v4.9] Null-safe per-line USD — omitted when no rate.
+                    const lineUSD = item.unitPriceUSD !== null ? multiplyMoney(item.unitPriceUSD, item.quantity) : null;
 
                     return (
                         <div key={item.id} className="grid grid-cols-12 items-start gap-2 px-3 py-2 text-xs">
@@ -105,16 +106,22 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
                             <div className="col-span-5 text-left">
                                 <p className="font-mono text-[11px] text-zinc-500">
                                     {formatMoney(item.unitPriceSYP, "SYP")} ل.س
-                                    <span className="mx-1 text-zinc-300 dark:text-zinc-700">|</span>
-                                    <span className="text-purple-600 dark:text-purple-400">
-                                        ≈ ${formatMoney(item.unitPriceUSD, "USD")}
-                                    </span>
+                                    {item.unitPriceUSD !== null && (
+                                        <>
+                                            <span className="mx-1 text-zinc-300 dark:text-zinc-700">|</span>
+                                            <span className="text-purple-600 dark:text-purple-400">
+                                                ≈ ${formatMoney(item.unitPriceUSD, "USD")}
+                                            </span>
+                                        </>
+                                    )}
                                 </p>
                                 <p className="font-mono font-bold text-zinc-900 dark:text-zinc-100">
                                     {formatMoney(lineSYP, "SYP")} ل.س
-                                    <span className="mr-1 text-[10px] font-semibold text-purple-600 dark:text-purple-400">
-                                        (≈ ${formatMoney(lineUSD, "USD")})
-                                    </span>
+                                    {lineUSD !== null && (
+                                        <span className="mr-1 text-[10px] font-semibold text-purple-600 dark:text-purple-400">
+                                            (≈ ${formatMoney(lineUSD, "USD")})
+                                        </span>
+                                    )}
                                 </p>
                                 {/* [v4.4, T4c2] ADMIN-only profit display. When the
                                     caller is a CASHIER, `item.profitSYP` is undefined
@@ -306,8 +313,8 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
 
                         <LineItemsTable detail={detail} />
 
-                        {/* Totals — SYP primary, USD secondary, both frozen
-                            on the invoice itself (its own exchangeRateUsed). */}
+                        {/* Totals — SYP primary, USD secondary (omitted when null),
+                            both frozen on the invoice itself (its own exchangeRateUsed). */}
                         <div className="space-y-1.5 rounded-lg border border-zinc-200 p-3 text-xs dark:border-zinc-800">
                             <div className="flex items-center justify-between">
                                 <span className="text-zinc-500">إجمالي الفاتورة</span>
@@ -315,9 +322,11 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                                     <span className="font-mono text-sm font-extrabold text-emerald-700 dark:text-emerald-400">
                                         {formatMoney(detail.totalSYP, "SYP")} ل.س
                                     </span>
-                                    <span className="mr-1 font-mono text-[11px] font-semibold text-purple-600 dark:text-purple-400">
-                                        (≈ ${formatMoney(detail.totalUSD, "USD")})
-                                    </span>
+                                    {detail.totalUSD !== null && (
+                                        <span className="mr-1 font-mono text-[11px] font-semibold text-purple-600 dark:text-purple-400">
+                                            (≈ ${formatMoney(detail.totalUSD, "USD")})
+                                        </span>
+                                    )}
                                 </div>
                             </div>
 
@@ -339,9 +348,11 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                                     <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
                                         {formatMoney(detail.paidAmountSYP, "SYP")} ل.س
                                     </span>
-                                    <span className="mr-1 font-mono text-[10px] text-purple-600 dark:text-purple-400">
-                                        (≈ ${formatMoney(detail.paidAmountUSD, "USD")})
-                                    </span>
+                                    {detail.paidAmountUSD !== null && (
+                                        <span className="mr-1 font-mono text-[10px] text-purple-600 dark:text-purple-400">
+                                            (≈ ${formatMoney(detail.paidAmountUSD, "USD")})
+                                        </span>
+                                    )}
                                 </div>
                             </div>
 
@@ -351,18 +362,23 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                                     <span className="font-mono font-bold text-red-600 dark:text-red-400">
                                         {formatMoney(detail.debtAmountSYP, "SYP")} ل.س
                                     </span>
-                                    <span className="mr-1 font-mono text-[10px] text-purple-600 dark:text-purple-400">
-                                        (≈ ${formatMoney(detail.debtAmountUSD, "USD")})
-                                    </span>
+                                    {detail.debtAmountUSD !== null && (
+                                        <span className="mr-1 font-mono text-[10px] text-purple-600 dark:text-purple-400">
+                                            (≈ ${formatMoney(detail.debtAmountUSD, "USD")})
+                                        </span>
+                                    )}
                                 </div>
                             </div>
 
-                            <div className="flex items-center justify-between border-t border-zinc-200 pt-1.5 dark:border-zinc-800">
-                                <span className="text-zinc-500">سعر الصرف المعتمد على الفاتورة</span>
-                                <span className="font-mono text-zinc-600 dark:text-zinc-400">
-                                    {formatMoney(detail.exchangeRateUsed, "SYP")} ل.س / $
-                                </span>
-                            </div>
+                            {/* [v4.9] Omit the rate line entirely when null. */}
+                            {detail.exchangeRateUsed !== null && (
+                                <div className="flex items-center justify-between border-t border-zinc-200 pt-1.5 dark:border-zinc-800">
+                                    <span className="text-zinc-500">سعر الصرف المعتمد على الفاتورة</span>
+                                    <span className="font-mono text-zinc-600 dark:text-zinc-400">
+                                        {formatMoney(detail.exchangeRateUsed, "SYP")} ل.س / $
+                                    </span>
+                                </div>
+                            )}
                         </div>
 
                         {/*

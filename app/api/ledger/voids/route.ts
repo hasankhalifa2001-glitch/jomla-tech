@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import { auth } from "@/auth";
 import {
   assertTenantWritable,
@@ -15,12 +16,26 @@ import { Prisma } from "@prisma/client";
 // [v4.1] Money negation goes through lib/utils/money.ts — never a raw
 // new Decimal(x).negated() — per that file's own scope note. The sync
 // engine's void path (app/api/sync/route.ts) negates identically.
-import { subtractMoney } from "@/lib/utils/money";
-import {
-  getUnitConversionFactor,
-  toBaseUnit,
-} from "@/lib/inventory/units";
+// [v4.9] Nullable USD uses negateNullableMoney (null stays null).
+import { negateNullableMoney, subtractMoney } from "@/lib/utils/money";
 import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
+
+// [v4.8] getUnitConversionFactor / toBaseUnit are NO LONGER imported here.
+// Inventory restoration reads InvoiceItem.baseQuantity (the exact base-unit
+// amount deducted at sale time) instead of converting the sale-unit
+// `quantity` back — that conversion used rounded figures for sales split
+// across batches (0.8333 x 24 = 19.9992) and corrupted batch quantities.
+
+// [v4.9] Request body validation. Previously the handler destructured the
+// raw JSON and called `voidReason.trim()` directly: a non-string voidReason
+// (number/object from a hand-made request) threw a TypeError and surfaced as
+// a 500, and malformed JSON threw out of `req.json()` and did the same.
+// Both are client errors and now return 400. `.trim()` inside the schema
+// also means `voidReason` below is already trimmed.
+const voidBodySchema = z.object({
+  invoiceId: z.string().min(1),
+  voidReason: z.string().trim().min(1),
+});
 
 export async function POST(req: Request) {
   try {
@@ -36,15 +51,16 @@ export async function POST(req: Request) {
     // Security boundary: assert tenant subscription is active.
     await assertTenantWritable(session.user.tenantId);
 
-    const body = await req.json();
-    const { invoiceId, voidReason } = body;
-
-    if (!invoiceId || !voidReason || !voidReason.trim()) {
+    // [v4.9] `.catch(() => null)` turns malformed JSON into a 400 instead
+    // of an unhandled throw (500).
+    const parsedBody = voidBodySchema.safeParse(await req.json().catch(() => null));
+    if (!parsedBody.success) {
       return NextResponse.json(
         { error: "VALIDATION_ERROR", message: "يجب تحديد الفاتورة وسبب الإلغاء." },
         { status: 400 }
       );
     }
+    const { invoiceId, voidReason } = parsedBody.data;
 
     const tenantId = session.user.tenantId;
     const adminUserId = session.user.id;
@@ -53,11 +69,10 @@ export async function POST(req: Request) {
     // [FIX] Single read carrying everything the rest of this handler
     // needs — the previous version fetched the invoice TWICE (once for
     // an early check, once with items). `batch`/`unit` are NOT included
-    // here — the restore logic below resolves the sold unit's factor
-    // exclusively through getUnitConversionFactor() (the sanctioned
-    // gateway), so a raw ProductUnit/ProductBatch relation carrying
-    // conversionFactor has no legitimate reason to be fetched into this
-    // route at all.
+    // here — [v4.8] the restore logic below needs no unit factor at all
+    // (it reads InvoiceItem.baseQuantity), so no ProductUnit/ProductBatch
+    // relation carrying conversionFactor has any reason to be fetched into
+    // this route.
     const originalInvoice = await db.invoice.findUnique({
       where: { id: invoiceId, tenantId },
       include: { items: true },
@@ -225,26 +240,35 @@ export async function POST(req: Request) {
           // statement feature are entirely unaffected by a later void.
           customerId: await resolveActiveCustomerId(tx, tenantId, originalInvoice.customerId),
           totalSYP: subtractMoney("0", originalInvoice.totalSYP.toString()),
-          totalUSD: subtractMoney("0", originalInvoice.totalUSD.toString()),
-          exchangeRateUsed: originalInvoice.exchangeRateUsed,
+          // [v4.9] Copies the ORIGINAL rate and negates stored USD (null
+          // stays null) — never the payload/current rate.
+          totalUSD: negateNullableMoney(originalInvoice.totalUSD?.toString() ?? null),
+          exchangeRateUsed: originalInvoice.exchangeRateUsed?.toString() ?? null,
           paidAmountSYP: subtractMoney("0", originalInvoice.paidAmountSYP.toString()),
-          paidAmountUSD: subtractMoney("0", originalInvoice.paidAmountUSD.toString()),
+          paidAmountUSD: negateNullableMoney(originalInvoice.paidAmountUSD?.toString() ?? null),
           debtAmountSYP: subtractMoney("0", originalInvoice.debtAmountSYP.toString()),
-          debtAmountUSD: subtractMoney("0", originalInvoice.debtAmountUSD.toString()),
+          debtAmountUSD: negateNullableMoney(originalInvoice.debtAmountUSD?.toString() ?? null),
           isPaid: originalInvoice.isPaid,
           status: "VOIDED",
           isSynced: true,
+          // [v4.9] Online void is written to the server directly, so it is
+          // "synced" at creation — stamp syncedAt like the sync engine does,
+          // so any report that reads syncedAt sees a consistent value.
+          syncedAt: new Date(),
           voidsInvoiceId: originalInvoice.id,
-          voidReason: voidReason.trim(),
+          // already trimmed by voidBodySchema
+          voidReason,
         },
       });
 
       // Step 2: Create void invoice items.
       // quantity = negated original (display only, never what's applied
-      //   to the batch); unitId = same original sold unit; batchId =
-      //   same as the original item.batchId; unitPriceSYP/USD = UNCHANGED
-      //   (never negated) — negating price too would double-negate the
-      //   line total and break the ledger's zero-sum property.
+      //   to the batch); baseQuantity = negated original base-unit amount
+      //   (exactly what is given back to the batch below); unitId = same
+      //   original sold unit; batchId = same as the original item.batchId;
+      //   unitPriceSYP/USD = UNCHANGED (never negated) — negating price too
+      //   would double-negate the line total and break the ledger's
+      //   zero-sum property.
       const voidItems = [];
       for (const item of originalInvoice.items) {
         const voidItem = await tx.invoiceItem.create({
@@ -254,12 +278,14 @@ export async function POST(req: Request) {
             productId: item.productId,
             unitId: item.unitId,
             batchId: item.batchId,
-            // Negated in the SOLD unit — display only, never the base-unit
-            // figure applied to the batch below (two distinct values, equal
-            // only when the sold unit IS the base unit). subtractMoney(0, x)
-            // is the same negation the sync engine's void path applies to
-            // each original batch portion.
+            // Negated in the SOLD unit — display only (receipts, sales-log
+            // detail). subtractMoney(0, x) is the same negation the sync
+            // engine's void path applies to each original batch portion.
             quantity: subtractMoney("0", item.quantity.toString()),
+            // [v4.8] The exact base-unit amount being restored, negated —
+            // original + void sum to exactly zero per batch, with no
+            // dependence on any conversionFactor or rounded sale-unit value.
+            baseQuantity: subtractMoney("0", item.baseQuantity.toString()),
             unitPriceSYP: item.unitPriceSYP,
             unitPriceUSD: item.unitPriceUSD,
             // [v4.4, T4g] A voided line always carries a NEGATIVE costAmountSYP
@@ -278,16 +304,16 @@ export async function POST(req: Request) {
       }
 
       // Step 3: Restore inventory to the original batches. Never
-      // requireBaseUnit() — that resolves the base unit (factor always
-      // 1), not the unit actually sold. Never commitFifoAllocation — a
-      // void restores to a pre-determined batch, it does not reallocate.
+      // requireBaseUnit() / never commitFifoAllocation — a void restores to
+      // a pre-determined batch, it does not reallocate. [v4.8] The amount
+      // restored is the stored InvoiceItem.baseQuantity itself: exactly what
+      // was deducted, with no unit conversion (the previous
+      // toBaseUnit(item.quantity, soldUnitFactor) multiplied a ROUNDED
+      // sale-unit share — 0.8333 x 24 = 19.9992 — back into base units).
       for (const item of originalInvoice.items) {
-        const soldUnitFactor = await getUnitConversionFactor(tx, tenantId, item.unitId);
-        const restoreQtyInBaseUnit = toBaseUnit(item.quantity.toString(), soldUnitFactor);
-
         await tx.productBatch.update({
           where: { id: item.batchId, tenantId },
-          data: { quantity: { increment: restoreQtyInBaseUnit.toString() } },
+          data: { quantity: { increment: item.baseQuantity.toString() } },
         });
       }
 

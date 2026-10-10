@@ -1,5 +1,6 @@
 /**
- * lib/inventory/units.ts — see prior turns for full header/rationale.
+ * lib/inventory/units.ts — unit conversion & cost helpers (the ONLY file allowed to name
+ * `conversionFactor` in a select).
  * This revision: tx typed as TenantTransactionClient; toDisplayUnits()
  * serializes priceWholesale to a string consistently;
  * validatePackagingUnits()'s duplicate-base-unit check now fires inside
@@ -268,7 +269,12 @@ export class InvalidCostInputError extends Error {
 // column holds, so no two screens can drift on precision.
 export const COST_PER_BASE_UNIT_REGEX = /^\d{1,10}(\.\d{1,8})?$/;
 // ProductBatch.costPricePerBaseUnit is Decimal(18,8): max 10 integer digits.
-const MAX_COST_PER_BASE_UNIT = new Decimal("9999999999.99999999");
+export const MAX_COST_PER_BASE_UNIT = new Decimal("9999999999.99999999");
+
+// [v4.7] THE one pattern for an entered quantity / total cost
+// (Decimal(18,4): up to 14 integer digits + up to 4 decimals). Shared by the
+// creation helper, the receiving gateway and the CSV commit route.
+export const AMOUNT_REGEX = /^\d{1,14}(\.\d{1,4})?$/;
 
 function toDecimalOrThrow(value: Numeric): DecimalInstance {
     try {
@@ -294,7 +300,7 @@ export function costFromTotal(
     const qty = toDecimalOrThrow(quantityInPurchaseUnit);
     const factor = toDecimalOrThrow(purchaseUnitConversionFactor);
 
-    if (!total.gt(0)) throw new InvalidCostInputError("إجمالي تكلفة الشراء يجب أن يكون أكبر من صفر.");
+    if (!total.gt(0)) throw new InvalidCostInputError("لا يمكن قبول سطر بتكلفة صفر — إجمالي تكلفة الشراء يجب أن يكون أكبر من صفر.");
     if (!qty.gt(0)) throw new InvalidCostInputError("الكمية يجب أن تكون أكبر من صفر.");
     if (!factor.gt(0)) throw new InvalidCostInputError("معامل تحويل وحدة الشراء غير صالح.");
 
@@ -390,19 +396,12 @@ export function batchCostDisplayLines(
 
 
 /**
- * ADD THIS to lib/inventory/units.ts (it is the only file allowed to name
- * `conversionFactor` in a select). It is NOT a standalone file.
- *
  * [T4h] Batch version of getUnitConversionFactor(): ONE query for any number
  * of sold-unit ids instead of one query per unit. Used by
  * lib/data/products.ts's listUnitConversionFactors() on every /dashboard load.
  *
- * NOTE: written without access to the current units.ts. If
- * getUnitConversionFactor() performs extra validation (e.g. rejects a
- * non-positive factor, or throws on a missing unit), mirror that validation
- * inside the loop below so both readers behave identically. TxOrClient is
- * already imported in units.ts per the existing getUnitConversionFactor()
- * signature.
+ * NOTE: if getUnitConversionFactor() ever adds validation, mirror it in the
+ * loop below so both readers behave identically.
  *
  * A unit id with no row for this tenant simply has no map entry; the caller
  * decides what that means.
@@ -425,4 +424,92 @@ export async function getUnitConversionFactors(
         result.set(row.id, row.conversionFactor.toString());
     }
     return result;
+}
+
+/**
+ * [v4.7 — Phase 6] netSoldInBaseUnit — THE reconciliation reader: the ONE
+ * place a set of InvoiceItem quantities (in their SALE units) becomes a net
+ * sold figure in the product's BASE unit, for the goods-receiving history's
+ * identity check:
+ *
+ *     remaining = initialQuantity − netSold + Σ StockAdjustment.quantityDelta
+ *
+ * WHY THIS SHAPE
+ *   - Rows are passed in WITH their unitId because InvoiceItem.quantity is
+ *     recorded in whichever unit the customer bought (schema.prisma's
+ *     InvoiceItem note) — converting it anywhere outside this file is
+ *     exactly the rounding-error class CONVERSION_FACTOR_RULES exists to
+ *     prevent. Callers aggregate per (batchId, unitId) first — legal,
+ *     because the factor is constant within a unit, so summing raw
+ *     quantities before multiplying is algebraically identical to
+ *     converting each row then summing (decimal.js makes both exact).
+ *   - EVERY row counts: voided sales are stored as NEGATIVE quantities in
+ *     the sale unit (app/api/ledger/voids/route.ts), so summing all rows
+ *     nets the reversal out — there is no status filtering here on purpose.
+ *     A void's mirror row plus its original must contribute exactly zero.
+ *   - A unit id with no factor in the map is a data-integrity bug (units are
+ *     never hard-deleted; InvoiceItem.unit is Restrict) and THROWS rather
+ *     than silently assuming factor 1 — same fail-loud posture as
+ *     lib/data/analytics.ts's buildProductAggregates(). Assuming 1 would
+ *     produce a plausible-but-wrong "reconciled" figure, which for stock
+ *     bookkeeping is worse than an error.
+ *   - Exact decimal equality, never epsilon: every value involved is stored
+ *     at Decimal(18,4) or finer and factors are exact decimal strings, so
+ *     the identity either holds to the digit or it does not. A batch that
+ *     fails the check indicates a quantity-drift bug (see schema.prisma's
+ *     [v4.7] header), not a display problem to be smoothed over.
+ *
+ * The identity itself (initial − netSold + adjustments vs. remaining) is
+ * evaluated by reconciliationIdentityHolds() below — also here, so no
+ * quantity arithmetic of any kind lands in lib/data/receipt-history.ts.
+ */
+export interface NetSoldRow {
+    unitId: string;
+    quantity: Numeric;
+}
+
+export function netSoldInBaseUnit(
+    rows: ReadonlyArray<NetSoldRow>,
+    factorByUnitId: ReadonlyMap<string, Numeric>
+): DecimalInstance {
+    let total = new Decimal(0);
+    for (const row of rows) {
+        const factor = factorByUnitId.get(row.unitId);
+        if (factor === undefined) {
+            throw new Error(
+                `netSoldInBaseUnit: no conversion factor for unit "${row.unitId}" — ` +
+                `data-integrity problem (units are never hard-deleted; InvoiceItem.unit is Restrict).`
+            );
+        }
+        total = total.plus(toBaseUnit(row.quantity, factor));
+    }
+    return total;
+}
+
+/**
+ * [v4.7 — Phase 6] The reconciliation identity, evaluated with EXACT decimal
+ * equality (Decimal.equals — no epsilon, no rounding tolerance):
+ *
+ *     remaining === initialQuantity − netSold + Σ adjustments
+ *
+ * All four values are decimal STRINGS straight off the storage columns (or
+ * from netSoldInBaseUnit().toString()); this function is the only place they
+ * are combined, so lib/data/receipt-history.ts itself performs no quantity
+ * arithmetic at all. Returns false — never throws — on unparseable input:
+ * a drifted batch must render as "not reconciled", not crash the screen.
+ */
+export function reconciliationIdentityHolds(values: {
+    initialQuantity: Numeric;
+    netSold: Numeric;
+    adjustments: Numeric;
+    remaining: Numeric;
+}): boolean {
+    try {
+        const expected = new Decimal(values.initialQuantity)
+            .minus(new Decimal(values.netSold))
+            .plus(new Decimal(values.adjustments));
+        return new Decimal(values.remaining).equals(expected);
+    } catch {
+        return false;
+    }
 }

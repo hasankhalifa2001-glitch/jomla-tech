@@ -236,6 +236,46 @@ export function convertCurrency(
 }
 
 /**
+ * [v4.9] THE ONLY place that decides "USD unavailable".
+ *
+ * Derives the informational USD figure from an authoritative SYP amount and
+ * the rate frozen at the moment of the transaction. Returns null when no
+ * usable rate exists (null/undefined/empty, non-numeric, or <= 0) — never a
+ * sentinel 0/1. Every write path and every UI view-model must go through
+ * this helper; no ad-hoc null checks scattered around.
+ */
+export function deriveUsd(amountSYP: MoneyInput, rate: MoneyInput | string | null | undefined): string | null {
+  if (rate === null || rate === undefined) {
+    return null;
+  }
+  if (typeof rate === "string" && rate.trim() === "") {
+    return null;
+  }
+  let parsed: MoneyDecimal;
+  try {
+    parsed = toDecimal(rate as MoneyInput);
+  } catch {
+    return null;
+  }
+  if (parsed.isZero() || parsed.isNegative()) {
+    return null;
+  }
+  return convertCurrency(amountSYP, parsed, "SYP", "USD");
+}
+
+/**
+ * [v4.9] Void-row negation for NULLABLE USD fields: null stays null,
+ * otherwise subtractMoney("0", x). Use for void rows that negate the
+ * ORIGINAL invoice's stored USD values.
+ */
+export function negateNullableMoney(value: MoneyInput | null | undefined): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return subtractMoney("0", value);
+}
+
+/**
  * Compares two monetary values. Returns -1 if a < b, 0 if a == b, 1 if a > b.
  */
 export function compareMoney(a: MoneyInput, b: MoneyInput): number {

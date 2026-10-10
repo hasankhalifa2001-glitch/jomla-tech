@@ -1,62 +1,58 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @next/next/no-img-element */
 "use client";
 
 import { useState, useRef } from "react";
-import Image from "next/image";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
-import { Badge } from "@/components/ui/badge";
 import {
   Package,
-  Layers,
   Plus,
   Trash2,
-  Barcode as BarcodeIcon,
   Camera,
-  Image as ImageIcon,
   Globe,
   Loader2,
   CheckCircle2,
   Flag,
+  ImagePlus,
+  Crop,
+  Info,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ImageCropModal } from "@/components/inventory/ImageCropModal";
 import { CatalogReportModal } from "@/components/inventory/CatalogReportModal";
+import { DecimalInput } from "@/components/inventory/DecimalInput";
 import {
   BarcodeSourceModal,
   type BarcodeSourceChoice,
   type BarcodeSourceCandidate,
   type BarcodeSourceSelection,
 } from "@/components/inventory/BarcodeSourceModal";
-// [FIX] lib/inventory/packaging-unit-validation.ts was deleted when
-// validatePackagingUnits() was merged into lib/inventory/units.ts. This
-// file was still importing from the deleted path — same fix already
-// applied to AddProductModal.tsx.
+import { ModalShell, Field, Segmented } from "@/components/inventory/modal-ui";
+import { StatusBadge } from "@/components/inventory/status-badge";
+// validatePackagingUnits() lives in lib/inventory/units.ts (the old
+// packaging-unit-validation.ts was deleted when it was merged in).
 import { validatePackagingUnits } from "@/lib/inventory/units";
 import { checkProductPublishable } from "@/lib/inventory/publishing-gate";
 import type { ProductItem } from "@/components/inventory/ProductTable";
 
-// [FIX] `[id]/route.ts`'s PATCH validates conversionFactor/priceWholesale
-// as decimal STRINGS (regex-checked, max 4 decimal places).
-// This modal's internal state stays `number`, but every such value
-// crossing into the PATCH payload must go through this helper rather than
-// a raw `String(...)` cast — see AddProductModal.tsx's identical helper
-// for the full reasoning (floating-point noise, regex compliance).
+// `[id]/route.ts`'s PATCH validates conversionFactor/priceWholesale as decimal
+// STRINGS (regex-checked, max 4 decimal places). This modal's internal state
+// stays `number`, but every such value crossing into the PATCH payload goes
+// through this helper rather than a raw `String(...)` cast — see
+// AddProductModal.tsx's identical helper for the reasoning (floating-point
+// noise, regex compliance).
 const toDecimalString = (value: number): string => {
   if (!Number.isFinite(value)) return "0";
   return value.toFixed(4);
 };
+
+/** "كرتونة" → "الكرتونة"; a name that already starts with "ال" is left alone. */
+const withAl = (name: string): string => (name.startsWith("ال") ? name : `ال${name}`);
 
 export interface EditUnitForm {
   id?: string;
@@ -72,7 +68,7 @@ export interface EditUnitForm {
   // confirmed value moves into `barcodes` above, and a dismissed one is
   // discarded entirely (spec: "the barcode value itself is also not saved").
   barcodeDraft: string;
-  // [v4.6] imageUrl removed — the image lives on the Product, not on individual units.
+  // [v4.6] imageUrl removed — the image lives on the Product, not on units.
   isActive: boolean;
 }
 
@@ -93,12 +89,7 @@ interface CatalogLookupResult {
   targetUnitIndex: number;
 }
 
-export function EditProductModal({
-  open,
-  onOpenChange,
-  product,
-  onSuccess,
-}: EditProductModalProps) {
+export function EditProductModal({ open, onOpenChange, product, onSuccess }: EditProductModalProps) {
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [imageUrl, setImageUrl] = useState("");
@@ -145,11 +136,9 @@ export function EditProductModal({
       setIsPublic(product.isPublic ?? false);
       setIsActive(product.isActive ?? true);
 
-      // [FIX] Explicit numeric coercion. The API consistently returns
-      // conversionFactor/priceWholesale as strings (Decimal
-      // precision fields); `Number(...)` here makes the local state genuinely
-      // match its declared type regardless of whether the API sends a string
-      // or a number.
+      // Explicit numeric coercion. The API consistently returns
+      // conversionFactor/priceWholesale as strings (Decimal precision fields);
+      // `Number(...)` makes the local state genuinely match its declared type.
       //
       // [FIX — base unit ordering] The BASE unit must be index 0 (the rest of
       // this screen treats `index === 0` as "the base unit": locked factor, no
@@ -497,18 +486,16 @@ export function EditProductModal({
 
   const handleRemoveUnit = (index: number) => {
     // Unit 0 is always the product's base unit — its conversionFactor is
-    // forced/locked to 1 and can never be changed via this screen (a
-    // base-unit correction is a dedicated, separate flow on the backend —
-    // see resetProductUnits()). This modal never exposes it.
+    // forced/locked to 1 and can never be changed via this screen (a base-unit
+    // correction is a dedicated, separate flow on the backend — see
+    // resetProductUnits()). This modal never exposes it.
     if (index === 0) {
       toast.error("لا يمكن حذف الوحدة الأساسية.");
       return;
     }
 
-    // [FIX] Defensive guard mirroring AddProductModal.tsx — index 0 is
-    // already protected above so this can't currently be reached with
-    // units.length going to 0, but kept for the same defense-in-depth
-    // reasoning.
+    // Defensive guard mirroring AddProductModal.tsx — index 0 is already
+    // protected above, kept for the same defense-in-depth reasoning.
     if (units.length <= 1) {
       toast.error("يجب الإبقاء على وحدة قياس واحدة على الأقل.");
       return;
@@ -516,7 +503,7 @@ export function EditProductModal({
 
     setUnits((prev) => prev.filter((_, i) => i !== index));
 
-    // [FIX] Removing a unit shifts every later index down by one: shift an open
+    // Removing a unit shifts every later index down by one: shift an open
     // gate's stored unitIndex accordingly, and clear it only on an exact match.
     setBarcodeGate((prev) => {
       if (prev.unitIndex === null) return prev;
@@ -568,9 +555,9 @@ export function EditProductModal({
       return;
     }
 
-    // priceWholesale is the ONLY figure ever used to bill a sale (POS or
-    // B2B alike) — a unit reaching submit with priceWholesale <= 0 must
-    // be rejected here, matching AddProductModal.tsx's identical check.
+    // priceWholesale is the ONLY figure ever used to bill a sale (POS or B2B
+    // alike) — a unit reaching submit with priceWholesale <= 0 must be
+    // rejected here, matching AddProductModal.tsx's identical check.
     if (units.some((u) => !u.unitName.trim() || u.conversionFactor <= 0 || u.priceWholesale <= 0)) {
       toast.error("يرجى التأكد من ملء جميع الوحدات بمعامل تحويل وسعر جملة أكبر من الصفر.");
       return;
@@ -667,479 +654,28 @@ export function EditProductModal({
 
   if (!product) return null;
 
+  const baseUnitName = units[0]?.unitName.trim() || "الوحدة الأساسية";
+  const imageIsUploaded = imageUrl.startsWith("data:");
+
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent
-          dir="rtl"
-          className="max-w-3xl max-h-[90vh] overflow-y-auto"
-        >
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-lg font-bold">
-              <Package className="w-5 h-5 text-emerald-600" />
-              <span>تعديل المنتج ووحدات التعبئة</span>
-            </DialogTitle>
-            <DialogDescription className="text-xs text-zinc-500">
-              تعديل بيانات المنتج، أسعار ووحدات التعبئة، وحالة النشر بالمتجر العام وفق بوابة النشر.
-            </DialogDescription>
-          </DialogHeader>
-
-          {catalogInfo && (
-            <div className="p-3 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 rounded-lg flex items-center justify-between gap-2 text-xs">
-              <div className="space-y-0.5">
-                <span className="font-semibold text-emerald-900 dark:text-emerald-300">
-                  متوفر في الكتالوج المشترك:
-                </span>{" "}
-                <span className="text-emerald-700 dark:text-emerald-400">
-                  {catalogInfo.name} {catalogInfo.category ? `(${catalogInfo.category})` : ""}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={applyCatalogSuggestion}
-                  className="h-7 text-xs border-emerald-300 text-emerald-800 hover:bg-emerald-100"
-                >
-                  نسخ البيانات
-                </Button>
-                {!catalogInfo.isOwner && (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setCatalogReportOpen(true)}
-                    className="h-7 text-xs text-amber-700 hover:bg-amber-100 gap-1"
-                  >
-                    <Flag className="w-3.5 h-3.5" />
-                    <span>إبلاغ عن خطأ</span>
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
-
-          <div className="space-y-6 py-2">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <Label htmlFor="edit-name" className="text-xs font-semibold">
-                  اسم المنتج <span className="text-red-500">*</span>
-                </Label>
-                <Input
-                  id="edit-name"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="مثال: شاي سيلاني فاخر"
-                  className="text-xs"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="edit-category" className="text-xs font-semibold">
-                  التصنيف
-                </Label>
-                <Input
-                  id="edit-category"
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                  placeholder="مثال: مشروبات ساخنة"
-                  className="text-xs"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <Label htmlFor="edit-image" className="text-xs font-semibold">
-                صورة المنتج
-              </Label>
-              <div className="flex items-center gap-2">
-                {imageUrl && (
-                  <Image
-                    src={imageUrl}
-                    alt="معاينة"
-                    width={36}
-                    height={36}
-                    unoptimized
-                    className="w-9 h-9 object-cover rounded border border-zinc-200 dark:border-zinc-700 shrink-0"
-                  />
-                )}
-                <Input
-                  id="edit-image"
-                  value={imageUrl}
-                  onChange={(e) => {
-                    const newVal = e.target.value;
-                    if (isPublic && !newVal.trim() && imageUrl.trim()) {
-                      toast.error("ألغِ النشر أولاً");
-                      return;
-                    }
-                    setImageUrl(newVal);
-                  }}
-                  placeholder="رابط الصورة أو ارفع وقص صورة..."
-                  className="text-xs flex-1"
-                />
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setCropModalOpen(true)}
-                  className="h-9 text-xs gap-1 border-zinc-300 shrink-0"
-                >
-                  <ImageIcon className="w-3.5 h-3.5" />
-                  <span>{imageUrl ? "تغيير الصورة" : "رفع وقص"}</span>
-                </Button>
-                {imageUrl && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    onClick={handleClearImage}
-                    className="h-9 text-xs text-red-500 hover:bg-red-50 shrink-0"
-                  >
-                    <Trash2 className="w-3.5 h-3.5 ml-1" />
-                    <span>إزالة</span>
-                  </Button>
-                )}
-              </div>
-            </div>
-
-            <div className="p-4 bg-zinc-50 dark:bg-zinc-800/40 rounded-xl border border-zinc-200 dark:border-zinc-800 space-y-3">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <Switch
-                    id="edit-is-active"
-                    checked={isActive}
-                    onCheckedChange={setIsActive}
-                  />
-                  <div>
-                    <Label htmlFor="edit-is-active" className="text-xs font-semibold cursor-pointer">
-                      حالة تفعيل المنتج
-                    </Label>
-                    <p className="text-[11px] text-zinc-500">
-                      تعطيل المنتج يخفيه من نقاط البيع والمتجر دون المساس بالكميات أو بحالات الوحدات السابقة.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3 border-t sm:border-t-0 sm:border-r border-zinc-200 dark:border-zinc-700 pt-2 sm:pt-0 sm:pr-4">
-                  <Switch
-                    id="edit-is-public"
-                    checked={isPublic}
-                    onCheckedChange={handleToggleIsPublic}
-                  />
-                  <div>
-                    <Label htmlFor="edit-is-public" className="text-xs font-semibold flex items-center gap-1.5 cursor-pointer">
-                      <Globe className="w-3.5 h-3.5 text-blue-600" />
-                      <span>النشر بالمتجر العام</span>
-                    </Label>
-                    <p className="text-[11px] text-zinc-500">
-                      يتطلب وجود صورة للمنتج ووحدة قياس نشطة واحدة على الأقل.
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-sm font-bold flex items-center gap-2">
-                    <Layers className="w-4 h-4 text-emerald-600" />
-                    <span>محرك وحدات التعبئة والتغليف</span>
-                  </h3>
-                  <p className="text-[11px] text-zinc-500">
-                    الوحدة الأساسية (معامل = 1) مقفلة هنا — تصحيحها يتم من شاشة مخصصة منفصلة. عدّل الوحدات
-                    الثانوية/الثلاثية وأسعارها بحرية.
-                  </p>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleAddUnit}
-                  className="h-8 text-xs gap-1 border-emerald-300 text-emerald-800 hover:bg-emerald-50"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>إضافة وحدة</span>
-                </Button>
-              </div>
-
-              <div className="space-y-3">
-                {units.map((unit, index) => {
-                  const isBase = index === 0;
-                  return (
-                    <div
-                      key={unit.id || index}
-                      className={`p-3.5 rounded-xl border transition-all ${!unit.isActive
-                        ? "bg-zinc-100/60 dark:bg-zinc-900/60 border-zinc-300 opacity-75"
-                        : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 shadow-sm"
-                        }`}
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-zinc-100 dark:border-zinc-800 mb-3">
-                        <div className="flex items-center gap-2">
-                          <Badge
-                            variant={isBase ? "default" : "secondary"}
-                            className="text-[10px]"
-                          >
-                            {isBase ? "الوحدة الأساسية" : `وحدة فرعية (${index + 1})`}
-                          </Badge>
-                          {!unit.isActive && (
-                            <Badge variant="destructive" className="text-[10px]">
-                              معطلة
-                            </Badge>
-                          )}
-                        </div>
-
-                        <div className="flex items-center gap-2">
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="ghost"
-                            onClick={() => handleToggleUnitActive(index)}
-                            className="h-6 text-[10px] px-2 text-zinc-600 hover:text-zinc-900"
-                          >
-                            {unit.isActive ? "تعطيل الوحدة" : "تفعيل الوحدة"}
-                          </Button>
-                          {!isBase && (
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleRemoveUnit(index)}
-                              className="h-6 w-6 p-0 text-red-500 hover:bg-red-50"
-                              title="حذف الوحدة"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
-                        <div>
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            اسم الوحدة <span className="text-red-500">*</span>
-                          </Label>
-                          <Input
-                            value={unit.unitName}
-                            onChange={(e) => {
-                              // Immutable update — never mutate `units[index]` in
-                              // place (see AddProductModal.tsx's same pattern).
-                              const value = e.target.value;
-                              setUnits((prev) => {
-                                const next = [...prev];
-                                next[index] = { ...next[index], unitName: value };
-                                return next;
-                              });
-                            }}
-                            placeholder={isBase ? "مثال: قطعة" : "مثال: طرد"}
-                            className="h-8 text-xs mt-1"
-                          />
-                        </div>
-
-                        <div>
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            معامل التحويل (إلى الأساسية)
-                          </Label>
-                          <Input
-                            type="number"
-                            step="any"
-                            min="0.0001"
-                            disabled={isBase}
-                            value={unit.conversionFactor}
-                            onChange={(e) => {
-                              // Fractional conversionFactor values are explicitly
-                              // allowed (a quarter- or half-carton) — only fall
-                              // back when the parse isn't a real number at all;
-                              // validatePackagingUnits() rejects <= 0 at submit.
-                              const parsed = parseFloat(e.target.value);
-                              const value = Number.isFinite(parsed) ? parsed : 0;
-                              setUnits((prev) => {
-                                const next = [...prev];
-                                next[index] = { ...next[index], conversionFactor: value };
-                                return next;
-                              });
-                            }}
-                            className="h-8 text-xs mt-1"
-                          />
-                        </div>
-
-                        <div>
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            عملة التسعير
-                          </Label>
-                          <select
-                            value={unit.pricingCurrency}
-                            onChange={(e) => {
-                              const value = e.target.value as "SYP" | "USD";
-                              setUnits((prev) => {
-                                const next = [...prev];
-                                next[index] = { ...next[index], pricingCurrency: value };
-                                return next;
-                              });
-                            }}
-                            className="h-8 w-full border border-zinc-200 dark:border-zinc-700 rounded-md px-2 text-xs bg-white dark:bg-zinc-900 mt-1"
-                          >
-                            <option value="SYP">ل.س (SYP)</option>
-                            <option value="USD">دولار ($ USD)</option>
-                          </select>
-                        </div>
-
-                        <div>
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            سعر الجملة <span className="text-red-500">*</span>
-                          </Label>
-                          <Input
-                            type="number"
-                            min="0"
-                            value={unit.priceWholesale}
-                            onChange={(e) => {
-                              const value = Number(e.target.value) || 0;
-                              setUnits((prev) => {
-                                const next = [...prev];
-                                next[index] = { ...next[index], priceWholesale: value };
-                                return next;
-                              });
-                            }}
-                            className="h-8 text-xs mt-1"
-                          />
-                        </div>
-
-                        <div className="sm:col-span-3">
-                          <Label className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
-                            الباركودات
-                            {unit.barcodes.length > 0 ? ` (${unit.barcodes.length})` : ""}
-                          </Label>
-
-                          {/* [v4.5 UX] ONE full-width barcode field per unit.
-                              Enter (what a keyboard-wedge scanner sends after each
-                              scan), the Add button, or a pasted delimited list all
-                              start classification. There is no blur trigger:
-                              tabbing/clicking away used to pop the modal
-                              unexpectedly, and an unclassified value is caught by
-                              the save check anyway. */}
-                          <div className="flex items-center gap-1.5 mt-1">
-                            <div className="relative flex-1">
-                              <Input
-                                ref={(el) => {
-                                  barcodeInputRefs.current[index] = el;
-                                }}
-                                dir="ltr"
-                                value={unit.barcodeDraft}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") {
-                                    e.preventDefault();
-                                    requestBarcodeClassification(index, unit.barcodeDraft);
-                                  }
-                                }}
-                                onPaste={(e) => {
-                                  // A pasted LIST (one barcode per line, or `;`/tab
-                                  // separated) is classified together in one modal.
-                                  const text = e.clipboardData.getData("text");
-                                  if (/[;\n\t]/.test(text.trim())) {
-                                    e.preventDefault();
-                                    requestBarcodeClassification(
-                                      index,
-                                      unit.barcodeDraft ? `${unit.barcodeDraft};${text}` : text
-                                    );
-                                  }
-                                }}
-                                onChange={(e) => {
-                                  const value = e.target.value;
-                                  setUnits((prev) => {
-                                    const next = [...prev];
-                                    next[index] = { ...next[index], barcodeDraft: value };
-                                    return next;
-                                  });
-                                }}
-                                placeholder="امسح أو اكتب الباركود ثم Enter"
-                                className="h-8 text-xs pl-7"
-                              />
-                              <BarcodeIcon className="w-3.5 h-3.5 absolute left-2 top-2.5 text-zinc-400" />
-                            </div>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              disabled={!unit.barcodeDraft.trim()}
-                              onClick={() => requestBarcodeClassification(index, unit.barcodeDraft)}
-                              className="h-8 px-2 gap-1 text-xs border-zinc-300"
-                            >
-                              <Plus className="w-3.5 h-3.5" />
-                              <span>إضافة</span>
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              onClick={() => openUnitScanner(index)}
-                              className="h-8 px-2 border-zinc-300"
-                              title="مسح بالكاميرا"
-                            >
-                              <Camera className="w-3.5 h-3.5 text-zinc-600" />
-                            </Button>
-                          </div>
-
-                          {/* [v4.5] The unit's CONFIRMED barcodes. A SAVED one is
-                              removed through the ADMIN-only DELETE route — that is
-                              the ONLY removal path, since the product PATCH is
-                              additive-only; one added in this session has no id yet
-                              and is removed from local state. */}
-                          {unit.barcodes.length > 0 && (
-                            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500">
-                              {unit.barcodes.map((b) => (
-                                <span
-                                  key={b.barcode}
-                                  className="inline-flex items-center gap-1 rounded border border-zinc-200 px-1.5 py-0.5 dark:border-zinc-700"
-                                >
-                                  <span className="font-mono" dir="ltr">
-                                    {b.barcode}
-                                  </span>
-                                  <Badge variant="outline" className="text-[9px] px-1 py-0">
-                                    {b.barcodeSource}
-                                  </Badge>
-                                  {!b.id && (
-                                    <span className="text-[9px] text-amber-600">جديد</span>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleRemoveBarcode(index, b.barcode)}
-                                    className="text-red-500 hover:text-red-600 p-1.5 -m-1.5"
-                                    aria-label={`حذف الباركود ${b.barcode}`}
-                                    title={b.id ? "حذف هذا الباركود نهائياً" : "إزالة هذا الباركود"}
-                                  >
-                                    <Trash2 className="w-3 h-3" />
-                                  </button>
-                                </span>
-                              ))}
-                            </div>
-                          )}
-
-                          {unit.barcodes.length > 1 && (
-                            <p className="mt-1 text-[10px] text-blue-700">
-                              كل هذه الباركودات تُباع كنفس الصنف: مخزون وسعر واحد، والفاتورة لا تسجّل أي باركود انمسح.
-                              إذا كان لكل نكهة مخزون منفصل، أضف كل نكهة كمنتج مستقل.
-                            </p>
-                          )}
-                          {unit.barcodes.some((b) => !b.id) && (
-                            <p className="mt-1 text-[10px] text-amber-700">
-                              الباركودات المعلّمة «جديد» تُحفظ عند الضغط على «حفظ التعديلات».
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-
-          <DialogFooter className="gap-2 sm:gap-0 pt-3 border-t border-zinc-100 dark:border-zinc-800">
+      <ModalShell
+        open={open}
+        onOpenChange={onOpenChange}
+        title="تعديل المنتج"
+        icon={Package}
+        description={product.name}
+        // This screen saves through the footer button; the form wrapper only
+        // exists for layout, so a stray Enter in a field must never submit.
+        onSubmit={(e) => e.preventDefault()}
+        footer={
+          <>
             <Button
               type="button"
-              variant="outline"
+              variant="ghost"
               onClick={() => onOpenChange(false)}
               disabled={saving}
-              className="text-xs"
+              className="text-slate-600"
             >
               إلغاء
             </Button>
@@ -1147,23 +683,501 @@ export function EditProductModal({
               type="button"
               onClick={handleSave}
               disabled={saving}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs gap-1.5"
+              className="flex-1 gap-1.5 bg-emerald-600 hover:bg-emerald-700 sm:min-w-40 sm:flex-none"
             >
               {saving ? (
                 <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>جاري الحفظ...</span>
+                  <Loader2 className="size-4 animate-spin" aria-hidden />
+                  جاري الحفظ...
                 </>
               ) : (
                 <>
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>حفظ التعديلات</span>
+                  <CheckCircle2 className="size-4" aria-hidden />
+                  حفظ التعديلات
                 </>
               )}
             </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          </>
+        }
+      >
+        {catalogInfo && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-sky-200 bg-sky-50 p-3">
+            <div className="min-w-0">
+              <p className="text-sm font-bold text-sky-900">متوفر بالكتالوج المشترك</p>
+              <p className="text-xs text-sky-700">
+                {catalogInfo.name}
+                {catalogInfo.category ? ` (${catalogInfo.category})` : ""}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={applyCatalogSuggestion}
+                className="h-8 border-sky-200 bg-white text-xs"
+              >
+                نسخ البيانات
+              </Button>
+              {!catalogInfo.isOwner && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setCatalogReportOpen(true)}
+                  className="h-8 gap-1 text-xs text-amber-700 hover:bg-amber-50 hover:text-amber-800"
+                >
+                  <Flag className="size-3.5" aria-hidden />
+                  إبلاغ عن خطأ
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ---------------------------------------------------- product data */}
+        <section className="space-y-4">
+          <h3 className="text-sm font-bold text-slate-900">بيانات المنتج</h3>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="اسم المنتج" htmlFor="edit-name" required>
+              <Input
+                id="edit-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="مثال: شاي سيلاني فاخر"
+                className="h-11 text-base font-semibold"
+              />
+            </Field>
+
+            <Field label="التصنيف" htmlFor="edit-category">
+              <Input
+                id="edit-category"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                placeholder="مثال: مشروبات ساخنة"
+                className="h-11 text-base"
+              />
+            </Field>
+          </div>
+
+          <Field label="صورة المنتج">
+            <div className="flex items-start gap-3">
+              <div className="flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 text-slate-300">
+                {imageUrl ? (
+                  <img src={imageUrl} alt="معاينة الصورة" className="size-full object-cover" />
+                ) : (
+                  <ImagePlus className="size-6" aria-hidden />
+                )}
+              </div>
+
+              <div className="min-w-0 flex-1 space-y-2">
+                {imageIsUploaded ? (
+                  <p className="flex h-10 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm text-slate-600">
+                    صورة مرفوعة من الجهاز
+                  </p>
+                ) : (
+                  <Input
+                    id="edit-image"
+                    dir="ltr"
+                    value={imageUrl}
+                    onChange={(e) => {
+                      const newVal = e.target.value;
+                      if (isPublic && !newVal.trim() && imageUrl.trim()) {
+                        toast.error("ألغِ النشر أولاً");
+                        return;
+                      }
+                      setImageUrl(newVal);
+                    }}
+                    placeholder="رابط الصورة (اختياري)"
+                    aria-label="رابط صورة المنتج"
+                    className="h-10 text-sm"
+                  />
+                )}
+
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setCropModalOpen(true)}
+                    className="h-9 gap-1.5"
+                  >
+                    <Crop className="size-4 text-sky-600" aria-hidden />
+                    {imageUrl ? "تغيير الصورة" : "رفع وقص"}
+                  </Button>
+                  {imageUrl && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleClearImage}
+                      className="h-9 gap-1.5 text-red-600 hover:bg-red-50 hover:text-red-700"
+                    >
+                      <Trash2 className="size-4" aria-hidden />
+                      إزالة
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </div>
+          </Field>
+        </section>
+
+        {/* ------------------------------------------------ status & publish */}
+        <section className="space-y-3">
+          <h3 className="text-sm font-bold text-slate-900">الحالة والنشر</h3>
+
+          {/* dir="ltr" on each Switch: the stock shadcn Switch slides its thumb
+              to the physical right when checked, wrong inside an RTL track. */}
+          <div className="flex items-start justify-between gap-4 rounded-lg border border-slate-200 p-3">
+            <div>
+              <label htmlFor="edit-is-active" className="text-sm font-semibold text-slate-900">
+                المنتج فعّال
+              </label>
+              <p className="mt-0.5 text-xs leading-relaxed text-slate-500">
+                تعطيل المنتج بيخفيه من نقاط البيع والمتجر، من دون ما يمس الكميات أو حالات الوحدات.
+              </p>
+            </div>
+            <Switch
+              id="edit-is-active"
+              dir="ltr"
+              checked={isActive}
+              onCheckedChange={setIsActive}
+              className="mt-0.5 shrink-0 data-[state=checked]:bg-emerald-600"
+            />
+          </div>
+
+          <div className="flex items-start justify-between gap-4 rounded-lg border border-slate-200 p-3">
+            <div>
+              <label
+                htmlFor="edit-is-public"
+                className="flex items-center gap-1.5 text-sm font-semibold text-slate-900"
+              >
+                <Globe className="size-4 text-sky-600" aria-hidden />
+                النشر بالمتجر العام
+              </label>
+              <p className="mt-0.5 text-xs leading-relaxed text-slate-500">
+                بيحتاج صورة للمنتج ووحدة قياس فعّالة وحدة على الأقل.
+              </p>
+            </div>
+            <Switch
+              id="edit-is-public"
+              dir="ltr"
+              checked={isPublic}
+              onCheckedChange={handleToggleIsPublic}
+              className="mt-0.5 shrink-0 data-[state=checked]:bg-emerald-600"
+            />
+          </div>
+        </section>
+
+        {/* ----------------------------------------------------------- units */}
+        <section className="space-y-3">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900">وحدات التعبئة والأسعار</h3>
+            <p className="mt-0.5 flex items-start gap-1.5 text-xs leading-relaxed text-slate-500">
+              <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              <span>
+                الوحدة الأساسية (معاملها 1) مقفلة هون — تصحيحها بيتم من شاشة مخصصة. عدّل باقي الوحدات وأسعارها بحرية.
+              </span>
+            </p>
+          </div>
+
+          {units.map((unit, index) => {
+            const isBase = index === 0;
+            const unitLabel = unit.unitName.trim() || "الوحدة";
+            // "كرتونة" → "الكرتونة" — used in the price label and the factor hint.
+            const unitLabelDefinite = withAl(unitLabel);
+            return (
+              <div
+                key={unit.id || index}
+                className={cn(
+                  "space-y-4 rounded-xl border p-4 transition-colors",
+                  unit.isActive ? "border-slate-200 bg-white shadow-sm" : "border-slate-200 bg-slate-50"
+                )}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h4 className="text-sm font-bold text-slate-900">
+                        {isBase ? "الوحدة الأساسية" : `وحدة تجميعية #${index + 1}`}
+                      </h4>
+                      {!unit.isActive && <StatusBadge tone="red">معطلة</StatusBadge>}
+                    </div>
+                    {!isBase && (
+                      <p className="text-xs text-slate-500">
+                        {unitLabel} = {unit.conversionFactor} {baseUnitName}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-2">
+                    <label
+                      htmlFor={`unit-active-${index}`}
+                      className="text-xs font-semibold text-slate-600"
+                    >
+                      {unit.isActive ? "فعّالة" : "معطلة"}
+                    </label>
+                    <Switch
+                      id={`unit-active-${index}`}
+                      dir="ltr"
+                      checked={unit.isActive}
+                      onCheckedChange={() => handleToggleUnitActive(index)}
+                      className="data-[state=checked]:bg-emerald-600"
+                    />
+                    {!isBase && (
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => handleRemoveUnit(index)}
+                        aria-label="حذف الوحدة"
+                        className="size-9 text-red-600 hover:bg-red-50 hover:text-red-700"
+                      >
+                        <Trash2 className="size-4" aria-hidden />
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {isBase && unit.isActive === false && (
+                  <p className="rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs leading-relaxed text-amber-800">
+                    تنبيه: هي الوحدة الأساسية — تعطيلها بيخفيها من كل الشاشات مع إنها الوحدة اللي بتنحسب فيها كل الدفعات.
+                  </p>
+                )}
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="اسم الوحدة" htmlFor={`unit-name-${index}`} required>
+                    <Input
+                      id={`unit-name-${index}`}
+                      value={unit.unitName}
+                      onChange={(e) => {
+                        // Immutable update — never mutate `units[index]` in place.
+                        const value = e.target.value;
+                        setUnits((prev) => {
+                          const next = [...prev];
+                          next[index] = { ...next[index], unitName: value };
+                          return next;
+                        });
+                      }}
+                      placeholder={isBase ? "مثال: قطعة" : "مثال: طرد"}
+                    />
+                  </Field>
+
+                  {/* The base unit's factor is locked to 1 and not shown at all
+                      (T3a §0). Every other unit states its factor RELATIVE to the
+                      base unit, in words. */}
+                  {!isBase && (
+                    <Field
+                      label={`${unitLabel} الواحدة تساوي كم ${baseUnitName}؟`}
+                      htmlFor={`unit-factor-${index}`}
+                      required
+                      hint={`مثال: ${unitLabelDefinite} = 24 ${baseUnitName}`}
+                    >
+                      {/* DecimalInput keeps the typed text locally, so the field
+                          can be cleared and retyped freely (80, 0.5, 0.25 ...)
+                          without a stuck "0". Fractional factors stay allowed;
+                          validatePackagingUnits() rejects <= 0 at submit. */}
+                      <DecimalInput
+                        id={`unit-factor-${index}`}
+                        placeholder="مثال: 24"
+                        value={unit.conversionFactor}
+                        onValueChange={(value) =>
+                          setUnits((prev) => {
+                            const next = [...prev];
+                            next[index] = { ...next[index], conversionFactor: value };
+                            return next;
+                          })
+                        }
+                      />
+                    </Field>
+                  )}
+
+                  <Field label="عملة التسعير">
+                    <Segmented
+                      ariaLabel="عملة التسعير"
+                      value={unit.pricingCurrency}
+                      onChange={(value) =>
+                        setUnits((prev) => {
+                          const next = [...prev];
+                          next[index] = { ...next[index], pricingCurrency: value };
+                          return next;
+                        })
+                      }
+                      options={[
+                        { value: "SYP", label: "ليرة سورية" },
+                        { value: "USD", label: "دولار" },
+                      ]}
+                    />
+                  </Field>
+
+                  <Field
+                    label={isBase ? `سعر بيع ${unitLabelDefinite} (POS)` : `سعر ${unitLabelDefinite} (POS)`}
+                    htmlFor={`unit-price-${index}`}
+                    required
+                  >
+                    <div className="relative">
+                      <DecimalInput
+                        id={`unit-price-${index}`}
+                        placeholder="0"
+                        value={unit.priceWholesale}
+                        onValueChange={(value) =>
+                          setUnits((prev) => {
+                            const next = [...prev];
+                            next[index] = { ...next[index], priceWholesale: value };
+                            return next;
+                          })
+                        }
+                        className="pe-12 font-semibold tabular-nums"
+                      />
+                      <span className="pointer-events-none absolute end-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-slate-500">
+                        {unit.pricingCurrency === "USD" ? "$" : "ل.س"}
+                      </span>
+                    </div>
+                  </Field>
+                </div>
+
+                {/* [v4.5 UX] ONE full-width barcode field per unit. Enter (what a
+                    keyboard-wedge scanner sends after each scan), the add button,
+                    or a pasted delimited list all start classification. There is
+                    no blur trigger: tabbing away used to pop the modal
+                    unexpectedly, and an unclassified value is caught by the save
+                    check anyway. */}
+                <Field
+                  label={`الباركودات${unit.barcodes.length > 0 ? ` (${unit.barcodes.length})` : ""}`}
+                  htmlFor={`unit-barcode-${index}`}
+                >
+                  <div className="flex gap-2">
+                    <Input
+                      id={`unit-barcode-${index}`}
+                      ref={(el) => {
+                        barcodeInputRefs.current[index] = el;
+                      }}
+                      dir="ltr"
+                      inputMode="numeric"
+                      value={unit.barcodeDraft}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          requestBarcodeClassification(index, unit.barcodeDraft);
+                        }
+                      }}
+                      onPaste={(e) => {
+                        // A pasted LIST (one barcode per line, or `;`/tab
+                        // separated) is classified together in one modal.
+                        const text = e.clipboardData.getData("text");
+                        if (/[;\n\t]/.test(text.trim())) {
+                          e.preventDefault();
+                          requestBarcodeClassification(
+                            index,
+                            unit.barcodeDraft ? `${unit.barcodeDraft};${text}` : text
+                          );
+                        }
+                      }}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setUnits((prev) => {
+                          const next = [...prev];
+                          next[index] = { ...next[index], barcodeDraft: value };
+                          return next;
+                        });
+                      }}
+                      placeholder="امسح أو اكتب الباركود ثم Enter"
+                      className="h-10 flex-1 font-mono"
+                    />
+                    {/* Icon-only: text labels ate most of the row on a phone and
+                        cut the placeholder off. */}
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="outline"
+                      disabled={!unit.barcodeDraft.trim()}
+                      onClick={() => requestBarcodeClassification(index, unit.barcodeDraft)}
+                      aria-label="إضافة الباركود"
+                      className="size-10 shrink-0"
+                    >
+                      <Plus className="size-5" aria-hidden />
+                    </Button>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="outline"
+                      onClick={() => openUnitScanner(index)}
+                      aria-label="مسح بالكاميرا"
+                      className="size-10 shrink-0 text-emerald-600"
+                    >
+                      <Camera className="size-5" aria-hidden />
+                    </Button>
+                  </div>
+
+                  {/* [v4.5] The unit's CONFIRMED barcodes. A SAVED one is removed
+                      through the ADMIN-only DELETE route — that is the ONLY
+                      removal path, since the product PATCH is additive-only; one
+                      added in this session has no id yet and is removed from
+                      local state. */}
+                  {unit.barcodes.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {unit.barcodes.map((b) => (
+                        <span
+                          key={b.barcode}
+                          className={cn(
+                            "inline-flex items-center gap-1.5 rounded-full border py-0.5 ps-3 pe-1 text-xs font-semibold",
+                            b.barcodeSource === "GS1"
+                              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                              : "border-slate-200 bg-slate-50 text-slate-700"
+                          )}
+                        >
+                          <span dir="ltr" className="font-mono">
+                            {b.barcode}
+                          </span>
+                          <span className="text-[10px] font-medium opacity-70">
+                            {b.barcodeSource === "GS1" ? "GS1" : "داخلي"}
+                          </span>
+                          {!b.id && <span className="text-[10px] font-bold text-amber-600">جديد</span>}
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveBarcode(index, b.barcode)}
+                            aria-label={`حذف الباركود ${b.barcode}`}
+                            title={b.id ? "حذف هذا الباركود نهائياً" : "إزالة هذا الباركود"}
+                            className="flex size-7 items-center justify-center rounded-full hover:bg-black/5"
+                          >
+                            <X className="size-3.5" aria-hidden />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {unit.barcodes.length > 1 && (
+                    <p className="flex items-start gap-1.5 rounded-md border border-sky-100 bg-sky-50 p-2.5 text-xs leading-relaxed text-sky-800">
+                      <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
+                      <span>
+                        كل هالباركودات بتنباع كنفس الصنف: مخزون وسعر واحد، والفاتورة ما بتسجّل أي باركود انمسح. إذا كل
+                        نكهة إلها مخزون منفصل، أضفها كمنتج مستقل.
+                      </span>
+                    </p>
+                  )}
+                  {unit.barcodes.some((b) => !b.id) && (
+                    <p className="text-xs text-amber-700">
+                      الباركودات المعلّمة «جديد» بتنحفظ لما تضغط «حفظ التعديلات».
+                    </p>
+                  )}
+                </Field>
+              </div>
+            );
+          })}
+
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleAddUnit}
+            className="h-11 w-full gap-1.5 border-dashed border-emerald-300 text-emerald-700 hover:bg-emerald-50 hover:text-emerald-800"
+          >
+            <Plus className="size-4" aria-hidden />
+            إضافة وحدة تجميعية (كرتونة، طرد...)
+          </Button>
+        </section>
+      </ModalShell>
 
       {/* [v4.5] ONE modal for this action's NEW barcodes, one radio group per
           barcode; the `key` is derived from the barcode set itself so a brand
@@ -1197,12 +1211,12 @@ export function EditProductModal({
         description="امسح باركودات هذه الوحدة بالتتابع، ثم اضغط «إنهاء المسح» لتصنيفها دفعة واحدة."
       >
         {scanBuffer.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-2">
+          <div className="mb-2 flex flex-wrap gap-1.5">
             {scanBuffer.map((b) => (
               <span
                 key={b}
                 dir="ltr"
-                className="font-mono text-[11px] rounded border border-zinc-200 px-1.5 py-0.5"
+                className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 font-mono text-xs text-slate-700"
               >
                 {b}
               </span>
@@ -1211,11 +1225,7 @@ export function EditProductModal({
         )}
       </BarcodeScannerModal>
 
-      <ImageCropModal
-        open={cropModalOpen}
-        onOpenChange={setCropModalOpen}
-        onCropComplete={handleCropComplete}
-      />
+      <ImageCropModal open={cropModalOpen} onOpenChange={setCropModalOpen} onCropComplete={handleCropComplete} />
 
       {catalogInfo && (
         <CatalogReportModal

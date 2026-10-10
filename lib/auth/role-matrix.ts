@@ -21,7 +21,19 @@ export type AppAction =
   // viewing the unfiltered (all-staff) log, or any CASHIER request — a
   // CASHIER is always scoped to their own invoices directly in
   // app/api/invoices/route.ts, before this permission is ever checked.
-  | "sales_log:view_all_staff";
+  | "sales_log:view_all_staff"
+  // [ADDED — v4.7 Round B] /inventory/receipts — the goods-receiving
+  // history. TWO rows, deliberately NOT folded into inventory:mutate (the
+  // v4.4 T4g pattern of riding an existing row was the interim state while
+  // the screen did not exist): the history is a READ surface whose PATCH
+  // edits only descriptive metadata (purchaseDate/supplierName — schema.prisma
+  // [v4.7]: "the FINANCIAL fields ... stay frozen"), so conflating "may view
+  // receiving history" with "may create batches" would make a future
+  // capability split silently wrong. Both rows are ADMIN-only because the
+  // response carries purchase-cost figures (schema.prisma [v4.7]: "The
+  // history screen and its GET endpoint are ADMIN-only (cost is visible)").
+  | "receipts:view"
+  | "receipts:edit";
 
 /**
  * Single authoritative statement of CASHIER vs ADMIN access across every screen/action in the system.
@@ -108,6 +120,23 @@ export const ROLE_CAPABILITY_MATRIX: Record<AppAction, Record<UserRole, boolean>
   // [ADDED — T4c2] /dashboard/sales-log — filtering the tenant-wide
   // invoice log by a staff member other than yourself.
   "sales_log:view_all_staff": {
+    ADMIN: true,
+    CASHIER: false,
+  },
+  // [ADDED — v4.7 Round B] /inventory/receipts — goods-receiving history.
+  // See the AppAction union's note above for why these are their own rows
+  // rather than rides on inventory:mutate. Enforcement points:
+  //   - receipts:view → GET /api/receipts (list), GET /api/receipts/[id]
+  //     (detail), GET /api/receipts/defaults (picker defaults) — each
+  //     asserts BEFORE any query, so a CASHIER's direct API call is 403
+  //     with zero data read, regardless of what the UI hides.
+  //   - receipts:edit → PATCH /api/receipts/[id] (purchaseDate/supplier
+  //     only) — additionally gated by assertTenantWritable().
+  "receipts:view": {
+    ADMIN: true,
+    CASHIER: false,
+  },
+  "receipts:edit": {
     ADMIN: true,
     CASHIER: false,
   },

@@ -304,10 +304,37 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       productId: "prod-1",
       unitId: "unit-1",
       batchNumber: "B100",
-      quantity: new Prisma.Decimal("10.0000"),
+      // [v4.7] Distinct, non-default values so a route that forgets to
+      // snapshot (or snapshots the LIVE quantity instead of the original)
+      // cannot pass by accident: initial 100 / total 500,000 versus a live
+      // quantity of 40 here (tests override the live quantity as needed).
+      receiptId: "receipt-1",
+      initialQuantity: new Prisma.Decimal("100.0000"),
+      totalCostSYP: new Prisma.Decimal("500000.0000"),
+      quantity: new Prisma.Decimal("40.0000"),
       costPricePerBaseUnit: new Prisma.Decimal("5000.0000"),
       ...overrides,
     });
+
+    // [v4.7] Asserts the three receipt snapshot fields on the row written to
+    // BatchDeletionLog. Compared via toString() so a MISSING field fails
+    // loudly (undefined !== "100") instead of being ignored the way
+    // toHaveBeenCalledWith ignores undefined properties.
+    const expectDeletionSnapshot = (
+      data: any,
+      exp: { receiptId: string; initial: string; total: string; live: string }
+    ) => {
+      expect(data.receiptId).toBe(exp.receiptId);
+      expect(new Prisma.Decimal(data.initialQuantityAtDeletion).toString()).toBe(
+        new Prisma.Decimal(exp.initial).toString()
+      );
+      expect(new Prisma.Decimal(data.totalCostAtDeletion).toString()).toBe(
+        new Prisma.Decimal(exp.total).toString()
+      );
+      expect(new Prisma.Decimal(data.quantityAtDeletion).toString()).toBe(
+        new Prisma.Decimal(exp.live).toString()
+      );
+    };
 
     const attemptHardDelete = (id: string, reason: string) =>
       deleteBatchHandler(
@@ -355,6 +382,10 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
           batchNumber: "TYPO-999",
           quantityAtDeletion: new Prisma.Decimal("10.0000"),
           costPriceAtDeletion: new Prisma.Decimal("5000.0000"),
+          // [v4.7] receipt snapshot — original values, not the live quantity.
+          receiptId: "receipt-1",
+          initialQuantityAtDeletion: new Prisma.Decimal("100.0000"),
+          totalCostAtDeletion: new Prisma.Decimal("500000.0000"),
           deletedByUserId: "admin-user-id",
           reason: "تم إدخال الدفعة بالخطأ وبشكل مكرر",
         },
@@ -363,6 +394,122 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(mockProductBatch.delete).toHaveBeenCalledWith({
         where: { id: "batch-err", tenantId: "tenant-al-baraka" },
       });
+    });
+
+    // [v4.7] The log must record what the batch was RECEIVED as (100 units for
+    // 500,000), not what is left on the shelf (40) — that is the whole point
+    // of the write-once initialQuantity / totalCostSYP fields.
+    it("[v4.7] snapshots the ORIGINAL receipt quantity/total, not the live remaining quantity", async () => {
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({ id: "batch-snap", batchNumber: "B-SNAP" }) // live 40, initial 100
+      );
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-snap" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-snap" });
+
+      const res = await attemptHardDelete("batch-snap", "سبب الحذف للاختبار");
+      expect(res.status).toBe(200);
+
+      const data = mockBatchDeletionLog.create.mock.calls[0][0].data;
+      expectDeletionSnapshot(data, {
+        receiptId: "receipt-1",
+        initial: "100",
+        total: "500000",
+        live: "40",
+      });
+      expect(new Prisma.Decimal(data.initialQuantityAtDeletion).eq(data.quantityAtDeletion)).toBe(
+        false
+      );
+    });
+
+    it("[v4.7] takes the snapshot from THE batch being deleted (different batches, different receipts)", async () => {
+      const cases = [
+        { id: "batch-x1", receiptId: "receipt-X", initial: "12.5000", total: "62500.0000", live: "3.0000" },
+        { id: "batch-y1", receiptId: "receipt-Y", initial: "9000.0000", total: "1234.5000", live: "9000.0000" },
+      ];
+
+      for (const c of cases) {
+        mockProductBatch.findFirst.mockResolvedValueOnce(
+          batchFixture({
+            id: c.id,
+            receiptId: c.receiptId,
+            initialQuantity: new Prisma.Decimal(c.initial),
+            totalCostSYP: new Prisma.Decimal(c.total),
+            quantity: new Prisma.Decimal(c.live),
+          })
+        );
+        mockInvoiceItem.count.mockResolvedValueOnce(0);
+        mockBatchDeletionLog.create.mockResolvedValueOnce({ id: `log-${c.id}` });
+        mockProductBatch.delete.mockResolvedValueOnce({ id: c.id });
+
+        const res = await attemptHardDelete(c.id, "سبب الحذف للاختبار");
+        expect(res.status).toBe(200);
+      }
+
+      expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(2);
+      cases.forEach((c, i) => {
+        expectDeletionSnapshot(mockBatchDeletionLog.create.mock.calls[i][0].data, {
+          receiptId: c.receiptId,
+          initial: c.initial,
+          total: c.total,
+          live: c.live,
+        });
+      });
+    });
+
+    it("[v4.7] writes the log row BEFORE deleting the batch, inside a single transaction", async () => {
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({ id: "batch-order", batchNumber: "B-ORDER" })
+      );
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-order" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-order" });
+
+      const res = await attemptHardDelete("batch-order", "سبب الحذف للاختبار");
+      expect(res.status).toBe(200);
+
+      expect(mockRawPrisma.$transaction).toHaveBeenCalledTimes(1);
+      const logOrder = mockBatchDeletionLog.create.mock.invocationCallOrder[0];
+      const deleteOrder = mockProductBatch.delete.mock.invocationCallOrder[0];
+      expect(logOrder).toBeLessThan(deleteOrder);
+    });
+
+    it("[v4.7] ignores receipt/snapshot values forged in the DELETE body", async () => {
+      mockProductBatch.findFirst.mockResolvedValueOnce(
+        batchFixture({ id: "batch-forge", batchNumber: "B-FORGE" })
+      );
+      mockInvoiceItem.count.mockResolvedValueOnce(0);
+      mockBatchDeletionLog.create.mockResolvedValueOnce({ id: "log-forge" });
+      mockProductBatch.delete.mockResolvedValueOnce({ id: "batch-forge" });
+
+      const res = await deleteBatchHandler(
+        new Request("http://localhost/api/inventory/batches/batch-forge", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reason: "سبب الحذف للاختبار",
+            receiptId: "forged-receipt",
+            initialQuantityAtDeletion: "999999",
+            totalCostAtDeletion: "1",
+          }),
+        }),
+        { params: Promise.resolve({ id: "batch-forge" }) }
+      );
+
+      // Either outcome is safe: rejecting the unknown keys (4xx, nothing
+      // written) or ignoring them (200, values taken from the DB row).
+      if (res.status === 200) {
+        expectDeletionSnapshot(mockBatchDeletionLog.create.mock.calls[0][0].data, {
+          receiptId: "receipt-1",
+          initial: "100",
+          total: "500000",
+          live: "40",
+        });
+      } else {
+        expect(res.status).toBe(400);
+        expect(mockBatchDeletionLog.create).not.toHaveBeenCalled();
+        expect(mockProductBatch.delete).not.toHaveBeenCalled();
+      }
     });
 
     it("blocks deletion if batch has InvoiceItem references (sales history exists)", async () => {
@@ -439,6 +586,9 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
           batchNumber: "B-ADJ",
           quantityAtDeletion: new Prisma.Decimal("7.0000"),
           costPriceAtDeletion: new Prisma.Decimal("5000.0000"),
+          receiptId: "receipt-1",
+          initialQuantityAtDeletion: new Prisma.Decimal("100.0000"),
+          totalCostAtDeletion: new Prisma.Decimal("500000.0000"),
           deletedByUserId: "admin-user-id",
           reason: "حذف دفعة خضعت لتسوية سابقة",
         },
@@ -515,6 +665,12 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
 
       expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
       expect(mockProductBatch.delete).toHaveBeenCalledTimes(1);
+      expectDeletionSnapshot(mockBatchDeletionLog.create.mock.calls[0][0].data, {
+        receiptId: "receipt-1",
+        initial: "100",
+        total: "500000",
+        live: "2",
+      });
       // The adjustment written in step 1 is left completely alone.
       expect(mockStockAdjustment.delete).not.toHaveBeenCalled();
       expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
@@ -546,6 +702,12 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(res.status).toBe(200);
       expect((await res.json()).success).toBe(true);
       expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expectDeletionSnapshot(mockBatchDeletionLog.create.mock.calls[0][0].data, {
+        receiptId: "receipt-1",
+        initial: "100",
+        total: "500000",
+        live: "4",
+      });
       expect(mockProductBatch.delete).toHaveBeenCalledWith({
         where: { id: "batch-cost-only", tenantId: "tenant-al-baraka" },
       });
@@ -652,6 +814,12 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(costPriceLogs[0].batchId).toBe("batch-combined-a");
 
       expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expectDeletionSnapshot(mockBatchDeletionLog.create.mock.calls[0][0].data, {
+        receiptId: "receipt-1",
+        initial: "100",
+        total: "500000",
+        live: "9",
+      });
       expect(mockStockAdjustment.delete).not.toHaveBeenCalled();
       expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
       expect(mockCostPriceChangeLog.delete).not.toHaveBeenCalled();
@@ -732,6 +900,12 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(adjustments).toHaveLength(1);
       expect(costPriceLogs).toHaveLength(1);
       expect(mockBatchDeletionLog.create).toHaveBeenCalledTimes(1);
+      expectDeletionSnapshot(mockBatchDeletionLog.create.mock.calls[0][0].data, {
+        receiptId: "receipt-1",
+        initial: "100",
+        total: "500000",
+        live: "3",
+      });
       expect(mockStockAdjustment.deleteMany).not.toHaveBeenCalled();
       expect(mockCostPriceChangeLog.deleteMany).not.toHaveBeenCalled();
     });
@@ -979,14 +1153,15 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       const productBatch = modelNamed("ProductBatch")!;
       expect(fieldNamed(productBatch, "adjustments")).toBeUndefined();
 
-      // The ONLY relations a batch still has. The snapshot logs (this one
-      // included) are deliberately not among them.
+      // The relations a batch still has. The snapshot logs (this one
+      // included) are deliberately not among them. [v4.7] adds `receipt` —
+      // the required goods-receiving header every batch now belongs to.
       expect(
         productBatch.fields
           .filter((f) => f.kind === "object")
           .map((f) => f.name)
           .sort()
-      ).toEqual(["invoiceItems", "product", "tenant", "unit"]);
+      ).toEqual(["invoiceItems", "product", "receipt", "tenant", "unit"]);
     });
 
     it("keeps CostPriceChangeLog.batchId a plain scalar snapshot too (no ProductBatch relation)", () => {
@@ -996,6 +1171,37 @@ describe("T3c — Batch, Expiration & Negative-Stock Tracker: Reconciliation & C
       expect(
         costPriceChangeLog!.fields.some((f) => f.kind === "object" && f.type === "ProductBatch")
       ).toBe(false);
+    });
+
+    // [v4.7] The deletion log keeps receipt data as plain scalar snapshots —
+    // a live relation to ProductReceipt/ProductBatch would either block the
+    // hard delete or cascade the audit row away with it.
+    it("[v4.7] keeps BatchDeletionLog's receipt fields plain scalars (no live relations)", () => {
+      const log = modelNamed("BatchDeletionLog");
+      expect(log).toBeDefined();
+
+      for (const field of ["receiptId", "initialQuantityAtDeletion", "totalCostAtDeletion"]) {
+        expect(fieldNamed(log, field)?.kind).toBe("scalar");
+      }
+      expect(
+        log!.fields
+          .filter((f) => f.kind === "object")
+          .map((f) => f.name)
+          .sort()
+      ).toEqual(["deletedByUser", "tenant"]);
+    });
+
+    it("[v4.7] gives ProductBatch the scalar receiptId / initialQuantity / totalCostSYP fields", () => {
+      const productBatch = modelNamed("ProductBatch");
+      expect(fieldNamed(productBatch, "receiptId")?.kind).toBe("scalar");
+      expect(fieldNamed(productBatch, "initialQuantity")).toMatchObject({
+        kind: "scalar",
+        type: "Decimal",
+      });
+      expect(fieldNamed(productBatch, "totalCostSYP")).toMatchObject({
+        kind: "scalar",
+        type: "Decimal",
+      });
     });
   });
 });

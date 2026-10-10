@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,15 @@ interface CsvImportModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSuccess: () => void;
+}
+
+// [v4.7] The SERVER-supplied receiving defaults — { businessDate, minDate }
+// from GET /api/receipts/defaults. One receipt is created per import FILE,
+// dated with this business date (never the device clock); if the request
+// fails, committing is disabled (no fallback).
+interface ReceivingDefaults {
+  businessDate: string;
+  minDate: string;
 }
 
 // [FIX] Field names now match NewProductImportData / PriceUpdateImportData
@@ -112,11 +121,43 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [loadingCommit, setLoadingCommit] = useState(false);
   const [commitResult, setCommitResult] = useState<CommitResult | null>(null);
+  // [v4.7] File-level receiving fields for the ONE receipt this file creates.
+  const [receivingDefaults, setReceivingDefaults] = useState<ReceivingDefaults | null>(null);
+  const [purchaseDate, setPurchaseDate] = useState<string>("");
+  const [supplierName, setSupplierName] = useState<string>("");
+
+  // [v4.7] Fetch the server's receiving defaults whenever the modal is open.
+  // On failure: null defaults → committing is disabled; there is
+  // deliberately NO device-clock fallback.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/receipts/defaults");
+        if (!res.ok) throw new Error("defaults unavailable");
+        const data: ReceivingDefaults = await res.json();
+        if (cancelled) return;
+        setReceivingDefaults(data);
+        setPurchaseDate((prev) => prev || data.businessDate);
+      } catch {
+        if (cancelled) return;
+        setReceivingDefaults(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   const resetAll = () => {
     setFile(null);
     setPreview(null);
     setCommitResult(null);
+    // [v4.7] Drop server defaults + receipt fields so a reopen refetches them.
+    setReceivingDefaults(null);
+    setPurchaseDate("");
+    setSupplierName("");
   };
 
   const resetToFilePicker = () => {
@@ -262,6 +303,25 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
       return;
     }
 
+    // [v4.7] The purchase date must exist and be within the SERVER-provided
+    // window (minDate..businessDate) — plain string comparisons against the
+    // server's own values; the device clock is never consulted. If the
+    // defaults request failed, committing is blocked: no device-date fallback.
+    if (!receivingDefaults || !purchaseDate) {
+      toast.error(
+        "تعذّر تحميل تاريخ الاستلام من الخادم — لا يمكن الاستيراد بدونه (لا يُستخدم تاريخ الجهاز أبداً)."
+      );
+      return;
+    }
+    if (purchaseDate > receivingDefaults.businessDate) {
+      toast.error("لا يمكن تسجيل استلام بتاريخ في المستقبل.");
+      return;
+    }
+    if (purchaseDate < receivingDefaults.minDate) {
+      toast.error("لا يمكن تسجيل استلام بتاريخ أقدم من سنتين (730 يوماً).");
+      return;
+    }
+
     setLoadingCommit(true);
 
     try {
@@ -271,6 +331,10 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
         body: JSON.stringify({
           newProducts: preview.newProducts,
           priceUpdates: preview.priceUpdates,
+          // [v4.7] ONE receipt per import FILE, dated with the SERVER's
+          // business date + optional supplier — both persisted on it.
+          purchaseDate,
+          ...(supplierName.trim() ? { supplierName: supplierName.trim() } : {}),
         }),
       });
 
@@ -297,7 +361,15 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
   };
 
   const canCommit =
-    !!preview && (preview.newProducts.length > 0 || preview.priceUpdates.length > 0);
+    !!preview &&
+    (preview.newProducts.length > 0 || preview.priceUpdates.length > 0) &&
+    // [v4.7] Committing is only possible once the SERVER's receiving
+    // defaults are known and a purchase date inside their window is chosen —
+    // there is deliberately no device-clock fallback.
+    !!receivingDefaults &&
+    !!purchaseDate &&
+    purchaseDate <= receivingDefaults.businessDate &&
+    purchaseDate >= receivingDefaults.minDate;
 
   // [FIX — critical] `.length`, not a truthy/numeric comparison on the
   // array itself. See the CommitResult interface comment above for the
@@ -467,6 +539,72 @@ export function CsvImportModal({ open, onOpenChange, onSuccess }: CsvImportModal
                     بخلاف شاشة إضافة الدفعة وشاشة استلام البضاعة، حيثُ يُدخل الإجمالي المدفوع
                     وتُحسب تكلفة الوحدة الأساسية تلقائياً.
                   </p>
+                  {/* [v4.7] The TOTAL this file's rows pay — the actual
+                      runtime behavior, with a concrete example: the CSV
+                      quantity (initialQuantity) is converted to BASE units
+                      first, then multiplied by the per-base-unit cost with one
+                      Decimal multiply, rounded once to 4 decimals, and stored
+                      verbatim in the receipt's totalCostSYP. */}
+                  <p className="text-[11px] leading-5 text-amber-700 dark:text-amber-400">
+                    <span className="font-semibold">إجمالي ما دُفع لكل دفعة</span> (totalCostSYP)
+                    يُحسب من الملف تلقائياً: سعر الوحدة الأساسية × الكمية بالوحدات الأساسية، بضربة
+                    واحدة تُقرَّب إلى ٤ منازل عشرية. مثال: سطر فيه{" "}
+                    <span className="font-semibold">15 كرتونة</span> ومعامل تحويل{" "}
+                    <span className="font-semibold">24</span> وسعر تكلفة{" "}
+                    <span className="font-semibold">2500</span> ل.س للوحدة الأساسية ← 15 × 24 =
+                    <span className="font-semibold"> 360 وحدة أساسية</span>، والإجمالي المدفوع =
+                    2500 × 360 = <span className="font-semibold">900000 ل.س</span>.
+                  </p>
+                </div>
+                {/* [v4.7] File-level receiving date + optional supplier for the
+                    ONE receipt this import file creates (purchaseDate is NOT a
+                    per-row column). Defaults/bounds come from GET
+                    /api/receipts/defaults — the device clock is never
+                    consulted; while defaults are unavailable the picker stays
+                    disabled and committing stays disabled (no fallback). */}
+                <div className="mt-1 mb-3 grid gap-3 sm:grid-cols-2 text-right">
+                  <div className="space-y-1">
+                    <label
+                      htmlFor="csv-purchase-date"
+                      className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-400"
+                    >
+                      تاريخ الشراء (يوم الاستلام) — لإيصال واحد للملف بأكمله *
+                    </label>
+                    <input
+                      id="csv-purchase-date"
+                      type="date"
+                      dir="ltr"
+                      value={purchaseDate}
+                      min={receivingDefaults?.minDate}
+                      max={receivingDefaults?.businessDate}
+                      onChange={(e) => setPurchaseDate(e.target.value)}
+                      disabled={!receivingDefaults}
+                      required
+                      className="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm disabled:opacity-60"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label
+                      htmlFor="csv-supplier"
+                      className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-400"
+                    >
+                      المورّد (اختياري)
+                    </label>
+                    <input
+                      id="csv-supplier"
+                      type="text"
+                      maxLength={120}
+                      placeholder="مثال: مورد الشام"
+                      value={supplierName}
+                      onChange={(e) => setSupplierName(e.target.value)}
+                      className="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                  </div>
+                  {!receivingDefaults && (
+                    <p className="text-[11px] text-amber-600 dark:text-amber-400 sm:col-span-2">
+                      تعذّر تحميل تاريخ الاستلام من الخادم — أعد فتح النافذة للمحاولة مجدداً (لا يُستخدم تاريخ الجهاز أبداً).
+                    </p>
+                  )}
                 </div>
                 <input
                   type="file"

@@ -471,6 +471,14 @@ export async function DELETE(
           productId: batch.productId,
           unitId: batch.unitId,
           batchNumber: batch.batchNumber,
+          // [v4.7] Receipt-history snapshots: all three values are read from
+          // the batch BEFORE it is deleted and written here, so the history
+          // screen can still show what this line originally received and paid
+          // after the live row is gone. receiptId keeps the deleted line
+          // attached to its receipt for the detail view's "محذوف" section.
+          receiptId: batch.receiptId,
+          initialQuantityAtDeletion: batch.initialQuantity,
+          totalCostAtDeletion: batch.totalCostSYP,
           quantityAtDeletion: batch.quantity,
           costPriceAtDeletion: batch.costPricePerBaseUnit,
           deletedByUserId: userId,
