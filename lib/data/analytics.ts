@@ -139,6 +139,7 @@ import {
 } from "@/lib/data/products";
 import { requireBaseUnits } from "@/lib/inventory/base-unit";
 import { saleQuantityFromBase } from "@/lib/inventory/units";
+import { callGroupBy } from "@/lib/db/call-group-by";
 import {
     addLocalDays,
     localDayKey,
@@ -547,19 +548,6 @@ interface RawRepaymentGroupRow {
     _sum: { amountSYP: DecimalLike | null };
 }
 
-/**
- * WHY THIS EXISTS — lib/db/tenant-scope's client extension types each
- * delegate's `groupBy` as a UNION of generic overloads whose mutual
- * incompatibility makes a direct call fail to compile (TS2349: "none of the
- * signatures are compatible with each other"), even though the argument object
- * itself is perfectly valid. Narrowing the method to a single non-generic
- * signature BEFORE invoking it is the standard workaround; the awaited row
- * shape stays pinned by RawDebtGroupRow / RawRepaymentGroupRow above, so
- * nothing about the runtime query changes.
- */
-function callGroupBy(groupFn: unknown, args: unknown): Promise<unknown> {
-    return (groupFn as (a: unknown) => Promise<unknown>)(args);
-}
 
 export interface AnalyticsOptions {
     range: AnalyticsRange;

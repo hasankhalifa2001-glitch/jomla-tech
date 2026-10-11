@@ -72,6 +72,7 @@
 
 import type { Prisma } from "@prisma/client";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
+import { callGroupBy } from "@/lib/db/call-group-by";
 import {
   breakdownForDisplay,
   reconciliationIdentityHolds,
@@ -163,15 +164,10 @@ const RECEIPT_ORDER_BY = [
 ] as const;
 
 // ============================================================================
-// WHY this exact helper is duplicated (not imported) from lib/data/analytics.ts:
-// callGroupBy is module-private there, and its whole body is a TYPE-level
-// workaround (narrow a union of generic overloads to one call signature) with
-// no runtime behaviour to share. Same rationale comment, same three lines.
+// callGroupBy is imported from lib/db/call-group-by.ts (the single shared
+// definition). It used to be duplicated here; T5a extracted it so the
+// storefront's stock aggregation reuses one helper instead of a third copy.
 // ============================================================================
-
-function callGroupBy(groupFn: unknown, args: unknown): Promise<unknown> {
-  return (groupFn as (a: unknown) => Promise<unknown>)(args);
-}
 
 
 // ============================================================================
