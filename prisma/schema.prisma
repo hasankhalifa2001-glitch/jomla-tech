@@ -189,9 +189,8 @@ datasource db {
 // earlier draft of this model also had a redundant `@@index([barcode])`
 // alongside it. Removed: an explicit index over the exact same column an
 // implicit unique index already covers wastes storage and slightly slows
-// writes for zero read benefit. (VerifiedRetailer.phone above has this same
-// redundant pattern from a prior revision, unrelated to this change — left
-// untouched here since it's outside this task's scope.)
+// writes for zero read benefit. (VerifiedRetailer.phone had this same
+// redundant pattern from a prior revision — fixed in [v5.0], see below.)
 // ============================================================================
 
 // ============================================================================
@@ -378,6 +377,59 @@ datasource db {
 // No data migration: all data is test data; edit the baseline migration in
 // place (drop NOT NULL on the seven columns above) followed by
 // `prisma migrate reset`.
+// ============================================================================
+
+// ============================================================================
+// [v5.0] T5 B2B STOREFRONT / ORDER APPROVAL — three schema changes, all
+// small, all backing the T5 spec (T5a storefront+submission, T5b queue+
+// rejection, T5c approval):
+//
+//  1. B2BOrderRequestItem.approvedQuantity (NEW, nullable Decimal(18,4)).
+//     The admin may raise or lower each line's quantity before approving.
+//     `quantity` stays the retailer's ORIGINAL request, frozen forever;
+//     `approvedQuantity` is the quantity the admin actually approved, in the
+//     SAME sale unit as `quantity`. It is written ONCE, inside the approval
+//     $transaction, for every line (equal to `quantity` when the admin did
+//     not change it) and never updated afterwards. It is NULL while the
+//     order is PENDING_REVIEW or REJECTED. Draft edits are NOT persisted
+//     (they live in the review screen only), which also removes any
+//     edit-vs-approve race. Approval converts `approvedQuantity` — never
+//     `quantity` — into base units via the SOLD unit's own conversionFactor
+//     (units.ts), exactly as v4.0 requires. A static test asserts that
+//     quantity / priceWholesaleSnapshot / pricingCurrencySnapshot never
+//     appear in an update data payload after submission.
+//
+//  2. B2BOrderRequest index: @@index([tenantId, status]) is REPLACED by
+//     @@index([tenantId, status, createdAt]). The queue screen (T5b) is
+//     always "this tenant's orders of status X, newest first, cursor-
+//     paginated"; the new composite serves that directly and still serves
+//     every tenantId-only and (tenantId, status) lookup through its leading
+//     columns, so nothing is lost. (tenantId, retailerPhone, status) is
+//     unchanged and still serves the per-phone pending cap.
+//
+//  3. VerifiedRetailer: the redundant @@index([phone]) is REMOVED — `phone`
+//     is already @unique, which creates the same index (same reasoning as
+//     the [v4.5, review fix] note above).
+//
+// No other model changes. Application-layer rules that are NOT schema:
+//   - B2BOrderRequest.rejectionReason stays String? at the schema level but
+//     is REQUIRED (non-empty, trimmed) by the reject route.
+//   - retailerPhone is stored in its normalized form (single shared
+//     normalizePhone helper) so the per-phone cap, VerifiedRetailer and
+//     customer matching all compare identical strings.
+//   - matchedCustomerId is a pre-approval hint only; it is never refreshed
+//     after approval (T4e v4.4 §3.2).
+//   - The approval Invoice is a normal COMPLETED invoice written by the
+//     approving ADMIN; it supplies baseQuantity and costAmountSYP per
+//     InvoiceItem and derives every USD field via deriveUsd() (null when no
+//     rate exists).
+//
+// No data migration: all data is test data. Edit the baseline migration in
+// place — add "approvedQuantity" DECIMAL(18,4) (nullable) to
+// "B2BOrderRequestItem"; drop the old (tenantId, status) index on
+// "B2BOrderRequest" and create (tenantId, status, createdAt); drop the
+// redundant phone index on "VerifiedRetailer" — followed by
+// `prisma migrate reset`, then `prisma generate`.
 // ============================================================================
 
 enum UserRole {
@@ -895,14 +947,23 @@ model Customer {
   @@index([tenantId, isSystemGenerated])
 }
 
+// ============================================================================
+// [v5.0] VerifiedRetailer — platform-wide behavioral trust: one row per
+// retailer phone (stored in the NORMALIZED form, same helper as
+// B2BOrderRequest.retailerPhone), created or incremented by T5c's approval
+// transaction via a single top-level upsert keyed on `phone`. Exposes
+// nothing about which wholesaler(s) approved the number. A verified phone is
+// exempt from T5a's per-phone pending-order cap.
+//
+// The redundant @@index([phone]) that used to sit here is REMOVED: `phone`
+// is @unique, which already creates the identical index.
+// ============================================================================
 model VerifiedRetailer {
   id                String   @id @default(cuid())
   phone             String   @unique
   shopName          String?
   firstVerifiedAt   DateTime @default(now())
   verificationCount Int      @default(1)
-
-  @@index([phone])
 }
 
 // ============================================================================
@@ -1167,6 +1228,17 @@ model Subscription {
   @@index([status])
 }
 
+// ============================================================================
+// [v5.0] B2BOrderRequest — a retailer's submitted order, pending admin
+// review. See the [v5.0] header note and the T5 spec (T5a/T5b/T5c).
+//   - retailerPhone is stored NORMALIZED (shared normalizePhone helper).
+//   - rejectionReason is String? here but REQUIRED by the reject route.
+//   - matchedCustomerId is a pre-approval hint only (set at submission when
+//     exactly one active, non-system customer shares the normalized phone);
+//     never refreshed after approval.
+//   - Approval/rejection both begin with the conditional update
+//     WHERE status = 'PENDING_REVIEW' (exactly one row must be affected).
+// ============================================================================
 model B2BOrderRequest {
   id               String         @id @default(cuid())
   tenantId         String
@@ -1191,13 +1263,17 @@ model B2BOrderRequest {
   tenant Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   items  B2BOrderRequestItem[]
 
-  @@index([tenantId])
-  @@index([tenantId, status])
+  // [v5.0] replaces @@index([tenantId, status]) — the queue is always
+  // "this tenant's orders of status X, newest first"; this composite serves
+  // that and every tenantId / (tenantId, status) lookup via its leading
+  // columns.
+  @@index([tenantId, status, createdAt])
+  // serves T5a's per-phone pending cap directly
   @@index([tenantId, retailerPhone, status])
 }
 
 model B2BOrderRequestItem {
-  id             String  @id @default(cuid())
+  id             String @id @default(cuid())
   tenantId       String
   orderRequestId String
   productId      String
@@ -1211,7 +1287,19 @@ model B2BOrderRequestItem {
   // requireBaseUnit(), and never from priceWholesaleSnapshot /
   // pricingCurrencySnapshot below, which cover pricing only.
   unitId         String
-  quantity       Decimal @db.Decimal(18, 4)
+
+  // The retailer's ORIGINAL request, in the sale unit `unitId`. Frozen at
+  // submission and never updated afterwards.
+  quantity Decimal @db.Decimal(18, 4)
+
+  // [v5.0] The quantity the admin APPROVED, in the same sale unit as
+  // `quantity` (may be higher or lower than the request). NULL until the
+  // order is approved; written ONCE, inside the approval $transaction, for
+  // every line (equal to `quantity` when unchanged), never updated again.
+  // Approval converts THIS value into base units through the sold unit's own
+  // conversionFactor (units.ts) — never `quantity`, and never with the base
+  // unit's factor.
+  approvedQuantity Decimal? @db.Decimal(18, 4)
 
   priceWholesaleSnapshot  Decimal         @db.Decimal(18, 4)
   pricingCurrencySnapshot PricingCurrency

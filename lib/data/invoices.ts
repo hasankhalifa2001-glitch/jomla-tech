@@ -11,11 +11,12 @@
  * (tenantId, createdAt) composite index on Invoice — no new index
  * required.
  *
- * NEVER reads .conversionFactor off any ProductUnit relation — this
- * screen only ever needs a unit's display name, so `unit` is
- * select-narrowed to { unitName } wherever an InvoiceItem's unit is
- * joined. See lib/inventory/units.ts's header for why that field has
- * exactly one sanctioned call site, which this file is not.
+ * NEVER names .conversionFactor and never reads it off a ProductUnit
+ * relation — `unit` is select-narrowed to { unitName } wherever an
+ * InvoiceItem's unit is joined. The one place this file needs a unit's
+ * factor (collapsing split sale lines for display, see findInvoiceDetail)
+ * goes through lib/inventory/units.ts's getUnitConversionFactors() and
+ * saleQuantityFromBase(), which are the sanctioned call sites.
  *
  * Monetary comparisons (deriving the payment-status badge) go through
  * lib/utils/money.ts's compareMoney() — never raw decimal.js or native
@@ -31,6 +32,7 @@ import {
     subtractMoney,
     sumMoney,
 } from "@/lib/utils/money";
+import { getUnitConversionFactors, saleQuantityFromBase } from "@/lib/inventory/units";
 
 export type PaymentStatusBadge = "CASH_FULL" | "CREDIT_FULL" | "PARTIAL";
 
@@ -240,23 +242,58 @@ export async function listInvoicesForTenant(
 // [FIX — business name] `businessName` (Tenant.name) is now resolved in the
 // same query, for receipt-model.ts's headerBlocks() — see that file's own
 // [FIX — business name] note.
+//
+// [v4.8 — FIX, split sale lines] A sale whose FIFO allocation spans several
+// batches is stored as several InvoiceItem rows (one per batch), each with a
+// ROUNDED sale-unit `quantity` (20/24 = 0.8333, 4/24 = 0.1667) and an exact
+// `baseQuantity`. The detail used to return one line per ROW, so the sales
+// log showed "0.8333" and "0.1667 طرد" for one carton, and the per-line
+// profit was computed from the rounded quantity (a 3-way split summed to
+// 0.9999). Rows are now COLLAPSED here into one line per
+// (product, sold unit, unit price): the quantity is the SUM of the exact
+// baseQuantity values divided ONCE by the sold unit's factor
+// (units.ts → saleQuantityFromBase), and revenue/profit are computed from
+// that exact quantity. The per-batch breakdown is preserved in `batches`
+// for an optional drill-down. InvoiceItem.quantity is no longer read at all.
 // ---------------------------------------------------------------------
+export interface InvoiceDetailBatchShare {
+    batchId: string;
+    /** Exact quantity drawn from this batch, in the product's BASE unit. */
+    baseQuantity: string;
+}
+
 export interface InvoiceDetailItem {
+    /** Id of the first underlying InvoiceItem row of this collapsed line. */
     id: string;
     productId: string;
     productName: string;
     unitId: string;
     unitName: string;
+    /**
+     * @deprecated [v4.8] A collapsed line can span several batches — this is
+     * only the FIRST batch's id, kept so existing consumers still compile.
+     * Use `batches` for the real breakdown.
+     */
     batchId: string;
+    /** Every batch this line drew from, with its exact base-unit share. */
+    batches: InvoiceDetailBatchShare[];
+    /**
+     * Quantity in the SOLD unit, collapsed and exact (e.g. "1" طرد, not
+     * "0.8333" + "0.1667"). Negative on a void line.
+     */
     quantity: string;
+    /** Σ baseQuantity of the collapsed rows, in the base unit (e.g. "24"). */
+    baseQuantity: string;
     unitPriceSYP: string;
     // [v4.9] Nullable — null when the parent invoice has no frozen rate.
     unitPriceUSD: string | null;
+    /** unitPriceSYP × quantity, via money.ts — the line's revenue in SYP. */
+    lineTotalSYP: string;
     /**
      * [v4.4, T4c2] Per-line profit, in SYP, present ONLY when the caller
      * passed `includeProfit: true` (i.e. the session is an ADMIN).
      *
-     *   profitSYP = (unitPriceSYP × quantity) − costAmountSYP
+     *   profitSYP = lineTotalSYP − Σ costAmountSYP of the collapsed rows
      *
      * Derived on read, never stored — see schema.prisma's InvoiceItem note.
      * costAmountSYP is non-nullable, so there is deliberately no
@@ -364,10 +401,18 @@ export async function findInvoiceDetail(
             // [FIX — business name]
             tenant: { select: { name: true } },
             items: {
+                // Stable order so the collapsed lines (and each line's
+                // `batches`) come out in the same sequence every time.
+                orderBy: [{ id: "asc" }],
                 select: {
                     id: true, productId: true, product: { select: { name: true } },
                     unitId: true, unit: { select: { unitName: true } },
-                    batchId: true, quantity: true, unitPriceSYP: true, unitPriceUSD: true,
+                    batchId: true,
+                    // [v4.8] The exact base-unit quantity deducted from the
+                    // batch. `quantity` (rounded, sale unit) is deliberately
+                    // NOT selected — nothing here may derive from it.
+                    baseQuantity: true,
+                    unitPriceSYP: true, unitPriceUSD: true,
                     costAmountSYP: includeProfit,
                 },
             },
@@ -375,6 +420,76 @@ export async function findInvoiceDetail(
     });
 
     if (!invoice) return null;
+
+    // ---- [v4.8] Collapse split rows into one line per sale line ----------
+    type RawItem = (typeof invoice.items)[number] & { costAmountSYP?: Prisma.Decimal };
+
+    const groups = new Map<string, RawItem[]>();
+    for (const item of invoice.items as RawItem[]) {
+        // Same product + same SOLD unit + same price = one sale line that
+        // FIFO split across batches. A different price for the same unit is
+        // a different line and must never be merged.
+        const key = `${item.productId}|${item.unitId}|${item.unitPriceSYP.toString()}`;
+        const list = groups.get(key);
+        if (list) list.push(item);
+        else groups.set(key, [item]);
+    }
+
+    // ONE factor lookup for every sold unit on this invoice (never per line).
+    const factorByUnitId = await getUnitConversionFactors(
+        db,
+        tenantId,
+        [...groups.values()].map((rows) => rows[0].unitId)
+    );
+
+    const lineProfits: string[] = [];
+
+    const items: InvoiceDetailItem[] = [...groups.values()].map((rows) => {
+        const first = rows[0];
+        const factor = factorByUnitId.get(first.unitId);
+        if (factor === undefined) {
+            // Same fail-loud posture as the receipts reconciliation: units
+            // are never hard-deleted (InvoiceItem.unit is Restrict), so a
+            // missing factor is a data-integrity bug, not a case to guess at.
+            throw new Error(
+                `findInvoiceDetail: no conversion factor for unit "${first.unitId}" on invoice "${invoice.id}".`
+            );
+        }
+
+        const { baseTotal, saleQuantity } = saleQuantityFromBase(
+            rows.map((row) => row.baseQuantity.toString()),
+            factor
+        );
+        const lineTotalSYP = multiplyMoney(first.unitPriceSYP.toString(), saleQuantity);
+
+        let profitSYP: string | undefined;
+        if (includeProfit) {
+            // profitSYP = lineTotalSYP − Σ costAmountSYP (frozen at commit time)
+            const costSYP = sumMoney(rows.map((row) => (row.costAmountSYP ?? "0").toString()));
+            profitSYP = subtractMoney(lineTotalSYP, costSYP);
+            lineProfits.push(profitSYP);
+        }
+
+        return {
+            id: first.id,
+            productId: first.productId,
+            productName: first.product.name,
+            unitId: first.unitId,
+            unitName: first.unit.unitName,
+            batchId: first.batchId,
+            batches: rows.map((row) => ({
+                batchId: row.batchId,
+                baseQuantity: row.baseQuantity.toString(),
+            })),
+            quantity: saleQuantity,
+            baseQuantity: baseTotal,
+            unitPriceSYP: first.unitPriceSYP.toString(),
+            // [v4.9] Null-safe per-line USD for SYP-only sales.
+            unitPriceUSD: first.unitPriceUSD?.toString() ?? null,
+            lineTotalSYP,
+            ...(profitSYP !== undefined ? { profitSYP } : {}),
+        };
+    });
 
     return {
         id: invoice.id,
@@ -400,53 +515,8 @@ export async function findInvoiceDetail(
         customer: invoice.customer,
         // [FIX — business name]
         businessName: invoice.tenant?.name ?? null,
-        items: invoice.items.map((item) => {
-            const rawItem = item as typeof item & {
-                costAmountSYP?: Prisma.Decimal;
-            };
-            let profitSYP: string | undefined;
-            if (includeProfit && rawItem.costAmountSYP !== undefined) {
-                // profitSYP = (unitPriceSYP × quantity) − costAmountSYP
-                const revenueSYP = multiplyMoney(
-                    item.unitPriceSYP.toString(),
-                    item.quantity.toString()
-                );
-                profitSYP = subtractMoney(revenueSYP, rawItem.costAmountSYP.toString());
-            }
-
-            return {
-                id: item.id,
-                productId: item.productId,
-                productName: item.product.name,
-                unitId: item.unitId,
-                unitName: item.unit.unitName,
-                batchId: item.batchId,
-                quantity: item.quantity.toString(),
-                unitPriceSYP: item.unitPriceSYP.toString(),
-                // [v4.9] Null-safe per-line USD for SYP-only sales.
-                unitPriceUSD: item.unitPriceUSD?.toString() ?? null,
-                ...(profitSYP !== undefined ? { profitSYP } : {}),
-            };
-        }),
-        ...(includeProfit
-            ? {
-                totalProfitSYP: sumMoney(
-                    invoice.items.map((item) => {
-                        const rawItem = item as typeof item & {
-                            costAmountSYP?: Prisma.Decimal;
-                        };
-                        const revenueSYP = multiplyMoney(
-                            item.unitPriceSYP.toString(),
-                            item.quantity.toString()
-                        );
-                        const costStr = (
-                            rawItem.costAmountSYP ?? "0"
-                        ).toString();
-                        return subtractMoney(revenueSYP, costStr);
-                    })
-                ),
-            }
-            : {}),
+        items,
+        ...(includeProfit ? { totalProfitSYP: sumMoney(lineProfits) } : {}),
     };
 }
 

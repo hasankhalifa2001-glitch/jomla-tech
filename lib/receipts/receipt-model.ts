@@ -43,10 +43,27 @@
  * network call; ServerReceiptDetail.businessName comes from Tenant.name,
  * resolved server-side (see lib/data/invoices.ts). Falls back to the plain
  * document title when null, so a missing name never breaks receipt building.
+ *
+ * [v4.9 — DISPLAY MERGE OF SPLIT LINES] A sale whose FIFO allocation spans
+ * several batches is stored as several InvoiceItem rows (one per batch), each
+ * carrying only its share of the quantity in the SALE unit (20/24 = 0.8333,
+ * 4/24 = 0.1667). Printed as-is, one طرد shows up as two fractional lines.
+ * Lines with the same product name + unit name + unit price are therefore
+ * merged for DISPLAY: quantities are summed with sumMoney(), and the merged
+ * line's total is the SUM of the original lines' totals (NOT merged quantity
+ * × price), so the receipt can never disagree with the invoice total even if
+ * the rounded fractions sum to 0.9999. Nothing stored or returned by the API
+ * changes — voids and stock restoration keep using the raw rows
+ * (InvoiceItem.baseQuantity); this is a presentation-only step.
  */
 
 import type { OfflineInvoice, OfflineInvoiceItem } from "@/lib/offline/db";
-import { compareMoney, multiplyMoney, type MoneyInput } from "@/lib/utils/money";
+import {
+  compareMoney,
+  multiplyMoney,
+  sumMoney,
+  type MoneyInput,
+} from "@/lib/utils/money";
 import {
   LOCAL_ONLY_NOTICE,
   SALE_DOCUMENT_LABEL,
@@ -345,54 +362,116 @@ function syncNoticeBlocks(isSynced: boolean): ReceiptBlock[] {
   return [{ type: "notice", text: LOCAL_ONLY_NOTICE, tone: "warn" }];
 }
 
+// ---------------------------------------------------------------------------
+// [v4.9] Display merge of split lines
+// ---------------------------------------------------------------------------
+
+interface ReceiptLineInput {
+  productName: string;
+  unitName: string;
+  /** Signed quantity in the SALE unit (negative on a void row). */
+  quantity: string;
+  unitPriceSYP: string;
+}
+
+interface MergedReceiptLine {
+  productName: string;
+  unitName: string;
+  /** Sum of the original lines' quantities (signed). */
+  quantity: string;
+  unitPriceSYP: string;
+  /**
+   * Sum of each ORIGINAL line's |quantity × price| — deliberately NOT
+   * (merged quantity × price): a split like 0.3333 × 3 sums to 0.9999 and
+   * would print a total that disagrees with the invoice. Summing the
+   * per-row totals reproduces the invoice total exactly.
+   */
+  lineTotalSYP: string;
+}
+
+/**
+ * Merges lines that share product name + unit name + unit price (the key a
+ * FIFO split produces: same sale line, different batch). Order of first
+ * appearance is preserved. Display-only — see the file header.
+ */
+function mergeReceiptLines(lines: ReceiptLineInput[]): MergedReceiptLine[] {
+  const merged = new Map<string, MergedReceiptLine>();
+
+  for (const line of lines) {
+    const rowTotal = absoluteMoney(multiplyMoney(line.quantity, line.unitPriceSYP));
+    const key = `${line.productName}::${line.unitName}::${line.unitPriceSYP}`;
+    const prev = merged.get(key);
+
+    if (!prev) {
+      merged.set(key, {
+        productName: line.productName,
+        unitName: line.unitName,
+        quantity: line.quantity,
+        unitPriceSYP: line.unitPriceSYP,
+        lineTotalSYP: rowTotal,
+      });
+    } else {
+      prev.quantity = sumMoney([prev.quantity, line.quantity]);
+      prev.lineTotalSYP = sumMoney([prev.lineTotalSYP, rowTotal]);
+    }
+  }
+
+  return [...merged.values()];
+}
+
+function mergedLinesToBlocks(lines: MergedReceiptLine[]): ReceiptBlock[] {
+  return lines.map((line) => ({
+    type: "item" as const,
+    name: line.productName,
+    // Rule 5: formatQuantityLabel turns a stored "-3" into "مرتجع: 3 <unit>".
+    detail: `${formatQuantityLabel(line.quantity, line.unitName)} × ${sypLabel(
+      absoluteMoney(line.unitPriceSYP)
+    )}`,
+    total: sypLabel(line.lineTotalSYP),
+    isReturn: compareMoney(line.quantity, "0") < 0,
+  }));
+}
+
 /**
  * [FIX — SYP-only] No longer computes or attaches `sub` (the "≈ $X" line per
  * item). Only the SYP line total is produced.
+ * [v4.9] Lines are merged for display (see mergeReceiptLines).
  */
 function localItemsToBlocks(
   items: OfflineInvoiceItem[],
   resolveName: (item: OfflineInvoiceItem) => { productName: string; unitName: string }
 ): ReceiptBlock[] {
-  const blocks: ReceiptBlock[] = [];
-
-  for (const item of items) {
-    const { productName, unitName } = resolveName(item);
-    const lineTotalSYP = absoluteMoney(multiplyMoney(item.quantity, item.unitPriceSYP));
-
-    blocks.push({
-      type: "item",
-      name: productName,
-      // Rule 5: formatQuantityLabel turns a stored "-3" into "مرتجع: 3 <unit>".
-      detail: `${formatQuantityLabel(item.quantity, unitName)} × ${sypLabel(
-        absoluteMoney(item.unitPriceSYP)
-      )}`,
-      total: sypLabel(lineTotalSYP),
-      isReturn: compareMoney(item.quantity, "0") < 0,
-    });
-  }
-
-  return blocks;
+  return mergedLinesToBlocks(
+    mergeReceiptLines(
+      items.map((item) => {
+        const { productName, unitName } = resolveName(item);
+        return {
+          productName,
+          unitName,
+          quantity: item.quantity,
+          unitPriceSYP: item.unitPriceSYP,
+        };
+      })
+    )
+  );
 }
 
-/** [FIX — SYP-only] Same change as localItemsToBlocks. */
+/**
+ * [FIX — SYP-only] Same change as localItemsToBlocks.
+ * [v4.9] Lines are merged for display (see mergeReceiptLines) — this is the
+ * path that actually matters: a server invoice is where FIFO splits exist.
+ */
 function serverItemsToBlocks(items: ServerReceiptDetailItem[]): ReceiptBlock[] {
-  const blocks: ReceiptBlock[] = [];
-
-  for (const item of items) {
-    const lineTotalSYP = absoluteMoney(multiplyMoney(item.quantity, item.unitPriceSYP));
-
-    blocks.push({
-      type: "item",
-      name: item.productName,
-      detail: `${formatQuantityLabel(item.quantity, item.unitName)} × ${sypLabel(
-        absoluteMoney(item.unitPriceSYP)
-      )}`,
-      total: sypLabel(lineTotalSYP),
-      isReturn: compareMoney(item.quantity, "0") < 0,
-    });
-  }
-
-  return blocks;
+  return mergedLinesToBlocks(
+    mergeReceiptLines(
+      items.map((item) => ({
+        productName: item.productName,
+        unitName: item.unitName,
+        quantity: item.quantity,
+        unitPriceSYP: item.unitPriceSYP,
+      }))
+    )
+  );
 }
 
 function buildLocalModel(source: LocalReceiptSource): ReceiptModel {
@@ -549,5 +628,11 @@ export function receiptModelStrings(model: ReceiptModel): string[] {
     }
   }
 
+  return receiptModelStringsTail(out);
+}
+
+// Kept as a trivial identity hop so the exported function above stays a
+// single linear switch; no behavior of its own.
+function receiptModelStringsTail(out: string[]): string[] {
   return out;
 }

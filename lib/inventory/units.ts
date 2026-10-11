@@ -17,6 +17,14 @@
  * `tx.productUnitBarcode.*` itself — it only reshapes data callers
  * already fetched, exactly the same posture it already has toward
  * `tx.productUnit.*`.
+ *
+ * [v4.8] netSoldInBaseUnit() / NetSoldRow were REMOVED. They converted
+ * InvoiceItem.quantity (sale unit, rounded for FIFO-split sales) back into
+ * base units by multiplying with the unit's conversionFactor — which is
+ * exactly the drift bug v4.8 closed (1 carton of 24 split 20 + 4 stored as
+ * 0.8333 + 0.1667, then re-multiplied to 19.9992 + 4.0008). The net-sold
+ * figure is now SUM(InvoiceItem.baseQuantity), computed by the database, so
+ * no conversion is needed anywhere in the reconciliation path.
  */
 
 import Decimal from "decimal.js";
@@ -427,76 +435,26 @@ export async function getUnitConversionFactors(
 }
 
 /**
- * [v4.7 — Phase 6] netSoldInBaseUnit — THE reconciliation reader: the ONE
- * place a set of InvoiceItem quantities (in their SALE units) becomes a net
- * sold figure in the product's BASE unit, for the goods-receiving history's
- * identity check:
- *
- *     remaining = initialQuantity − netSold + Σ StockAdjustment.quantityDelta
- *
- * WHY THIS SHAPE
- *   - Rows are passed in WITH their unitId because InvoiceItem.quantity is
- *     recorded in whichever unit the customer bought (schema.prisma's
- *     InvoiceItem note) — converting it anywhere outside this file is
- *     exactly the rounding-error class CONVERSION_FACTOR_RULES exists to
- *     prevent. Callers aggregate per (batchId, unitId) first — legal,
- *     because the factor is constant within a unit, so summing raw
- *     quantities before multiplying is algebraically identical to
- *     converting each row then summing (decimal.js makes both exact).
- *   - EVERY row counts: voided sales are stored as NEGATIVE quantities in
- *     the sale unit (app/api/ledger/voids/route.ts), so summing all rows
- *     nets the reversal out — there is no status filtering here on purpose.
- *     A void's mirror row plus its original must contribute exactly zero.
- *   - A unit id with no factor in the map is a data-integrity bug (units are
- *     never hard-deleted; InvoiceItem.unit is Restrict) and THROWS rather
- *     than silently assuming factor 1 — same fail-loud posture as
- *     lib/data/analytics.ts's buildProductAggregates(). Assuming 1 would
- *     produce a plausible-but-wrong "reconciled" figure, which for stock
- *     bookkeeping is worse than an error.
- *   - Exact decimal equality, never epsilon: every value involved is stored
- *     at Decimal(18,4) or finer and factors are exact decimal strings, so
- *     the identity either holds to the digit or it does not. A batch that
- *     fails the check indicates a quantity-drift bug (see schema.prisma's
- *     [v4.7] header), not a display problem to be smoothed over.
- *
- * The identity itself (initial − netSold + adjustments vs. remaining) is
- * evaluated by reconciliationIdentityHolds() below — also here, so no
- * quantity arithmetic of any kind lands in lib/data/receipt-history.ts.
- */
-export interface NetSoldRow {
-    unitId: string;
-    quantity: Numeric;
-}
-
-export function netSoldInBaseUnit(
-    rows: ReadonlyArray<NetSoldRow>,
-    factorByUnitId: ReadonlyMap<string, Numeric>
-): DecimalInstance {
-    let total = new Decimal(0);
-    for (const row of rows) {
-        const factor = factorByUnitId.get(row.unitId);
-        if (factor === undefined) {
-            throw new Error(
-                `netSoldInBaseUnit: no conversion factor for unit "${row.unitId}" — ` +
-                `data-integrity problem (units are never hard-deleted; InvoiceItem.unit is Restrict).`
-            );
-        }
-        total = total.plus(toBaseUnit(row.quantity, factor));
-    }
-    return total;
-}
-
-/**
- * [v4.7 — Phase 6] The reconciliation identity, evaluated with EXACT decimal
- * equality (Decimal.equals — no epsilon, no rounding tolerance):
+ * [v4.7 — Phase 6, updated v4.8] The reconciliation identity, evaluated with
+ * EXACT decimal equality (Decimal.equals — no epsilon, no rounding
+ * tolerance):
  *
  *     remaining === initialQuantity − netSold + Σ adjustments
  *
+ * where, since v4.8:
+ *     netSold = SUM(InvoiceItem.baseQuantity) for the batch
+ *               (the quantity actually deducted, already in the base unit;
+ *                VOIDED rows are negative so they net out).
+ *
  * All four values are decimal STRINGS straight off the storage columns (or
- * from netSoldInBaseUnit().toString()); this function is the only place they
- * are combined, so lib/data/receipt-history.ts itself performs no quantity
- * arithmetic at all. Returns false — never throws — on unparseable input:
- * a drifted batch must render as "not reconciled", not crash the screen.
+ * the database's own groupBy sums); this function is the only place they are
+ * combined, so lib/data/receipt-history.ts itself performs no quantity
+ * arithmetic at all. A batch that fails the check indicates a quantity-drift
+ * bug (see schema.prisma's [v4.7]/[v4.8] headers), not a display problem to
+ * be smoothed over — hence exact equality.
+ *
+ * Returns false — never throws — on unparseable input: a drifted batch must
+ * render as "not reconciled", not crash the screen.
  */
 export function reconciliationIdentityHolds(values: {
     initialQuantity: Numeric;
@@ -512,4 +470,39 @@ export function reconciliationIdentityHolds(values: {
     } catch {
         return false;
     }
+}
+
+/**
+ * [v4.8] Display-only: collapses the base-unit quantities of several
+ * InvoiceItem rows that belong to ONE sale line (same product, same sold
+ * unit, same price — a sale whose FIFO allocation was split across batches)
+ * back into a single quantity in the SALE unit.
+ *
+ * It works from the stored, exact `baseQuantity` of each row (20 + 4 = 24)
+ * and divides ONCE by the sold unit's factor (24 → 1 طرد). It never touches
+ * the rounded per-row `quantity` (0.8333 + 0.1667), which is what made a
+ * 3-way split sum to 0.9999.
+ *
+ * Voided rows carry negative baseQuantity, so a void line yields a negative
+ * sale quantity (receipts render it as "مرتجع: N" with the absolute value).
+ * Nothing here is ever written back to a table.
+ */
+export function saleQuantityFromBase(
+    baseQuantities: ReadonlyArray<Numeric>,
+    saleUnitFactor: Numeric
+): { baseTotal: string; saleQuantity: string } {
+    const factor = new Decimal(saleUnitFactor);
+    if (!factor.gt(0)) {
+        throw new Error(
+            `saleQuantityFromBase: invalid sale-unit conversion factor "${factor.toString()}".`
+        );
+    }
+    let total = new Decimal(0);
+    for (const q of baseQuantities) total = total.plus(new Decimal(q));
+    return {
+        baseTotal: total.toString(),
+        saleQuantity: fromBaseUnit(total, factor)
+            .toDecimalPlaces(4, Decimal.ROUND_HALF_UP)
+            .toString(),
+    };
 }

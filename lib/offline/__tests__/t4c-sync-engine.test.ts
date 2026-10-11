@@ -916,6 +916,152 @@ describe("T4c — سعر الصرف المجمّد و USD الاختياري (v4
     });
 });
 
+describe("T4c — تحقق لكل عنصر بدل رفض الطلب كله (v4.9)", () => {
+    beforeEach(() => {
+        seedBatch("A", "P1", "100", "2026-12-01");
+    });
+
+    const piece = (offlineId: string, q = "10", extra: Record<string, unknown> = {}) =>
+        Object.assign(
+            saleInvoice({ offlineId, items: [{ unitId: "P1-base", quantity: q, price: PIECE_PRICE }] }),
+            extra
+        ) as any;
+
+    it("createdAt غير صالح: FAILED لهذا العنصر فقط (لا 400) والباقي يُزامَن", async () => {
+        const { status, json } = await postSync({
+            invoices: [piece("bad", "10", { createdAt: "abc" }), piece("good", "10")],
+        });
+
+        expect(status).toBe(200);
+        const byId = Object.fromEntries(json.invoices.map((r: any) => [r.offlineId, r]));
+        expect(byId.bad.status).toBe("FAILED");
+        expect(byId.good.status).toBe("SYNCED");
+        expect(eq(qty("A"), "90")).toBe(true); // خُصمت مرة وحدة فقط
+    });
+
+    it("مفاتيح USD/السعر غائبة بالـ payload تُقرأ كـ null (لا 400)", async () => {
+        const inv = piece("s1", "10");
+        delete inv.totalUSD;
+        delete inv.paidAmountUSD;
+        delete inv.debtAmountUSD;
+        delete inv.exchangeRateUsed;
+        delete inv.items[0].unitPriceUSD;
+
+        const { status, json } = await postSync({ invoices: [inv] });
+        expect(status).toBe(200);
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const row = store.invoices.find((i) => i.offlineId === "s1");
+        expect(row.exchangeRateUsed).toBeNull();
+        expect(row.totalUSD).toBeNull();
+    });
+
+    it("دفعة بلا سعر صرف: تُقبل ويُمرَّر frozenRate = null", async () => {
+        const { status, json } = await postSync({
+            payments: [
+                {
+                    offlineId: "p1",
+                    customerId: "cust-old",
+                    amountSYP: "1000.0000",
+                    // amountUSD مفقود، exchangeRate = null
+                    exchangeRate: null,
+                    paymentMethod: "CASH",
+                    createdAt: new Date().toISOString(),
+                },
+            ],
+        });
+        expect(status).toBe(200);
+        expect(json.payments[0].status).toBe("SYNCED");
+        const params = vi.mocked(recordRepaymentIdempotent).mock.calls[0][2] as any;
+        expect(params.frozenRate).toBeNull();
+    });
+
+    it("خطأ بيانات رسالته فيها رقم 140001 يبقى FAILED (لا RETRY_LATER)", async () => {
+        const inv = piece("s1", "1");
+        inv.totalSYP = "140001.0000";
+        inv.paidAmountSYP = "140001.0000"; // الدين 0 → يمرّ فحص الدين ويفشل فحص مجموع البنود
+        const { json } = await postSync({ invoices: [inv] });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/140001/);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("بيع بمبلغ مدفوع سالب → FAILED ولا يتغير المخزون", async () => {
+        const inv = piece("s1", "1");
+        inv.paidAmountSYP = "-500.0000";
+        inv.debtAmountSYP = "1500.0000"; // total(1000) - paid(-500)
+        const { json } = await postSync({ invoices: [inv] });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("paymentMethod ناقص مع مدفوع > 0: FAILED لهذه الفاتورة فقط وتُرجَع كمية مخزونها", async () => {
+        const bad = piece("s_bad", "10");
+        delete bad.paymentMethod;
+
+        const { status, json } = await postSync({ invoices: [bad, piece("s_ok", "10")] });
+
+        expect(status).toBe(200);
+        const byId = Object.fromEntries(json.invoices.map((r: any) => [r.offlineId, r.status]));
+        expect(byId.s_bad).toBe("FAILED");
+        expect(byId.s_ok).toBe("SYNCED");
+        expect(eq(qty("A"), "90")).toBe(true); // فقط خصم s_ok (rollback للأولى)
+        expect(store.invoices).toHaveLength(1);
+    });
+
+    it("إلغاء ببنود مكررة لنفس المنتج/الوحدة (4 + 6) يُدمج ويُقبل", async () => {
+        await postSync({ invoices: [piece("s1", "10")] });
+        expect(eq(qty("A"), "90")).toBe(true);
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "4", price: PIECE_PRICE },
+                        { unitId: "P1-base", quantity: "6", price: PIECE_PRICE },
+                    ],
+                }),
+            ],
+        });
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("إلغاء [P1, P1] مقابل فاتورة أصلية {P1, P2} → FAILED (لا استرجاع مزدوج)", async () => {
+        seedBatch("C", "P2", "10", "2026-12-01");
+        await postSync({
+            invoices: [
+                saleInvoice({
+                    offlineId: "s1",
+                    items: [
+                        { productId: "P1", unitId: "P1-base", quantity: "1", price: PIECE_PRICE },
+                        { productId: "P2", unitId: "P2-base", quantity: "1", price: PIECE_PRICE },
+                    ],
+                }),
+            ],
+        });
+        const before = [qty("A"), qty("C")];
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { productId: "P1", unitId: "P1-base", quantity: "1", price: PIECE_PRICE },
+                        { productId: "P1", unitId: "P1-base", quantity: "1", price: PIECE_PRICE },
+                    ],
+                }),
+            ],
+        });
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect([qty("A"), qty("C")]).toEqual(before);
+    });
+});
+
 describe("T4c — batch-locking.ts و fifo.ts", () => {
     it("commitFifoAllocation بدون params يرمي خطأ (لا يرجّع undefined بصمت)", async () => {
         await expect(commitFifoAllocation({} as any, undefined as any)).rejects.toThrow();

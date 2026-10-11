@@ -23,32 +23,33 @@ import Decimal from "decimal.js";
  * MOCKED only where a real call needs a real database: the Prisma boundary
  * (getTenantDb + the fakes below), the session, and the THREE narrow dashboard
  * gateways of lib/data/products.ts (product names, unit conversion factors,
- * batch alert sets) — their SQL is the gateway's own concern (and needs its
- * own test against a real/faked Prisma client: the capped, separately counted
- * WHERE clauses live THERE, not in analytics.ts); here they exist only to feed
- * analytics.ts's real derivations.
+ * batch alert sets).
  *
- * [Revised for the T4h review fixes]
- *   - listBatchAlertRows → listBatchAlertSets (two capped lists, each with its
- *     own exact DB count). analytics.ts no longer filters or caps batch alerts
- *     itself; it reshapes what the gateway returns.
- *   - the expiry boundary is EXACT: start of the local day EXPIRING_SOON_DAYS
- *     from today (no +1 slack).
- *   - invoiceCount is EVENT-DATED: COMPLETED rows created today, independent
- *     of any void (the invoice read no longer even selects `voidedBy`).
- *   - unit conversion factors are fetched ONCE (batched), and a failure to
- *     resolve base-unit names is logged, not swallowed silently.
- *   - the route sets `Cache-Control: private, max-age=30`.
+ * [Revised for v4.8 / v4.9 of lib/data/analytics.ts]
+ *   - InvoiceItem fixtures carry `baseQuantity` (exact BASE-unit quantity, the
+ *     number the data layer now reads) — NOT the rounded sale-unit `quantity`.
+ *     Every fixture line also carries `invoice.status`.
+ *   - SALES and RETURNS are separate figures: `salesSYP` is GROSS (non-VOIDED
+ *     rows only), `returnsSYP` is a POSITIVE number (|Σ void totals|),
+ *     `netSalesSYP = salesSYP − returnsSYP`.
+ *   - PROFIT is invoice-level: Σ Invoice.totalSYP − Σ InvoiceItem.costAmountSYP.
+ *     The seed invoice totals are therefore made CONSISTENT with their item
+ *     lines (qty × price), so the figures below are meaningful.
+ *   - Trend points gain `returnsSYP`; a void lands in returns, not in sales.
+ *   - Product rankings collapse the rows of one sale line, divide the summed
+ *     base quantity ONCE by the sold unit's factor, then multiply by price.
+ *   - (earlier T4h review fixes still apply: batch gateway, exact expiry
+ *     boundary, event-dated invoiceCount, batched factor fetch, private cache)
  *
  * COVERAGE → ACCEPTANCE CRITERIA
  *   1. CASHIER rejected server-side, no figure ever exposed.
  *   2. Every KPI equals an independent recomputation over the same rows.
- *   3. The chart reflects the last 7/30 days per the selected filter, with
- *      tenant-local (UTC+3) day boundaries — a 23:30 UTC sale belongs to the
+ *   3. The chart reflects the last 1/7/30 days per the selected filter, with
+ *      tenant-local (UTC+3) day boundaries — a 22:30 UTC sale belongs to the
  *      NEXT local day.
  *   4. "Most profitable" vs "top-selling" contain different items.
  *   5. by-value vs by-quantity produce two genuinely different orderings
- *      (quantities converted to BASE units per line).
+ *      (quantities are BASE units).
  *   6. The balance alert never references or implies a payment deadline —
  *      enforced by a static source scan plus a response-shape assertion.
  */
@@ -132,16 +133,21 @@ function expectNullableMoneyEq(actual: string | null, expected: string | number)
 
 // === SEEDS — one fixed calendar; every date is chosen deliberately ===
 const D = (iso: string) => new Date(iso);
-const INV_T1 = D("2026-10-05T09:00:00.000Z"); // today (local)
-const INV_T2 = D("2026-10-05T10:00:00.000Z"); // today — this original is voided by INV_T3
-const INV_T3 = D("2026-10-05T11:00:00.000Z"); // today — VOID mirror row (negated totals)
+const INV_T1 = D("2026-10-05T09:00:00.000Z"); // today (local) 12:00
+const INV_T2 = D("2026-10-05T10:00:00.000Z"); // today 13:00 — this original is voided by INV_T3
+const INV_T3 = D("2026-10-05T11:00:00.000Z"); // today 14:00 — VOID mirror row (negated totals)
 const INV_T7 = D("2026-10-04T22:30:00.000Z"); // 22:30 UTC yesterday → LOCAL TODAY 01:30
 const INV_O4 = D("2026-10-03T10:00:00.000Z"); // two local days ago
 const INV_M5 = D("2026-09-15T10:00:00.000Z"); // inside the 30-day window only
 const INV_OUT = D("2026-09-01T10:00:00.000Z"); // 35 local days ago — outside BOTH windows
 
+/**
+ * Invoice totals are CONSISTENT with their item lines (Σ qty × price), because
+ * profit is now Σ totalSYP − Σ costAmountSYP:
+ *   T1 = 600 (5 cartons × 120) + 400 (40 pieces × 10) + 1500 (5 × 300) = 2500
+ */
 const invoiceRows: any[] = [
-    { totalSYP: "10000", totalUSD: "10", status: "COMPLETED", createdAt: INV_T1 },
+    { totalSYP: "2500", totalUSD: "10", status: "COMPLETED", createdAt: INV_T1 },
     { totalSYP: "1000", totalUSD: "1", status: "COMPLETED", createdAt: INV_T2 },
     { totalSYP: "-1000", totalUSD: "-1", status: "VOIDED", createdAt: INV_T3 },
     { totalSYP: "600", totalUSD: "6", status: "COMPLETED", createdAt: INV_T7 },
@@ -150,21 +156,36 @@ const invoiceRows: any[] = [
     { totalSYP: "99999", totalUSD: "99", status: "COMPLETED", createdAt: INV_OUT },
 ];
 
+type InvStatus = "COMPLETED" | "VOIDED";
+
+/**
+ * An InvoiceItem row as analytics.ts selects it. `baseQuantity` is the exact
+ * quantity in the product's BASE unit (negative on a void line) — NOT the
+ * sale-unit quantity. `unitPriceSYP` is per SOLD unit.
+ */
 const line = (
     productId: string,
     unitId: string,
-    quantity: string,
+    baseQuantity: string,
     unitPriceSYP: string,
     costAmountSYP: string,
-    invoice: Date
-) => ({ productId, unitId, quantity, unitPriceSYP, costAmountSYP, invoice: { createdAt: invoice } });
+    invoice: Date,
+    status: InvStatus = "COMPLETED"
+) => ({
+    productId,
+    unitId,
+    baseQuantity,
+    unitPriceSYP,
+    costAmountSYP,
+    invoice: { createdAt: invoice, status },
+});
 
 const invoiceItemRows: any[] = [
-    line("prod-volume", "unit-carton", "5", "120", "540", INV_T1), // 5 cartons, 12 pieces each
+    line("prod-volume", "unit-carton", "60", "120", "540", INV_T1), // 5 cartons × 12 = 60 pieces
     line("prod-volume", "unit-piece", "40", "10", "260", INV_T1),
     line("prod-profit", "unit-lux", "5", "300", "300", INV_T1),
     line("prod-value", "unit-case", "1", "1000", "950", INV_T2),
-    line("prod-value", "unit-case", "-1", "1000", "-950", INV_T3), // void mirror line
+    line("prod-value", "unit-case", "-1", "1000", "-950", INV_T3, "VOIDED"), // void mirror line
     line("prod-edge", "unit-edge", "1", "600", "500", INV_T7),
     line("prod-value", "unit-case", "10", "1000", "9900", INV_O4),
     line("prod-value", "unit-case", "7", "1000", "6930", INV_M5),
@@ -311,7 +332,16 @@ describe("T4h — GET /api/analytics: route guards", () => {
         expect(mockListBatchSets).not.toHaveBeenCalled();
         // …and no financial figure leaks into the body by any path.
         const raw = JSON.stringify(body);
-        for (const leaked of ["kpis", "salesSYP", "salesUSD", "netProfitSYP", "outstandingDebtSYP", "trend", "topProducts"]) {
+        for (const leaked of [
+            "kpis",
+            "salesSYP",
+            "salesUSD",
+            "returnsSYP",
+            "netProfitSYP",
+            "outstandingDebtSYP",
+            "trend",
+            "topProducts",
+        ]) {
             expect(raw).not.toContain(leaked);
         }
     });
@@ -339,11 +369,17 @@ describe("T4h — GET /api/analytics: route guards", () => {
             expect(point).toHaveProperty("date");
             expect(point.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
             expect(new Decimal(point.salesSYP).isFinite()).toBe(true);
+            expect(new Decimal(point.returnsSYP).isFinite()).toBe(true);
             expect(new Decimal(point.profitSYP).isFinite()).toBe(true);
         }
         expect(typeof body.kpis.salesSYP).toBe("string");
         // [v4.9] Null when no rated invoice exists today.
         expect(body.kpis.salesUSD === null || typeof body.kpis.salesUSD === "string").toBe(true);
+        expect(typeof body.kpis.returnsSYP).toBe("string");
+        expect(typeof body.kpis.returnsCount).toBe("number");
+        expect(typeof body.kpis.netSalesSYP).toBe("string");
+        expect(typeof body.kpis.grossProfitSYP).toBe("string");
+        expect(typeof body.kpis.returnsProfitSYP).toBe("string");
         expect(typeof body.kpis.netProfitSYP).toBe("string");
         expect(typeof body.kpis.invoiceCount).toBe("number");
         expect(typeof body.kpis.outstandingDebtSYP).toBe("string");
@@ -403,17 +439,40 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
     it("2a. every KPI equals a recomputation over the same seeded rows", async () => {
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
-        // Today (local): 10000 + 1000 − 1000 (void mirror) + 600 (22:30 UTC
-        // yesterday → local today) = 10600. Out-of-window rows must not add up.
-        expectMoneyEq(dash.kpis.salesSYP, 10600);
-        expectNullableMoneyEq(dash.kpis.salesUSD, 16);
+        // GROSS sales today (non-void rows only): 2500 + 1000 + 600 (22:30 UTC
+        // yesterday → local today) = 4100. The void mirror (−1000) is NOT
+        // netted into it, and out-of-window rows must not add up.
+        expectMoneyEq(dash.kpis.salesSYP, 4100);
+        // USD: the same non-void rows' own frozen-rate figures: 10 + 1 + 6.
+        expectNullableMoneyEq(dash.kpis.salesUSD, 17);
+
+        // RETURNS are reported separately, as a POSITIVE number.
+        expectMoneyEq(dash.kpis.returnsSYP, 1000);
+        expect(dash.kpis.returnsCount).toBe(1);
+        // netSales = gross − returns (= Σ over every row); identity pinned.
+        expectMoneyEq(dash.kpis.netSalesSYP, 3100);
+        expectMoneyEq(
+            dash.kpis.netSalesSYP,
+            new Decimal(dash.kpis.salesSYP).minus(dash.kpis.returnsSYP).toString()
+        );
+
         // EVENT-DATED count: COMPLETED invoices created today = T1, T2, T7.
-        // T2 was later voided, but the count does not move for a void (the VOID
-        // mirror row is VOIDED, so it is never counted either) — salesSYP above
-        // is what nets the reversal.
+        // T2 was later voided, but the count does not move for a void.
         expect(dash.kpis.invoiceCount).toBe(3);
-        // Σ(unitPrice × qty − cost) over today's lines: 60 + 140 + 1200 + 50 − 50 + 100.
+
+        // PROFIT is invoice-level: Σ totalSYP − Σ costAmountSYP.
+        //   gross costs today: 540+260+300 (T1) + 950 (T2) + 500 (T7) = 2550
+        //   gross profit     = 4100 − 2550 = 1550  (= 1400 + 50 + 100)
+        //   returns profit   = −1000 − (−950) = −50 (the negation of T2's 50)
+        //   net profit       = 1500
+        expectMoneyEq(dash.kpis.grossProfitSYP, 1550);
+        expectMoneyEq(dash.kpis.returnsProfitSYP, -50);
         expectMoneyEq(dash.kpis.netProfitSYP, 1500);
+        expectMoneyEq(
+            dash.kpis.netProfitSYP,
+            new Decimal(dash.kpis.grossProfitSYP).plus(dash.kpis.returnsProfitSYP).toString()
+        );
+
         // T4e's equation over ACTIVE customers only: (50000−20000) + 0 + (10000−15000).
         const expectedDebt = computeBalanceSYP(["50000", "0", "10000"], ["20000", "0", "15000"]);
         expectMoneyEq(expectedDebt, 25000);
@@ -429,11 +488,12 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
         // ledger that is a NEW row dated TOMORROW — it is outside today's
         // window, and today's original row is untouched.
         const TOMORROW = D("2026-10-06T08:00:00.000Z");
-        invoiceRows.push({ totalSYP: "-10000", totalUSD: "-10", status: "VOIDED", createdAt: TOMORROW });
+        invoiceRows.push({ totalSYP: "-2500", totalUSD: "-10", status: "VOIDED", createdAt: TOMORROW });
         try {
             const after = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
             expect(after.kpis.invoiceCount).toBe(before.kpis.invoiceCount);
             expectMoneyEq(after.kpis.salesSYP, before.kpis.salesSYP);
+            expectMoneyEq(after.kpis.returnsSYP, before.kpis.returnsSYP);
         } finally {
             invoiceRows.pop();
         }
@@ -447,11 +507,22 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
         expect(Object.keys(select).sort()).toEqual(["createdAt", "status", "totalSYP", "totalUSD"]);
     });
 
+    it("2a-iv. the item read selects the exact baseQuantity (never the rounded sale quantity)", async () => {
+        await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
+
+        const select = fakeDb.invoiceItem.findMany.mock.calls[0][0].select;
+        expect(select).toHaveProperty("baseQuantity", true);
+        expect(select).not.toHaveProperty("quantity");
+        expect(select).toHaveProperty("costAmountSYP", true);
+        expect(select.invoice).toEqual({ select: { createdAt: true, status: true } });
+    });
+
     it("2b. a KPI card and the trend's last bucket derive from the SAME rows", async () => {
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
         const last = dash.trend[dash.trend.length - 1];
         expect(last.date).toBe(localDayKey(NOW));
         expectMoneyEq(dash.kpis.salesSYP, last.salesSYP);
+        expectMoneyEq(dash.kpis.returnsSYP, last.returnsSYP);
         expectMoneyEq(dash.kpis.netProfitSYP, last.profitSYP);
     });
 
@@ -490,19 +561,23 @@ describe("T4h — windows & tenant-local (UTC+3) day bucketing", () => {
         expect(expectedDates[expectedDates.length - 1]).toBe("2026-10-05");
 
         // The 22:30 UTC sale (INV_T7) buckets into LOCAL today, not UTC yesterday.
+        // Gross sales 4100; the void is a RETURN of 1000; net profit 1500.
         const today = dash.trend[6];
-        expectMoneyEq(today.salesSYP, 10600);
+        expectMoneyEq(today.salesSYP, 4100);
+        expectMoneyEq(today.returnsSYP, 1000);
         expectMoneyEq(today.profitSYP, 1500);
 
         // INV_O4 (2026-10-03 local) — the window's only other sale day.
         const oct3 = dash.trend.find((p) => p.date === "2026-10-03")!;
         expectMoneyEq(oct3.salesSYP, 10000);
+        expectMoneyEq(oct3.returnsSYP, 0);
         expectMoneyEq(oct3.profitSYP, 100);
 
         // Every other bucket exists and is exactly zero — never missing, never NaN.
         for (const point of dash.trend) {
             if (point.date === "2026-10-05" || point.date === "2026-10-03") continue;
             expectMoneyEq(point.salesSYP, 0);
+            expectMoneyEq(point.returnsSYP, 0);
             expectMoneyEq(point.profitSYP, 0);
         }
     });
@@ -521,7 +596,7 @@ describe("T4h — windows & tenant-local (UTC+3) day bucketing", () => {
         // The poison row (2026-09-01, 99999 SYP) is outside every window…
         expect(dash.trend.find((p) => p.date === "2026-09-01")).toBeUndefined();
         // …and KPI "today" is window-invariant: one window, one truth.
-        expectMoneyEq(dash.kpis.salesSYP, 10600);
+        expectMoneyEq(dash.kpis.salesSYP, 4100);
     });
 });
 
@@ -537,18 +612,24 @@ describe("T4h — range=1 (today): hourly trend over the same rows", () => {
         expect(dash.trend[15].date).toBe("2026-10-05T15");
     });
 
-    it("7b. each sale lands in its LOCAL hour (UTC+3), and the buckets sum to the KPI", async () => {
+    it("7b. each sale lands in its LOCAL hour (UTC+3), voids land in RETURNS, and buckets sum to the KPIs", async () => {
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 1, now: NOW });
         const at = (key: string) => dash.trend.find((p) => p.date === key)!;
 
         // 22:30 UTC yesterday = 01:30 local today → hour 01.
         expectMoneyEq(at("2026-10-05T01").salesSYP, 600);
+        expectMoneyEq(at("2026-10-05T01").returnsSYP, 0);
         expectMoneyEq(at("2026-10-05T01").profitSYP, 100);
-        // 09:00Z → 12:00 local; 10:00Z → 13:00; 11:00Z (the void mirror) → 14:00.
-        expectMoneyEq(at("2026-10-05T12").salesSYP, 10000);
+        // 09:00Z → 12:00 local: 2500 − 1100 cost = 1400.
+        expectMoneyEq(at("2026-10-05T12").salesSYP, 2500);
         expectMoneyEq(at("2026-10-05T12").profitSYP, 1400);
+        // 10:00Z → 13:00: 1000 − 950 = 50.
         expectMoneyEq(at("2026-10-05T13").salesSYP, 1000);
-        expectMoneyEq(at("2026-10-05T14").salesSYP, -1000);
+        expectMoneyEq(at("2026-10-05T13").profitSYP, 50);
+        // 11:00Z (the void mirror) → 14:00: no GROSS sales, 1000 RETURNED,
+        // profit given back −1000 − (−950) = −50.
+        expectMoneyEq(at("2026-10-05T14").salesSYP, 0);
+        expectMoneyEq(at("2026-10-05T14").returnsSYP, 1000);
         expectMoneyEq(at("2026-10-05T14").profitSYP, -50);
 
         // Every other hour exists and is exactly zero.
@@ -556,12 +637,15 @@ describe("T4h — range=1 (today): hourly trend over the same rows", () => {
         for (const p of dash.trend) {
             if (busy.has(p.date.slice(11))) continue;
             expectMoneyEq(p.salesSYP, 0);
+            expectMoneyEq(p.returnsSYP, 0);
             expectMoneyEq(p.profitSYP, 0);
         }
 
         const sumSales = dash.trend.reduce((acc, p) => acc.plus(p.salesSYP), new Decimal(0));
+        const sumReturns = dash.trend.reduce((acc, p) => acc.plus(p.returnsSYP), new Decimal(0));
         const sumProfit = dash.trend.reduce((acc, p) => acc.plus(p.profitSYP), new Decimal(0));
         expectMoneyEq(sumSales.toString(), dash.kpis.salesSYP);
+        expectMoneyEq(sumReturns.toString(), dash.kpis.returnsSYP);
         expectMoneyEq(sumProfit.toString(), dash.kpis.netProfitSYP);
     });
 
@@ -572,14 +656,15 @@ describe("T4h — range=1 (today): hourly trend over the same rows", () => {
         expect(one.kpis).toEqual(seven.kpis);
 
         const ids = (list: { productId: string }[]) => list.map((a) => a.productId);
-        // The 3-days-ago sale (prod-value × 10) is outside a one-day window:
-        // prod-value nets to ZERO today (sold 1, voided 1).
+        // The 2-days-ago sale (prod-value × 10) is outside a one-day window:
+        // prod-value nets to ZERO today (sold 1, voided 1 — one collapsed line).
         expect(ids(one.topProducts.bySalesValue)).toEqual(["prod-profit", "prod-volume", "prod-edge", "prod-value"]);
         expect(ids(one.topProducts.byQuantity)).toEqual(["prod-volume", "prod-profit", "prod-edge", "prod-value"]);
         expect(ids(one.topProducts.byProfit)).toEqual(["prod-profit", "prod-volume", "prod-edge", "prod-value"]);
         const value = one.topProducts.bySalesValue.find((a) => a.productId === "prod-value")!;
         expectMoneyEq(value.salesSYP, 0);
         expectMoneyEq(value.quantity, 0);
+        expectMoneyEq(value.profitSYP, 0);
     });
 
     it("7d. at local 00:30 the chart has exactly one bucket (hour 00)", async () => {
@@ -646,6 +731,7 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
             "prod-profit",
             "prod-edge",
         ]);
+        // profit: 1200 / 200 / 170 / 100
         expect(ids(dash.topProducts.byProfit)).toEqual([
             "prod-profit",
             "prod-volume",
@@ -656,14 +742,17 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
         expect(ids(dash.topProducts.bySalesValue)).not.toEqual(ids(dash.topProducts.byQuantity));
     });
 
-    it("5b. quantities are per-line converted to BASE units (carton → 12 pieces)", async () => {
+    it("5b. quantities are BASE units (5 cartons → 60 + 40 pieces = 100); revenue uses the sold unit's price", async () => {
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
         const volume = dash.topProducts.byQuantity.find((a) => a.productId === "prod-volume")!;
-        // 5 cartons × 12 + 40 pieces = 100. A raw sum would be 45 and would
-        // rank 10 pieces (prod-value) ABOVE 5 cartons — exactly the T4h bug.
+        // baseQuantity 60 + 40 = 100. Ranking on a raw sale-unit sum (5 + 40 =
+        // 45) would put 10 pieces (prod-value) ABOVE 5 cartons — the T4h bug.
         expectMoneyEq(volume.quantity, 100);
         expect(volume.baseUnitName).toBe("قطعة");
+        // Revenue: 60 base ÷ 12 = 5 cartons × 120 = 600, plus 40 × 10 = 400.
+        expectMoneyEq(volume.salesSYP, 1000);
+        expectMoneyEq(volume.profitSYP, 200);
 
         const value = dash.topProducts.bySalesValue.find((a) => a.productId === "prod-value")!;
         expect(value.baseUnitName).toBe("صندوق");
@@ -682,7 +771,7 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
         // The dashboard still renders every figure…
-        expectMoneyEq(dash.kpis.salesSYP, 10600);
+        expectMoneyEq(dash.kpis.salesSYP, 4100);
         const volume = dash.topProducts.byQuantity.find((a) => a.productId === "prod-volume")!;
         expectMoneyEq(volume.quantity, 100);
         // …with an empty label rather than a failed request…
@@ -699,7 +788,7 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
         factors.delete("unit-carton");
         expect(() =>
             buildProductAggregates(
-                [line("prod-volume", "unit-carton", "1", "10", "5", INV_T1)],
+                [line("prod-volume", "unit-carton", "12", "10", "5", INV_T1)],
                 PRODUCT_NAMES,
                 factors
             )
@@ -716,6 +805,29 @@ describe("T4h — Top-5 product rankings (criteria 4 & 5)", () => {
         expect(aggregates[0].productName).toBe(UNKNOWN_PRODUCT_NAME);
         expectMoneyEq(aggregates[0].salesSYP, 100);
         expectMoneyEq(aggregates[0].profitSYP, 50);
+    });
+
+    it("5e. a sale FIFO-split across batches collapses to ONE line; its void nets to exactly zero", () => {
+        // 1 carton (12 base pieces) sold at 120, split 4 + 4 + 4 across three
+        // batches (three rows, one sale line). The void mirrors every row.
+        const sale = [
+            line("prod-volume", "unit-carton", "4", "120", "60", INV_T1),
+            line("prod-volume", "unit-carton", "4", "120", "60", INV_T1),
+            line("prod-volume", "unit-carton", "4", "120", "60", INV_T1),
+        ];
+        const [only] = buildProductAggregates(sale, PRODUCT_NAMES, UNIT_FACTORS);
+        // Divided ONCE (12 ÷ 12 = 1 carton), not per row (3 × 0.3333 = 0.9999).
+        expectMoneyEq(only.salesSYP, 120);
+        expectMoneyEq(only.quantity, 12);
+        expectMoneyEq(only.profitSYP, -60); // 120 revenue − 180 cost
+
+        const voided = sale.map((r) =>
+            line("prod-volume", "unit-carton", `-${r.baseQuantity}`, "120", `-${r.costAmountSYP}`, INV_T3, "VOIDED")
+        );
+        const [net] = buildProductAggregates([...sale, ...voided], PRODUCT_NAMES, UNIT_FACTORS);
+        expectMoneyEq(net.salesSYP, 0);
+        expectMoneyEq(net.quantity, 0);
+        expectMoneyEq(net.profitSYP, 0);
     });
 });
 
@@ -817,7 +929,7 @@ describe("T4h — alerts (gateway contract, ordering, counts, no deadlines)", ()
 });
 
 describe("T4h — pure helpers (no database)", () => {
-    it("lineProfitSYP: a void line is the EXACT negation of the original", () => {
+    it("lineProfitSYP (deprecated, still exported): a void line is the EXACT negation of the original", () => {
         const original = lineProfitSYP("10", "3", "25"); // 10×3 − 25
         const mirror = lineProfitSYP("10", "-3", "-25"); // 10×(−3) − (−25)
         expectMoneyEq(original, 5);

@@ -60,6 +60,21 @@ import { Prisma } from "@prisma/client";
 import Decimal from "decimal.js";
 import { z } from "zod";
 
+// [v4.9 FIX — P2028 "Transaction not found"] Prisma's interactive-transaction
+// default is 5s. Creating a product runs MANY sequential queries inside one
+// transaction (product + base unit + each extra unit + one
+// assertProductUnitBelongsToTenant + insert per barcode + one shared-catalog
+// resolution per GS1 barcode + receipt + batch). On a slow/remote database
+// that exceeded 5s: Prisma closed the transaction mid-way and the NEXT query
+// failed with P2028, surfacing as a generic 500 (observed: 7.0s request).
+// Same envelope idea as app/api/sync/route.ts's TX_OPTIONS, with a longer
+// timeout because this path is sequential and unbatched.
+//
+// NOTE: this only takes effect if getTenantDb(...).$transaction forwards its
+// second argument to Prisma's $transaction. If the failure persists after
+// this change, check lib/db/tenant-scope.ts.
+const CREATE_PRODUCT_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 } as const;
+
 const DECIMAL_STRING_REGEX = /^-?\d{1,14}(\.\d{1,4})?$/;
 
 const positiveDecimalString = (message: string) =>
@@ -443,7 +458,15 @@ export async function POST(req: Request) {
 
     const tenantId = session.user.tenantId;
     const db = getTenantDb(tenantId);
-    const body = await req.json();
+
+    // [v4.9] Malformed JSON → 400 instead of an unhandled throw (500).
+    const body = await req.json().catch(() => null);
+    if (body === null || typeof body !== "object") {
+      return NextResponse.json(
+        { error: "VALIDATION_ERROR", message: "طلب غير صالح (JSON غير صحيح)." },
+        { status: 400 }
+      );
+    }
 
     // [v4.4, Sections 10–10.1] Checked on the RAW body, before schema
     // validation, so a direct API call can never smuggle a full,
@@ -575,178 +598,182 @@ export async function POST(req: Request) {
       );
     }
 
-    const createdProduct = await db.$transaction(async (tx) => {
-      const baseUnitInput = units[baseUnitIndex];
-      // [FIX] createProductWithBaseUnit() now returns
-      // { createdProduct, createdBaseUnit } instead of { product, baseUnit }
-      // — renamed in lib/data/products.ts specifically so that
-      // destructuring this SANCTIONED, trusted return value no longer
-      // trips the PRODUCT_MODEL_RULES / BASE_UNIT_ID_RULES ESLint
-      // ObjectPattern selectors, which match on the destructured KEY NAME
-      // alone and can't distinguish "this function's own safe return"
-      // from "a raw Prisma relation." Aliased back to the original local
-      // names (`product`, `baseUnit`) here so every downstream reference
-      // in this function body (product.id, product.name, baseUnit.id,
-      // baseUnit.unitName, ...) needs no further changes.
-      const { createdProduct: product, createdBaseUnit: baseUnit } = await createProductWithBaseUnit(
-        tx,
-        tenantId,
-        { name, category: category || null, imageUrl: imageUrl?.trim() || null, isPublic: !!isPublic },
-        {
-          unitName: baseUnitInput.unitName,
-          pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
-          priceWholesale: baseUnitInput.priceWholesale,
-          isActive: baseUnitInput.isActive ?? true,
-        }
-      );
+    const createdProduct = await db.$transaction(
+      async (tx) => {
+        const baseUnitInput = units[baseUnitIndex];
+        // [FIX] createProductWithBaseUnit() now returns
+        // { createdProduct, createdBaseUnit } instead of { product, baseUnit }
+        // — renamed in lib/data/products.ts specifically so that
+        // destructuring this SANCTIONED, trusted return value no longer
+        // trips the PRODUCT_MODEL_RULES / BASE_UNIT_ID_RULES ESLint
+        // ObjectPattern selectors, which match on the destructured KEY NAME
+        // alone and can't distinguish "this function's own safe return"
+        // from "a raw Prisma relation." Aliased back to the original local
+        // names (`product`, `baseUnit`) here so every downstream reference
+        // in this function body (product.id, product.name, baseUnit.id,
+        // baseUnit.unitName, ...) needs no further changes.
+        const { createdProduct: product, createdBaseUnit: baseUnit } = await createProductWithBaseUnit(
+          tx,
+          tenantId,
+          { name, category: category || null, imageUrl: imageUrl?.trim() || null, isPublic: !!isPublic },
+          {
+            unitName: baseUnitInput.unitName,
+            pricingCurrency: baseUnitInput.pricingCurrency || "SYP",
+            priceWholesale: baseUnitInput.priceWholesale,
+            isActive: baseUnitInput.isActive ?? true,
+          }
+        );
 
-      // createdUnits, in the SAME ORDER as the submitted `units` array, so
-      // initialBatch.unitIndex still lines up. Filled in below.
-      const createdUnits: { id: string; conversionFactor: string }[] = new Array(units.length);
-      createdUnits[baseUnitIndex] = { id: baseUnit.id, conversionFactor: "1" };
+        // createdUnits, in the SAME ORDER as the submitted `units` array, so
+        // initialBatch.unitIndex still lines up. Filled in below.
+        const createdUnits: { id: string; conversionFactor: string }[] = new Array(units.length);
+        createdUnits[baseUnitIndex] = { id: baseUnit.id, conversionFactor: "1" };
 
-      // [v4.5] The base unit's barcodes — ONE createUnitBarcode() call per
-      // barcode, each its own top-level write inside THIS transaction (T1's
-      // nested-write ban: never `barcodes: { create: ... }`). A unit with no
-      // barcodes issues no calls at all.
-      for (const barcodeRow of baseUnitInput.barcodes) {
-        await createUnitBarcode(tx, tenantId, baseUnit.id, {
-          barcode: barcodeRow.barcode,
-          barcodeSource: barcodeRow.barcodeSource,
-        });
-      }
-
-      for (let i = 0; i < units.length; i++) {
-        if (i === baseUnitIndex) continue;
-        const u = units[i];
-        const createdUnit = await createAdditionalUnit(tx, tenantId, product.id, u.conversionFactor, {
-          unitName: u.unitName,
-          pricingCurrency: u.pricingCurrency || "SYP",
-          priceWholesale: u.priceWholesale,
-          isActive: u.isActive ?? true,
-        });
-        createdUnits[i] = { id: createdUnit.id, conversionFactor: u.conversionFactor };
-
-        // [v4.5] Same per-barcode treatment as the base unit above.
-        for (const barcodeRow of u.barcodes) {
-          await createUnitBarcode(tx, tenantId, createdUnit.id, {
+        // [v4.5] The base unit's barcodes — ONE createUnitBarcode() call per
+        // barcode, each its own top-level write inside THIS transaction (T1's
+        // nested-write ban: never `barcodes: { create: ... }`). A unit with no
+        // barcodes issues no calls at all.
+        for (const barcodeRow of baseUnitInput.barcodes) {
+          await createUnitBarcode(tx, tenantId, baseUnit.id, {
             barcode: barcodeRow.barcode,
             barcodeSource: barcodeRow.barcodeSource,
           });
         }
-      }
 
-      // [v4.5] GS1 shared-catalog reconciliation. Every GS1 barcode across
-      // every unit of this request, in submission order, resolved through
-      // lib/data/products.ts's gateway with REQUEST-SCOPED continuity:
-      //   * a barcode the platform already knows resolves to ITS OWN entry
-      //   * the first barcode that needs an entry creates exactly one
-      //   * every later NEW barcode links to that same entry — so a product
-      //     entered with three barcodes produces ONE ProductCatalogEntry,
-      //     never three near-duplicate rows
-      // INTERNAL barcodes are deliberately excluded (T3a §5: internal codes
-      // are the merchant's own labels and never contribute to the shared
-      // cross-tenant catalog).
-      let sharedCatalogEntryId: string | null = null;
-      for (const u of units) {
-        for (const barcodeRow of u.barcodes) {
-          if (barcodeRow.barcodeSource !== "GS1") continue;
-          sharedCatalogEntryId = await resolveSharedCatalogForBarcode(tx, {
-            barcode: barcodeRow.barcode,
-            name,
-            category: category || null,
-            imageUrl: imageUrl?.trim() || null,
-            addedByTenantId: tenantId,
-            preferEntryId: sharedCatalogEntryId,
+        for (let i = 0; i < units.length; i++) {
+          if (i === baseUnitIndex) continue;
+          const u = units[i];
+          const createdUnit = await createAdditionalUnit(tx, tenantId, product.id, u.conversionFactor, {
+            unitName: u.unitName,
+            pricingCurrency: u.pricingCurrency || "SYP",
+            priceWholesale: u.priceWholesale,
+            isActive: u.isActive ?? true,
+          });
+          createdUnits[i] = { id: createdUnit.id, conversionFactor: u.conversionFactor };
+
+          // [v4.5] Same per-barcode treatment as the base unit above.
+          for (const barcodeRow of u.barcodes) {
+            await createUnitBarcode(tx, tenantId, createdUnit.id, {
+              barcode: barcodeRow.barcode,
+              barcodeSource: barcodeRow.barcodeSource,
+            });
+          }
+        }
+
+        // [v4.5] GS1 shared-catalog reconciliation. Every GS1 barcode across
+        // every unit of this request, in submission order, resolved through
+        // lib/data/products.ts's gateway with REQUEST-SCOPED continuity:
+        //   * a barcode the platform already knows resolves to ITS OWN entry
+        //   * the first barcode that needs an entry creates exactly one
+        //   * every later NEW barcode links to that same entry — so a product
+        //     entered with three barcodes produces ONE ProductCatalogEntry,
+        //     never three near-duplicate rows
+        // INTERNAL barcodes are deliberately excluded (T3a §5: internal codes
+        // are the merchant's own labels and never contribute to the shared
+        // cross-tenant catalog).
+        let sharedCatalogEntryId: string | null = null;
+        for (const u of units) {
+          for (const barcodeRow of u.barcodes) {
+            if (barcodeRow.barcodeSource !== "GS1") continue;
+            sharedCatalogEntryId = await resolveSharedCatalogForBarcode(tx, {
+              barcode: barcodeRow.barcode,
+              name,
+              category: category || null,
+              imageUrl: imageUrl?.trim() || null,
+              addedByTenantId: tenantId,
+              preferEntryId: sharedCatalogEntryId,
+            });
+          }
+        }
+
+        if (initialBatch) {
+          // [v4.0] ProductBatch.unitId is ALWAYS the base unit — never the
+          // unit the admin picked via `initialBatch.unitIndex` (an ENTRY
+          // convenience only). The entered quantity is converted via the
+          // ENTERED unit's own conversionFactor — trusted here because it
+          // comes from this same create request, not a later,
+          // separately-submitted payload (contrast with T4c/T5, which must
+          // re-fetch the factor from the DB instead of trusting a client
+          // payload).
+          //
+          // [v4.4, Sections 10–11] The write itself — including the one
+          // sanctioned constructBatchNumber() call — is delegated to the
+          // shared lib/inventory/batch-creation.ts helper, so this screen,
+          // T3a's single-batch screen and Section 11's multi-product receipt
+          // screen cannot drift into three subtly different writes.
+          //
+          // [Batch cost entry — UNIFIED] Passes `totalCost`, not
+          // `costPricePerBaseUnit` — createBatchRow() derives the stored
+          // per-base-unit figure via costFromTotal(), using the ENTERED
+          // unit's own conversionFactor (never the base unit's, which is
+          // always 1). This is the exact same call shape the single-batch
+          // and multi-product receipt routes already use.
+          //
+          // [FIX — unitIndex] No `?? createdUnits[baseUnitIndex]` fallback
+          // any more. `initialBatch.unitIndex` was bounds-checked against
+          // `units.length` in POST before this transaction opened, and every
+          // slot of `createdUnits` has been filled by now, so the lookup
+          // cannot miss. If it ever did, the thrown error below is louder
+          // and safer than silently treating "3 cartons" as "3 pieces".
+          const enteredUnit = createdUnits[initialBatch.unitIndex];
+          if (!enteredUnit) {
+            throw new Error(
+              `initialBatch.unitIndex ${initialBatch.unitIndex} has no created unit — bounds check bypassed.`
+            );
+          }
+
+          // [v4.7] Step 3 rides the receiving gateway: ONE ProductReceipt
+          // written first, then the batch under it — top-level calls only, so
+          // a failure rolls back product, receipt and batch together.
+          await createReceiptWithBatches(tx, {
+            tenantId,
+            userId: session.user.id,
+            purchaseDate: initialBatch.purchaseDate,
+            supplierName: initialBatch.supplierName,
+            batchNumberSuffix: initialBatch.batchNumberSuffix,
+            lines: [
+              {
+                productId: product.id,
+                entryUnitId: enteredUnit.id,
+                quantity: initialBatch.quantity,
+                totalCost: initialBatch.totalCost,
+                expiryDate: initialBatch.expiryDate ?? null,
+              },
+            ],
           });
         }
-      }
 
-      if (initialBatch) {
-        // [v4.0] ProductBatch.unitId is ALWAYS the base unit — never the
-        // unit the admin picked via `initialBatch.unitIndex` (an ENTRY
-        // convenience only). The entered quantity is converted via the
-        // ENTERED unit's own conversionFactor — trusted here because it
-        // comes from this same create request, not a later,
-        // separately-submitted payload (contrast with T4c/T5, which must
-        // re-fetch the factor from the DB instead of trusting a client
-        // payload).
-        //
-        // [v4.4, Sections 10–11] The write itself — including the one
-        // sanctioned constructBatchNumber() call — is delegated to the
-        // shared lib/inventory/batch-creation.ts helper, so this screen,
-        // T3a's single-batch screen and Section 11's multi-product receipt
-        // screen cannot drift into three subtly different writes.
-        //
-        // [Batch cost entry — UNIFIED] Passes `totalCost`, not
-        // `costPricePerBaseUnit` — createBatchRow() derives the stored
-        // per-base-unit figure via costFromTotal(), using the ENTERED
-        // unit's own conversionFactor (never the base unit's, which is
-        // always 1). This is the exact same call shape the single-batch
-        // and multi-product receipt routes already use.
-        //
-        // [FIX — unitIndex] No `?? createdUnits[baseUnitIndex]` fallback
-        // any more. `initialBatch.unitIndex` was bounds-checked against
-        // `units.length` in POST before this transaction opened, and every
-        // slot of `createdUnits` has been filled by now, so the lookup
-        // cannot miss. If it ever did, the thrown error below is louder
-        // and safer than silently treating "3 cartons" as "3 pieces".
-        const enteredUnit = createdUnits[initialBatch.unitIndex];
-        if (!enteredUnit) {
-          throw new Error(
-            `initialBatch.unitIndex ${initialBatch.unitIndex} has no created unit — bounds check bypassed.`
-          );
-        }
-
-        // [v4.7] Step 3 rides the receiving gateway: ONE ProductReceipt
-        // written first, then the batch under it — top-level calls only, so
-        // a failure rolls back product, receipt and batch together.
-        await createReceiptWithBatches(tx, {
-          tenantId,
-          userId: session.user.id,
-          purchaseDate: initialBatch.purchaseDate,
-          supplierName: initialBatch.supplierName,
-          batchNumberSuffix: initialBatch.batchNumberSuffix,
-          lines: [
-            {
-              productId: product.id,
-              entryUnitId: enteredUnit.id,
-              quantity: initialBatch.quantity,
-              totalCost: initialBatch.totalCost,
-              expiryDate: initialBatch.expiryDate ?? null,
-            },
-          ],
-        });
-      }
-
-      // [FIX] The field holding the resolved base unit's id here is
-      // named `resolvedBaseUnitId`, not `baseUnitId` — this is a plain
-      // local object this route builds itself (not a raw Prisma
-      // relation), but eslint.config.mjs's BASE_UNIT_ID_RULES bans the
-      // literal property name `.baseUnitId` via MemberExpression
-      // ANYWHERE outside lib/inventory/base-unit.ts, regardless of the
-      // object's actual origin — it can't distinguish "a safe local DTO"
-      // from "a raw fetched Product row." Every later READ of this field
-      // in this function (`createdProduct.baseUnitId`) would otherwise
-      // trip that rule. Renaming the field itself avoids the false
-      // positive, matching the exact same reasoning behind
-      // createProductWithBaseUnit()'s createdProduct/createdBaseUnit
-      // rename in lib/data/products.ts. The outbound JSON response below
-      // still exposes this as `baseUnitId` — that's a plain object-literal
-      // Property key, not a MemberExpression read, so it isn't restricted.
-      return {
-        productId: product.id,
-        productName: product.name,
-        productCategory: product.category,
-        productImageUrl: product.imageUrl,
-        productIsPublic: product.isPublic,
-        productIsActive: product.isActive,
-        productCreatedAt: product.createdAt,
-        resolvedBaseUnitId: baseUnit.id,
-        createdUnits,
-        unitInputs: units,
-      };
-    });
+        // [FIX] The field holding the resolved base unit's id here is
+        // named `resolvedBaseUnitId`, not `baseUnitId` — this is a plain
+        // local object this route builds itself (not a raw Prisma
+        // relation), but eslint.config.mjs's BASE_UNIT_ID_RULES bans the
+        // literal property name `.baseUnitId` via MemberExpression
+        // ANYWHERE outside lib/inventory/base-unit.ts, regardless of the
+        // object's actual origin — it can't distinguish "a safe local DTO"
+        // from "a raw fetched Product row." Every later READ of this field
+        // in this function (`createdProduct.baseUnitId`) would otherwise
+        // trip that rule. Renaming the field itself avoids the false
+        // positive, matching the exact same reasoning behind
+        // createProductWithBaseUnit()'s createdProduct/createdBaseUnit
+        // rename in lib/data/products.ts. The outbound JSON response below
+        // still exposes this as `baseUnitId` — that's a plain object-literal
+        // Property key, not a MemberExpression read, so it isn't restricted.
+        return {
+          productId: product.id,
+          productName: product.name,
+          productCategory: product.category,
+          productImageUrl: product.imageUrl,
+          productIsPublic: product.isPublic,
+          productIsActive: product.isActive,
+          productCreatedAt: product.createdAt,
+          resolvedBaseUnitId: baseUnit.id,
+          createdUnits,
+          unitInputs: units,
+        };
+      },
+      // [v4.9 FIX — P2028] see CREATE_PRODUCT_TX_OPTIONS above.
+      CREATE_PRODUCT_TX_OPTIONS
+    );
 
     const responseProduct = {
       id: createdProduct.productId,
@@ -823,10 +850,35 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+    // [v4.9 FIX — P2002 narrowing] Previously ANY unique-constraint conflict
+    // was reported as "a barcode is already used", even when the conflict was
+    // on something else. Now only a conflict whose structured meta.target
+    // names the barcode column gets that message; anything else is logged and
+    // returned as a generic error. (A double-click / two tabs racing the
+    // pre-check above still lands here as a barcode conflict — the UI should
+    // also disable the save button while the request is in flight.)
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      const target = Array.isArray(error.meta?.target)
+        ? (error.meta.target as string[])
+        : [];
+      if (target.includes("barcode")) {
+        return NextResponse.json(
+          { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لمنتج آخر." },
+          { status: 400 }
+        );
+      }
+    }
+    // [v4.9 FIX — P2028] The interactive transaction outlived its timeout (or
+    // was closed under us). Nothing was committed (Prisma rolled it back), so
+    // retrying is safe. 503 + a clear message instead of an opaque 500.
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2028") {
+      console.error("Product creation transaction timed out:", error);
       return NextResponse.json(
-        { error: "BARCODE_EXISTS", message: "أحد الباركودات المدخلة مستخدم بالفعل لمنتج آخر." },
-        { status: 400 }
+        {
+          error: "TRANSACTION_TIMEOUT",
+          message: "استغرقت عملية إضافة المنتج وقتاً أطول من المتوقع ولم تُحفظ. يرجى المحاولة مرة أخرى.",
+        },
+        { status: 503 }
       );
     }
     console.error("Error creating product:", error);

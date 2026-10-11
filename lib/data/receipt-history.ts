@@ -34,16 +34,23 @@
  * ProductBatch and ONE over BatchDeletionLog (restricted to the page's ids)
  * — never one query per receipt. The detail's reconciliation inputs are
  * fixed-cost reads regardless of line count: InvoiceItems grouped ONCE by
- * (batchId, unitId), StockAdjustments grouped ONCE by batchId,
- * CostPriceChangeLogs grouped ONCE by batchId, factors via units.ts's
- * getUnitConversionFactors() ONCE, names via lib/data/products.ts's
- * listProductNamesByIds()/listUnitNamesByIds() ONCE each. The groupBy calls
- * go through the same callGroupBy overload-narrowing helper as
- * lib/data/analytics.ts (why that helper exists: the tenant extension types
- * each delegate's groupBy as an incompatible union of generic overloads).
+ * batchId (summing the stored baseQuantity), StockAdjustments grouped ONCE
+ * by batchId, CostPriceChangeLogs grouped ONCE by batchId, names via
+ * lib/data/products.ts's listProductNamesByIds()/listUnitNamesByIds() ONCE
+ * each. The groupBy calls go through the same callGroupBy overload-narrowing
+ * helper as lib/data/analytics.ts (why that helper exists: the tenant
+ * extension types each delegate's groupBy as an incompatible union of
+ * generic overloads).
  *
- * ── No quantity/money math in this file ─────────────────────────────────
- *   - netSold: units.ts's netSoldInBaseUnit() (THE conversion site).
+ * ── No quantity conversion / money math in this file ────────────────────
+ *   - netSold: [v4.8] SUM(InvoiceItem.baseQuantity) per batch, computed by
+ *     the database (groupBy _sum). baseQuantity is the quantity ACTUALLY
+ *     deducted from the batch, in the product's BASE unit, written once at
+ *     commit time straight from the FIFO allocation. VOIDED rows carry the
+ *     negated value, so a plain sum nets reversals out. InvoiceItem.quantity
+ *     (sale unit, rounded for split sales: 20/24 = 0.8333) is DISPLAY-ONLY
+ *     and is NEVER read here — multiplying it back by a conversion factor is
+ *     exactly the drift bug v4.8 closed (19.9992 instead of 20).
  *   - the identity: units.ts's reconciliationIdentityHolds() (EXACT decimal
  *     equality — no epsilon; a failure is a data-drift signal, not a display
  *     bug to be tolerated away).
@@ -67,8 +74,6 @@ import type { Prisma } from "@prisma/client";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
 import {
   breakdownForDisplay,
-  getUnitConversionFactors,
-  netSoldInBaseUnit,
   reconciliationIdentityHolds,
   type DisplayUnit,
 } from "@/lib/inventory/units";
@@ -261,11 +266,11 @@ export async function listReceiptsForTenant(
       ...(Object.keys(dateBounds).length > 0 ? { purchaseDate: dateBounds } : {}),
       ...(filters.supplierName
         ? {
-            supplierName: {
-              contains: filters.supplierName,
-              mode: "insensitive" as const,
-            },
-          }
+          supplierName: {
+            contains: filters.supplierName,
+            mode: "insensitive" as const,
+          },
+        }
         : {}),
       ...(cursorKeys ? { AND: [keysetWhere(cursorKeys)] } : {}),
     },
@@ -328,10 +333,10 @@ export async function listReceiptsForTenant(
     items,
     nextCursor: hasMore
       ? encodeReceiptCursor({
-          purchaseDate: formatDbDate(last.purchaseDate),
-          createdAt: last.createdAt.toISOString(),
-          id: last.id,
-        })
+        purchaseDate: formatDbDate(last.purchaseDate),
+        createdAt: last.createdAt.toISOString(),
+        id: last.id,
+      })
       : null,
   };
 }
@@ -354,7 +359,11 @@ export interface ReceiptDetailLine {
   initialQuantity: string;
   /** ProductBatch.quantity today — live, moves with sales/adjustments. */
   remaining: string;
-  /** Σ all InvoiceItems converted to base unit (voids are negative → net out). */
+  /**
+   * [v4.8] Σ InvoiceItem.baseQuantity for this batch — already in the base
+   * unit, exact (never derived from the rounded sale-unit `quantity`).
+   * Voided rows are negative, so reversals net out.
+   */
   netSold: string;
   /** Σ StockAdjustment.quantityDelta for this batch. */
   adjustments: string;
@@ -444,10 +453,13 @@ interface RawDeletedLogRow {
   deletedByUser: { name: string } | null;
 }
 
+/**
+ * [v4.8] One group per batch: Σ baseQuantity over EVERY InvoiceItem of the
+ * batch (POS, B2B and VOIDED rows alike — voids are stored negative).
+ */
 interface RawSoldGroup {
   batchId: string;
-  unitId: string;
-  _sum: { quantity: DecimalLike | null };
+  _sum: { baseQuantity: DecimalLike | null };
 }
 
 interface RawAdjustmentGroup {
@@ -526,6 +538,8 @@ export async function getReceiptDetail(
   ])) as [RawLiveBatchRow[], RawDeletedLogRow[]];
 
   const batchIds = liveBatches.map((batch) => batch.id);
+  // Unit ids are needed ONLY for display names now — [v4.8] no sale-unit
+  // conversion factors are fetched anywhere in this file.
   const unitIds = [
     ...new Set([
       ...liveBatches.map((batch) => batch.unitId),
@@ -539,14 +553,19 @@ export async function getReceiptDetail(
     ]),
   ];
 
-  // Fixed-cost fan-out: five grouped/batched reads — the same count whether
-  // the receipt has 1 line or 100. No per-line query.
+  // Fixed-cost fan-out: grouped/batched reads — the same count whether the
+  // receipt has 1 line or 100. No per-line query.
   const [soldGroups, adjustmentGroups, costChangeGroups, productNameById, unitNameById, displayUnitsByProduct] =
     (await Promise.all([
+      // [v4.8 — FIX] Sum the stored base-unit quantity actually deducted from
+      // each batch. The old query summed `quantity` (sale unit, rounded for
+      // FIFO-split sales) per (batchId, unitId) and multiplied by the unit's
+      // factor afterwards — producing 19.9992 / 4.0008 for a 20 + 4 split of
+      // one 24-piece carton.
       callGroupBy(db.invoiceItem.groupBy, {
-        by: ["batchId", "unitId"],
+        by: ["batchId"],
         where: { tenantId, batchId: { in: batchIds } },
-        _sum: { quantity: true },
+        _sum: { baseQuantity: true },
       }),
       callGroupBy(db.stockAdjustment.groupBy, {
         by: ["batchId"],
@@ -574,24 +593,9 @@ export async function getReceiptDetail(
       Map<string, DisplayUnit[]>,
     ];
 
-  // [Round B — FIX] netSoldInBaseUnit() converts InvoiceItem quantities
-  // from the SOLD unit (packs, cartons — often NOT one of the batch's own
-  // unit ids), so the factor map must include every unit the sale groups
-  // reference. That set is only knowable AFTER the invoiceItem groupBy
-  // above, which is why this read runs just after the parallel batch —
-  // still ONE fixed-cost query per detail fetch (never per line), and a
-  // genuinely missing factor still throws inside units.ts rather than
-  // silently assuming 1.
-  const factorByUnitId = await getUnitConversionFactors(db, tenantId, [
-    ...unitIds,
-    ...soldGroups.map((group) => group.unitId),
-  ]);
-
-  const soldByBatch = new Map<string, RawSoldGroup[]>();
+  const netSoldByBatch = new Map<string, string>();
   for (const group of soldGroups) {
-    const list = soldByBatch.get(group.batchId);
-    if (list) list.push(group);
-    else soldByBatch.set(group.batchId, [group]);
+    netSoldByBatch.set(group.batchId, (group._sum.baseQuantity ?? "0").toString());
   }
   const adjustmentsByBatch = new Map<string, string>();
   for (const group of adjustmentGroups) {
@@ -601,17 +605,8 @@ export async function getReceiptDetail(
 
 
   const lines: ReceiptDetailLine[] = liveBatches.map((batch) => {
-    // Conversion happens ONLY inside units.ts (netSoldInBaseUnit) — the
-    // groups below are pre-aggregated per (batchId, unitId), which is exact
-    // because the factor is constant within a unit.
-    const groups = soldByBatch.get(batch.id) ?? [];
-    const netSold = netSoldInBaseUnit(
-      groups.map((group) => ({
-        unitId: group.unitId,
-        quantity: (group._sum.quantity ?? "0").toString(),
-      })),
-      factorByUnitId
-    ).toString();
+    // [v4.8] Already exact and already in the base unit — no conversion.
+    const netSold = netSoldByBatch.get(batch.id) ?? "0";
     const adjustments = adjustmentsByBatch.get(batch.id) ?? "0";
 
     // [Round B] units.ts's breakdownForDisplay() decomposes the RECEIVED
@@ -684,4 +679,3 @@ export async function getReceiptDetail(
     deletedLineCount: deletedLines.length,
   };
 }
-

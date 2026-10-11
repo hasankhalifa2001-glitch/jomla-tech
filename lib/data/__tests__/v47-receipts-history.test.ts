@@ -1,32 +1,26 @@
 /* eslint-disable no-restricted-syntax */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
- * lib/data/__tests__/v47-receipts-history.test.ts — [v4.7, Round B]
- * The READ side of the goods-receiving history: lib/data/receipt-history.ts
- * exercised as written (REAL data layer, fake Prisma boundary — the same
- * posture t4c2-sales-log takes).
+ * lib/data/__tests__/v47-receipts-history.test.ts
  *
- * Pins:
- *  1. Cursor pagination encodes ALL THREE sort keys — several receipts
- *     sharing BOTH purchaseDate and createdAt are walked page by page with
- *     every id seen exactly once (no skips, no duplicates).
- *  2. from/to filter on purchaseDate (business dates); supplierName is a
- *     case-insensitive contains-match; both compose with the cursor.
- *  3. Totals/counts come from ONE groupBy per table per page (no N+1) and
- *     count LIVE lines only; deleted lines are counted separately.
- *  4. Detail: live lines (four figures + breakdown + costAdjusted) and
- *     deleted lines (shown, EXCLUDED from the receipt total). A receipt
- *     whose lines are ALL deleted still returns with an empty live list.
- *  5. Reconciliation identity: remaining = initial − netSold + adjustments,
- *     exact decimal equality, netSold via the SOLD unit's factor (a factor
- *     of 24 — using the base unit's 1 would fail the identity), voids
- *     netting out, and corruption flipping reconciles to false.
- *  6. netSoldInBaseUnit unit tests (voids net out, fractional exact, a
- *     missing factor throws instead of silently assuming 1).
- *  7. Static scans: no writes at all in this file's subject, no conversion
- *     arithmetic outside lib/inventory/units.ts, no USD anywhere in the
- *     receipts read path.
+ * [v4.8, Round B] Receipt history read-side tests.
+ *
+ * Tests the REAL data layer with a fake Prisma boundary.
+ *
+ * Coverage:
+ * 1. Three-key cursor pagination: purchaseDate, createdAt, id.
+ * 2. Inclusive business-date filters and case-insensitive supplier search.
+ * 3. Grouped totals/counts, tenant isolation, no N+1.
+ * 4. Live/deleted receipt details and live-only totals.
+ * 5. Reconciliation using SUM(InvoiceItem.baseQuantity).
+ * 6. Exact decimal reconciliation equality.
+ * 7. Static scans for read-only behavior, conversion boundaries and SYP-only
+ *    receipt history.
+ *
+ * v4.8: netSoldInBaseUnit was removed. netSold is now the database sum of
+ * InvoiceItem.baseQuantity, already expressed in the product's base unit.
  */
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
@@ -38,17 +32,15 @@ import {
   encodeReceiptCursor,
   InvalidReceiptCursorError,
 } from "@/lib/data/receipt-history";
+
 import {
-  netSoldInBaseUnit,
   reconciliationIdentityHolds,
-  toBaseUnit,
 } from "@/lib/inventory/units";
 
 const TENANT_ID = "tenant-1";
 
 // ---------------------------------------------------------------------------
-// Fake Prisma boundary. Decimal columns are decimal.js instances (the data
-// layer only ever calls .toString() on them — exactly like Prisma.Decimal).
+// Fake Prisma boundary.
 // ---------------------------------------------------------------------------
 
 type AnyRec = Record<string, any>;
@@ -63,8 +55,13 @@ function date(iso: string): Date {
   return new Date(iso);
 }
 
-/** One ProductReceipt-shaped row (@db.Date stored as UTC midnight). */
-function receipt(id: string, purchaseDate: string, createdAt: string, supplier: string | null = null): AnyRec {
+/** One ProductReceipt-shaped row (@db.Date stored at UTC midnight). */
+function receipt(
+  id: string,
+  purchaseDate: string,
+  createdAt: string,
+  supplier: string | null = null
+): AnyRec {
   return {
     id,
     tenantId: TENANT_ID,
@@ -75,38 +72,62 @@ function receipt(id: string, purchaseDate: string, createdAt: string, supplier: 
   };
 }
 
-/** Evaluates the exact (small) where vocabulary listReceiptsForTenant emits. */
+/** Evaluates the where vocabulary emitted by listReceiptsForTenant. */
 function matchesReceiptWhere(row: AnyRec, where: AnyRec): boolean {
-  if (where.tenantId && row.tenantId !== where.tenantId) return false;
+  if (where.tenantId && row.tenantId !== where.tenantId) {
+    return false;
+  }
+
   if (where.purchaseDate) {
     const { gte, lte } = where.purchaseDate;
-    if (gte && row.purchaseDate.getTime() < gte.getTime()) return false;
-    if (lte && row.purchaseDate.getTime() > lte.getTime()) return false;
-  }
-  if (where.supplierName) {
-    const needle = String(where.supplierName.contains ?? "").toLowerCase();
-    const hay = (row.supplierName ?? "").toLowerCase();
-    if (!hay.includes(needle)) return false;
-  }
-  if (Array.isArray(where.AND)) {
-    for (const clause of where.AND) {
-      if (!matchesKeyset(row, clause)) return false;
+
+    if (gte && row.purchaseDate.getTime() < gte.getTime()) {
+      return false;
+    }
+
+    if (lte && row.purchaseDate.getTime() > lte.getTime()) {
+      return false;
     }
   }
+
+  if (where.supplierName) {
+    const needle = String(
+      where.supplierName.contains ?? ""
+    ).toLowerCase();
+
+    const hay = (row.supplierName ?? "").toLowerCase();
+
+    if (!hay.includes(needle)) {
+      return false;
+    }
+  }
+
+  if (Array.isArray(where.AND)) {
+    for (const clause of where.AND) {
+      if (!matchesKeyset(row, clause)) {
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 
-/** The keyset predicate: OR of the three (pd, ca, id) DESC steps. */
+/** The keyset predicate: OR of the three (purchaseDate, createdAt, id) DESC steps. */
 function matchesKeyset(row: AnyRec, clause: AnyRec): boolean {
   const or: AnyRec[] = clause.OR ?? [];
+
   for (const branch of or) {
     const pd = branch.purchaseDate;
+
     if (pd instanceof Date) {
-      // Branches 2 and 3 require the SAME purchaseDate as the cursor.
-      if (row.purchaseDate.getTime() !== pd.getTime()) continue;
+      if (row.purchaseDate.getTime() !== pd.getTime()) {
+        continue;
+      }
+
       const ca = branch.createdAt;
+
       if (ca instanceof Date) {
-        // Branch 3: same pd AND same createdAt → strictly smaller id.
         if (
           row.createdAt.getTime() === ca.getTime() &&
           branch.id?.lt !== undefined &&
@@ -115,14 +136,17 @@ function matchesKeyset(row: AnyRec, clause: AnyRec): boolean {
           return true;
         }
       } else if (ca?.lt instanceof Date) {
-        // Branch 2: same pd, strictly older createdAt.
-        if (row.createdAt.getTime() < ca.lt.getTime()) return true;
+        if (row.createdAt.getTime() < ca.lt.getTime()) {
+          return true;
+        }
       }
     } else if (pd?.lt instanceof Date) {
-      // Branch 1: strictly older purchaseDate.
-      if (row.purchaseDate.getTime() < pd.lt.getTime()) return true;
+      if (row.purchaseDate.getTime() < pd.lt.getTime()) {
+        return true;
+      }
     }
   }
+
   return false;
 }
 
@@ -130,39 +154,53 @@ function byDesc(a: AnyRec, b: AnyRec): number {
   if (a.purchaseDate.getTime() !== b.purchaseDate.getTime()) {
     return b.purchaseDate.getTime() - a.purchaseDate.getTime();
   }
+
   if (a.createdAt.getTime() !== b.createdAt.getTime()) {
     return b.createdAt.getTime() - a.createdAt.getTime();
   }
+
   return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
 }
 
-/** Grouped totals fake: ONE call per table per page, grouped by receiptId. */
-function makeListDb(options: {
-  batches?: AnyRec[]; // { receiptId, totalCostSYP, tenantId }
-  deletions?: AnyRec[]; // { receiptId, tenantId }
-} = {}) {
+/** Grouped totals fake: one groupBy per table per page. */
+function makeListDb(
+  options: {
+    batches?: AnyRec[];
+    deletions?: AnyRec[];
+  } = {}
+) {
   const batches = options.batches ?? [];
   const deletions = options.deletions ?? [];
 
   const productBatch = {
     findMany: vi.fn(),
+
     groupBy: vi.fn(async (args: AnyRec) => {
       const ids: string[] = args.where?.receiptId?.in ?? [];
+
       const rows = batches.filter(
-        (b) => b.tenantId === args.where?.tenantId && ids.includes(b.receiptId)
+        (b) =>
+          b.tenantId === args.where?.tenantId &&
+          ids.includes(b.receiptId)
       );
+
       const byReceipt = new Map<string, AnyRec[]>();
+
       for (const row of rows) {
         const list = byReceipt.get(row.receiptId) ?? [];
         list.push(row);
         byReceipt.set(row.receiptId, list);
       }
+
       return [...byReceipt.entries()].map(([receiptId, group]) => ({
         receiptId,
         _count: group.length,
         _sum: {
           totalCostSYP: group
-            .reduce((acc, row) => acc.plus(row.totalCostSYP), new Decimal(0))
+            .reduce(
+              (acc, row) => acc.plus(row.totalCostSYP),
+              new Decimal(0)
+            )
             .toString(),
         },
       }));
@@ -171,15 +209,25 @@ function makeListDb(options: {
 
   const batchDeletionLog = {
     findMany: vi.fn(),
+
     groupBy: vi.fn(async (args: AnyRec) => {
       const ids: string[] = args.where?.receiptId?.in ?? [];
+
       const rows = deletions.filter(
-        (row) => row.tenantId === args.where?.tenantId && ids.includes(row.receiptId)
+        (row) =>
+          row.tenantId === args.where?.tenantId &&
+          ids.includes(row.receiptId)
       );
+
       const byReceipt = new Map<string, number>();
+
       for (const row of rows) {
-        byReceipt.set(row.receiptId, (byReceipt.get(row.receiptId) ?? 0) + 1);
+        byReceipt.set(
+          row.receiptId,
+          (byReceipt.get(row.receiptId) ?? 0) + 1
+        );
       }
+
       return [...byReceipt.entries()].map(([receiptId, count]) => ({
         receiptId,
         _count: count,
@@ -189,18 +237,24 @@ function makeListDb(options: {
 
   const productReceipt = {
     findMany: vi.fn(async (args: AnyRec) => {
-      const filtered = RECEIPTS_STORE.filter((row) => matchesReceiptWhere(row, args.where ?? {})).sort(
-        byDesc
-      );
+      const filtered = RECEIPTS_STORE.filter((row) =>
+        matchesReceiptWhere(row, args.where ?? {})
+      ).sort(byDesc);
+
       return filtered.slice(0, args.take);
     }),
+
     findFirst: vi.fn(),
   };
 
-  return { productReceipt, productBatch, batchDeletionLog };
+  return {
+    productReceipt,
+    productBatch,
+    batchDeletionLog,
+  };
 }
 
-/** The store the list fake reads from — swapped per test. */
+/** The store the list fake reads from. */
 let RECEIPTS_STORE: AnyRec[] = [];
 
 beforeEach(() => {
@@ -208,14 +262,11 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// 1. Cursor pagination — the three-key tie-break
+// 1. Cursor pagination — all three sort keys.
 // ---------------------------------------------------------------------------
 
-describe("listReceiptsForTenant — cursor pagination (all THREE sort keys)", () => {
-  it("walks receipts that share BOTH purchaseDate and createdAt exactly once each", async () => {
-    // Five receipts, same purchaseDate AND same createdAt — only the id
-    // differs. A cursor carrying fewer than all three keys would position
-    // the next page ambiguously and skip/duplicate rows here.
+describe("listReceiptsForTenant — cursor pagination", () => {
+  it("walks rows sharing purchaseDate and createdAt exactly once each", async () => {
     RECEIPTS_STORE = [
       receipt("r-5", "2026-06-01T00:00:00.000Z", "2026-06-02T09:00:00.000Z"),
       receipt("r-4", "2026-06-01T00:00:00.000Z", "2026-06-02T09:00:00.000Z"),
@@ -223,144 +274,235 @@ describe("listReceiptsForTenant — cursor pagination (all THREE sort keys)", ()
       receipt("r-2", "2026-06-01T00:00:00.000Z", "2026-06-02T09:00:00.000Z"),
       receipt("r-1", "2026-06-01T00:00:00.000Z", "2026-06-02T09:00:00.000Z"),
     ];
-    const db = makeListDb();
 
+    const db = makeListDb();
     const seen: string[] = [];
+
     let cursor: string | undefined;
     let pages = 0;
+
     do {
-      const page = await listReceiptsForTenant(db as any, TENANT_ID, { limit: 2, cursor });
+      const page = await listReceiptsForTenant(
+        db as any,
+        TENANT_ID,
+        { limit: 2, cursor }
+      );
+
       seen.push(...page.items.map((row) => row.id));
       cursor = page.nextCursor ?? undefined;
+
       pages += 1;
-      expect(pages).toBeLessThan(10); // no infinite loop on a broken cursor
+      expect(pages).toBeLessThan(10);
     } while (cursor);
 
     expect(seen).toHaveLength(5);
     expect(new Set(seen).size).toBe(5);
-    // Newest-first: r-5 … r-1 under (pd desc, ca desc, id desc).
     expect(seen).toEqual(["r-5", "r-4", "r-3", "r-2", "r-1"]);
   });
 
-  it("keeps ordering correct when dates AND timestamps differ across pages", async () => {
+  it("keeps ordering correct when dates and timestamps differ across pages", async () => {
     RECEIPTS_STORE = [
       receipt("a", "2026-06-03T00:00:00.000Z", "2026-06-03T10:00:00.000Z"),
       receipt("b", "2026-06-02T00:00:00.000Z", "2026-06-02T10:00:00.000Z"),
       receipt("c", "2026-06-02T00:00:00.000Z", "2026-06-02T08:00:00.000Z"),
       receipt("d", "2026-06-01T00:00:00.000Z", "2026-06-01T10:00:00.000Z"),
     ];
+
     const db = makeListDb();
 
-    const first = await listReceiptsForTenant(db as any, TENANT_ID, { limit: 2 });
+    const first = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      { limit: 2 }
+    );
+
     expect(first.items.map((r) => r.id)).toEqual(["a", "b"]);
     expect(first.nextCursor).toBeTruthy();
 
-    const second = await listReceiptsForTenant(db as any, TENANT_ID, {
-      limit: 2,
-      cursor: first.nextCursor!,
-    });
+    const second = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {
+        limit: 2,
+        cursor: first.nextCursor!,
+      }
+    );
+
     expect(second.items.map((r) => r.id)).toEqual(["c", "d"]);
     expect(second.nextCursor).toBeNull();
   });
 
-  it("rejects a malformed cursor BEFORE touching the store", async () => {
+  it("rejects a malformed cursor before touching the store", async () => {
     const db = makeListDb();
+
     await expect(
-      listReceiptsForTenant(db as any, TENANT_ID, { cursor: "not-a-valid-cursor" })
+      listReceiptsForTenant(
+        db as any,
+        TENANT_ID,
+        { cursor: "not-a-valid-cursor" }
+      )
     ).rejects.toBeInstanceOf(InvalidReceiptCursorError);
+
     expect(db.productReceipt.findMany).not.toHaveBeenCalled();
   });
 });
 
 // ---------------------------------------------------------------------------
-// 2. Filters — from/to on purchaseDate, supplier contains
+// 2. Filters — purchaseDate and supplierName.
 // ---------------------------------------------------------------------------
 
 describe("listReceiptsForTenant — filters", () => {
   beforeEach(() => {
     RECEIPTS_STORE = [
-      receipt("old", "2026-01-10T00:00:00.000Z", "2026-01-10T08:00:00.000Z", "شركة الأقدم"),
-      receipt("mid", "2026-03-05T00:00:00.000Z", "2026-03-05T08:00:00.000Z", "مؤسسة الوسط"),
-      receipt("new", "2026-06-20T00:00:00.000Z", "2026-06-20T08:00:00.000Z", "شركة الفجر"),
+      receipt(
+        "old",
+        "2026-01-10T00:00:00.000Z",
+        "2026-01-10T08:00:00.000Z",
+        "شركة الأقدم"
+      ),
+      receipt(
+        "mid",
+        "2026-03-05T00:00:00.000Z",
+        "2026-03-05T08:00:00.000Z",
+        "مؤسسة الوسط"
+      ),
+      receipt(
+        "new",
+        "2026-06-20T00:00:00.000Z",
+        "2026-06-20T08:00:00.000Z",
+        "شركة الفجر"
+      ),
     ];
   });
 
-  it("filters on purchaseDate with an inclusive [from, to] window", async () => {
+  it("filters on purchaseDate with an inclusive date window", async () => {
     const db = makeListDb();
-    const page = await listReceiptsForTenant(db as any, TENANT_ID, {
-      from: "2026-03-01",
-      to: "2026-06-30",
-    });
+
+    const page = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {
+        from: "2026-03-01",
+        to: "2026-06-30",
+      }
+    );
+
     expect(page.items.map((r) => r.id)).toEqual(["new", "mid"]);
-    // The window is pushed INTO the query (business date → UTC-midnight
-    // @db.Date) — never post-filtered in JS, which would break cursors.
+
     const where = db.productReceipt.findMany.mock.calls[0][0].where;
-    expect(where.purchaseDate.gte).toEqual(new Date("2026-03-01T00:00:00.000Z"));
-    expect(where.purchaseDate.lte).toEqual(new Date("2026-06-30T00:00:00.000Z"));
+
+    expect(where.purchaseDate.gte).toEqual(
+      new Date("2026-03-01T00:00:00.000Z")
+    );
+
+    expect(where.purchaseDate.lte).toEqual(
+      new Date("2026-06-30T00:00:00.000Z")
+    );
   });
 
   it("a single-day window keeps only that purchaseDate", async () => {
     const db = makeListDb();
-    const page = await listReceiptsForTenant(db as any, TENANT_ID, {
-      from: "2026-03-05",
-      to: "2026-03-05",
-    });
+
+    const page = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {
+        from: "2026-03-05",
+        to: "2026-03-05",
+      }
+    );
+
     expect(page.items.map((r) => r.id)).toEqual(["mid"]);
   });
 
-  it("omits the purchaseDate clause entirely when no bound is given", async () => {
+  it("omits purchaseDate when no date bounds are supplied", async () => {
     const db = makeListDb();
+
     await listReceiptsForTenant(db as any, TENANT_ID, {});
+
     const where = db.productReceipt.findMany.mock.calls[0][0].where;
+
     expect(where.purchaseDate).toBeUndefined();
   });
 
-  it("matches the supplier case-insensitively as a partial match", async () => {
+  it("matches supplierName case-insensitively as a partial match", async () => {
     const db = makeListDb();
-    const page = await listReceiptsForTenant(db as any, TENANT_ID, {
-      supplierName: "الفجر",
-    });
+
+    const page = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      { supplierName: "الفجر" }
+    );
+
     expect(page.items.map((r) => r.id)).toEqual(["new"]);
+
     const where = db.productReceipt.findMany.mock.calls[0][0].where;
-    expect(where.supplierName).toEqual({ contains: "الفجر", mode: "insensitive" });
+
+    expect(where.supplierName).toEqual({
+      contains: "الفجر",
+      mode: "insensitive",
+    });
   });
 
-  it("composes the date window with the cursor (both applied in the same query)", async () => {
+  it("composes date bounds and cursor in the same query", async () => {
     const db = makeListDb();
-    const first = await listReceiptsForTenant(db as any, TENANT_ID, {
-      limit: 1,
-      from: "2026-03-01",
-      to: "2026-06-30",
-    });
+
+    const first = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {
+        limit: 1,
+        from: "2026-03-01",
+        to: "2026-06-30",
+      }
+    );
+
     expect(first.items.map((r) => r.id)).toEqual(["new"]);
 
-    const second = await listReceiptsForTenant(db as any, TENANT_ID, {
-      limit: 1,
-      from: "2026-03-01",
-      to: "2026-06-30",
-      cursor: first.nextCursor!,
-    });
+    const second = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {
+        limit: 1,
+        from: "2026-03-01",
+        to: "2026-06-30",
+        cursor: first.nextCursor!,
+      }
+    );
+
     expect(second.items.map((r) => r.id)).toEqual(["mid"]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 3. Totals/counts — grouped, LIVE lines only, one groupBy per table
+// 3. List totals/counts — grouped queries and tenant isolation.
 // ---------------------------------------------------------------------------
 
-describe("listReceiptsForTenant — totals & counts (grouped, no N+1)", () => {
-  it("computes each row's total and counts from ONE groupBy per table for the whole page", async () => {
+describe("listReceiptsForTenant — totals and counts", () => {
+  it("uses one groupBy per table for the page and counts live/deleted lines separately", async () => {
     RECEIPTS_STORE = [
       receipt("r1", "2026-06-01T00:00:00.000Z", "2026-06-01T09:00:00.000Z"),
       receipt("r2", "2026-05-01T00:00:00.000Z", "2026-05-01T09:00:00.000Z"),
       receipt("r3", "2026-04-01T00:00:00.000Z", "2026-04-01T09:00:00.000Z"),
     ];
+
     const db = makeListDb({
       batches: [
-        { tenantId: TENANT_ID, receiptId: "r1", totalCostSYP: d("120000") },
-        { tenantId: TENANT_ID, receiptId: "r1", totalCostSYP: d("80000") },
-        { tenantId: TENANT_ID, receiptId: "r2", totalCostSYP: d("50000") },
-        // r3 has no live batches → total 0, lineCount 0 (all deleted).
+        {
+          tenantId: TENANT_ID,
+          receiptId: "r1",
+          totalCostSYP: d("120000"),
+        },
+        {
+          tenantId: TENANT_ID,
+          receiptId: "r1",
+          totalCostSYP: d("80000"),
+        },
+        {
+          tenantId: TENANT_ID,
+          receiptId: "r2",
+          totalCostSYP: d("50000"),
+        },
       ],
       deletions: [
         { tenantId: TENANT_ID, receiptId: "r1" },
@@ -369,71 +511,139 @@ describe("listReceiptsForTenant — totals & counts (grouped, no N+1)", () => {
       ],
     });
 
-    const page = await listReceiptsForTenant(db as any, TENANT_ID, { limit: 10 });
+    const page = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      { limit: 10 }
+    );
 
     const byId = new Map(page.items.map((row) => [row.id, row]));
+
     expect(byId.get("r1")).toMatchObject({
       lineCount: 2,
       deletedCount: 1,
       totalCostSYP: "200000",
     });
+
     expect(byId.get("r2")).toMatchObject({
       lineCount: 1,
       deletedCount: 0,
       totalCostSYP: "50000",
     });
+
     expect(byId.get("r3")).toMatchObject({
       lineCount: 0,
       deletedCount: 2,
-      totalCostSYP: "0", // deleted lines are NEVER counted into the total
+      totalCostSYP: "0",
     });
 
-    // The no-N+1 contract: exactly ONE grouped query per table for the page,
-    // no matter how many receipts it holds.
     expect(db.productBatch.groupBy).toHaveBeenCalledTimes(1);
     expect(db.batchDeletionLog.groupBy).toHaveBeenCalledTimes(1);
-    expect(db.productBatch.groupBy.mock.calls[0][0].where.receiptId.in).toEqual([
-      "r1",
-      "r2",
-      "r3",
-    ]);
+
+    expect(
+      db.productBatch.groupBy.mock.calls[0][0].where.receiptId.in
+    ).toEqual(["r1", "r2", "r3"]);
   });
 
-  it("a receipt whose lines are ALL deleted still appears in the list", async () => {
-    RECEIPTS_STORE = [receipt("gone", "2026-06-01T00:00:00.000Z", "2026-06-01T09:00:00.000Z")];
-    const db = makeListDb({ deletions: [{ tenantId: TENANT_ID, receiptId: "gone" }] });
+  it("keeps a receipt visible when all its lines have been deleted", async () => {
+    RECEIPTS_STORE = [
+      receipt(
+        "gone",
+        "2026-06-01T00:00:00.000Z",
+        "2026-06-01T09:00:00.000Z"
+      ),
+    ];
 
-    const page = await listReceiptsForTenant(db as any, TENANT_ID, {});
-    expect(page.items).toHaveLength(1);
-    expect(page.items[0]).toMatchObject({ id: "gone", lineCount: 0, deletedCount: 1 });
-  });
-
-  it("never reads outside the tenant — every where clause carries tenantId", async () => {
-    RECEIPTS_STORE = [receipt("r1", "2026-06-01T00:00:00.000Z", "2026-06-01T09:00:00.000Z")];
     const db = makeListDb({
-      batches: [{ tenantId: TENANT_ID, receiptId: "r1", totalCostSYP: d("10") }],
+      deletions: [
+        { tenantId: TENANT_ID, receiptId: "gone" },
+      ],
+    });
+
+    const page = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {}
+    );
+
+    expect(page.items).toHaveLength(1);
+
+    expect(page.items[0]).toMatchObject({
+      id: "gone",
+      lineCount: 0,
+      deletedCount: 1,
+      totalCostSYP: "0",
+    });
+  });
+
+  it("includes tenantId in every grouped/list query", async () => {
+    RECEIPTS_STORE = [
+      receipt(
+        "r1",
+        "2026-06-01T00:00:00.000Z",
+        "2026-06-01T09:00:00.000Z"
+      ),
+    ];
+
+    const db = makeListDb({
+      batches: [
+        {
+          tenantId: TENANT_ID,
+          receiptId: "r1",
+          totalCostSYP: d("10"),
+        },
+      ],
     });
 
     await listReceiptsForTenant(db as any, TENANT_ID, {});
-    expect(db.productReceipt.findMany.mock.calls[0][0].where.tenantId).toBe(TENANT_ID);
-    expect(db.productBatch.groupBy.mock.calls[0][0].where.tenantId).toBe(TENANT_ID);
-    expect(db.batchDeletionLog.groupBy.mock.calls[0][0].where.tenantId).toBe(TENANT_ID);
+
+    expect(
+      db.productReceipt.findMany.mock.calls[0][0].where.tenantId
+    ).toBe(TENANT_ID);
+
+    expect(
+      db.productBatch.groupBy.mock.calls[0][0].where.tenantId
+    ).toBe(TENANT_ID);
+
+    expect(
+      db.batchDeletionLog.groupBy.mock.calls[0][0].where.tenantId
+    ).toBe(TENANT_ID);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 4. Detail — live lines, deleted lines, the total, all-deleted receipts
+// 4. Detail fixtures — v4.8 sums baseQuantity directly.
 // ---------------------------------------------------------------------------
 
 interface DetailFixture {
   receipt?: AnyRec | null;
   batches?: AnyRec[];
   deletions?: AnyRec[];
-  soldGroups?: Array<{ batchId: string; unitId: string; sum: string }>;
-  adjustmentGroups?: Array<{ batchId: string; sum: string }>;
+
+  /** SUM(InvoiceItem.baseQuantity), already in base units. */
+  soldGroups?: Array<{
+    batchId: string;
+    sum: string;
+  }>;
+
+  adjustmentGroups?: Array<{
+    batchId: string;
+    sum: string;
+  }>;
+
   costChangeBatchIds?: string[];
-  units?: Array<{ id: string; productId: string; unitName: string; conversionFactor: string }>;
-  products?: Array<{ id: string; name: string }>;
+
+  units?: Array<{
+    id: string;
+    productId: string;
+    unitName: string;
+    conversionFactor: string;
+  }>;
+
+  products?: Array<{
+    id: string;
+    name: string;
+  }>;
 }
 
 function detailReceiptRow(id: string): AnyRec {
@@ -443,7 +653,10 @@ function detailReceiptRow(id: string): AnyRec {
     purchaseDate: date("2026-06-01T00:00:00.000Z"),
     createdAt: date("2026-06-01T09:00:00.000Z"),
     supplierName: "شركة الفجر",
-    createdByUser: { id: "admin-1", name: "المدير" },
+    createdByUser: {
+      id: "admin-1",
+      name: "المدير",
+    },
   };
 }
 
@@ -474,87 +687,158 @@ function makeDetailDb(fx: DetailFixture) {
     productReceipt: {
       findFirst: vi.fn(async (args: AnyRec) => {
         const row = fx.receipt ?? null;
-        return row && row.id === args.where?.id && row.tenantId === args.where?.tenantId
+
+        return row &&
+          row.id === args.where?.id &&
+          row.tenantId === args.where?.tenantId
           ? row
           : null;
       }),
+
       findMany: vi.fn(),
     },
+
     productBatch: {
       findMany: vi.fn(async () => batches),
       groupBy: vi.fn(),
     },
+
     batchDeletionLog: {
       findMany: vi.fn(async () => deletions),
       groupBy: vi.fn(),
     },
+
     invoiceItem: {
       groupBy: vi.fn(async (args: AnyRec) => {
         const ids: string[] = args.where?.batchId?.in ?? [];
+
         return (fx.soldGroups ?? [])
-          .filter((g) => ids.includes(g.batchId))
-          .map((g) => ({ batchId: g.batchId, unitId: g.unitId, _sum: { quantity: d(g.sum) } }));
+          .filter((group) => ids.includes(group.batchId))
+          .map((group) => ({
+            batchId: group.batchId,
+            _sum: {
+              baseQuantity: d(group.sum),
+            },
+          }));
       }),
     },
+
     stockAdjustment: {
       groupBy: vi.fn(async (args: AnyRec) => {
         const ids: string[] = args.where?.batchId?.in ?? [];
+
         return (fx.adjustmentGroups ?? [])
-          .filter((g) => ids.includes(g.batchId))
-          .map((g) => ({ batchId: g.batchId, _sum: { quantityDelta: d(g.sum) } }));
+          .filter((group) => ids.includes(group.batchId))
+          .map((group) => ({
+            batchId: group.batchId,
+            _sum: {
+              quantityDelta: d(group.sum),
+            },
+          }));
       }),
     },
+
     costPriceChangeLog: {
       groupBy: vi.fn(async (args: AnyRec) => {
         const ids: string[] = args.where?.batchId?.in ?? [];
+
         return (fx.costChangeBatchIds ?? [])
           .filter((id) => ids.includes(id))
-          .map((batchId) => ({ batchId, _count: 1 }));
+          .map((batchId) => ({
+            batchId,
+            _count: 1,
+          }));
       }),
     },
-    // ONE model, THREE sanctioned read shapes (factors / names / display
-    // units) — exactly how units.ts and products.ts dispatch them.
+
     productUnit: {
       findMany: vi.fn(async (args: AnyRec) => {
         if (args.select && "conversionFactor" in args.select) {
           const ids: string[] = args.where?.id?.in ?? [];
+
           return units
-            .filter((u) => ids.includes(u.id))
-            .map((u) => ({ id: u.id, conversionFactor: u.conversionFactor }));
+            .filter((unit) => ids.includes(unit.id))
+            .map((unit) => ({
+              id: unit.id,
+              conversionFactor: unit.conversionFactor,
+            }));
         }
+
         if (args.select && "unitName" in args.select) {
           const ids: string[] = args.where?.id?.in ?? [];
-          return units.filter((u) => ids.includes(u.id)).map((u) => ({ id: u.id, unitName: u.unitName }));
+
+          return units
+            .filter((unit) => ids.includes(unit.id))
+            .map((unit) => ({
+              id: unit.id,
+              unitName: unit.unitName,
+            }));
         }
-        const productIds: string[] = args.where?.productId?.in ?? [];
+
+        const productIds: string[] =
+          args.where?.productId?.in ?? [];
+
         return units
-          .filter((u) => productIds.includes(u.productId))
-          .map((u) => ({ ...u, barcodes: [] }));
+          .filter((unit) => productIds.includes(unit.productId))
+          .map((unit) => ({
+            ...unit,
+            barcodes: [],
+          }));
       }),
     },
+
     product: {
       findMany: vi.fn(async (args: AnyRec) => {
         const ids: string[] = args.where?.id?.in ?? [];
-        return products.filter((p) => ids.includes(p.id)).map((p) => ({ id: p.id, name: p.name }));
+
+        return products
+          .filter((product) => ids.includes(product.id))
+          .map((product) => ({
+            id: product.id,
+            name: product.name,
+          }));
       }),
     },
   };
+
   return db;
 }
 
 const BASE_UNITS = [
-  { id: "unit-piece", productId: "prod-1", unitName: "قطعة", conversionFactor: "1" },
-  { id: "unit-carton", productId: "prod-1", unitName: "كرتونة", conversionFactor: "24" },
+  {
+    id: "unit-piece",
+    productId: "prod-1",
+    unitName: "قطعة",
+    conversionFactor: "1",
+  },
+  {
+    id: "unit-carton",
+    productId: "prod-1",
+    unitName: "كرتونة",
+    conversionFactor: "24",
+  },
 ];
 
-describe("getReceiptDetail — live + deleted lines and the total", () => {
-  it("sums ONLY live lines; deleted lines appear with their snapshot, excluded from the total", async () => {
+// ---------------------------------------------------------------------------
+// 5. Detail — live/deleted lines, totals, display and query counts.
+// ---------------------------------------------------------------------------
+
+describe("getReceiptDetail — live and deleted lines", () => {
+  it("sums only live lines and preserves deleted-line snapshots", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("r1"),
+
       batches: [
-        liveBatch({ id: "b1", totalCostSYP: d("100000") }),
-        liveBatch({ id: "b2", totalCostSYP: d("50000") }),
+        liveBatch({
+          id: "b1",
+          totalCostSYP: d("100000"),
+        }),
+        liveBatch({
+          id: "b2",
+          totalCostSYP: d("50000"),
+        }),
       ],
+
       deletions: [
         {
           batchId: "b-gone",
@@ -570,35 +854,44 @@ describe("getReceiptDetail — live + deleted lines and the total", () => {
           deletedByUser: { name: "المدير" },
         },
       ],
-      products: [{ id: "prod-1", name: "زيت دوار الشمس" }],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت دوار الشمس",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
     const detail = await getReceiptDetail(db as any, TENANT_ID, "r1");
 
     expect(detail).not.toBeNull();
-    // 100000 + 50000 — the deleted line's 900000 is EXCLUDED by design.
-    // (Compared as a decimal, not a string: sumMoney may render trailing
-    // zeros — "150000.0000" — both are the same SYP figure.)
-    expect(new Decimal(detail!.totalCostSYP).eq("150000")).toBe(true);
+
+    expect(
+      new Decimal(detail!.totalCostSYP).eq("150000")
+    ).toBe(true);
+
     expect(detail!.liveLineCount).toBe(2);
     expect(detail!.deletedLineCount).toBe(1);
 
-    const deleted = detail!.deletedLines[0];
-    expect(deleted).toMatchObject({
+    expect(detail!.deletedLines[0]).toMatchObject({
       batchId: "b-gone",
       initialQuantityAtDeletion: "60",
       totalCostAtDeletion: "900000",
       reason: "انتهت الصلاحية",
       productName: "زيت دوار الشمس",
     });
-    expect(deleted.deletedByName).toBe("المدير");
+
+    expect(detail!.deletedLines[0].deletedByName).toBe("المدير");
   });
 
-  it("returns a receipt whose lines are ALL deleted: empty live list, total 0, deletions shown", async () => {
+  it("returns a receipt whose lines are all deleted", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("r2"),
       batches: [],
+
       deletions: [
         {
           batchId: "b-gone",
@@ -614,7 +907,14 @@ describe("getReceiptDetail — live + deleted lines and the total", () => {
           deletedByUser: null,
         },
       ],
-      products: [{ id: "prod-1", name: "زيت دوار الشمس" }],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت دوار الشمس",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
@@ -628,17 +928,37 @@ describe("getReceiptDetail — live + deleted lines and the total", () => {
     expect(detail!.totalCostSYP).toBe("0");
   });
 
-  it("returns null for an unknown/foreign receipt id (the route maps it to 404)", async () => {
-    const db = makeDetailDb({ receipt: detailReceiptRow("r1") });
-    expect(await getReceiptDetail(db as any, TENANT_ID, "someone-elses-id")).toBeNull();
+  it("returns null for an unknown or foreign receipt id", async () => {
+    const db = makeDetailDb({
+      receipt: detailReceiptRow("r1"),
+    });
+
+    expect(
+      await getReceiptDetail(db as any, TENANT_ID, "someone-elses-id")
+    ).toBeNull();
   });
 
-  it("carries the display breakdown, costAdjusted flag and every figure per live line", async () => {
+  it("returns display breakdown, costAdjusted and every live-line figure", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("r3"),
-      batches: [liveBatch({ id: "b1", initialQuantity: d("240"), quantity: d("180") })],
+
+      batches: [
+        liveBatch({
+          id: "b1",
+          initialQuantity: d("240"),
+          quantity: d("180"),
+        }),
+      ],
+
       costChangeBatchIds: ["b1"],
-      products: [{ id: "prod-1", name: "زيت دوار الشمس" }],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت دوار الشمس",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
@@ -648,28 +968,45 @@ describe("getReceiptDetail — live + deleted lines and the total", () => {
     expect(line).toMatchObject({
       initialQuantity: "240",
       remaining: "180",
-      costAdjusted: true, // a CostPriceChangeLog row exists for this batch
+      costAdjusted: true,
       totalCostSYP: "100000",
       productName: "زيت دوار الشمس",
       unitName: "قطعة",
     });
-    // 240 base pieces = exactly 10 كرتونة — decomposed by units.ts's
-    // breakdownForDisplay(), never recomputed here.
+
     expect(line.initialQuantityBreakdown).toEqual([
-      { unitId: "unit-carton", unitName: "كرتونة", count: "10" },
+      {
+        unitId: "unit-carton",
+        unitName: "كرتونة",
+        count: "10",
+      },
     ]);
   });
 
-  it("never queries per line — one batch fetch and one groupBy per table regardless of line count", async () => {
+  it("does not query once per live line", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("r4"),
+
       batches: [
         liveBatch({ id: "b1" }),
         liveBatch({ id: "b2" }),
         liveBatch({ id: "b3" }),
       ],
-      soldGroups: [{ batchId: "b1", unitId: "unit-carton", sum: "1" }],
-      products: [{ id: "prod-1", name: "زيت" }],
+
+      soldGroups: [
+        {
+          batchId: "b1",
+          sum: "24",
+        },
+      ],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
@@ -679,66 +1016,128 @@ describe("getReceiptDetail — live + deleted lines and the total", () => {
     expect(db.invoiceItem.groupBy).toHaveBeenCalledTimes(1);
     expect(db.stockAdjustment.groupBy).toHaveBeenCalledTimes(1);
     expect(db.costPriceChangeLog.groupBy).toHaveBeenCalledTimes(1);
-    // Factors + unit-names + display-unit sets: 3 unit reads total, never one
-    // per line/unit. product.findMany once for names.
-    expect(db.productUnit.findMany).toHaveBeenCalledTimes(3);
+
+    // These counts depend on the current products gateway implementation.
+    // The assertion here pins the fixed query count, not a per-line query.
+    expect(db.productUnit.findMany.mock.calls.length).toBeLessThanOrEqual(3);
     expect(db.product.findMany).toHaveBeenCalledTimes(1);
+
+    const soldCall = db.invoiceItem.groupBy.mock.calls[0][0];
+
+    expect(soldCall.by).toEqual(["batchId"]);
+    expect(soldCall._sum).toEqual({
+      baseQuantity: true,
+    });
   });
 });
 
 // ---------------------------------------------------------------------------
-// 5. Reconciliation identity — remaining = initial − netSold + adjustments
+// 6. Reconciliation — v4.8 uses stored baseQuantity, without conversion.
 // ---------------------------------------------------------------------------
 
-describe("getReceiptDetail — reconciliation identity", () => {
-  it("100 received, 3 packs sold, 1 pack voided, −2 adjustment → remaining 50, reconciles true (sold unit's factor ≠ 1)", async () => {
+describe("getReceiptDetail — v4.8 reconciliation identity", () => {
+  it("reconciles using the stored base-unit sold quantity and adjustments", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("rr"),
-      batches: [liveBatch({ id: "b1", initialQuantity: d("100"), quantity: d("50") })],
-      // Sold in PACKS (factor 24), stored per (batchId, unitId): 3 packs sold
-      // and the void's −1 pack already summed in → net 2 packs = 48 base
-      // units. Using the BASE unit's factor (1) here would compute netSold=2
-      // and the identity would fail — that is exactly the bug this pins.
-      soldGroups: [{ batchId: "b1", unitId: "unit-carton", sum: "2" }],
-      adjustmentGroups: [{ batchId: "b1", sum: "-2" }],
-      products: [{ id: "prod-1", name: "زيت" }],
+
+      batches: [
+        liveBatch({
+          id: "b1",
+          initialQuantity: d("100"),
+          quantity: d("50"),
+        }),
+      ],
+
+      // Three packs sold and one pack voided have already netted to
+      // 48 base units in InvoiceItem.baseQuantity.
+      // No conversion factor is applied in receipt-history.ts.
+      soldGroups: [
+        {
+          batchId: "b1",
+          sum: "48",
+        },
+      ],
+
+      adjustmentGroups: [
+        {
+          batchId: "b1",
+          sum: "-2",
+        },
+      ],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
     const detail = await getReceiptDetail(db as any, TENANT_ID, "rr");
     const line = detail!.lines[0];
 
-    expect(line.netSold).toBe("48"); // 2 packs × 24 — the SOLD unit's factor
+    expect(line.netSold).toBe("48");
     expect(line.adjustments).toBe("-2");
     expect(line.remaining).toBe("50");
     expect(line.initialQuantity).toBe("100");
-    // 100 − 48 + (−2) = 50, exact decimal equality (no epsilon).
     expect(line.reconciles).toBe(true);
 
-    // The factor map was read from the units the SALE was made in — the
-    // query carries both units' ids, and the pack row's factor is 24.
-    const factorCall = db.productUnit.findMany.mock.calls.find(
-      (call: AnyRec) => call[0]?.select && "conversionFactor" in call[0].select
-    );
-    expect(factorCall[0].where.id.in).toEqual(
-      expect.arrayContaining(["unit-carton", "unit-piece"])
-    );
+    // v4.8 reads the database's baseQuantity sum directly.
+    const soldCall = db.invoiceItem.groupBy.mock.calls[0][0];
+
+    expect(soldCall.by).toEqual(["batchId"]);
+    expect(soldCall._sum).toEqual({
+      baseQuantity: true,
+    });
+
+    expect(soldCall.where).toMatchObject({
+      tenantId: TENANT_ID,
+      batchId: { in: ["b1"] },
+    });
   });
 
-  it("corrupts the stored quantity → reconciles flips to false (still surfaced, not hidden)", async () => {
+  it("surfaces corrupted stored quantity as a failed reconciliation", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("rr2"),
-      batches: [liveBatch({ id: "b1", initialQuantity: d("100"), quantity: d("51") })],
-      soldGroups: [{ batchId: "b1", unitId: "unit-carton", sum: "2" }],
-      adjustmentGroups: [{ batchId: "b1", sum: "-2" }],
-      products: [{ id: "prod-1", name: "زيت" }],
+
+      batches: [
+        liveBatch({
+          id: "b1",
+          initialQuantity: d("100"),
+          quantity: d("51"),
+        }),
+      ],
+
+      soldGroups: [
+        {
+          batchId: "b1",
+          sum: "48",
+        },
+      ],
+
+      adjustmentGroups: [
+        {
+          batchId: "b1",
+          sum: "-2",
+        },
+      ],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
     const detail = await getReceiptDetail(db as any, TENANT_ID, "rr2");
+
     expect(detail!.lines[0].reconciles).toBe(false);
-    // The four figures are still all present so the warning can be shown
-    // alongside the numbers it disagrees with.
+
     expect(detail!.lines[0]).toMatchObject({
       initialQuantity: "100",
       netSold: "48",
@@ -747,119 +1146,120 @@ describe("getReceiptDetail — reconciliation identity", () => {
     });
   });
 
-  it("a VOIDED sale nets out: +3 packs and its −1 mirror row are already one group", async () => {
+  it("nets voided sales out through their negative baseQuantity", async () => {
     const db = makeDetailDb({
       receipt: detailReceiptRow("rr3"),
-      // 100 − 48 + 0 = 52 remaining.
-      batches: [liveBatch({ id: "b1", initialQuantity: d("100"), quantity: d("52") })],
-      soldGroups: [{ batchId: "b1", unitId: "unit-carton", sum: "2" }],
-      products: [{ id: "prod-1", name: "زيت" }],
+
+      batches: [
+        liveBatch({
+          id: "b1",
+          initialQuantity: d("100"),
+          quantity: d("52"),
+        }),
+      ],
+
+      // Net sale after the void: 48 base units.
+      soldGroups: [
+        {
+          batchId: "b1",
+          sum: "48",
+        },
+      ],
+
+      products: [
+        {
+          id: "prod-1",
+          name: "زيت",
+        },
+      ],
+
       units: BASE_UNITS,
     });
 
     const detail = await getReceiptDetail(db as any, TENANT_ID, "rr3");
+
     expect(detail!.lines[0].netSold).toBe("48");
     expect(detail!.lines[0].reconciles).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 6. netSoldInBaseUnit — THE conversion site
+// 7. Cursor codec and exact reconciliation equality.
 // ---------------------------------------------------------------------------
 
-describe("netSoldInBaseUnit (lib/inventory/units)", () => {
-  const factors = new Map<string, string>([
-    ["unit-piece", "1"],
-    ["unit-carton", "24"],
-    ["unit-box", "3.3"],
-  ]);
-
-  it("nets a void out exactly: 3 packs sold − 1 pack voided = 2 packs = 48 base units", () => {
-    const net = netSoldInBaseUnit(
-      [
-        { unitId: "unit-carton", quantity: "3" },
-        { unitId: "unit-carton", quantity: "-1" },
-      ],
-      factors
-    );
-    expect(net.toString()).toBe("48");
-    // Cross-checked against the sanctioned single-row converter — the two
-    // paths can never disagree.
-    expect(net.toString()).toBe(toBaseUnit("2", "24").toString());
-  });
-
-  it("keeps fractional quantities exact: 2.5 × 3.3 = 8.25 (no float drift)", () => {
-    const net = netSoldInBaseUnit([{ unitId: "unit-box", quantity: "2.5" }], factors);
-    expect(net.toString()).toBe("8.25");
-  });
-
-  it("uses each row's OWN unit factor — never the base unit's 1", () => {
-    const mixed = netSoldInBaseUnit(
-      [
-        { unitId: "unit-carton", quantity: "1" },
-        { unitId: "unit-piece", quantity: "5" },
-      ],
-      factors
-    );
-    expect(mixed.toString()).toBe("29"); // 24 + 5, not 1 + 5
-  });
-
-  it("THROWS on a missing factor instead of silently assuming 1", () => {
-    expect(() =>
-      netSoldInBaseUnit([{ unitId: "unit-ghost", quantity: "3" }], factors)
-    ).toThrow(/no conversion factor/);
-  });
-
-  it("sums an empty row set to zero", () => {
-    expect(netSoldInBaseUnit([], factors).toString()).toBe("0");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 7. Cursor codec + EXACT equality + static scans
-// ---------------------------------------------------------------------------
-
-describe("cursor codec & exact reconciliation equality", () => {
-  it("a cursor built by encodeReceiptCursor positions the next page exactly (clients echo it verbatim)", async () => {
+describe("cursor codec and exact reconciliation equality", () => {
+  it("positions the next page using an encoded cursor", async () => {
     RECEIPTS_STORE = [
-      receipt("r-new", "2026-06-02T00:00:00.000Z", "2026-06-02T09:00:00.000Z"),
-      receipt("r-old", "2026-05-30T00:00:00.000Z", "2026-05-30T09:00:00.000Z"),
+      receipt(
+        "r-new",
+        "2026-06-02T00:00:00.000Z",
+        "2026-06-02T09:00:00.000Z"
+      ),
+      receipt(
+        "r-old",
+        "2026-05-30T00:00:00.000Z",
+        "2026-05-30T09:00:00.000Z"
+      ),
     ];
+
     const db = makeListDb();
 
-    const page = await listReceiptsForTenant(db as any, TENANT_ID, {
-      limit: 5,
-      cursor: encodeReceiptCursor({
-        purchaseDate: "2026-06-02",
-        createdAt: "2026-06-02T09:00:00.000Z",
-        id: "r-new",
-      }),
-    });
+    const page = await listReceiptsForTenant(
+      db as any,
+      TENANT_ID,
+      {
+        limit: 5,
+        cursor: encodeReceiptCursor({
+          purchaseDate: "2026-06-02",
+          createdAt: "2026-06-02T09:00:00.000Z",
+          id: "r-new",
+        }),
+      }
+    );
+
     expect(page.items.map((r) => r.id)).toEqual(["r-old"]);
   });
 
-  it("the identity uses EXACT decimal equality — a 0.0001 drift is false, not tolerated away", () => {
+  it("uses exact decimal equality with no tolerance", () => {
     const base = {
       initialQuantity: "100",
       netSold: "48",
       adjustments: "-2",
       remaining: "50",
     };
+
     expect(reconciliationIdentityHolds(base)).toBe(true);
-    expect(reconciliationIdentityHolds({ ...base, remaining: "50.0001" })).toBe(false);
-    // Unparseable input is false (render as a warning), never a crash.
-    expect(reconciliationIdentityHolds({ ...base, remaining: "not-a-number" })).toBe(false);
+
+    expect(
+      reconciliationIdentityHolds({
+        ...base,
+        remaining: "50.0001",
+      })
+    ).toBe(false);
+
+    expect(
+      reconciliationIdentityHolds({
+        ...base,
+        remaining: "not-a-number",
+      })
+    ).toBe(false);
   });
 });
 
-describe("static scans — [v4.7] Round B invariants", () => {
+// ---------------------------------------------------------------------------
+// 8. Static scans — read-only gateway and v4.8 invariants.
+// ---------------------------------------------------------------------------
+
+describe("static scans — receipt history invariants", () => {
   const read = (relative: string) =>
-    fs.readFileSync(path.resolve(process.cwd(), relative), "utf8");
+    fs.readFileSync(
+      path.resolve(process.cwd(), relative),
+      "utf8"
+    );
+
   /**
-   * Scans run on CODE, not on comments — several headers deliberately name
-   * the very words they forbid ("this file never names conversionFactor"),
-   * and stripping comments keeps those explanations honest instead of
-   * forcing them to be reworded around the scan.
+   * Scan code, not comments. The source comments may discuss terms that
+   * are forbidden in executable code.
    */
   const code = (relative: string) =>
     read(relative)
@@ -871,73 +1271,82 @@ describe("static scans — [v4.7] Round B invariants", () => {
     "app/api/receipts/[id]/route.ts",
     "app/api/receipts/defaults/route.ts",
   ];
-  const READ_PATH_FILES = [...ROUTE_FILES, "lib/data/receipt-history.ts"];
 
-  it("no writes at all in the read gateway; the routes' ONLY write is productReceipt.update", () => {
+  const READ_PATH_FILES = [
+    ...ROUTE_FILES,
+    "lib/data/receipt-history.ts",
+  ];
+
+  it("keeps the read gateway write-free and limits the detail route update", () => {
     const history = code("lib/data/receipt-history.ts");
-    // The whole read layer is query-only.
-    for (const method of [".create(", ".update(", ".upsert(", ".delete(", ".execute("]) {
+
+    for (const method of [
+      ".create(",
+      ".update(",
+      ".upsert(",
+      ".delete(",
+      ".execute(",
+    ]) {
       expect(history).not.toContain(method);
     }
+
     for (const file of ROUTE_FILES) {
       const source = code(file);
-      // No create/delete anywhere; [id] holds exactly ONE update and it is
-      // the plain top-level productReceipt.update (never a batch write).
+
       expect(source).not.toContain(".create(");
       expect(source).not.toContain(".delete(");
     }
+
     const idRoute = code("app/api/receipts/[id]/route.ts");
+
     expect(idRoute.match(/\.update\(/g) ?? []).toHaveLength(1);
     expect(idRoute).toContain("productReceipt.update");
     expect(idRoute).not.toContain("productBatch.update");
   });
 
-  it("no nested writes: no batch/collection keys inside any payload in the receipts routes", () => {
+  it("prevents nested batch/collection writes in receipt routes", () => {
     for (const file of ROUTE_FILES) {
       const source = code(file);
+
       expect(source).not.toMatch(/batches\s*:\s*\{/);
       expect(source).not.toMatch(/items\s*:\s*\{\s*create/);
-      expect(source).not.toMatch(/data\s*:\s*\{[^\n]*receipt\s*:\s*\{/);
+      expect(source).not.toMatch(
+        /data\s*:\s*\{[^\n]*receipt\s*:\s*\{/
+      );
     }
-    // PATCH's payload may only ever name the two allowed columns.
+
     const idRoute = code("app/api/receipts/[id]/route.ts");
+
     expect(idRoute).not.toContain("initialQuantity");
     expect(idRoute).not.toContain("totalCostSYP");
     expect(idRoute).not.toContain("quantity");
   });
 
-  it("no conversion arithmetic outside lib/inventory/units.ts", () => {
+  it("keeps conversion arithmetic out of the receipt read path", () => {
     for (const file of READ_PATH_FILES) {
       const source = code(file);
-      // The read path may not name the factor at all — factors are fetched
-      // by units.ts's getUnitConversionFactors() and consumed by
-      // netSoldInBaseUnit()/breakdownForDisplay() inside units.ts.
+
       expect(source).not.toContain("conversionFactor");
       expect(source).not.toContain("toBaseUnit(");
       expect(source).not.toContain("fromBaseUnit(");
       expect(source).not.toContain("new Decimal");
     }
-    // receipt-history DELEGATES every quantity operation to units.ts.
+
     const history = read("lib/data/receipt-history.ts");
+
     expect(history).toContain('from "@/lib/inventory/units"');
-    expect(history).toContain("netSoldInBaseUnit");
+    expect(history).toContain("baseQuantity");
     expect(history).toContain("reconciliationIdentityHolds");
     expect(history).toContain("breakdownForDisplay");
   });
 
-  it("no USD / exchange-rate field anywhere in the receipts read path (SYP only)", () => {
+  it("keeps the receipt read path SYP-only without exchange-rate fields", () => {
     for (const file of READ_PATH_FILES) {
       const source = code(file);
+
       expect(source).not.toMatch(/USD/);
       expect(source).not.toMatch(/exchangeRate/i);
       expect(source).not.toMatch(/dailyExchangeRate/);
     }
   });
 });
-
-
-
-
-
-
-

@@ -19,9 +19,16 @@
  * [WHAT THE RANGE TOGGLE CONTROLS] 1/7/30 → `?range=` (1 = today, charted BY
  * HOUR). The server derives the trend AND the Top-5 rankings from that SAME
  * window (lib/data/analytics.ts). The four KPI cards are NOT affected: three
- * are "today" and the debt card is a running balance. That is why the toggle
- * now lives in the "تحليل الفترة" section header, directly above the things it
- * changes, instead of next to the page title where it looked global.
+ * are "today" (their titles say so) and the debt card is a running balance.
+ * The toggle therefore lives in the "تحليل الفترة" header, directly above the
+ * things it changes.
+ *
+ * [SALES vs RETURNS — v4.8] "مبيعات اليوم" is GROSS sales: a void never
+ * reduces it. Cancellations are shown separately ("مرتجعات"), on the day the
+ * void was made, so a cancellation day reads "مبيعات 0 · مرتجعات 3,550" instead
+ * of a negative sales figure next to "0 invoices". Returns use the amber
+ * colour everywhere (cards, chart, tooltip) so they are never mistaken for
+ * ordinary sales or for a loss.
  *
  * [LOADING IS DERIVED, NOT STORED] Every request is identified by a
  * `requestKey` (role + range + refresh tick). `isLoading` is "no completed
@@ -35,16 +42,26 @@
  * [OFFLINE] /api/analytics is network-only by design (T4a2). When the device
  * is offline the screen keeps whatever it last showed and says so in Arabic.
  *
- * [NUMBERS] All figures are formatted through ONE locale constant
- * (NUMBER_LOCALE) and lib/utils/money.ts's formatMoney(), so digits are
- * consistent across KPIs, chart axes, tooltips and lists. Decimal strings are
- * converted to `Number` ONLY for chart geometry / bar widths — display-only,
- * never fed back into a calculation; margins and averages use decimal.js.
+ * [DIGITS] USE_LATIN_DIGITS is the ONE switch for the digit style on this
+ * screen. Arabic-Indic digits made a zero look like a bullet ("٠" → "•"), a one
+ * look like a bar ("١" → "I") and a leading zero in a date look like a dash.
+ * Amounts still come from lib/utils/money.ts's formatMoney() (the single source
+ * of truth for money); only the digit glyphs are localised on top of it. When
+ * the whole app settles on one digit style, change formatMoney() itself and
+ * delete localizeDigits().
  *
- * [MOTION] Entrance/ count-up animation is presentational only — see the
- * "motion" block below. It never touches the authoritative Decimal strings;
- * it only drives what's painted on screen while a value tweens toward it,
- * and the component always lands on the exact formatMoney() output.
+ * [NUMBERS] Decimal strings are converted to `Number` ONLY for chart geometry /
+ * bar widths / the count-up tween — display-only, never fed back into a
+ * calculation; margins, averages and "is this amount non-zero" checks use
+ * decimal.js.
+ *
+ * [MOTION] Everything animated here is short, one-shot and purely
+ * presentational: staggered fade-up on first paint (<Reveal>), bars that grow
+ * to their width, a ping dot on open alerts, and a count-up on the KPI hero
+ * numbers. The count-up only drives what is painted WHILE a value tweens; the
+ * settled frame always re-renders through <Money>, so the exact formatMoney()
+ * output is what the user reads at rest. All of it is disabled under
+ * prefers-reduced-motion.
  *
  * NO dark-mode classes (light-only shell styling, matching the sales log).
  */
@@ -54,10 +71,10 @@ import Link from "next/link";
 import Decimal from "decimal.js";
 import {
     AlertTriangle,
+    Check,
     CheckCircle2,
     ChevronLeft,
     Clock,
-    DollarSign,
     Loader2,
     PackageX,
     Receipt,
@@ -89,9 +106,19 @@ type Range = 1 | 7 | 30;
 type Granularity = "hour" | "day";
 
 interface Kpis {
+    /** GROSS sales — a void never reduces it. */
     salesSYP: string;
-    // [v4.9] Null when no rated invoice exists today — caption omitted then.
+    // [v4.9] Null when no rated sale exists today — caption omitted then.
     salesUSD: string | null;
+    /** [v4.8] Returns/cancellations made today — a POSITIVE number. */
+    returnsSYP: string;
+    returnsCount: number;
+    netSalesSYP: string;
+    /** Profit on today's non-void sales. */
+    grossProfitSYP: string;
+    /** Profit given back by today's voids (≤ 0). */
+    returnsProfitSYP: string;
+    /** gross + returns profit. */
     netProfitSYP: string;
     invoiceCount: number;
     outstandingDebtSYP: string;
@@ -100,6 +127,8 @@ interface Kpis {
 interface TrendPoint {
     date: string;
     salesSYP: string;
+    /** [v4.8] Positive number. */
+    returnsSYP: string;
     profitSYP: string;
 }
 
@@ -165,14 +194,20 @@ interface ChartPoint {
     date: string;
     /** Display-only numbers for recharts geometry. */
     sales: number;
+    /** NEGATIVE (drawn below the zero line) — display-only. */
+    returns: number;
     profit: number;
     /** The exact server strings, used for every printed figure. */
     salesSYP: string;
+    returnsSYP: string;
     profitSYP: string;
 }
 
+const RETURNS_COLOR = "#d97706";
+
 const chartConfig = {
     sales: { label: "المبيعات", color: "#059669" },
+    returns: { label: "المرتجعات", color: RETURNS_COLOR },
     profit: { label: "الربح", color: "#2563eb" },
 } satisfies ChartConfig;
 
@@ -180,11 +215,13 @@ const GENERIC_ERROR = "تعذر تحميل مؤشرات لوحة التحكم.";
 const NETWORK_ERROR = "تعذر الاتصال بالخادم. تحقق من اتصال الإنترنت — المعروض هو آخر بيانات محمّلة.";
 
 // ---------------------------------------------------------------------------
-// Formatting. ONE locale constant: keep it in sync with formatMoney() in
-// lib/utils/money.ts — switching the whole app to Latin digits later is then a
-// one-line change here plus the one in money.ts ("ar-SY-u-nu-latn").
+// Formatting
 // ---------------------------------------------------------------------------
-const NUMBER_LOCALE = "ar-SY";
+
+/** The ONE digit-style switch for this screen — see the [DIGITS] note above. */
+const USE_LATIN_DIGITS: boolean = true;
+const NUMBER_LOCALE = USE_LATIN_DIGITS ? "ar-SY-u-nu-latn" : "ar-SY";
+
 const intFormatter = new Intl.NumberFormat(NUMBER_LOCALE);
 const pad2Formatter = new Intl.NumberFormat(NUMBER_LOCALE, { minimumIntegerDigits: 2, useGrouping: false });
 const qtyFormatter = new Intl.NumberFormat(NUMBER_LOCALE, { maximumFractionDigits: 4 });
@@ -193,20 +230,49 @@ const percentFormatter = new Intl.NumberFormat(NUMBER_LOCALE, { style: "percent"
 
 const fmtInt = (n: number) => intFormatter.format(n);
 
+/** Arabic-Indic digits / separators → Latin, on top of formatMoney()'s output. */
+function localizeDigits(s: string): string {
+    if (!USE_LATIN_DIGITS) return s;
+    return s
+        .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+        .replace(/\u066C/g, ",")
+        .replace(/\u066B/g, ".");
+}
+
+const fmtMoney = (value: string, currency: "SYP" | "USD") => localizeDigits(formatMoney(value, currency));
+
 /** A QUANTITY (not money) — display-only; trailing zeros dropped. */
 function qty(value: string): string {
     const n = Number(value);
     return Number.isFinite(n) ? qtyFormatter.format(n) : value;
 }
 
-/** "2026-10-05" → "٠٥/١٠"; hourly "2026-10-05T14" → "١٤:٠٠". Derived from the
+/** True when a decimal string is not zero (decimal.js — never a float compare). */
+function isNonZero(value: string): boolean {
+    try {
+        return !new Decimal(value).isZero();
+    } catch {
+        return false;
+    }
+}
+
+/** True when a decimal string is strictly positive. */
+function isPositive(value: string): boolean {
+    try {
+        return new Decimal(value).gt(0);
+    } catch {
+        return false;
+    }
+}
+
+/** "2026-10-05" → "05/10"; hourly "2026-10-05T14" → "14:00". Derived from the
  *  string, never parsed as a Date, so no browser timezone can shift a bucket. */
 function axisLabel(date: string): string {
     if (date.length > 10) return `${pad2Formatter.format(Number(date.slice(11, 13)))}:00`;
     return `${pad2Formatter.format(Number(date.slice(8, 10)))}/${pad2Formatter.format(Number(date.slice(5, 7)))}`;
 }
 
-/** Full label for the chart tooltip (the raw ISO string used to leak here). */
+/** Full label for the chart tooltip. */
 function tooltipLabel(date: string): string {
     if (date.length > 10) return `الساعة ${axisLabel(date)}`;
     const d = new Date(Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10))));
@@ -218,13 +284,13 @@ function tooltipLabel(date: string): string {
     });
 }
 
-/** "اليوم" for a one-day window, otherwise "آخر ٧ أيام" / "آخر ٣٠ يوماً". */
+/** "اليوم" for a one-day window, otherwise "آخر 7 أيام" / "آخر 30 يوماً". */
 function windowLabel(days: number): string {
     if (days === 1) return "اليوم";
     return `آخر ${fmtInt(days)} ${days <= 10 ? "أيام" : "يوماً"}`;
 }
 
-/** Net profit as a share of sales, via decimal.js. Null when there are no sales. */
+/** Profit as a share of sales, via decimal.js. Null when there are no sales. */
 function marginRatio(profit: string, sales: string): number | null {
     try {
         const s = new Decimal(sales);
@@ -278,13 +344,12 @@ async function fetchDashboard(range: Range, signal: AbortSignal): Promise<Dashbo
 }
 
 // ---------------------------------------------------------------------------
-// Motion — a single ease-out count-up used only by the four KPI hero
-// numbers. Pure presentation: it tweens a plain `number` for painting, while
-// every OTHER figure in the tree (chart, lists, captions) still goes through
-// formatMoney() on the exact Decimal string, unchanged. On finish the hook's
-// own display value lands exactly on `Number(target)`, and the caller still
-// runs ITS OWN formatMoney/Intl call on the real string for the settled
-// frame, so no rounding drift from the tween can reach the screen.
+// Motion — a single ease-out count-up used only by the KPI hero numbers.
+// Pure presentation: it tweens a plain `number` for painting, while every
+// OTHER figure in the tree (chart, lists, captions) goes through formatMoney()
+// on the exact Decimal string, unchanged. On finish the hook lands exactly on
+// `target`, and the caller re-renders the real string through <Money> for the
+// settled frame, so no rounding drift from the tween can reach the screen.
 // ---------------------------------------------------------------------------
 
 const REDUCED_MOTION =
@@ -333,47 +398,36 @@ function useCountUp(target: number, duration = 650): number {
 /** The animated hero figure for a SYP KPI. Mid-tween frames use a plain
  *  grouped-integer format (cheap, display-only); the settled frame always
  *  re-renders through <Money>, so the authoritative string is what the user
- *  reads at rest. */
-function AnimatedMoneySYP({ value, className }: { value: string; className?: string }) {
+ *  reads at rest. `unitClassName` keeps the "ل.س" colour correct on both the
+ *  tween frame and the settled frame (white-ish on the hero card, etc.). */
+function AnimatedMoneySYP({
+    value,
+    className,
+    unitClassName,
+}: {
+    value: string;
+    className?: string;
+    unitClassName?: string;
+}) {
     const target = Number(value);
     const safeTarget = Number.isFinite(target) ? target : 0;
     const display = useCountUp(safeTarget);
     const settled = display === safeTarget;
 
     if (settled) {
-        return <Money value={value} currency="SYP" className={className} />;
+        return <Money value={value} currency="SYP" className={className} unitClassName={unitClassName} />;
     }
     return (
-        <span className={cn("tabular-nums", className)}>
-            {intFormatter.format(Math.round(display))} <span className="text-[0.62em] font-semibold text-slate-500">ل.س</span>
+        <span className={cn("inline-flex items-baseline gap-1 tabular-nums", className)}>
+            <span>{intFormatter.format(Math.round(display))}</span>
+            <span className={cn("text-[0.6em] font-semibold text-slate-500", unitClassName)}>ل.س</span>
         </span>
     );
 }
 
 function AnimatedInt({ value, className }: { value: number; className?: string }) {
     const display = useCountUp(value);
-    return (
-        <span className={cn("tabular-nums", className)}>{intFormatter.format(Math.round(display))}</span>
-    );
-}
-
-/** One-time global keyframes for the card entrance. Scoped by class name
- *  only (no styled-jsx dependency), injected once from the page root. */
-function MotionStyles() {
-    return (
-        <style>{`
-            @keyframes dashCardIn {
-                from { opacity: 0; transform: translateY(8px); }
-                to { opacity: 1; transform: translateY(0); }
-            }
-            .dash-card-in {
-                animation: dashCardIn .45s cubic-bezier(.16,.84,.44,1) both;
-            }
-            @media (prefers-reduced-motion: reduce) {
-                .dash-card-in { animation: none; }
-            }
-        `}</style>
-    );
+    return <span className={cn("tabular-nums", className)}>{intFormatter.format(Math.round(display))}</span>;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +440,11 @@ interface SettledResult {
     /** When the data on screen was fetched (ms epoch), for "آخر تحديث". */
     at: number | null;
 }
+
+/** Active state of a toggle item: solid emerald, so the chosen period/sort is
+ *  unmistakable (the stock "accent" grey was barely distinguishable). */
+const TOGGLE_ITEM =
+    "flex-1 px-3 text-[13px] font-semibold sm:flex-none sm:px-4 data-[state=on]:bg-emerald-600 data-[state=on]:text-white data-[state=on]:hover:bg-emerald-700";
 
 export function DashboardAnalyticsClient() {
     const { data: session, status } = useSessionWithOfflineFallback();
@@ -453,58 +512,36 @@ export function DashboardAnalyticsClient() {
         : null;
 
     return (
-        <section className="space-y-6">
-            <MotionStyles />
+        <section className="space-y-4 sm:space-y-6">
             {/* ------------------------------------------------------ header
-                Mobile: title row and the refresh button stay on ONE line
-                (button goes icon-only, no wrap-to-its-own-row), the date
-                shrinks to a single small line, and the exchange-rate hint
-                sentence is desktop-only — it's nice-to-know, not essential,
-                and was the single biggest line-count contributor on a phone.
-                Everything that previously forced 5 stacked lines above the
-                first KPI card now fits in 2. */}
-            <header className="space-y-2">
-                <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                        <p className="truncate text-[11px] font-medium text-slate-500 sm:text-xs">{todayLabel}</p>
-                        <h2 className="truncate text-lg font-bold text-slate-900 sm:text-2xl">ملخص أداء المتجر</h2>
-                    </div>
-
-                    <div className="flex shrink-0 items-center gap-2">
-                        {updatedLabel && !isLoading && (
-                            <span className="hidden text-xs text-slate-400 lg:inline">آخر تحديث {updatedLabel}</span>
-                        )}
-                        <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={refresh}
-                            disabled={isLoading}
-                            aria-label="تحديث"
-                            className="h-8 gap-1.5 bg-white px-2.5 transition-transform active:scale-95 sm:h-9 sm:px-3"
-                        >
-                            {isLoading ? (
-                                <Loader2 className="size-4 animate-spin" aria-hidden />
-                            ) : (
-                                <RefreshCw className="size-4" aria-hidden />
-                            )}
-                            <span className="hidden sm:inline">تحديث</span>
-                        </Button>
-                    </div>
+                One compact row on every screen: title block + an icon-sized
+                refresh. The exchange-rate chip is intentionally NOT here — it
+                duplicates the one in the top bar. */}
+            <header className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                    <p className="text-xs font-medium text-slate-500">{todayLabel}</p>
+                    <h2 className="text-xl font-extrabold text-slate-900 sm:text-2xl">ملخص أداء المتجر</h2>
                 </div>
 
-                {data?.exchangeRate && (
-                    <div className="flex flex-wrap items-center gap-2">
-                        <span className="inline-flex items-center gap-1.5 rounded-full border border-purple-200 bg-purple-50 px-2.5 py-0.5 text-[11px] font-semibold text-purple-700 sm:px-3 sm:py-1 sm:text-xs">
-                            <DollarSign className="size-3.5" aria-hidden />
-                            <bdi dir="ltr">$1</bdi>
-                            <span aria-hidden>=</span>
-                            <span className="tabular-nums">{formatMoney(data.exchangeRate, "SYP")} ل.س</span>
-                        </span>
-                        <span className="hidden text-[11px] text-slate-400 sm:inline">
-                            مبالغ الدولار تقريبية، بسعر كل فاتورة وقت إصدارها.
-                        </span>
-                    </div>
-                )}
+                <div className="flex shrink-0 items-center gap-2">
+                    {updatedLabel && !isLoading && (
+                        <span className="hidden text-xs text-slate-500 sm:inline">آخر تحديث {updatedLabel}</span>
+                    )}
+                    <Button
+                        variant="outline"
+                        onClick={refresh}
+                        disabled={isLoading}
+                        aria-label="تحديث البيانات"
+                        className="size-10 bg-white p-0 sm:h-9 sm:w-auto sm:gap-1.5 sm:px-3"
+                    >
+                        {isLoading ? (
+                            <Loader2 className="size-4 animate-spin" aria-hidden />
+                        ) : (
+                            <RefreshCw className="size-4" aria-hidden />
+                        )}
+                        <span className="hidden sm:inline">تحديث</span>
+                    </Button>
+                </div>
             </header>
 
             {error && (
@@ -523,18 +560,18 @@ export function DashboardAnalyticsClient() {
 
             {data && (
                 <div
-                    className={cn("space-y-6 transition-opacity", isLoading && "opacity-60")}
+                    className={cn("space-y-4 transition-opacity duration-300 sm:space-y-6", isLoading && "opacity-60")}
                     aria-busy={isLoading}
                 >
                     <KpiCards kpis={data.kpis} />
 
                     {/* ------------------------------------- period analysis */}
-                    <div className="space-y-4">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-3 sm:space-y-4">
+                        <div className="flex flex-wrap items-end justify-between gap-3">
                             <div>
-                                <h3 className="text-base font-bold text-slate-900">تحليل الفترة</h3>
-                                <p className="text-xs text-slate-500">
-                                    المخطط والقوائم أدناه تتبع الفترة المختارة — {windowLabel(windowDays)}.
+                                <h3 className="text-base font-extrabold text-slate-900">تحليل الفترة</h3>
+                                <p className="hidden text-xs text-slate-500 sm:block">
+                                    المخطط والقوائم تتبع الفترة المختارة — {windowLabel(windowDays)}.
                                 </p>
                             </div>
                             <ToggleGroup
@@ -544,23 +581,33 @@ export function DashboardAnalyticsClient() {
                                 value={String(range)}
                                 onValueChange={onRangeChange}
                                 aria-label="الفترة الزمنية للتحليل"
-                                className="bg-white"
+                                className="w-full bg-white sm:w-auto"
                             >
-                                <ToggleGroupItem value="1">اليوم</ToggleGroupItem>
-                                <ToggleGroupItem value="7">{fmtInt(7)} أيام</ToggleGroupItem>
-                                <ToggleGroupItem value="30">{fmtInt(30)} يوماً</ToggleGroupItem>
+                                <ToggleGroupItem value="1" className={TOGGLE_ITEM}>
+                                    اليوم
+                                </ToggleGroupItem>
+                                <ToggleGroupItem value="7" className={TOGGLE_ITEM}>
+                                    {fmtInt(7)} أيام
+                                </ToggleGroupItem>
+                                <ToggleGroupItem value="30" className={TOGGLE_ITEM}>
+                                    {fmtInt(30)} يوماً
+                                </ToggleGroupItem>
                             </ToggleGroup>
                         </div>
 
-                        <TrendCard trend={data.trend} granularity={data.trendGranularity} />
+                        <Reveal delay={120}>
+                            <TrendCard trend={data.trend} granularity={data.trendGranularity} />
+                        </Reveal>
 
-                        <div className="grid gap-4 lg:grid-cols-2">
+                        <Reveal delay={200} className="grid gap-3 sm:gap-4 lg:grid-cols-2">
                             <TopSellingCard rows={data.topProducts} days={windowDays} />
                             <TopProfitableCard rows={data.topProducts.byProfit} days={windowDays} />
-                        </div>
+                        </Reveal>
                     </div>
 
-                    <AlertsCard alerts={data.alerts} />
+                    <Reveal delay={280}>
+                        <AlertsCard alerts={data.alerts} />
+                    </Reveal>
                 </div>
             )}
         </section>
@@ -575,7 +622,7 @@ export function DashboardAnalyticsClient() {
 function ForbiddenPanel() {
     return (
         <section className="space-y-4">
-            <h2 className="text-xl font-bold text-slate-900">ملخص أداء المتجر</h2>
+            <h2 className="text-xl font-extrabold text-slate-900">ملخص أداء المتجر</h2>
             <Panel>
                 <div className="flex items-center gap-3 p-5 text-sm text-slate-700">
                     <ShieldCheck className="size-5 shrink-0 text-emerald-600" aria-hidden />
@@ -590,19 +637,35 @@ function ForbiddenPanel() {
 // Building blocks
 // ---------------------------------------------------------------------------
 
-/** shadcn Card with its built-in vertical padding/gap neutralised, so every
- *  panel below controls its own spacing regardless of the Card version. */
-function Panel({
+/** One-shot fade-up used for first paint. Re-fetches do not replay it (the
+ *  wrapper stays mounted), and reduced-motion users get no animation at all. */
+function Reveal({
     children,
+    delay = 0,
     className,
-    style,
 }: {
     children: React.ReactNode;
+    delay?: number;
     className?: string;
-    style?: React.CSSProperties;
 }) {
     return (
-        <Card style={style} className={cn("gap-0 overflow-hidden border-slate-200 bg-white py-0 shadow-sm", className)}>
+        <div
+            className={cn(
+                "animate-in fade-in-0 slide-in-from-bottom-2 duration-500 [animation-fill-mode:backwards] motion-reduce:animate-none",
+                className
+            )}
+            style={{ animationDelay: `${delay}ms` }}
+        >
+            {children}
+        </div>
+    );
+}
+
+/** shadcn Card with its built-in vertical padding/gap neutralised, so every
+ *  panel below controls its own spacing regardless of the Card version. */
+function Panel({ children, className }: { children: React.ReactNode; className?: string }) {
+    return (
+        <Card className={cn("gap-0 overflow-hidden border-slate-200 bg-white py-0 shadow-sm", className)}>
             {children}
         </Card>
     );
@@ -618,221 +681,252 @@ function PanelHeader({
     action?: React.ReactNode;
 }) {
     return (
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-3.5 sm:px-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-3 sm:px-5 sm:py-3.5">
             <div>
-                <h4 className="text-sm font-bold text-slate-900">{title}</h4>
-                {subtitle && <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>}
+                <h4 className="text-sm font-extrabold text-slate-900">{title}</h4>
+                {subtitle && <p className="mt-0.5 text-xs text-slate-600">{subtitle}</p>}
             </div>
             {action}
         </div>
     );
 }
 
-/** One money figure. The unit is its OWN element (not part of one string) so the
- *  RTL bidi algorithm can never shuffle it; USD is an isolated LTR run. */
+/** One money figure. Number and unit are SEPARATE elements so the RTL bidi
+ *  algorithm can never shuffle them; USD is an isolated LTR run. */
 function Money({
     value,
     currency,
     className,
+    unitClassName,
 }: {
     value: string;
     currency: "SYP" | "USD";
     className?: string;
+    unitClassName?: string;
 }) {
     if (currency === "USD") {
         return (
             <bdi dir="ltr" className={cn("tabular-nums", className)}>
-                $ {formatMoney(value, "USD")}
+                $ {fmtMoney(value, "USD")}
             </bdi>
         );
     }
     return (
-        <span className={cn("tabular-nums", className)}>
-            {formatMoney(value, "SYP")} <span className="text-[0.62em] font-semibold text-slate-500">ل.س</span>
+        <span className={cn("inline-flex items-baseline gap-1 tabular-nums", className)}>
+            <span>{fmtMoney(value, "SYP")}</span>
+            <span className={cn("text-[0.6em] font-semibold text-slate-500", unitClassName)}>ل.س</span>
         </span>
     );
 }
 
-type Tone = "emerald" | "sky" | "red" | "slate";
+type KpiTone = "hero" | "sky" | "slate" | "red";
 
-const TONE_CHIP: Record<Tone, string> = {
-    emerald: "bg-emerald-50 text-emerald-600",
-    sky: "bg-sky-50 text-sky-600",
-    red: "bg-red-50 text-red-600",
-    slate: "bg-slate-100 text-slate-600",
-};
-
-/** Accent-card wash — ONLY applied when `accent` is true, so color still
- *  encodes meaning (profit = positive, debt = attention) instead of being
- *  sprayed across every KPI the way the four cards used to look identical. */
-const TONE_CARD: Partial<Record<Tone, string>> = {
-    emerald: "border-emerald-200 bg-emerald-50/60",
-    red: "border-red-200 bg-red-50/60",
-};
-
-const TONE_CAPTION: Partial<Record<Tone, string>> = {
-    emerald: "text-emerald-700/80",
-    red: "text-red-700/80",
+const KPI_STYLES: Record<
+    KpiTone,
+    { card: string; chip: string; title: string; value: string; caption: string; unit: string }
+> = {
+    // The headline number gets a solid brand-colour card: white on emerald-700
+    // is 5.5:1, so it stays readable at small sizes too.
+    hero: {
+        card: "border-emerald-700 bg-gradient-to-br from-emerald-600 to-emerald-800 text-white shadow-md shadow-emerald-900/20",
+        chip: "bg-white/20 text-white",
+        title: "text-emerald-50",
+        value: "text-white",
+        caption: "text-emerald-100",
+        unit: "text-emerald-100",
+    },
+    sky: {
+        card: "border-slate-200 border-t-[3px] border-t-sky-500",
+        chip: "bg-sky-100 text-sky-700",
+        title: "text-slate-700",
+        value: "text-slate-900",
+        caption: "text-slate-600",
+        unit: "text-slate-500",
+    },
+    slate: {
+        card: "border-slate-200 border-t-[3px] border-t-slate-500",
+        chip: "bg-slate-100 text-slate-700",
+        title: "text-slate-700",
+        value: "text-slate-900",
+        caption: "text-slate-600",
+        unit: "text-slate-500",
+    },
+    red: {
+        card: "border-slate-200 border-t-[3px] border-t-red-500",
+        chip: "bg-red-100 text-red-700",
+        title: "text-slate-700",
+        value: "text-red-700",
+        caption: "text-slate-600",
+        unit: "text-red-500",
+    },
 };
 
 function KpiCard({
     title,
-    tag,
-    icon,
     tone,
-    accent = false,
-    hero,
-    className,
-    style,
+    icon,
     caption,
     children,
 }: {
     title: string;
-    tag: string;
+    tone: KpiTone;
     icon: React.ReactNode;
-    tone: Tone;
-    /** Tints the whole card (not just the icon chip) — reserve for the one
-     *  or two KPIs whose color genuinely carries meaning. */
-    accent?: boolean;
-    hero?: boolean;
-    className?: string;
-    style?: React.CSSProperties;
     caption?: React.ReactNode;
-    children: React.ReactNode;
+    children: (unitClassName: string) => React.ReactNode;
 }) {
+    const s = KPI_STYLES[tone];
+
     return (
-        <Panel style={style} className={cn("dash-card-in", accent && TONE_CARD[tone], className)}>
-            <div className="flex h-full flex-col gap-2 p-3.5 sm:gap-3 sm:p-5">
-                {/* Icon and the "اليوم" tag share the top row; the title gets
-                    its OWN full-width row below so it never has to compete
-                    for space and fight `truncate` down to "الفوا...". */}
-                <div className="flex items-center justify-between gap-2">
+        <Panel
+            className={cn(
+                "h-full transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transition-none motion-reduce:hover:translate-y-0",
+                s.card
+            )}
+        >
+            {/* Compact on a phone (no fixed heights, no tag pill stealing the
+                title's width), roomier from sm up. */}
+            <div className="flex flex-col gap-1.5 p-3.5 sm:gap-2.5 sm:p-5">
+                <div className="flex items-center gap-2">
                     <span
                         className={cn(
-                            "flex size-7 shrink-0 items-center justify-center rounded-lg sm:size-9 sm:rounded-xl",
-                            accent ? "bg-white shadow-sm" : TONE_CHIP[tone],
-                            accent && (tone === "red" ? "text-red-600" : "text-emerald-600")
+                            "flex size-8 shrink-0 items-center justify-center rounded-lg sm:size-9 sm:rounded-xl",
+                            s.chip
                         )}
                         aria-hidden
                     >
                         {icon}
                     </span>
-                    <span className="shrink-0 rounded-full bg-white/70 px-2 py-0.5 text-[10px] font-semibold text-slate-500 sm:text-[11px]">
-                        {tag}
-                    </span>
+                    <p className={cn("text-[13px] font-bold leading-tight sm:text-sm", s.title)}>{title}</p>
                 </div>
-
-                <p
-                    className={cn(
-                        "line-clamp-2 text-[13px] font-semibold leading-tight sm:text-sm",
-                        accent ? "text-slate-700" : "text-slate-600"
-                    )}
-                >
-                    {title}
-                </p>
 
                 <div
                     className={cn(
-                        "font-extrabold leading-tight tracking-tight text-slate-900",
-                        hero ? "text-2xl sm:text-3xl" : "text-lg sm:text-2xl"
+                        "text-start font-extrabold leading-tight tracking-tight",
+                        tone === "hero" ? "text-2xl sm:text-3xl" : "text-xl sm:text-2xl",
+                        s.value
                     )}
                 >
-                    {children}
+                    {children(s.unit)}
                 </div>
 
-                {caption && (
-                    <div className={cn("text-xs leading-relaxed", accent ? TONE_CAPTION[tone] : "text-slate-500")}>
-                        {caption}
-                    </div>
-                )}
+                {caption && <div className={cn("space-y-0.5 text-[11px] leading-snug sm:text-xs", s.caption)}>{caption}</div>}
             </div>
         </Panel>
     );
 }
 
 function KpiCards({ kpis }: { kpis: Kpis }) {
-    const margin = marginRatio(kpis.netProfitSYP, kpis.salesSYP);
+    // [v4.8] Margin is a property of the SALES made today (gross profit ÷ gross
+    // sales) — returns are reported on their own line, never blended into it.
+    const margin = marginRatio(kpis.grossProfitSYP, kpis.salesSYP);
     const average = averageInvoice(kpis.salesSYP, kpis.invoiceCount);
 
-    // Mobile: sales and debts are full-width, profit + invoices share a row.
-    // sm: 2 columns. xl: all four in one row.
+    const hasReturns = kpis.returnsCount > 0 || isNonZero(kpis.returnsSYP);
+    const hasReturnsProfit = isNonZero(kpis.returnsProfitSYP);
+
+    // 2×2 on a phone (4 equal compact cards instead of a tall stack), 4 across
+    // from xl.
     return (
         <div className="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
-            <KpiCard
-                title="المبيعات"
-                tag="اليوم"
-                tone="sky"
-                hero
-                className="col-span-2 sm:col-span-1"
-                style={{ animationDelay: "0ms" }}
-                icon={<ShoppingBag className="size-5" />}
-                // SYP is authoritative; USD is the secondary figure, summed from
-                // each invoice's own frozen-rate USD value (omitted when null).
-                caption={
-                    kpis.salesUSD !== null ? (
-                        <span className="inline-flex items-center gap-1">
-                            <span aria-hidden>≈</span>
-                            <Money value={kpis.salesUSD} currency="USD" className="font-semibold text-slate-700" />
-                        </span>
-                    ) : undefined
-                }
-            >
-                <AnimatedMoneySYP value={kpis.salesSYP} />
-            </KpiCard>
+            <Reveal delay={0}>
+                <KpiCard
+                    title="مبيعات اليوم"
+                    tone="hero"
+                    icon={<ShoppingBag className="size-5" />}
+                    // SYP is authoritative; USD is the secondary figure, summed
+                    // from each invoice's own frozen-rate USD value. [v4.9] It is
+                    // null when no rated sale exists today — caption omitted.
+                    // [v4.8] Returns get their own amber line, only when present.
+                    caption={
+                        kpis.salesUSD !== null || hasReturns ? (
+                            <>
+                                {kpis.salesUSD !== null && (
+                                    <div>
+                                        <span title="محسوبة بسعر صرف كل فاتورة وقت إصدارها" className="inline-flex items-center gap-1">
+                                            <span aria-hidden>≈</span>
+                                            <Money value={kpis.salesUSD} currency="USD" className="font-bold text-white" />
+                                        </span>
+                                    </div>
+                                )}
+                                {hasReturns && (
+                                    <div className="font-bold text-amber-200">
+                                        مرتجعات{" "}
+                                        <Money value={kpis.returnsSYP} currency="SYP" unitClassName="text-amber-200" />
+                                        {" · "}
+                                        {fmtInt(kpis.returnsCount)} {kpis.returnsCount === 1 ? "فاتورة" : "فواتير"}
+                                    </div>
+                                )}
+                            </>
+                        ) : undefined
+                    }
+                >
+                    {(unit) => <AnimatedMoneySYP value={kpis.salesSYP} unitClassName={unit} />}
+                </KpiCard>
+            </Reveal>
 
-            <KpiCard
-                title="صافي الربح"
-                tag="اليوم"
-                tone="emerald"
-                accent
-                style={{ animationDelay: "40ms" }}
-                icon={<TrendingUp className="size-5" />}
-                caption={
-                    margin === null ? (
-                        "لا مبيعات لحساب الهامش"
-                    ) : (
+            <Reveal delay={70}>
+                <KpiCard
+                    title="ربح اليوم"
+                    tone="sky"
+                    icon={<TrendingUp className="size-5" />}
+                    caption={
                         <>
-                            هامش الربح{" "}
-                            <span className="font-semibold text-emerald-800">{percentFormatter.format(margin)}</span>
+                            {margin !== null ? (
+                                <div>
+                                    هامش الربح{" "}
+                                    <span className="font-bold text-sky-700">{percentFormatter.format(margin)}</span>
+                                </div>
+                            ) : (
+                                !hasReturnsProfit && <div>لا مبيعات لحساب الهامش</div>
+                            )}
+                            {hasReturnsProfit && (
+                                <div className="font-bold text-amber-700">
+                                    منها <Money value={kpis.returnsProfitSYP} currency="SYP" unitClassName="text-amber-600" />{" "}
+                                    من مرتجعات
+                                </div>
+                            )}
                         </>
-                    )
-                }
-            >
-                <AnimatedMoneySYP value={kpis.netProfitSYP} className="text-emerald-900" />
-            </KpiCard>
+                    }
+                >
+                    {(unit) => <AnimatedMoneySYP value={kpis.netProfitSYP} unitClassName={unit} />}
+                </KpiCard>
+            </Reveal>
 
-            <KpiCard
-                title="الفواتير"
-                tag="اليوم"
-                tone="slate"
-                style={{ animationDelay: "80ms" }}
-                icon={<Receipt className="size-5" />}
-                caption={
-                    average === null ? (
-                        "لا فواتير صادرة بعد"
-                    ) : (
+            <Reveal delay={140}>
+                <KpiCard
+                    title="فواتير اليوم"
+                    tone="slate"
+                    icon={<Receipt className="size-5" />}
+                    caption={
                         <>
-                            متوسط الفاتورة{" "}
-                            <Money value={average} currency="SYP" className="font-semibold text-slate-700" />
+                            {average === null ? (
+                                <div>لا فواتير صادرة بعد</div>
+                            ) : (
+                                <div>
+                                    متوسط الفاتورة{" "}
+                                    <Money value={average} currency="SYP" className="font-bold text-slate-800" />
+                                </div>
+                            )}
+                            {kpis.returnsCount > 0 && (
+                                <div className="font-bold text-amber-700">+ {fmtInt(kpis.returnsCount)} مرتجع</div>
+                            )}
                         </>
-                    )
-                }
-            >
-                <AnimatedInt value={kpis.invoiceCount} />
-            </KpiCard>
+                    }
+                >
+                    {() => <AnimatedInt value={kpis.invoiceCount} />}
+                </KpiCard>
+            </Reveal>
 
-            <KpiCard
-                title="ديون الزبائن"
-                tag="الإجمالي"
-                tone="red"
-                accent
-                className="col-span-2 sm:col-span-1"
-                style={{ animationDelay: "120ms" }}
-                icon={<Wallet className="size-5" />}
-                caption="صافي المستحقات حسب دفتر الديون"
-            >
-                <AnimatedMoneySYP value={kpis.outstandingDebtSYP} className="text-red-900" />
-            </KpiCard>
+            <Reveal delay={210}>
+                <KpiCard
+                    title="ديون الزبائن"
+                    tone="red"
+                    icon={<Wallet className="size-5" />}
+                    caption="الرصيد الإجمالي حسب دفتر الديون"
+                >
+                    {(unit) => <AnimatedMoneySYP value={kpis.outstandingDebtSYP} unitClassName={unit} />}
+                </KpiCard>
+            </Reveal>
         </div>
     );
 }
@@ -860,19 +954,34 @@ function TrendTooltip({
                         <span className="size-2 rounded-full" style={{ background: chartConfig.sales.color }} aria-hidden />
                         المبيعات
                     </span>
-                    <Money value={point.salesSYP} currency="SYP" className="font-semibold text-slate-900" />
+                    <Money value={point.salesSYP} currency="SYP" className="font-bold text-slate-900" />
                 </div>
+                {isNonZero(point.returnsSYP) && (
+                    <div className="flex items-center justify-between gap-4">
+                        <span className="flex items-center gap-1.5 text-slate-600">
+                            <span className="size-2 rounded-full" style={{ background: RETURNS_COLOR }} aria-hidden />
+                            المرتجعات
+                        </span>
+                        <Money value={point.returnsSYP} currency="SYP" className="font-bold text-amber-700" />
+                    </div>
+                )}
                 <div className="flex items-center justify-between gap-4">
                     <span className="flex items-center gap-1.5 text-slate-600">
                         <span className="size-2 rounded-full" style={{ background: chartConfig.profit.color }} aria-hidden />
                         الربح
                     </span>
-                    <Money value={point.profitSYP} currency="SYP" className="font-semibold text-slate-900" />
+                    <Money value={point.profitSYP} currency="SYP" className="font-bold text-slate-900" />
                 </div>
             </div>
         </div>
     );
 }
+
+/** Up to this many points the trend is drawn as BARS. A smoothed area chart
+ *  invents a "hill" between a few isolated sales days and zeros, which reads as
+ *  a trend that never happened; bars show each day/hour as the discrete total
+ *  it is. A long window (dense data) is a better fit for a continuous area. */
+const MAX_BAR_POINTS = 14;
 
 function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: Granularity }) {
     const chartData = useMemo<ChartPoint[]>(
@@ -881,14 +990,19 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
                 date: p.date,
                 // Display-only conversion for recharts; never fed back into math.
                 sales: Number(p.salesSYP),
+                // Returns hang BELOW the zero line.
+                returns: -Number(p.returnsSYP),
                 profit: Number(p.profitSYP),
                 salesSYP: p.salesSYP,
+                returnsSYP: p.returnsSYP,
                 profitSYP: p.profitSYP,
             })),
         [trend]
     );
 
-    const hasActivity = chartData.some((p) => p.sales !== 0 || p.profit !== 0);
+    const hasActivity = chartData.some((p) => p.sales !== 0 || p.returns !== 0 || p.profit !== 0);
+    const hasReturnsInTrend = chartData.some((p) => p.returns !== 0);
+    const useBars = granularity === "hour" || chartData.length <= MAX_BAR_POINTS;
 
     // Period totals only make sense for a multi-day window (for "today" they
     // would just repeat the KPI cards above).
@@ -896,6 +1010,7 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
         granularity === "day" && trend.length > 0
             ? {
                 sales: sumMoney(trend.map((p) => p.salesSYP)),
+                returns: sumMoney(trend.map((p) => p.returnsSYP)),
                 profit: sumMoney(trend.map((p) => p.profitSYP)),
             }
             : null;
@@ -903,39 +1018,53 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
     const axisProps = {
         tickLine: false,
         axisLine: false,
-        tick: { fontSize: 11, fill: "#64748b" },
+        tick: { fontSize: 11, fill: "#475569" },
     } as const;
 
     return (
-        <Panel className="dash-card-in" style={{ animationDelay: "80ms" }}>
+        <Panel>
             <PanelHeader
-                title={granularity === "hour" ? "المبيعات والأرباح بالساعة" : "اتجاه المبيعات والأرباح"}
+                title={granularity === "hour" ? "المبيعات والأرباح بالساعة" : "المبيعات والأرباح"}
                 action={
-                    <span className="flex items-center gap-4 text-xs text-slate-500">
+                    <span className="flex items-center gap-4 text-xs font-medium text-slate-700">
                         <span className="flex items-center gap-1.5">
-                            <span className="size-2.5 rounded-full bg-emerald-600" aria-hidden />
+                            <span className="size-2.5 rounded-sm bg-emerald-600" aria-hidden />
                             المبيعات
                         </span>
+                        {hasReturnsInTrend && (
+                            <span className="flex items-center gap-1.5">
+                                <span className="size-2.5 rounded-sm" style={{ background: RETURNS_COLOR }} aria-hidden />
+                                المرتجعات
+                            </span>
+                        )}
                         <span className="flex items-center gap-1.5">
-                            <span className="size-2.5 rounded-full bg-blue-600" aria-hidden />
+                            <span className="size-2.5 rounded-sm bg-blue-600" aria-hidden />
                             الربح
                         </span>
                     </span>
                 }
             />
 
-            <div className="p-4 sm:p-5">
+            <div className="p-3 sm:p-5">
                 {totals && hasActivity && (
-                    <dl className="mb-4 flex flex-wrap gap-x-8 gap-y-2">
-                        <div>
-                            <dt className="text-xs text-slate-500">إجمالي مبيعات الفترة</dt>
-                            <dd className="text-lg font-extrabold text-slate-900">
+                    <dl className="mb-3 grid grid-cols-2 gap-3 sm:mb-4 sm:flex sm:gap-10">
+                        <div className="rounded-lg bg-emerald-50 px-3 py-2 sm:bg-transparent sm:p-0">
+                            <dt className="text-xs text-slate-600">مبيعات الفترة</dt>
+                            <dd className="text-base font-extrabold text-emerald-800 sm:text-lg sm:text-slate-900">
                                 <Money value={totals.sales} currency="SYP" />
                             </dd>
                         </div>
-                        <div>
-                            <dt className="text-xs text-slate-500">إجمالي ربح الفترة</dt>
-                            <dd className="text-lg font-extrabold text-slate-900">
+                        {isPositive(totals.returns) && (
+                            <div className="rounded-lg bg-amber-50 px-3 py-2 sm:bg-transparent sm:p-0">
+                                <dt className="text-xs text-slate-600">مرتجعات الفترة</dt>
+                                <dd className="text-base font-extrabold text-amber-800 sm:text-lg sm:text-slate-900">
+                                    <Money value={totals.returns} currency="SYP" />
+                                </dd>
+                            </div>
+                        )}
+                        <div className="rounded-lg bg-blue-50 px-3 py-2 sm:bg-transparent sm:p-0">
+                            <dt className="text-xs text-slate-600">ربح الفترة</dt>
+                            <dd className="text-base font-extrabold text-blue-800 sm:text-lg sm:text-slate-900">
                                 <Money value={totals.profit} currency="SYP" />
                             </dd>
                         </div>
@@ -943,53 +1072,65 @@ function TrendCard({ trend, granularity }: { trend: TrendPoint[]; granularity: G
                 )}
 
                 {!hasActivity ? (
-                    <div className="flex h-56 flex-col items-center justify-center gap-2 text-center">
-                        <span className="flex size-12 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+                    <div className="flex h-44 flex-col items-center justify-center gap-2 text-center sm:h-56">
+                        <span className="flex size-12 items-center justify-center rounded-full bg-slate-100 text-slate-500">
                             <TrendingUp className="size-6" aria-hidden />
                         </span>
-                        <p className="text-sm font-semibold text-slate-700">لا توجد مبيعات خلال هذه الفترة</p>
-                        <p className="text-xs text-slate-500">ستظهر هنا بمجرد تسجيل أول فاتورة.</p>
+                        <p className="text-sm font-bold text-slate-800">لا توجد مبيعات خلال هذه الفترة</p>
+                        <p className="text-xs text-slate-600">ستظهر هنا بمجرد تسجيل أول فاتورة.</p>
                     </div>
                 ) : (
                     // The chart itself stays LTR (time runs left to right, the
                     // value axis on the left) so it is identical regardless of
                     // page direction; the tooltip re-asserts RTL for its text.
-                    // Recharts animates Area/Bar paths in on mount by default
-                    // (isAnimationActive), which is the "draws itself" motion —
-                    // left as-is rather than reimplemented.
                     <div dir="ltr">
-                        <ChartContainer config={chartConfig} className="aspect-auto h-64 w-full">
-                            {granularity === "hour" ? (
-                                <BarChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }} barGap={3}>
-                                    <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#e2e8f0" />
-                                    <XAxis dataKey="date" tickFormatter={axisLabel} interval="preserveStartEnd" minTickGap={20} {...axisProps} />
-                                    <YAxis width={64} tickFormatter={(v: number) => compactFormatter.format(v)} {...axisProps} />
-                                    <ChartTooltip cursor={{ fill: "#f1f5f9" }} content={<TrendTooltip />} />
-                                    <Bar dataKey="sales" fill="var(--color-sales)" radius={[4, 4, 0, 0]} maxBarSize={26} animationDuration={500} />
-                                    <Bar dataKey="profit" fill="var(--color-profit)" radius={[4, 4, 0, 0]} maxBarSize={26} animationDuration={500} />
+                        <ChartContainer config={chartConfig} className="aspect-auto h-56 w-full sm:h-64">
+                            {useBars ? (
+                                <BarChart data={chartData} margin={{ top: 8, right: 4, left: 0, bottom: 0 }} barGap={3}>
+                                    <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#cbd5e1" />
+                                    <XAxis dataKey="date" tickFormatter={axisLabel} interval="preserveStartEnd" minTickGap={16} {...axisProps} />
+                                    <YAxis width={52} tickFormatter={(v: number) => compactFormatter.format(v)} {...axisProps} />
+                                    <ChartTooltip cursor={{ fill: "#e2e8f0", opacity: 0.5 }} content={<TrendTooltip />} />
+                                    <Bar dataKey="sales" fill="var(--color-sales)" radius={[5, 5, 0, 0]} maxBarSize={30} animationDuration={700} />
+                                    <Bar dataKey="returns" fill="var(--color-returns)" radius={[0, 0, 5, 5]} maxBarSize={30} animationDuration={700} />
+                                    <Bar dataKey="profit" fill="var(--color-profit)" radius={[5, 5, 0, 0]} maxBarSize={30} animationDuration={700} />
                                 </BarChart>
                             ) : (
-                                <AreaChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                                <AreaChart data={chartData} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
                                     <defs>
                                         <linearGradient id="fillSales" x1="0" y1="0" x2="0" y2="1">
-                                            <stop offset="5%" stopColor="var(--color-sales)" stopOpacity={0.28} />
-                                            <stop offset="95%" stopColor="var(--color-sales)" stopOpacity={0.02} />
+                                            <stop offset="5%" stopColor="var(--color-sales)" stopOpacity={0.32} />
+                                            <stop offset="95%" stopColor="var(--color-sales)" stopOpacity={0.03} />
                                         </linearGradient>
                                         <linearGradient id="fillProfit" x1="0" y1="0" x2="0" y2="1">
-                                            <stop offset="5%" stopColor="var(--color-profit)" stopOpacity={0.2} />
-                                            <stop offset="95%" stopColor="var(--color-profit)" stopOpacity={0.02} />
+                                            <stop offset="5%" stopColor="var(--color-profit)" stopOpacity={0.24} />
+                                            <stop offset="95%" stopColor="var(--color-profit)" stopOpacity={0.03} />
+                                        </linearGradient>
+                                        <linearGradient id="fillReturns" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor="var(--color-returns)" stopOpacity={0.03} />
+                                            <stop offset="95%" stopColor="var(--color-returns)" stopOpacity={0.28} />
                                         </linearGradient>
                                     </defs>
-                                    <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#e2e8f0" />
+                                    <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#cbd5e1" />
                                     <XAxis dataKey="date" tickFormatter={axisLabel} interval="preserveStartEnd" minTickGap={24} {...axisProps} />
-                                    <YAxis width={64} tickFormatter={(v: number) => compactFormatter.format(v)} {...axisProps} />
-                                    <ChartTooltip cursor={{ stroke: "#cbd5e1", strokeDasharray: "3 3" }} content={<TrendTooltip />} />
+                                    <YAxis width={52} tickFormatter={(v: number) => compactFormatter.format(v)} {...axisProps} />
+                                    <ChartTooltip cursor={{ stroke: "#94a3b8", strokeDasharray: "3 3" }} content={<TrendTooltip />} />
                                     <Area
                                         dataKey="sales"
                                         type="monotone"
                                         stroke="var(--color-sales)"
                                         strokeWidth={2.5}
                                         fill="url(#fillSales)"
+                                        dot={false}
+                                        activeDot={{ r: 4 }}
+                                        animationDuration={700}
+                                    />
+                                    <Area
+                                        dataKey="returns"
+                                        type="monotone"
+                                        stroke="var(--color-returns)"
+                                        strokeWidth={2}
+                                        fill="url(#fillReturns)"
                                         dot={false}
                                         activeDot={{ r: 4 }}
                                         animationDuration={700}
@@ -1024,30 +1165,41 @@ function quantityLabel(row: ProductAggregate): string {
 
 type RankMetric = "value" | "quantity" | "profit";
 
-const BAR_TONE: Record<RankMetric, string> = {
-    value: "bg-emerald-50",
-    quantity: "bg-sky-50",
-    profit: "bg-emerald-50",
+/** Each metric keeps ONE colour everywhere: sales = emerald (same as the chart),
+ *  profit = blue (same as the chart), quantity = cyan. */
+const BAR_FILL: Record<RankMetric, string> = {
+    value: "bg-emerald-500",
+    quantity: "bg-cyan-500",
+    profit: "bg-blue-500",
 };
 
-/** The numeric used ONLY to size the background bar (display-only). */
+/** The numeric used ONLY to size the bar (display-only). */
 function barValue(row: ProductAggregate, metric: RankMetric): number {
     const raw = metric === "quantity" ? row.quantity : metric === "profit" ? row.profitSYP : row.salesSYP;
     const n = Number(raw);
     return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/** Shared Top-N renderer. `metric` decides which figure is the headline, and
- *  each row carries a bar sized relative to the leader so the gap between #1
- *  and #5 is visible at a glance. */
+/** Shared Top-N renderer. `metric` decides which figure is the headline; every
+ *  row carries a bar sized relative to the leader, drawn UNDER the text (so the
+ *  text keeps full contrast), and the bars grow in once on first paint. */
 function RankList({ rows, metric, days }: { rows: ProductAggregate[]; metric: RankMetric; days: number }) {
+    // Starts at 0 and flips on the next frame, so every bar transitions from 0
+    // to its width instead of simply appearing. Later metric toggles animate
+    // between the two widths for free (the <li> keys are stable).
+    const [grown, setGrown] = useState(false);
+    useEffect(() => {
+        const id = requestAnimationFrame(() => setGrown(true));
+        return () => cancelAnimationFrame(id);
+    }, []);
+
     if (rows.length === 0) {
         return (
-            <div className="flex flex-col items-center gap-2 py-10 text-center">
-                <span className="flex size-11 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+            <div className="flex flex-col items-center gap-2 py-8 text-center">
+                <span className="flex size-11 items-center justify-center rounded-full bg-slate-100 text-slate-500">
                     <ShoppingBag className="size-5" aria-hidden />
                 </span>
-                <p className="text-sm text-slate-500">لا توجد مبيعات مسجلة — {windowLabel(days)}.</p>
+                <p className="text-sm text-slate-600">لا توجد مبيعات مسجلة — {windowLabel(days)}.</p>
             </div>
         );
     }
@@ -1057,7 +1209,7 @@ function RankList({ rows, metric, days }: { rows: ProductAggregate[]; metric: Ra
     return (
         <ol className="space-y-2">
             {rows.map((row, index) => {
-                const pct = max > 0 ? Math.max(6, (barValue(row, metric) / max) * 100) : 0;
+                const pct = max > 0 ? Math.max(4, (barValue(row, metric) / max) * 100) : 0;
 
                 const headline =
                     metric === "quantity" ? (
@@ -1080,31 +1232,38 @@ function RankList({ rows, metric, days }: { rows: ProductAggregate[]; metric: Ra
                 return (
                     <li
                         key={row.productId}
-                        className="dash-card-in relative overflow-hidden rounded-lg border border-slate-100 bg-white transition-colors hover:border-slate-200"
-                        style={{ animationDelay: `${120 + index * 40}ms` }}
+                        className="rounded-lg border border-slate-200 bg-white p-3 transition-colors hover:border-slate-300 hover:bg-slate-50"
                     >
-                        {/* start-0 = the right edge in RTL, so the bar grows toward the left. */}
-                        <div
-                            className={cn("absolute inset-y-0 start-0 transition-[width] duration-500 ease-out", BAR_TONE[metric])}
-                            style={{ width: `${pct}%` }}
-                            aria-hidden
-                        />
-                        <div className="relative flex items-center justify-between gap-3 px-3 py-2.5">
-                            <div className="flex min-w-0 items-center gap-3">
+                        <div className="flex items-center justify-between gap-3">
+                            <div className="flex min-w-0 items-center gap-2.5">
                                 <span
                                     className={cn(
-                                        "flex size-7 shrink-0 items-center justify-center rounded-full text-xs font-bold",
-                                        index === 0 ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"
+                                        "flex size-7 shrink-0 items-center justify-center rounded-full text-xs font-extrabold",
+                                        index === 0
+                                            ? "bg-amber-400 text-amber-950"
+                                            : "bg-slate-100 text-slate-700"
                                     )}
                                 >
                                     {fmtInt(index + 1)}
                                 </span>
                                 <div className="min-w-0">
-                                    <p className="truncate text-sm font-semibold text-slate-900">{row.productName}</p>
-                                    <p className="truncate text-xs text-slate-500">{sub}</p>
+                                    <p className="truncate text-sm font-bold text-slate-900">{row.productName}</p>
+                                    <p className="truncate text-xs text-slate-600">{sub}</p>
                                 </div>
                             </div>
                             <span className="shrink-0 text-sm font-extrabold text-slate-900">{headline}</span>
+                        </div>
+
+                        {/* The track fills from the RIGHT edge in RTL, so the bar
+                            grows toward the left, the reading direction. */}
+                        <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-slate-100" aria-hidden>
+                            <div
+                                className={cn(
+                                    "h-full rounded-full transition-[width] duration-700 ease-out motion-reduce:transition-none",
+                                    BAR_FILL[metric]
+                                )}
+                                style={{ width: `${grown ? pct : 0}%` }}
+                            />
                         </div>
                     </li>
                 );
@@ -1118,10 +1277,10 @@ function TopSellingCard({ rows, days }: { rows: DashboardPayload["topProducts"];
     const list = metric === "value" ? rows.bySalesValue : rows.byQuantity;
 
     return (
-        <Panel className="dash-card-in" style={{ animationDelay: "160ms" }}>
+        <Panel>
             <PanelHeader
                 title="الأكثر مبيعاً"
-                subtitle={windowLabel(days)}
+                subtitle={`${windowLabel(days)} — بعد خصم المرتجعات`}
                 action={
                     <ToggleGroup
                         type="single"
@@ -1133,12 +1292,16 @@ function TopSellingCard({ rows, days }: { rows: DashboardPayload["topProducts"];
                         }}
                         aria-label="ترتيب قائمة الأكثر مبيعاً"
                     >
-                        <ToggleGroupItem value="value">حسب القيمة</ToggleGroupItem>
-                        <ToggleGroupItem value="quantity">حسب الكمية</ToggleGroupItem>
+                        <ToggleGroupItem value="value" className={TOGGLE_ITEM}>
+                            حسب القيمة
+                        </ToggleGroupItem>
+                        <ToggleGroupItem value="quantity" className={TOGGLE_ITEM}>
+                            حسب الكمية
+                        </ToggleGroupItem>
                     </ToggleGroup>
                 }
             />
-            <div className="p-4 sm:p-5">
+            <div className="p-3 sm:p-5">
                 <RankList rows={list} metric={metric} days={days} />
             </div>
         </Panel>
@@ -1147,9 +1310,9 @@ function TopSellingCard({ rows, days }: { rows: DashboardPayload["topProducts"];
 
 function TopProfitableCard({ rows, days }: { rows: ProductAggregate[]; days: number }) {
     return (
-        <Panel className="dash-card-in" style={{ animationDelay: "200ms" }}>
+        <Panel>
             <PanelHeader title="الأكثر ربحاً" subtitle={`حسب صافي الربح — ${windowLabel(days)}`} />
-            <div className="p-4 sm:p-5">
+            <div className="p-3 sm:p-5">
                 <RankList rows={rows} metric="profit" days={days} />
             </div>
         </Panel>
@@ -1162,10 +1325,10 @@ function TopProfitableCard({ rows, days }: { rows: ProductAggregate[]; days: num
 
 type AlertTone = "red" | "amber" | "slate";
 
-const ALERT_STYLES: Record<AlertTone, { chip: string; badge: string; ring: string }> = {
-    red: { chip: "bg-red-50 text-red-600", badge: "bg-red-100 text-red-700", ring: "ring-red-100" },
-    amber: { chip: "bg-amber-50 text-amber-600", badge: "bg-amber-100 text-amber-800", ring: "ring-amber-100" },
-    slate: { chip: "bg-slate-100 text-slate-600", badge: "bg-slate-200 text-slate-700", ring: "ring-slate-100" },
+const ALERT_STYLES: Record<AlertTone, { chip: string; badge: string; dot: string; ping: string }> = {
+    red: { chip: "bg-red-100 text-red-700", badge: "bg-red-600 text-white", dot: "bg-red-500", ping: "bg-red-400" },
+    amber: { chip: "bg-amber-100 text-amber-800", badge: "bg-amber-500 text-white", dot: "bg-amber-500", ping: "bg-amber-400" },
+    slate: { chip: "bg-slate-200 text-slate-700", badge: "bg-slate-700 text-white", dot: "bg-slate-500", ping: "bg-slate-400" },
 };
 
 function AlertColumn({
@@ -1174,7 +1337,7 @@ function AlertColumn({
     tone,
     count,
     shown,
-    emptyText,
+    okText,
     href,
     children,
 }: {
@@ -1183,54 +1346,55 @@ function AlertColumn({
     tone: AlertTone;
     count: number;
     shown: number;
-    emptyText: string;
+    okText: string;
     href: string;
     children: React.ReactNode;
 }) {
     const styles = ALERT_STYLES[tone];
-    // Only columns with something open get a tinted frame — an empty column
-    // stays neutral so the open ones are what draw the eye first.
-    const frame = count > 0 ? cn("ring-1", styles.ring, "bg-white") : "bg-slate-50/60";
+
+    // Nothing to act on: a slim one-line row instead of a full empty box.
+    if (count === 0) {
+        return (
+            <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-3">
+                <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700" aria-hidden>
+                    <Check className="size-4" />
+                </span>
+                <div className="min-w-0">
+                    <p className="truncate text-sm font-bold text-emerald-900">{title}</p>
+                    <p className="truncate text-xs text-emerald-700">{okText}</p>
+                </div>
+            </div>
+        );
+    }
 
     return (
-        <div className={cn("flex flex-col gap-3 rounded-xl border border-slate-200 p-4", frame)}>
+        <div className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5 sm:p-4">
             <div className="flex items-center justify-between gap-2">
                 <span className="flex min-w-0 items-center gap-2.5">
-                    <span className={cn("flex size-8 shrink-0 items-center justify-center rounded-lg", styles.chip)} aria-hidden>
+                    <span className={cn("relative flex size-8 shrink-0 items-center justify-center rounded-lg", styles.chip)} aria-hidden>
                         {icon}
+                        {/* A live dot: this alert needs attention right now. */}
+                        <span className="absolute -end-1 -top-1 flex size-2.5">
+                            <span className={cn("absolute inline-flex size-full animate-ping rounded-full opacity-75 motion-reduce:animate-none", styles.ping)} />
+                            <span className={cn("relative inline-flex size-2.5 rounded-full", styles.dot)} />
+                        </span>
                     </span>
-                    <span className="truncate text-sm font-bold text-slate-800">{title}</span>
+                    <span className="truncate text-sm font-extrabold text-slate-900">{title}</span>
                 </span>
-                <span
-                    className={cn(
-                        "shrink-0 rounded-full px-2.5 py-0.5 text-xs font-bold tabular-nums",
-                        count > 0 ? styles.badge : "bg-emerald-100 text-emerald-700"
-                    )}
-                >
+                <span className={cn("shrink-0 rounded-full px-2.5 py-0.5 text-xs font-extrabold tabular-nums", styles.badge)}>
                     {fmtInt(count)}
                 </span>
             </div>
 
-            {count === 0 ? (
-                <p className="flex items-start gap-2 rounded-lg bg-emerald-50 px-3 py-2.5 text-xs leading-relaxed text-emerald-700">
-                    <CheckCircle2 className="mt-0.5 size-4 shrink-0" aria-hidden />
-                    {emptyText}
-                </p>
-            ) : (
-                <>
-                    <ul className="space-y-2">{children}</ul>
-                    {count > shown && (
-                        <p className="text-center text-xs text-slate-400">و {fmtInt(count - shown)} غيرها…</p>
-                    )}
-                    <Link
-                        href={href}
-                        className="mt-auto inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:underline"
-                    >
-                        عرض الكل
-                        <ChevronLeft className="size-3.5" aria-hidden />
-                    </Link>
-                </>
-            )}
+            <ul className="space-y-2">{children}</ul>
+            {count > shown && <p className="text-center text-xs text-slate-500">و {fmtInt(count - shown)} غيرها…</p>}
+            <Link
+                href={href}
+                className="mt-auto inline-flex items-center gap-1 text-xs font-bold text-emerald-700 hover:underline"
+            >
+                عرض الكل
+                <ChevronLeft className="size-3.5" aria-hidden />
+            </Link>
         </div>
     );
 }
@@ -1245,36 +1409,61 @@ function AlertsCard({ alerts }: { alerts: DashboardPayload["alerts"] }) {
     const total =
         alerts.needsReconciliation.count + alerts.expiringSoon.count + alerts.largeBalances.count;
 
+    // Nothing open anywhere: ONE slim confirmation instead of three empty boxes.
+    if (total === 0) {
+        return (
+            <Panel className="border-emerald-200 bg-emerald-50">
+                <div className="flex flex-wrap items-center gap-x-6 gap-y-2 p-4 sm:p-5">
+                    <span className="flex items-center gap-2 text-sm font-extrabold text-emerald-900">
+                        <CheckCircle2 className="size-5 shrink-0 text-emerald-600" aria-hidden />
+                        كل شيء على ما يرام
+                    </span>
+                    <ul className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-medium text-emerald-800">
+                        <li className="flex items-center gap-1">
+                            <Check className="size-3.5" aria-hidden />
+                            المخزون متسق
+                        </li>
+                        <li className="flex items-center gap-1">
+                            <Check className="size-3.5" aria-hidden />
+                            لا دفعات قريبة الانتهاء
+                        </li>
+                        <li className="flex items-center gap-1">
+                            <Check className="size-3.5" aria-hidden />
+                            لا أرصدة ديون
+                        </li>
+                    </ul>
+                </div>
+            </Panel>
+        );
+    }
+
     return (
-        <Panel className="dash-card-in" style={{ animationDelay: "240ms" }}>
-            <PanelHeader
-                title="تنبيهات تحتاج انتباهك"
-                subtitle={total === 0 ? "كل شيء على ما يرام." : `${fmtInt(total)} تنبيه مفتوح`}
-            />
-            <div className="grid gap-4 p-4 sm:p-5 lg:grid-cols-3">
+        <Panel>
+            <PanelHeader title="تنبيهات تحتاج انتباهك" subtitle={`${fmtInt(total)} تنبيه مفتوح`} />
+            <div className="grid gap-3 p-3 sm:gap-4 sm:p-5 lg:grid-cols-3">
                 <AlertColumn
                     title="مخزون يحتاج تسوية"
                     icon={<PackageX className="size-4" />}
                     tone="red"
                     count={alerts.needsReconciliation.count}
                     shown={alerts.needsReconciliation.items.length}
-                    emptyText="لا توجد دفعات برصيد سالب — المخزون متسق."
+                    okText="لا دفعات برصيد سالب — المخزون متسق."
                     href="/inventory?filter=needs_reconciliation"
                 >
                     {alerts.needsReconciliation.items.map((row) => (
                         <li
                             key={row.batchId}
-                            className="flex items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-100"
+                            className="flex items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-200"
                         >
                             <div className="min-w-0">
-                                <p className="truncate text-xs font-semibold text-slate-800">{row.productName}</p>
-                                <p className="truncate text-[11px] text-slate-500">
+                                <p className="truncate text-xs font-bold text-slate-900">{row.productName}</p>
+                                <p className="truncate text-[11px] text-slate-600">
                                     <bdi dir="ltr" className="font-mono">
                                         {row.batchNumber}
                                     </bdi>
                                 </p>
                             </div>
-                            <span className="shrink-0 text-xs font-bold tabular-nums text-red-600">
+                            <span className="shrink-0 text-xs font-extrabold tabular-nums text-red-700">
                                 <bdi dir="ltr">{qty(row.quantity)}</bdi> {row.unitName}
                             </span>
                         </li>
@@ -1287,17 +1476,17 @@ function AlertsCard({ alerts }: { alerts: DashboardPayload["alerts"] }) {
                     tone="amber"
                     count={alerts.expiringSoon.count}
                     shown={alerts.expiringSoon.items.length}
-                    emptyText={`لا توجد دفعات على وشك الانتهاء خلال ${fmtInt(60)} يوماً.`}
+                    okText={`لا دفعات تنتهي خلال ${fmtInt(60)} يوماً.`}
                     href="/inventory?filter=expiring"
                 >
                     {alerts.expiringSoon.items.map((row) => (
                         <li
                             key={row.batchId}
-                            className="flex items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-100"
+                            className="flex items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-200"
                         >
                             <div className="min-w-0">
-                                <p className="truncate text-xs font-semibold text-slate-800">{row.productName}</p>
-                                <p className="truncate text-[11px] text-slate-500">
+                                <p className="truncate text-xs font-bold text-slate-900">{row.productName}</p>
+                                <p className="truncate text-[11px] text-slate-600">
                                     <bdi dir="ltr" className="font-mono">
                                         {row.batchNumber}
                                     </bdi>{" "}
@@ -1306,8 +1495,8 @@ function AlertsCard({ alerts }: { alerts: DashboardPayload["alerts"] }) {
                             </div>
                             <span
                                 className={cn(
-                                    "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold",
-                                    row.daysToExpiry <= 7 ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-800"
+                                    "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-extrabold",
+                                    row.daysToExpiry <= 7 ? "bg-red-600 text-white" : "bg-amber-100 text-amber-900"
                                 )}
                             >
                                 {expiryLabel(row.daysToExpiry)}
@@ -1322,18 +1511,18 @@ function AlertsCard({ alerts }: { alerts: DashboardPayload["alerts"] }) {
                     tone="slate"
                     count={alerts.largeBalances.count}
                     shown={alerts.largeBalances.items.length}
-                    emptyText="لا توجد أرصدة مستحقة على أي زبون."
+                    okText="لا أرصدة مستحقة على أي زبون."
                     href="/ledger"
                 >
                     {alerts.largeBalances.items.map((row) => (
                         <li
                             key={row.customerId}
-                            className="flex items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-100"
+                            className="flex items-center justify-between gap-2 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-200"
                         >
-                            <span className="min-w-0 truncate text-xs font-semibold text-slate-800">
+                            <span className="min-w-0 truncate text-xs font-bold text-slate-900">
                                 {row.customerName}
                             </span>
-                            <Money value={row.balanceSYP} currency="SYP" className="shrink-0 text-xs font-bold text-red-600" />
+                            <Money value={row.balanceSYP} currency="SYP" className="shrink-0 text-xs font-extrabold text-red-700" />
                         </li>
                     ))}
                 </AlertColumn>
@@ -1346,21 +1535,20 @@ function AlertsCard({ alerts }: { alerts: DashboardPayload["alerts"] }) {
 
 function DashboardSkeleton() {
     return (
-        <section className="space-y-6" aria-busy="true" aria-label="جاري تحميل لوحة التحكم">
+        <section className="space-y-4 sm:space-y-6" aria-busy="true" aria-label="جاري تحميل لوحة التحكم">
             <div className="space-y-2">
                 <Skeleton className="h-3 w-40" />
                 <Skeleton className="h-7 w-56" />
             </div>
             <div className="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
-                <Skeleton className="col-span-2 h-32 rounded-xl sm:col-span-1" />
-                <Skeleton className="h-32 rounded-xl" />
-                <Skeleton className="h-32 rounded-xl" />
-                <Skeleton className="col-span-2 h-32 rounded-xl sm:col-span-1" />
+                {[0, 1, 2, 3].map((i) => (
+                    <Skeleton key={i} className="h-28 rounded-xl" />
+                ))}
             </div>
-            <Skeleton className="h-80 rounded-xl" />
-            <div className="grid gap-4 lg:grid-cols-2">
-                <Skeleton className="h-64 rounded-xl" />
-                <Skeleton className="h-64 rounded-xl" />
+            <Skeleton className="h-72 rounded-xl" />
+            <div className="grid gap-3 sm:gap-4 lg:grid-cols-2">
+                <Skeleton className="h-56 rounded-xl" />
+                <Skeleton className="h-56 rounded-xl" />
             </div>
         </section>
     );

@@ -21,40 +21,56 @@
  * -----------------------------------------------------------------------------
  * THE DEFINITIONS (each one is the EXACT query a verification script runs):
  * -----------------------------------------------------------------------------
- * salesSYP(window)      = SUM(Invoice.totalSYP) over EVERY Invoice row with
- *                         createdAt in the window, ANY status. A void writes a
- *                         mirror row with a NEGATED totalSYP (see
- *                         app/api/ledger/voids/route.ts), so summing all
- *                         statuses already nets a void back out.
+ * [v4.8 — SALES vs RETURNS ARE SEPARATE FIGURES]
+ *   A void writes a mirror Invoice row (status VOIDED) with NEGATED money, on
+ *   the day the void is made. Previously every status was summed into ONE
+ *   "sales" number, so the day of a cancellation showed NEGATIVE sales next to
+ *   "0 invoices" — two figures that looked contradictory. They are now
+ *   reported separately, from the same rows:
  *
- * salesUSD(today)       = SUM(Invoice.totalUSD) over the same rows, skipping
- *                         nulls. Each invoice carries the USD figure derived
- *                         from ITS OWN frozen exchangeRateUsed, so the total
- *                         is never re-converted at today's rate (T4c2's "no
- *                         live rate" rule). Null when no rated invoice exists
- *                         today — null-rate invoices contribute nothing.
+ * salesSYP(window)      = SUM(Invoice.totalSYP) over invoices with
+ *                         status != VOIDED created in the window. GROSS sales:
+ *                         never reduced by a later (or same-day) void, so a
+ *                         day's figure cannot change retroactively.
  *
- * netProfitSYP(window)  = SUM(unitPriceSYP × quantity − costAmountSYP) over
- *                         EVERY InvoiceItem of those invoices. costAmountSYP is
- *                         non-nullable (T4g), so this is ALWAYS computable.
+ * returnsSYP(window)    = −SUM(Invoice.totalSYP) over VOIDED rows created in
+ *                         the window, i.e. a POSITIVE number ("how much was
+ *                         returned/cancelled today"). returnsCount is the
+ *                         number of such void rows.
+ *
+ * netSalesSYP(window)   = salesSYP − returnsSYP  (= SUM over EVERY row).
+ *                         Identity pinned by tests.
+ *
+ * salesUSD(today)       = SUM(Invoice.totalUSD) over the SAME non-void rows,
+ *                         skipping nulls. Each invoice carries the USD figure
+ *                         derived from ITS OWN frozen exchangeRateUsed, so the
+ *                         total is never re-converted at today's rate. Null
+ *                         when no rated sale exists today. (Returns have no
+ *                         USD caption — SYP is authoritative.)
+ *
+ * PROFIT — [v4.8] computed at INVOICE level, never from quantities:
+ *   profit(rows) = SUM(Invoice.totalSYP) − SUM(InvoiceItem.costAmountSYP)
+ *   Both operands are stored, exact figures (costAmountSYP is frozen at commit
+ *   time, T4g; non-nullable). The previous formula
+ *   Σ(unitPriceSYP × quantity − costAmountSYP) multiplied by the ROUNDED
+ *   sale-unit `quantity` (20/24 = 0.8333), which drifts for FIFO-split sales
+ *   (a 3-way split summed to 0.9999). Void rows carry negated totalSYP AND
+ *   negated costAmountSYP, so a void's profit is exactly the negation of the
+ *   original's.
+ *     grossProfitSYP   = profit over non-void rows
+ *     returnsProfitSYP = profit over VOIDED rows (≤ 0 — "profit given back")
+ *     netProfitSYP     = grossProfitSYP + returnsProfitSYP
  *
  * invoiceCount(today)   = COUNT of invoices created today with status
  *                         COMPLETED. Void mirror rows are VOIDED, so they are
- *                         never counted. [T4h fix] The count is EVENT-DATED
- *                         exactly like salesSYP: it is a function of rows
- *                         created today and nothing else, so a void issued
- *                         TOMORROW can never change today's already-displayed
- *                         figure. (The previous definition also excluded sales
- *                         that had a void against them, which made today's
- *                         count drop retroactively while today's sales did
- *                         not.) Consequence, stated plainly: a sale made AND
- *                         voided today still counts as one issued sale, while
- *                         salesSYP nets it to zero. The count answers "how many
- *                         sale documents were issued today"; salesSYP answers
- *                         "what is today's net revenue". To get the stricter
- *                         "live sales only" reading back, add `voidedBy` to the
- *                         invoice select and skip rows where it is non-null —
- *                         at the cost of that retroactive drift.
+ *                         never counted (they are counted in returnsCount).
+ *                         [T4h fix] The count is EVENT-DATED exactly like
+ *                         salesSYP: it is a function of rows created today and
+ *                         nothing else, so a void issued TOMORROW can never
+ *                         change today's already-displayed figure. A sale made
+ *                         AND voided today therefore counts as one issued sale
+ *                         AND one return — and salesSYP / returnsSYP now show
+ *                         both sides of it instead of silently netting.
  *
  * outstandingDebtSYP    = SUM over active customers of computeBalanceSYP(
  *                         [SUM(invoice.debtAmountSYP)], [SUM(independent
@@ -63,9 +79,10 @@
  *                         from two groupBy queries instead of every row.
  *
  * EVENT-DATE ACCOUNTING: a void counts on the day IT was created, not on the
- * day of the sale it reverses. Voiding yesterday's sale today therefore shows
- * as NEGATIVE sales/profit today. That is correct accounting (the ledger is
- * append-only and event-dated), not a bug.
+ * day of the sale it reverses. Yesterday's report therefore never changes
+ * after the day closes (the merchant may already have counted the till).
+ * Voiding yesterday's sale today shows as today's RETURNS (and negative net
+ * profit) — never as negative "sales".
  *
  * WINDOWS
  *   One window, `range` days (1, 7 or 30), ending today. The trend, the KPI
@@ -80,10 +97,16 @@
  *   platform-wide constant — the market is Syria. A sale at 23:30 UTC belongs
  *   to the NEXT local day.
  *
- * QUANTITY RANKING: InvoiceItem.quantity is in the unit SOLD (carton, piece…),
- * so summing it raw would rank 1000 pieces above 50 cartons of 24. The
- * by-quantity figure is therefore converted to BASE units with each line's
- * OWN sold unit factor (never the base unit's, which is always 1).
+ * PRODUCT RANKINGS [v4.8]: built from InvoiceItem.baseQuantity (the exact
+ *   quantity deducted from the batch, in the product's BASE unit; negative on
+ *   a void line) — never from the rounded sale-unit `quantity`.
+ *     - quantity ranking = SUM(baseQuantity): already base-unit, no conversion.
+ *     - revenue: rows of ONE sale line (same product, same sold unit, same
+ *       price — a sale FIFO-split across batches) are collapsed first, then the
+ *       summed base quantity is divided ONCE by the sold unit's factor
+ *       (units.ts → saleQuantityFromBase) and multiplied by the unit price.
+ *       A sale and its void collapse to exactly zero.
+ *   Because voids are included (negative), product figures are NET of returns.
  *
  * ALERTS [T4h fix]: the batch alerts are two capped, separately COUNTED
  * database queries (lib/data/products.ts's listBatchAlertSets()). The
@@ -92,16 +115,16 @@
  * the same definition; nothing is fetched just to be thrown away.
  *
  * KNOWN LIMIT: the invoice and invoiceItem reads cover the whole window
- * (up to 30 days) because per-day, per-line profit needs row-level math that
- * Prisma cannot aggregate without raw SQL. Fine at small-merchant scale; the
- * route sets a short private Cache-Control to absorb repeated loads.
+ * (up to 30 days) because per-day figures need row-level math that Prisma
+ * cannot aggregate without raw SQL. Fine at small-merchant scale; the route
+ * sets a short private Cache-Control to absorb repeated loads.
  *
  * LINT NOTE (eslint.config.mjs's BACKEND_ONLY_FILES block): this file may not
  * name `product`/`productUnit` as a select/include/where key or as a member
  * expression, nor read .baseUnit/.conversionFactor arithmetic. Product names,
  * unit factors and batch alerts come from small gateway helpers in
  * lib/data/products.ts; base-unit names from base-unit.ts's requireBaseUnits();
- * the conversion itself from units.ts's toBaseUnit().
+ * the sale-unit division from units.ts's saleQuantityFromBase().
  */
 
 import type { InvoiceStatus } from "@prisma/client";
@@ -115,7 +138,7 @@ import {
     type BatchAlertSets,
 } from "@/lib/data/products";
 import { requireBaseUnits } from "@/lib/inventory/base-unit";
-import { toBaseUnit } from "@/lib/inventory/units";
+import { saleQuantityFromBase } from "@/lib/inventory/units";
 import {
     addLocalDays,
     localDayKey,
@@ -153,15 +176,28 @@ function dstr(v: DecimalLike): string {
 type DecimalInstance = InstanceType<typeof Decimal>;
 
 export interface AnalyticsKpis {
-    /** Today's net sales, SYP (voids already netted out). */
+    /**
+     * Today's GROSS sales, SYP — every non-VOIDED invoice created today. A
+     * void never reduces this (see returnsSYP).
+     */
     salesSYP: string;
     /**
-     * [v4.9] Sum of each invoice's own frozen-rate USD figure — never
-     * re-converted. Null when no rated invoice exists today (null-rate
-     * invoices contribute nothing, never today's rate).
+     * [v4.9] Sum of each non-void invoice's own frozen-rate USD figure — never
+     * re-converted. Null when no rated sale exists today (null-rate invoices
+     * contribute nothing, never today's rate).
      */
     salesUSD: string | null;
-    /** Today's net profit, SYP — always fully computable (costAmountSYP is non-nullable). */
+    /** [v4.8] Today's returns/cancellations, SYP — a POSITIVE number (|Σ void totals|). */
+    returnsSYP: string;
+    /** [v4.8] Number of void rows created today. */
+    returnsCount: number;
+    /** [v4.8] salesSYP − returnsSYP. */
+    netSalesSYP: string;
+    /** [v4.8] Profit on today's non-void sales: Σ totalSYP − Σ costAmountSYP. */
+    grossProfitSYP: string;
+    /** [v4.8] Profit given back by today's voids (≤ 0, the negation of the originals' profit). */
+    returnsProfitSYP: string;
+    /** Today's NET profit, SYP = grossProfitSYP + returnsProfitSYP. */
     netProfitSYP: string;
     /** COMPLETED invoices issued today (event-dated; see the definition above). */
     invoiceCount: number;
@@ -177,20 +213,24 @@ export interface TrendPoint {
      * "YYYY-MM-DDTHH" (hour 00–23) when `trendGranularity` is "hour".
      */
     date: string;
+    /** [v4.8] GROSS sales in the bucket (non-void rows). */
     salesSYP: string;
+    /** [v4.8] Returns in the bucket — a POSITIVE number. */
+    returnsSYP: string;
+    /** NET profit in the bucket (Σ totalSYP − Σ costAmountSYP over every row). */
     profitSYP: string;
 }
 
 export interface ProductAggregate {
     productId: string;
     productName: string;
-    /** SUM(unitPriceSYP × quantity) over the window. */
+    /** Net revenue over the window (voids included, so returns are subtracted). */
     salesSYP: string;
-    /** SUM of quantity converted to the product's BASE unit, over the window. */
+    /** SUM(baseQuantity) over the window — already in the product's BASE unit. */
     quantity: string;
     /** Name of the base unit `quantity` is expressed in ("" if it could not be resolved). */
     baseUnitName: string;
-    /** SUM(unitPriceSYP × quantity − costAmountSYP) over the window. */
+    /** salesSYP − Σ costAmountSYP over the window. */
     profitSYP: string;
 }
 
@@ -312,13 +352,11 @@ function calendarDaysUntil(target: Date, now: Date): number {
 // === PURE HELPERS (exported — unit-testable with no database at all) ===
 
 /**
- * One invoice line's profit, in SYP:
- *
- *   profitSYP = (unitPriceSYP × quantity) − costAmountSYP
- *
- * Identical to lib/data/invoices.ts's per-line derivation (T4c2). For a void
- * line both `quantity` and `costAmountSYP` are already negated, so this returns
- * the negation of the original line — adding the two gives exactly zero.
+ * @deprecated [v4.8] No longer used by this module. It multiplies by the
+ * ROUNDED sale-unit `quantity`, which drifts for FIFO-split sales (a 3-way
+ * split: 0.3333 × 3 = 0.9999). Profit is now Σ totalSYP − Σ costAmountSYP at
+ * invoice level, and product revenue is built from baseQuantity. Kept only so
+ * existing imports still compile; delete it with its tests when convenient.
  */
 export function lineProfitSYP(
     unitPriceSYP: DecimalLike,
@@ -331,10 +369,17 @@ export function lineProfitSYP(
 
 /**
  * Aggregate raw InvoiceItem rows (already windowed) into one row per product.
- * Money columns accumulate through lib/utils/money.ts. `quantity` is converted
- * to the BASE unit PER LINE with that line's own sold-unit factor (looked up
- * by `unitId` in `factorByUnitId`) via units.ts's toBaseUnit() — a void line's
- * negative quantity converts to a negative base quantity, so it nets out.
+ *
+ * [v4.8] Works from `baseQuantity` (exact, base unit, negative on a void line)
+ * and NEVER from the rounded sale-unit `quantity`:
+ *   1. Rows of one sale line — same product, same SOLD unit, same unit price,
+ *      i.e. a sale that FIFO split across batches — are collapsed, summing
+ *      baseQuantity and costAmountSYP.
+ *   2. Each collapsed line's base total is divided ONCE by the sold unit's
+ *      factor (units.ts → saleQuantityFromBase), then × unitPriceSYP gives its
+ *      revenue (money.ts). A sale and its void collapse to exactly 0.
+ *   3. Lines add up per product. `quantity` is simply Σ baseQuantity.
+ *   profitSYP = revenue − Σ costAmountSYP.
  *
  * A line whose unit has no factor in the map is a data-integrity bug (units
  * are never hard-deleted; InvoiceItem.unit is Restrict) — it throws rather
@@ -349,40 +394,67 @@ export function buildProductAggregates(
     items: Array<{
         productId: string;
         unitId: string;
-        quantity: DecimalLike;
+        baseQuantity: DecimalLike;
         unitPriceSYP: DecimalLike;
         costAmountSYP: DecimalLike;
     }>,
     nameById: Map<string, string>,
     factorByUnitId: Map<string, string>
 ): ProductAggregate[] {
-    const acc = new Map<
+    // Step 1 — collapse the rows of one sale line.
+    const lines = new Map<
         string,
-        { sales: string; profit: string; baseQuantity: DecimalInstance }
+        {
+            productId: string;
+            unitId: string;
+            unitPriceSYP: string;
+            baseQuantity: DecimalInstance;
+            cost: string;
+        }
     >();
 
     for (const item of items) {
-        const factor = factorByUnitId.get(item.unitId);
+        const unitPriceSYP = dstr(item.unitPriceSYP);
+        const key = `${item.productId}|${item.unitId}|${unitPriceSYP}`;
+        const line =
+            lines.get(key) ??
+            {
+                productId: item.productId,
+                unitId: item.unitId,
+                unitPriceSYP,
+                baseQuantity: new Decimal(0),
+                cost: "0.0000",
+            };
+        line.baseQuantity = line.baseQuantity.plus(new Decimal(dstr(item.baseQuantity)));
+        line.cost = addMoney(line.cost, dstr(item.costAmountSYP));
+        lines.set(key, line);
+    }
+
+    // Steps 2 + 3 — revenue per collapsed line, then per product.
+    const acc = new Map<
+        string,
+        { sales: string; cost: string; baseQuantity: DecimalInstance }
+    >();
+
+    for (const line of lines.values()) {
+        const factor = factorByUnitId.get(line.unitId);
         if (factor === undefined) {
             throw new Error(
-                `Analytics: no conversion factor found for unit ${item.unitId} ` +
-                `(product ${item.productId}) — data-integrity problem.`
+                `Analytics: no conversion factor found for unit ${line.unitId} ` +
+                `(product ${line.productId}) — data-integrity problem.`
             );
         }
 
+        const { saleQuantity } = saleQuantityFromBase([line.baseQuantity], factor);
+        const revenue = multiplyMoney(line.unitPriceSYP, saleQuantity);
+
         const entry =
-            acc.get(item.productId) ??
-            { sales: "0.0000", profit: "0.0000", baseQuantity: new Decimal(0) };
-
-        const revenue = multiplyMoney(dstr(item.unitPriceSYP), dstr(item.quantity));
+            acc.get(line.productId) ??
+            { sales: "0.0000", cost: "0.0000", baseQuantity: new Decimal(0) };
         entry.sales = addMoney(entry.sales, revenue);
-        entry.profit = addMoney(
-            entry.profit,
-            lineProfitSYP(item.unitPriceSYP, item.quantity, item.costAmountSYP)
-        );
-        entry.baseQuantity = entry.baseQuantity.plus(toBaseUnit(dstr(item.quantity), factor));
-
-        acc.set(item.productId, entry);
+        entry.cost = addMoney(entry.cost, line.cost);
+        entry.baseQuantity = entry.baseQuantity.plus(line.baseQuantity);
+        acc.set(line.productId, entry);
     }
 
     const aggregates: ProductAggregate[] = [];
@@ -393,7 +465,7 @@ export function buildProductAggregates(
             salesSYP: entry.sales,
             quantity: entry.baseQuantity.toFixed(4),
             baseUnitName: "",
-            profitSYP: entry.profit,
+            profitSYP: subtractMoney(entry.sales, entry.cost),
         });
     }
     return aggregates;
@@ -416,7 +488,7 @@ function rank(
         .slice(0, limit);
 }
 
-/** Top-sellers by TOTAL SALES VALUE (SYP) — Σ(unitPriceSYP × quantity). */
+/** Top-sellers by TOTAL SALES VALUE (SYP) — net of returns. */
 export function rankTopBySalesValue(
     aggregates: ProductAggregate[],
     limit: number = TOP_PRODUCT_LIMIT
@@ -432,7 +504,7 @@ export function rankTopByQuantity(
     return rank(aggregates, (a) => a.quantity, limit);
 }
 
-/** Most profitable — Σ(unitPriceSYP × quantity − costAmountSYP). */
+/** Most profitable — net revenue minus frozen cost. */
 export function rankTopByProfit(
     aggregates: ProductAggregate[],
     limit: number = TOP_PRODUCT_LIMIT
@@ -453,10 +525,11 @@ interface RawInvoiceRow {
 interface RawItemRow {
     productId: string;
     unitId: string;
-    quantity: DecimalLike;
+    /** [v4.8] Exact base-unit quantity deducted from the batch (negative on a void line). */
+    baseQuantity: DecimalLike;
     unitPriceSYP: DecimalLike;
     costAmountSYP: DecimalLike;
-    invoice: { createdAt: Date };
+    invoice: { createdAt: Date; status: InvoiceStatus };
 }
 
 interface RawActiveCustomerRow {
@@ -535,10 +608,11 @@ export async function getAnalyticsDashboard(
                 select: {
                     productId: true,
                     unitId: true,
-                    quantity: true,
+                    // [v4.8] baseQuantity, NOT quantity — see the header.
+                    baseQuantity: true,
                     unitPriceSYP: true,
                     costAmountSYP: true,
-                    invoice: { select: { createdAt: true } },
+                    invoice: { select: { createdAt: true, status: true } },
                 },
             }) as Promise<RawItemRow[]>,
 
@@ -585,20 +659,29 @@ export async function getAnalyticsDashboard(
     ]);
 
     // === TODAY'S KPIs ===
+    // [v4.8] Sales and returns are accumulated SEPARATELY from the same rows.
     let todaySalesSYP = "0.0000";
+    // Σ of VOIDED totals — NEGATIVE (a void row carries negated money). Turned
+    // into the positive `returnsSYP` figure below.
+    let todayReturnsRawSYP = "0.0000";
     // [v4.9] Null-rate invoices contribute nothing to USD aggregates and are
-    // never converted using today's rate. Null until a rated invoice appears.
+    // never converted using today's rate. Null until a rated sale appears.
     let todaySalesUSD: string | null = null;
     let invoiceCount = 0;
+    let returnsCount = 0;
     for (const inv of invoices) {
         if (localDayKey(inv.createdAt) !== todayKey) continue;
-        // Revenue SUMS every status (a void mirror row is negative, so it
-        // already nets out). The COUNT is event-dated: COMPLETED rows created
-        // today, independent of any later void.
+        if (inv.status === "VOIDED") {
+            todayReturnsRawSYP = addMoney(todayReturnsRawSYP, dstr(inv.totalSYP));
+            returnsCount += 1;
+            continue;
+        }
         todaySalesSYP = addMoney(todaySalesSYP, dstr(inv.totalSYP));
         if (inv.totalUSD !== null) {
             todaySalesUSD = addMoney(todaySalesUSD ?? "0.0000", dstr(inv.totalUSD));
         }
+        // The COUNT is event-dated: COMPLETED rows created today, independent
+        // of any later void.
         if (inv.status === "COMPLETED") invoiceCount += 1;
     }
 
@@ -622,35 +705,59 @@ export async function getAnalyticsDashboard(
     }
 
     const salesByBucket = new Map<string, string>(trendKeys.map((k) => [k, "0.0000"]));
-    const profitByBucket = new Map<string, string>(trendKeys.map((k) => [k, "0.0000"]));
+    // Σ of VOIDED totals per bucket — negative; shown to the client as positive.
+    const returnsRawByBucket = new Map<string, string>(trendKeys.map((k) => [k, "0.0000"]));
+    // Σ costAmountSYP of EVERY item per bucket (void lines are negative).
+    const costByBucket = new Map<string, string>(trendKeys.map((k) => [k, "0.0000"]));
 
     for (const inv of invoices) {
         const key = bucketOf(inv.createdAt);
-        const prev = salesByBucket.get(key);
+        const target = inv.status === "VOIDED" ? returnsRawByBucket : salesByBucket;
+        const prev = target.get(key);
         if (prev === undefined) continue;
-        salesByBucket.set(key, addMoney(prev, dstr(inv.totalSYP)));
+        target.set(key, addMoney(prev, dstr(inv.totalSYP)));
     }
 
-    let todayProfitSYP = "0.0000";
+    // [v4.8] Profit is invoice-level: Σ totalSYP − Σ costAmountSYP. Costs are
+    // split by void/non-void ONLY for today's gross-vs-returns profit split.
+    let todayGrossCostSYP = "0.0000";
+    let todayReturnsCostSYP = "0.0000";
     for (const item of items) {
-        const profit = lineProfitSYP(item.unitPriceSYP, item.quantity, item.costAmountSYP);
+        const cost = dstr(item.costAmountSYP);
 
         const key = bucketOf(item.invoice.createdAt);
-        const prev = profitByBucket.get(key);
-        if (prev !== undefined) profitByBucket.set(key, addMoney(prev, profit));
+        const prev = costByBucket.get(key);
+        if (prev !== undefined) costByBucket.set(key, addMoney(prev, cost));
+
         // The KPI is always the whole local DAY, whatever the trend granularity.
         if (localDayKey(item.invoice.createdAt) === todayKey) {
-            todayProfitSYP = addMoney(todayProfitSYP, profit);
+            if (item.invoice.status === "VOIDED") {
+                todayReturnsCostSYP = addMoney(todayReturnsCostSYP, cost);
+            } else {
+                todayGrossCostSYP = addMoney(todayGrossCostSYP, cost);
+            }
         }
     }
 
+    const todayGrossProfitSYP = subtractMoney(todaySalesSYP, todayGrossCostSYP);
+    // returnsRaw (negative total) − returnsCost (negative cost) = the negated
+    // profit of the reversed sales, e.g. −3550 − (−3480) = −70.
+    const todayReturnsProfitSYP = subtractMoney(todayReturnsRawSYP, todayReturnsCostSYP);
+    const todayNetProfitSYP = addMoney(todayGrossProfitSYP, todayReturnsProfitSYP);
+
     // Today's KPI figures and the trend's buckets come from the SAME rows and
     // the SAME arithmetic, so a KPI card and the chart cannot disagree.
-    const trend: TrendPoint[] = trendKeys.map((date) => ({
-        date,
-        salesSYP: salesByBucket.get(date)!,
-        profitSYP: profitByBucket.get(date)!,
-    }));
+    const trend: TrendPoint[] = trendKeys.map((date) => {
+        const sales = salesByBucket.get(date)!;
+        const returnsRaw = returnsRawByBucket.get(date)!;
+        const cost = costByBucket.get(date)!;
+        return {
+            date,
+            salesSYP: sales,
+            returnsSYP: subtractMoney("0.0000", returnsRaw),
+            profitSYP: subtractMoney(addMoney(sales, returnsRaw), cost),
+        };
+    });
 
     // === TOP PRODUCTS (same window as the chart's selected range) ===
     const aggregates = buildProductAggregates(items, nameById, factorByUnitId);
@@ -729,7 +836,12 @@ export async function getAnalyticsDashboard(
         kpis: {
             salesSYP: todaySalesSYP,
             salesUSD: todaySalesUSD,
-            netProfitSYP: todayProfitSYP,
+            returnsSYP: subtractMoney("0.0000", todayReturnsRawSYP),
+            returnsCount,
+            netSalesSYP: addMoney(todaySalesSYP, todayReturnsRawSYP),
+            grossProfitSYP: todayGrossProfitSYP,
+            returnsProfitSYP: todayReturnsProfitSYP,
+            netProfitSYP: todayNetProfitSYP,
             invoiceCount,
             outstandingDebtSYP,
         },
