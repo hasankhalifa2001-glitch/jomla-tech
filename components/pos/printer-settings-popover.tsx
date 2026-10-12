@@ -4,7 +4,7 @@
  * components/pos/printer-settings-popover.tsx
  *
  * T4f addendum — Rule 4's settings control. Per the approved decision it lives
- * ON THE POS SCREEN (mounted in pos-layout.tsx's top bar), not under
+ * ON THE POS SCREEN (mounted in pos-layout.tsx's command bar), not under
  * /settings/**, for one concrete reason: the sidebar's settings entries are
  * ADMIN-gated (components/dashboard/sidebar.tsx), while printing is a CASHIER
  * activity. A cashier on a fresh device would otherwise hit
@@ -46,6 +46,10 @@
  * [THE PAIRED DEVICE IS NEVER ASKED FOR A WIDTH] `handle.name` is displayed for
  * identification only. bluetooth-printer.ts is the only module that touches
  * Web Bluetooth, and it deliberately exposes no resolution information at all.
+ *
+ * [STYLE] The default trigger now matches the POS command bar (44px, rounded-xl,
+ * label from xl up like the sync button) so the host no longer needs a
+ * wrapper to restyle it. Light-only slate/emerald.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -55,7 +59,6 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
 import {
   Popover,
   PopoverContent,
@@ -84,6 +87,7 @@ import {
   printEscPosBytes,
 } from "@/lib/receipts/bluetooth-printer";
 import { ensurePairedPrinter, setPairedPrinter, usePairedPrinter } from "@/lib/receipts/printer-session";
+import { cn } from "@/lib/utils";
 
 const PAPER_WIDTH_LABELS: Record<PaperWidth, string> = {
   "80mm": "80 مم",
@@ -97,7 +101,7 @@ export interface PrinterSettingsPopoverProps {
    */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
-  /** Rendered as the trigger when neither `open` nor a custom trigger is given. */
+  /** Overrides the trigger's classes (the default matches the POS command bar). */
   className?: string;
 }
 
@@ -259,40 +263,38 @@ export function PrinterSettingsPopover({
         <Button
           type="button"
           variant="outline"
-          size="sm"
-          className={
-            className ??
-            "text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-          }
+          className={cn(
+            "h-11 min-w-11 shrink-0 gap-1.5 rounded-xl border-slate-200 bg-white px-3 text-xs font-bold text-slate-700 shadow-sm hover:bg-slate-50 hover:text-slate-900",
+            className
+          )}
+          aria-label="إعدادات الطابعة"
           title={
             isConfirmed && config
               ? `إعدادات الطابعة الحرارية (${PAPER_WIDTH_LABELS[config.paperWidth]})`
               : "اضبط عرض رأس الطابعة على هذا الجهاز قبل الطباعة"
           }
         >
-          <Printer className="h-3.5 w-3.5 text-emerald-600" />
-          <span className="hidden lg:inline">الطابعة</span>
+          <Printer className="size-4 text-emerald-600" aria-hidden />
+          <span className="hidden xl:inline">الطابعة</span>
         </Button>
       </PopoverTrigger>
 
-      <PopoverContent dir="rtl" align="end" className="w-80 space-y-3 text-xs">
+      <PopoverContent dir="rtl" align="end" className="w-80 space-y-3.5 border-slate-200 text-xs">
         <div className="flex items-center justify-between gap-2">
-          <span className="font-bold text-zinc-800 dark:text-zinc-200">
-            إعدادات الطابعة الحرارية
-          </span>
-          <Badge
-            variant="outline"
-            className={
+          <span className="text-sm font-extrabold text-slate-900">إعدادات الطابعة الحرارية</span>
+          <span
+            className={cn(
+              "rounded-full px-2 py-0.5 text-[11px] font-bold ring-1",
               isConfirmed
-                ? "bg-emerald-50 text-emerald-700 text-[10px]"
-                : "bg-amber-50 text-amber-700 text-[10px]"
-            }
+                ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+                : "bg-amber-50 text-amber-700 ring-amber-200"
+            )}
           >
             {isConfirmed ? "مضبوطة" : "غير مضبوطة"}
-          </Badge>
+          </span>
         </div>
 
-        <p className="text-[11px] leading-relaxed text-zinc-500">
+        <p className="text-[11px] leading-relaxed text-slate-600">
           هذا الإعداد خاص بهذا الجهاز فقط — لا ينتقل مع المستخدم أو المتجر. اختر مقاس الورق،
           ثم أدخل عدد النقاط في السطر من دليل طابعتك (أو من نتيجة الطباعة التجريبية) واضغط
           «تأكيد». اختيار المقاس وحده لا يغيّر أي إعداد محفوظ فعلياً — التغيير يُحفظ فقط عند
@@ -300,40 +302,51 @@ export function PrinterSettingsPopover({
         </p>
 
         <div className="space-y-1.5">
-          <Label className="text-[11px] font-semibold">مقاس الورق</Label>
+          <Label className="text-[11px] font-bold text-slate-700">مقاس الورق</Label>
           <div className="flex gap-2">
-            {(Object.keys(PAPER_WIDTH_LABELS) as PaperWidth[]).map((width) => (
-              <Button
-                key={width}
-                type="button"
-                size="sm"
-                variant={config?.paperWidth === width ? "default" : "outline"}
-                onClick={() => handleSelectWidth(width)}
-                disabled={isBusy || isLoading}
-                className="flex-1 text-[11px]"
-              >
-                {PAPER_WIDTH_LABELS[width]}
-              </Button>
-            ))}
+            {(Object.keys(PAPER_WIDTH_LABELS) as PaperWidth[]).map((width) => {
+              const selected = config?.paperWidth === width;
+              return (
+                <Button
+                  key={width}
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  aria-pressed={selected}
+                  onClick={() => handleSelectWidth(width)}
+                  disabled={isBusy || isLoading}
+                  className={cn(
+                    "h-9 flex-1 text-xs font-bold",
+                    selected
+                      ? "border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700 hover:text-white"
+                      : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+                  )}
+                >
+                  {PAPER_WIDTH_LABELS[width]}
+                </Button>
+              );
+            })}
           </div>
         </div>
 
         <div className="space-y-1.5">
-          <Label htmlFor="printer-dots" className="text-[11px] font-semibold">
+          <Label htmlFor="printer-dots" className="text-[11px] font-bold text-slate-700">
             عدد النقاط في السطر (dots per line)
           </Label>
           <Input
             id="printer-dots"
             inputMode="numeric"
+            dir="ltr"
             value={dotsDraft}
             onChange={(event) => setDotsDraft(event.target.value.replace(/[^0-9]/g, ""))}
-            className="h-8 font-mono text-xs"
+            className="h-9 border-slate-200 text-center font-mono text-sm tabular-nums focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
             placeholder="576"
           />
-          <p className="text-[10px] text-zinc-400">
-            القيمة المقترحة لمقاس{" "}
-            {PAPER_WIDTH_LABELS[config?.paperWidth ?? "80mm"]}:{" "}
-            <span className="font-mono">{suggestedDotsPerLine(config?.paperWidth ?? "80mm")}</span>{" "}
+          <p className="text-[11px] text-slate-500">
+            القيمة المقترحة لمقاس {PAPER_WIDTH_LABELS[config?.paperWidth ?? "80mm"]}:{" "}
+            <span className="font-mono font-bold text-slate-700">
+              {suggestedDotsPerLine(config?.paperWidth ?? "80mm")}
+            </span>{" "}
             — عدّلها إن اختلفت طابعتك.
           </p>
         </div>
@@ -344,13 +357,9 @@ export function PrinterSettingsPopover({
             size="sm"
             onClick={handleConfirm}
             disabled={isBusy || dotsDraft === ""}
-            className="gap-1.5 bg-emerald-600 text-[11px] text-white hover:bg-emerald-700"
+            className="h-9 gap-1.5 bg-emerald-600 text-xs font-bold text-white hover:bg-emerald-700"
           >
-            {isBusy ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Check className="h-3.5 w-3.5" />
-            )}
+            {isBusy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : <Check className="size-3.5" aria-hidden />}
             <span>تأكيد</span>
           </Button>
 
@@ -360,9 +369,9 @@ export function PrinterSettingsPopover({
             variant="outline"
             onClick={handlePair}
             disabled={isBusy}
-            className="gap-1.5 text-[11px]"
+            className="h-9 gap-1.5 border-slate-200 text-xs font-semibold"
           >
-            <Bluetooth className="h-3.5 w-3.5" />
+            <Bluetooth className="size-3.5" aria-hidden />
             <span>{paired ? "إعادة الإقران" : "إقران الطابعة"}</span>
           </Button>
 
@@ -372,9 +381,9 @@ export function PrinterSettingsPopover({
             variant="outline"
             onClick={handleTestPrint}
             disabled={isBusy}
-            className="gap-1.5 text-[11px]"
+            className="h-9 gap-1.5 border-slate-200 text-xs font-semibold"
           >
-            <RefreshCw className="h-3.5 w-3.5" />
+            <RefreshCw className="size-3.5" aria-hidden />
             <span>طباعة تجريبية</span>
           </Button>
 
@@ -384,14 +393,14 @@ export function PrinterSettingsPopover({
             variant="ghost"
             onClick={handleClear}
             disabled={isBusy}
-            className="gap-1.5 text-[11px] text-red-600 hover:text-red-700"
+            className="h-9 gap-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 hover:text-red-700"
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="size-3.5" aria-hidden />
             <span>حذف</span>
           </Button>
         </div>
 
-        <p className="text-[10px] text-zinc-400">
+        <p className="border-t border-slate-100 pt-2.5 text-[11px] text-slate-500">
           {paired ? `الطابعة المقترنة: ${paired.name}` : "لا توجد طابعة مقترنة في هذه الجلسة."}
         </p>
       </PopoverContent>

@@ -12,7 +12,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Badge } from "@/components/ui/badge";
 import {
   Search,
   UserPlus,
@@ -34,7 +33,9 @@ import {
   type SelectedCustomer,
   type DuplicatePhoneMatch,
 } from "@/lib/offline";
-import { formatMoney } from "@/lib/utils/money";
+import { cn } from "@/lib/utils";
+import { fmtInt } from "@/lib/utils/digits";
+import { Money } from "./money";
 
 interface WalkInCustomerModalProps {
   open: boolean;
@@ -43,6 +44,19 @@ interface WalkInCustomerModalProps {
   onSelectCustomer: (customer: SelectedCustomer | null) => void;
   tenantId?: string;
   allowSystemCustomer?: boolean;
+}
+
+/** Inline error row used by both tabs. */
+function ErrorRow({ message }: { message: string }) {
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 p-2.5 text-xs font-semibold text-red-700"
+    >
+      <AlertCircle className="mt-px size-4 shrink-0" aria-hidden />
+      <span>{message}</span>
+    </div>
+  );
 }
 
 export function WalkInCustomerModal({
@@ -308,101 +322,112 @@ export function WalkInCustomerModal({
 
   return (
     <Dialog open={open} onOpenChange={handleDialogOpenChange}>
-      <DialogContent className="sm:max-w-lg" dir="rtl">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-lg" dir="rtl">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2 text-lg font-bold text-zinc-900 dark:text-zinc-100">
-            <Users className="h-5 w-5 text-emerald-600" />
+          <DialogTitle className="flex items-center gap-2.5 text-lg font-extrabold text-slate-900">
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
+              <Users className="size-4.5" aria-hidden />
+            </span>
             تحديد أو تسجيل الزبون
           </DialogTitle>
-          <DialogDescription className="text-xs text-zinc-500">
+          <DialogDescription className="text-xs text-slate-500">
             اختر زبوناً مسجلاً من الذاكرة المحلية أو سجل زبوناً نقدياً / مؤقتاً
             جديداً فوراً بدون مغادرة نقطة البيع.
           </DialogDescription>
         </DialogHeader>
 
-        {formError && tab === "existing" && (
-          <div className="flex items-center gap-2 rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/50 dark:text-red-300 border border-red-200">
-            <AlertCircle className="h-4 w-4 shrink-0" />
-            <span>{formError}</span>
-          </div>
-        )}
+        {formError && tab === "existing" && <ErrorRow message={formError} />}
 
         <Tabs
           value={tab}
           onValueChange={(v) => setTab(v as "existing" | "new")}
-          className="mt-2"
+          className="mt-1"
         >
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="existing" className="text-xs">
-              <Users className="ml-1.5 h-3.5 w-3.5" />
-              الزبائن المسجلون ({realCustomers.length})
+          <TabsList className="grid h-10 w-full grid-cols-2 bg-slate-100">
+            <TabsTrigger
+              value="existing"
+              className="gap-1.5 text-xs font-bold data-[state=active]:bg-white data-[state=active]:text-emerald-800 data-[state=active]:shadow-sm"
+            >
+              <Users className="size-3.5" aria-hidden />
+              الزبائن المسجلون ({fmtInt(realCustomers.length)})
             </TabsTrigger>
-            <TabsTrigger value="new" className="text-xs">
-              <UserPlus className="ml-1.5 h-3.5 w-3.5" />
-              تسجيل زبون جديد (سريع)
+            <TabsTrigger
+              value="new"
+              className="gap-1.5 text-xs font-bold data-[state=active]:bg-white data-[state=active]:text-emerald-800 data-[state=active]:shadow-sm"
+            >
+              <UserPlus className="size-3.5" aria-hidden />
+              زبون جديد (سريع)
             </TabsTrigger>
           </TabsList>
 
           {/* TAB 1: Existing Customers & Cash Walk-in Shortcut */}
-          <TabsContent value="existing" className="space-y-3 mt-3">
-            {/* Quick One-Tap Cash Walk-in Option ("زبون نقدي") */}
-            <div
+          <TabsContent value="existing" className="mt-3 space-y-3">
+            {/* Quick one-tap cash walk-in option ("زبون نقدي") */}
+            <button
+              type="button"
+              disabled={!allowSystemCustomer}
               onClick={() => {
                 void handleSelectCashCustomer();
               }}
-              className={`rounded-xl border p-3 transition-all flex items-center justify-between ${!allowSystemCustomer
-                ? "cursor-not-allowed opacity-50 border-zinc-200 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-900/50"
-                : isSystemSelected
-                  ? "cursor-pointer border-emerald-600 bg-emerald-50/80 dark:bg-emerald-950/50 text-emerald-900 dark:text-emerald-100 font-semibold shadow-xs"
-                  : "cursor-pointer border-zinc-200 bg-zinc-50/50 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
-                }`}
-            >
-              <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-300">
-                  <UserCheck className="h-4 w-4" />
-                </div>
-                <div>
-                  <p className="text-xs font-bold">زبون نقدي عام (زبون نقدي)</p>
-                  <p className="text-[11px] text-zinc-500">
-                    {allowSystemCustomer
-                      ? "اختصار بنقرة واحدة للمبيعات النقدية الفورية المباشرة (سداد 100% كاش)"
-                      : "غير متاح مع البيع على الحساب أو الدفع الجزئي — اختر زبوناً حقيقياً أو سجّل زبوناً جديداً"}
-                  </p>
-                </div>
-              </div>
-              {isSystemSelected && allowSystemCustomer && (
-                <Badge className="bg-emerald-600 text-white text-[10px]">
-                  محدد حالياً
-                </Badge>
+              className={cn(
+                "flex w-full items-center justify-between gap-3 rounded-xl border p-3 text-start transition-all duration-150",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50",
+                !allowSystemCustomer
+                  ? "cursor-not-allowed border-slate-200 bg-slate-50 opacity-60"
+                  : isSystemSelected
+                    ? "border-emerald-600 bg-emerald-50 shadow-sm"
+                    : "border-slate-200 bg-slate-50 hover:border-emerald-300 hover:bg-emerald-50/60"
               )}
-            </div>
+            >
+              <span className="flex min-w-0 items-center gap-3">
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
+                  <UserCheck className="size-4" aria-hidden />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-[13px] font-extrabold text-slate-900">زبون نقدي عام</span>
+                  <span className="block text-[11px] leading-snug text-slate-600">
+                    {allowSystemCustomer
+                      ? "اختصار بنقرة واحدة للمبيعات النقدية الفورية (سداد 100% كاش)"
+                      : "غير متاح مع البيع على الحساب أو الدفع الجزئي — اختر زبوناً حقيقياً أو سجّل زبوناً جديداً"}
+                  </span>
+                </span>
+              </span>
+              {isSystemSelected && allowSystemCustomer && (
+                <span className="shrink-0 rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] font-extrabold text-white">
+                  محدد حالياً
+                </span>
+              )}
+            </button>
 
             {/* Search Input */}
             <div className="relative">
-              <Search className="absolute right-3 top-2.5 h-4 w-4 text-zinc-400" />
+              <Search
+                className="pointer-events-none absolute inset-s-3 top-1/2 size-4 -translate-y-1/2 text-slate-400"
+                aria-hidden
+              />
               <Input
                 placeholder="ابحث بالاسم، المحل، أو الهاتف..."
+                aria-label="بحث عن زبون"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="pr-9 text-xs"
+                className="h-10 border-slate-200 bg-white ps-9 text-sm focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
               />
             </div>
 
             {/* Customers List */}
-            <div className="max-h-60 overflow-y-auto space-y-2 pr-0.5">
+            <div className="max-h-60 space-y-2 overflow-y-auto pe-0.5">
               {loading ? (
-                <p className="text-center py-4 text-xs text-zinc-400">
-                  جاري قراءة البيانات المحلية...
-                </p>
+                <p className="py-4 text-center text-xs text-slate-500">جاري قراءة البيانات المحلية...</p>
               ) : realCustomers.length === 0 ? (
-                <div className="text-center py-6 text-xs text-zinc-400">
+                <div className="py-6 text-center text-xs text-slate-500">
                   لا يوجد زبائن يطابقون البحث في الذاكرة المحلية.
                 </div>
               ) : (
                 realCustomers.map((c) => {
                   const isSelected = selectedCustomer?.id === c.id;
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={c.id}
                       onClick={() => {
                         // [FIX] Same reasoning as the other direct
@@ -411,76 +436,67 @@ export function WalkInCustomerModal({
                         onSelectCustomer(c);
                         onOpenChange(false);
                       }}
-                      className={`cursor-pointer rounded-lg border p-2.5 transition-all flex items-center justify-between ${isSelected
-                        ? "border-emerald-600 bg-emerald-50/60 dark:bg-emerald-950/40"
-                        : "border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
-                        }`}
+                      className={cn(
+                        "flex w-full items-center justify-between gap-3 rounded-xl border p-2.5 text-start transition-all duration-150",
+                        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50",
+                        isSelected
+                          ? "border-emerald-600 bg-emerald-50 shadow-sm"
+                          : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
+                      )}
                     >
-                      <div className="space-y-0.5">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200">
-                            {c.name}
-                          </span>
+                      <span className="min-w-0 space-y-0.5">
+                        <span className="flex items-center gap-2">
+                          <span className="truncate text-[13px] font-extrabold text-slate-900">{c.name}</span>
                           {c.type === "WALK_IN" && (
-                            <Badge
-                              variant="outline"
-                              className="text-[10px] text-amber-600 border-amber-300 bg-amber-50 dark:bg-amber-950/50"
-                            >
+                            <span className="shrink-0 rounded-full bg-amber-50 px-1.5 py-px text-[10px] font-bold text-amber-700 ring-1 ring-amber-200">
                               محلي جديد
-                            </Badge>
+                            </span>
                           )}
-                        </div>
-                        <div className="flex items-center gap-3 text-[11px] text-zinc-500">
+                        </span>
+                        <span className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
                           {c.shopName && (
                             <span className="flex items-center gap-1">
-                              <Store className="h-3 w-3" />
+                              <Store className="size-3" aria-hidden />
                               {c.shopName}
                             </span>
                           )}
                           {c.phone && (
                             <span className="flex items-center gap-1">
-                              <Phone className="h-3 w-3" />
-                              {c.phone}
+                              <Phone className="size-3" aria-hidden />
+                              <bdi dir="ltr">{c.phone}</bdi>
                             </span>
                           )}
-                        </div>
-                      </div>
+                        </span>
+                      </span>
 
                       {/*
-                        [v3.6] FIX — was checking/displaying
-                        `c.balanceDebtUSD` only, via raw `.toFixed(2)`
-                        (bypassing formatMoney entirely, inconsistent with
-                        every other money display in the app). SelectedCustomer's
-                        `balanceDebtSYP` is the authoritative field
-                        (pos-service.ts) — the debt/no-debt decision and
-                        the primary figure shown must be based on it.
-                        balanceDebtUSD (when present) is now a guarded,
-                        secondary "≈" figure only, matching the pattern
-                        used everywhere else in the POS UI.
+                        [v3.6] SelectedCustomer's `balanceDebtSYP` is the
+                        authoritative field (pos-service.ts) — the
+                        debt/no-debt decision and the primary figure shown are
+                        based on it. balanceDebtUSD (when present) is a
+                        guarded, secondary "≈" figure only.
                       */}
-                      <div className="text-left">
-                        {c.balanceDebtSYP !== undefined &&
-                          c.balanceDebtSYP > 0 ? (
-                          <div className="text-right">
-                            <span className="text-[10px] text-zinc-400 block">
-                              الدين الحالي
-                            </span>
-                            <span className="text-xs font-bold text-red-600 dark:text-red-400 font-mono">
-                              {formatMoney(c.balanceDebtSYP, "SYP")} ل.س
-                            </span>
+                      <span className="shrink-0 text-end">
+                        {c.balanceDebtSYP !== undefined && c.balanceDebtSYP > 0 ? (
+                          <span className="block">
+                            <span className="block text-[10px] text-slate-500">الدين الحالي</span>
+                            <Money
+                              value={c.balanceDebtSYP}
+                              compact
+                              className="text-xs font-extrabold text-red-600"
+                              unitClassName="text-red-500"
+                            />
                             {c.balanceDebtUSD !== undefined && (
-                              <span className="text-[10px] text-red-400 dark:text-red-500 block">
+                              <span dir="ltr" className="block text-[10px] text-red-400">
                                 ≈ ${c.balanceDebtUSD.toFixed(2)}
                               </span>
                             )}
-                          </div>
-                        ) : (
-                          <span className="text-[11px] text-emerald-600">
-                            لا يوجد ديون
                           </span>
+                        ) : (
+                          <span className="text-[11px] font-semibold text-emerald-600">لا يوجد ديون</span>
                         )}
-                      </div>
-                    </div>
+                      </span>
+                    </button>
                   );
                 })
               )}
@@ -490,15 +506,10 @@ export function WalkInCustomerModal({
           {/* TAB 2: Inline Walk-in Creation with Soft Duplicate Check */}
           <TabsContent value="new" className="mt-3">
             <form onSubmit={handleCreateWalkIn} className="space-y-3">
-              {formError && (
-                <div className="flex items-center gap-2 rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/50 dark:text-red-300 border border-red-200">
-                  <AlertCircle className="h-4 w-4 shrink-0" />
-                  <span>{formError}</span>
-                </div>
-              )}
+              {formError && <ErrorRow message={formError} />}
 
               <div className="space-y-1">
-                <Label htmlFor="cust-name" className="text-xs font-semibold">
+                <Label htmlFor="cust-name" className="text-xs font-bold text-slate-700">
                   اسم الزبون <span className="text-red-500">*</span>
                 </Label>
                 <Input
@@ -506,55 +517,53 @@ export function WalkInCustomerModal({
                   placeholder="مثال: أحمد عبد الله / بقالية السلام"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  className="text-xs"
+                  className="h-10 border-slate-200 text-sm focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
                   autoFocus
                   required
                 />
               </div>
 
               <div className="space-y-1">
-                <Label htmlFor="cust-phone" className="text-xs font-semibold flex items-center justify-between">
+                <Label
+                  htmlFor="cust-phone"
+                  className="flex items-center justify-between text-xs font-bold text-slate-700"
+                >
                   <span>رقم الهاتف (اختياري)</span>
                   {isCheckingPhone && (
-                    <span className="text-[10px] text-zinc-400 font-normal">
-                      جاري التحقق من الرقم...
-                    </span>
+                    <span className="text-[11px] font-normal text-slate-500">جاري التحقق من الرقم...</span>
                   )}
                 </Label>
                 <Input
                   id="cust-phone"
+                  inputMode="tel"
                   placeholder="مثال: 0991234567"
                   value={phone}
                   onChange={(e) => handlePhoneChange(e.target.value)}
-                  className="text-xs"
+                  className="h-10 border-slate-200 text-sm focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
                 />
               </div>
 
               {/* [v3.4] Soft Duplicate-Phone Prompt */}
               {duplicateMatch && (
-                <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/60 text-xs space-y-2 animate-in fade-in-50 duration-200">
-                  <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200">
-                    <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="animate-in space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs duration-200 fade-in-0 motion-reduce:animate-none">
+                  <div className="flex items-start gap-2 text-amber-900">
+                    <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden />
                     <div>
-                      <p className="font-bold">
+                      <p className="font-extrabold">
                         في زبون مسجّل بنفس الرقم: {duplicateMatch.customer.name}
-                        {duplicateMatch.customer.shopName
-                          ? ` (${duplicateMatch.customer.shopName})`
-                          : ""}
+                        {duplicateMatch.customer.shopName ? ` (${duplicateMatch.customer.shopName})` : ""}
                       </p>
-                      <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-0.5">
-                        تستخدمه ولا تنشئ زبون جديد؟
-                      </p>
+                      <p className="mt-0.5 text-[11px] text-amber-700">تستخدمه ولا تنشئ زبون جديد؟</p>
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-end gap-2 pt-1 border-t border-amber-200 dark:border-amber-900/80">
+                  <div className="flex flex-wrap items-center justify-end gap-2 border-t border-amber-200 pt-2">
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
                       onClick={handleIgnoreDuplicate}
-                      className="text-xs h-7 text-amber-800 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900/50"
+                      className="h-8 text-xs font-semibold text-amber-800 hover:bg-amber-100"
                     >
                       إنشاء زبون جديد بهذا الرقم
                     </Button>
@@ -562,17 +571,17 @@ export function WalkInCustomerModal({
                       type="button"
                       size="sm"
                       onClick={handleAcceptDuplicate}
-                      className="text-xs h-7 bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1 shadow-xs"
+                      className="h-8 gap-1 bg-emerald-600 text-xs font-bold text-white shadow-sm hover:bg-emerald-700"
                     >
-                      <Check className="h-3.5 w-3.5" />
-                      استخدام الزبون الحالي (المسجّل)
+                      <Check className="size-3.5" aria-hidden />
+                      استخدام الزبون الحالي
                     </Button>
                   </div>
                 </div>
               )}
 
               <div className="space-y-1">
-                <Label htmlFor="cust-shop" className="text-xs font-semibold">
+                <Label htmlFor="cust-shop" className="text-xs font-bold text-slate-700">
                   اسم المحل أو العنوان (اختياري)
                 </Label>
                 <Input
@@ -580,20 +589,19 @@ export function WalkInCustomerModal({
                   placeholder="مثال: دمشق - الميدان"
                   value={shopName}
                   onChange={(e) => setShopName(e.target.value)}
-                  className="text-xs"
+                  className="h-10 border-slate-200 text-sm focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
                 />
               </div>
 
-              <div className="rounded-lg bg-zinc-50 p-2.5 text-[11px] text-zinc-500 border border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800">
-                💡 سيتم حفظ الزبون محلياً في قاعدة بيانات المتصفح وإرفاقه فوراً
-                بهذه الفاتورة مع توليد معرف UUID فريد.
-              </div>
+              <p className="rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-[11px] leading-relaxed text-slate-600">
+                سيتم حفظ الزبون محلياً في قاعدة بيانات المتصفح وإرفاقه فوراً بهذه الفاتورة مع
+                توليد معرف UUID فريد.
+              </p>
 
-              <div className="flex justify-end gap-2 pt-2">
+              <div className="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:justify-end">
                 <Button
                   type="button"
                   variant="outline"
-                  size="sm"
                   onClick={() => {
                     // [FIX] Same debounce-timer leak as the other close
                     // paths — this button also calls the `onOpenChange`
@@ -602,15 +610,14 @@ export function WalkInCustomerModal({
                     clearPhoneDebounce();
                     onOpenChange(false);
                   }}
-                  className="text-xs"
+                  className="h-11 w-full border-slate-200 text-sm font-semibold text-slate-700 sm:w-auto"
                 >
                   إلغاء
                 </Button>
                 <Button
                   type="submit"
-                  size="sm"
                   disabled={isSubmitting || !name.trim() || !!duplicateMatch || isCheckingPhone}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold"
+                  className="h-11 w-full bg-emerald-600 px-6 text-sm font-extrabold text-white shadow-sm shadow-emerald-900/20 hover:bg-emerald-700 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none sm:w-auto"
                 >
                   {isSubmitting
                     ? "جاري الحفظ..."

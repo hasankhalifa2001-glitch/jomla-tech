@@ -11,7 +11,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
 import {
   CreditCard,
   Banknote,
@@ -31,11 +30,13 @@ import {
   subtractMoney,
   convertCurrency,
   compareMoney,
-  formatMoney,
   serializeMoney,
   toDecimal,
   type MoneyInput,
 } from "@/lib/utils/money";
+import { cn } from "@/lib/utils";
+import { fmtMoney } from "@/lib/utils/digits";
+import { Money } from "./money";
 
 export type PaymentMode = "FULL_CASH" | "FULL_DEBT" | "PARTIAL";
 
@@ -84,6 +85,52 @@ const PAYMENT_RAILS: {
     { id: "BANK_TRANSFER", label: "تحويل بنكي / مكتب", icon: Building2, sub: "حوالة مصرفية أو مكتب صرافة" },
     { id: "OTHER", label: "وسيلة دفع أخرى", icon: HelpCircle, sub: "وسيلة دفع بديلة" },
   ];
+
+type ModeTone = "emerald" | "red" | "blue";
+
+const MODE_ACTIVE: Record<ModeTone, string> = {
+  emerald: "border-emerald-600 bg-emerald-600 text-white shadow-sm shadow-emerald-900/20",
+  red: "border-red-600 bg-red-600 text-white shadow-sm shadow-red-900/20",
+  blue: "border-blue-600 bg-blue-600 text-white shadow-sm shadow-blue-900/20",
+};
+
+/** One of the three "نوع السداد" choices. */
+function ModeButton({
+  active,
+  tone,
+  icon,
+  label,
+  sub,
+  onClick,
+}: {
+  active: boolean;
+  tone: ModeTone;
+  icon: React.ReactNode;
+  label: string;
+  sub: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        "flex min-h-14 flex-col items-center justify-center gap-0.5 rounded-xl border px-2 py-2 text-xs font-extrabold transition-all duration-150",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 active:scale-[0.98]",
+        active
+          ? MODE_ACTIVE[tone]
+          : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+      )}
+    >
+      <span className="flex items-center gap-1.5">
+        {icon}
+        {label}
+      </span>
+      <span className={cn("text-[10px] font-semibold", active ? "text-white/80" : "text-slate-500")}>{sub}</span>
+    </button>
+  );
+}
 
 export function PaymentModal({
   open,
@@ -289,7 +336,7 @@ export function PaymentModal({
       return "لا يمكن أن يكون المبلغ المدفوع أقل من صفر.";
     }
     if (compareMoney(paidInputParsed, totalSYPValue) > 0) {
-      return `المبلغ المدخل (${formatMoney(paidInputParsed, "SYP")} ل.س) أكبر من إجمالي الفاتورة (${formatMoney(totalSYPValue, "SYP")} ل.س) — يرجى تصحيح المبلغ.`;
+      return `المبلغ المدخل (${fmtMoney(paidInputParsed, "SYP")} ل.س) أكبر من إجمالي الفاتورة (${fmtMoney(totalSYPValue, "SYP")} ل.س) — يرجى تصحيح المبلغ.`;
     }
     return null;
   }, [mode, paidInputParsed, totalSYPValue]);
@@ -309,17 +356,6 @@ export function PaymentModal({
 
   // Derived/display-only — may be null with no cached rate. Never sent to
   // onConfirmCheckout.
-  const computedPaidUSD = useMemo(() => {
-    try {
-      if (exchangeRate > 0) {
-        return convertCurrency(computedPaidSYP, exchangeRate, "SYP", "USD");
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }, [computedPaidSYP, exchangeRate]);
-
   const computedDebtUSD = useMemo(() => {
     try {
       if (exchangeRate > 0) {
@@ -413,11 +449,13 @@ export function PaymentModal({
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-md" dir="rtl">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-red-700 dark:text-red-400 text-base font-bold">
-              <AlertTriangle className="h-5 w-5" />
+            <DialogTitle className="flex items-center gap-2 text-base font-extrabold text-red-700">
+              <span className="flex size-8 items-center justify-center rounded-lg bg-red-100">
+                <AlertTriangle className="size-4" aria-hidden />
+              </span>
               تعذّر حساب إجمالي الفاتورة
             </DialogTitle>
-            <DialogDescription className="text-xs text-zinc-500">
+            <DialogDescription className="text-xs leading-relaxed text-slate-600">
               حدث خطأ غير متوقع أثناء احتساب إجمالي السلة، ولا يمكن المتابعة إلى شاشة الدفع بأمان. الرجاء إغلاق هذه النافذة والعودة إلى السلة لمراجعتها.
             </DialogDescription>
           </DialogHeader>
@@ -434,90 +472,79 @@ export function PaymentModal({
   return (
     <Dialog open={open} onOpenChange={guardedOnOpenChange}>
       {/*
-        [FIX — mobile overflow] `sm:max-w-xl` only caps the width from the
-        `sm` breakpoint up; below that shadcn's default Dialog width is a
-        fixed inset from the viewport edges, which is fine. Added
-        `max-h-[90vh] overflow-y-auto` because this dialog's content
-        (title + customer row + totals + 3 mode buttons + rail grid +
-        footer) is tall enough to exceed the viewport height on a short
-        phone screen in landscape or with the on-screen keyboard open —
-        without a scroll container the footer confirm button could end up
-        pushed off-screen and unreachable.
+        [FIX — mobile overflow] `max-h` + `overflow-y-auto`: this dialog's
+        content (title + customer row + totals + 3 mode buttons + rail grid +
+        footer) is tall enough to exceed the viewport on a short phone screen
+        or with the on-screen keyboard open — without a scroll container the
+        confirm button could be pushed off-screen. `dvh` follows the real
+        visible viewport on mobile browsers.
       */}
-      <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto" dir="rtl">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-xl" dir="rtl">
         <DialogHeader>
-          {/*
-            [FIX — mobile overflow] The title text ("إتمام الدفع واختيار
-            وسيلة التحصيل") plus the exchange-rate Badge used to share one
-            `justify-between` row. On a ~320-375px phone, after dialog
-            padding, that combination doesn't reliably fit on one line —
-            stacked here below `sm`, side-by-side from `sm` up where
-            there's room.
-          */}
-          <DialogTitle className="flex flex-col items-start gap-1.5 sm:flex-row sm:items-center sm:justify-between text-lg font-bold text-zinc-900 dark:text-zinc-100">
-            <span className="flex items-center gap-2">
-              <Receipt className="h-5 w-5 text-emerald-600 shrink-0" />
-              إتمام الدفع واختيار وسيلة التحصيل
+          {/* Stacked below `sm` (title + rate chip don't fit one line on a
+              320–375px phone), side by side from `sm` up. */}
+          <DialogTitle className="flex flex-col items-start gap-2 text-lg font-extrabold text-slate-900 sm:flex-row sm:items-center sm:justify-between">
+            <span className="flex items-center gap-2.5">
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
+                <Receipt className="size-4.5" aria-hidden />
+              </span>
+              إتمام الدفع
             </span>
-            <Badge
-              variant="outline"
-              className={`text-xs shrink-0 ${rateIsBlocking ? "border-red-400 text-red-600 dark:text-red-400" : ""}`}
+            <span
+              className={cn(
+                "inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-[11px] font-bold",
+                rateIsBlocking
+                  ? "border-red-300 bg-red-50 text-red-700"
+                  : "border-slate-200 bg-slate-50 text-slate-600"
+              )}
             >
               {exchangeRate > 0
-                ? `سعر الصرف: ${formatMoney(exchangeRate, "SYP")} ل.س`
+                ? `سعر الصرف: ${fmtMoney(exchangeRate, "SYP")} ل.س`
                 : requiresExchangeRate
                   ? "⚠ سعر الصرف غير محدد"
                   : "أسعار الليرة — لا يلزم سعر صرف"}
-            </Badge>
+            </span>
           </DialogTitle>
-          <DialogDescription className="text-xs text-zinc-500">
+          <DialogDescription className="text-xs text-slate-500">
             حدد طريقة التحصيل: نقدي بالكامل، على الحساب (دين)، أو دفع جزئي مع
             تحديد محفظة الدفع.
           </DialogDescription>
         </DialogHeader>
 
         {errorMessage && (
-          <div className="flex items-center gap-2 rounded-lg bg-red-50 p-3 text-xs text-red-700 dark:bg-red-950/50 dark:text-red-300 border border-red-200">
-            <AlertTriangle className="h-4 w-4 shrink-0" />
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-semibold text-red-700"
+          >
+            <AlertTriangle className="mt-px size-4 shrink-0" aria-hidden />
             <span>{errorMessage}</span>
           </div>
         )}
 
         {/*
-          Customer Header Info.
-          [FIX — mobile overflow] Neither side of this row could shrink or
-          truncate before: a long registered customer name on the left
-          and a long button label ("اختر زبوناً للدين") on the right, both
-          sitting in a plain `justify-between` flex row, could together
-          exceed a narrow dialog's width with nothing able to give way.
-          `flex-wrap` lets the button drop to its own line if needed, and
-          `min-w-0` + `truncate` on the name block lets a long customer
-          name shorten instead of forcing an overflow.
+          Customer row. `flex-wrap` lets the button drop to its own line on a
+          narrow dialog, and `min-w-0` + `truncate` on the name block lets a
+          long customer name shorten instead of forcing an overflow.
         */}
         <div
-          className={`flex flex-wrap items-center justify-between gap-2 rounded-xl p-3 border transition-colors ${isDebtBlockedBySystemCustomer
-            ? "bg-red-50/80 border-red-300 dark:bg-red-950/40 dark:border-red-800"
-            : "bg-zinc-50 border-zinc-200 dark:bg-zinc-900 dark:border-zinc-800"
-            }`}
+          className={cn(
+            "flex flex-wrap items-center justify-between gap-2 rounded-xl border p-3 transition-colors",
+            isDebtBlockedBySystemCustomer ? "border-red-300 bg-red-50" : "border-slate-200 bg-slate-50"
+          )}
         >
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div
-              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${isSystemCustomer
-                ? "bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300"
-                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
-                }`}
-            >
-              {isSystemCustomer ? (
-                <User className="h-4 w-4" />
-              ) : (
-                <UserCheck className="h-4 w-4" />
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span
+              className={cn(
+                "flex size-9 shrink-0 items-center justify-center rounded-lg",
+                isSystemCustomer ? "bg-slate-200 text-slate-600" : "bg-emerald-100 text-emerald-700"
               )}
-            </div>
+              aria-hidden
+            >
+              {isSystemCustomer ? <User className="size-4" /> : <UserCheck className="size-4" />}
+            </span>
             <div className="min-w-0">
-              <span className="text-[10px] text-zinc-400 block">
-                الزبون المرفق بالفاتورة
-              </span>
-              <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200 block truncate">
+              <span className="block text-[11px] text-slate-500">الزبون المرفق بالفاتورة</span>
+              <span className="block truncate text-[13px] font-extrabold text-slate-900">
                 {isSystemCustomer
                   ? "زبون نقدي عام (مبيعات نقدية فقط)"
                   : selectedCustomer
@@ -532,24 +559,26 @@ export function PaymentModal({
             variant="outline"
             size="sm"
             onClick={onOpenCustomerModal}
-            className={`text-xs h-8 gap-1 font-semibold shrink-0 ${isDebtBlockedBySystemCustomer
-              ? "bg-red-600 hover:bg-red-700 text-white border-red-600"
-              : ""
-              }`}
+            className={cn(
+              "h-9 shrink-0 gap-1.5 text-xs font-bold",
+              isDebtBlockedBySystemCustomer
+                ? "border-red-600 bg-red-600 text-white hover:bg-red-700 hover:text-white"
+                : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+            )}
           >
-            <UserPlus className="h-3.5 w-3.5" />
-            <span>{isDebtBlockedBySystemCustomer ? "اختر زبوناً للدين" : "تغيير الزبون"}</span>
+            <UserPlus className="size-3.5" aria-hidden />
+            {isDebtBlockedBySystemCustomer ? "اختر زبوناً للدين" : "تغيير الزبون"}
           </Button>
         </div>
 
         {/* Debt Blocked Alert (when Debt > 0 and Customer is System/Cash) */}
         {isDebtBlockedBySystemCustomer && (
-          <div className="rounded-xl border border-red-300 bg-red-50/90 p-3 dark:border-red-900 dark:bg-red-950/60 text-xs space-y-1.5 animate-in fade-in-50">
-            <div className="flex items-center gap-2 text-red-800 dark:text-red-200 font-bold">
-              <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
+          <div className="animate-in space-y-1.5 rounded-xl border border-red-200 bg-red-50 p-3 text-xs duration-200 fade-in-0 motion-reduce:animate-none">
+            <div className="flex items-center gap-2 font-extrabold text-red-800">
+              <AlertTriangle className="size-4 shrink-0 text-red-600" aria-hidden />
               <span>لا يمكن تسجيل دين على حساب &quot;زبون نقدي عام&quot;</span>
             </div>
-            <p className="text-[11px] text-red-700 dark:text-red-300 leading-relaxed">
+            <p className="text-[11px] leading-relaxed text-red-700">
               عمليات البيع الآجل (على الحساب أو الدفع الجزئي) تتطلب تحديد زبون
               مسجل لمعرفة صاحب المديونية. يرجى اختيار زبون مسجل أو تسجيل زبون
               جديد للمتابعة.
@@ -558,171 +587,125 @@ export function PaymentModal({
         )}
 
         {/*
-          Total Overview Cards.
-          [v3.6] FIX — SYP is now the primary/authoritative card (was the
-          "المعادل" secondary card before); USD is now the derived,
-          possibly-unavailable secondary card (was the primary "إجمالي
-          الفاتورة بالدولار" card before).
-          [FIX — mobile overflow] Large SYP totals (6-7 digits + "ل.س")
-          at `text-xl font-extrabold` could get tight inside a ~150px-wide
-          card on a 320px phone. Stepped the size down to `text-lg` below
-          `sm` and back up to `text-xl` from `sm` up, and allowed the
-          figure to wrap onto a second line (`break-words`) instead of
-          silently overflowing its card on the narrowest screens.
+          Totals. [v3.6] SYP is the primary/authoritative card; USD is the
+          derived, possibly-unavailable secondary card. `break-words` lets a
+          large figure wrap on the narrowest screens instead of overflowing.
         */}
-        <div className="grid grid-cols-2 gap-3 text-center">
-          <div className="rounded-xl bg-emerald-50/70 p-2.5 border border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-900">
-            <span className="text-[11px] text-emerald-800 dark:text-emerald-300 font-semibold block">
-              إجمالي الفاتورة بالليرة السورية
-            </span>
-            <span className="text-lg sm:text-xl font-extrabold text-emerald-700 dark:text-emerald-400 wrap-break-word">
-              {formatMoney(totalSYPValue as string, "SYP")} ل.س
-            </span>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="rounded-xl border border-emerald-700 bg-linear-to-br from-emerald-600 to-emerald-800 p-3 text-white shadow-md shadow-emerald-900/20">
+            <span className="block text-[11px] font-semibold text-emerald-100">إجمالي الفاتورة</span>
+            <Money
+              value={totalSYPValue as string}
+              className="mt-0.5 wrap-break-word text-xl font-extrabold leading-tight sm:text-2xl"
+              unitClassName="text-emerald-100"
+            />
           </div>
 
-          <div className="rounded-xl bg-purple-50/70 p-2.5 border border-purple-200 dark:bg-purple-950/30 dark:border-purple-900">
-            <span className="text-[11px] text-purple-800 dark:text-purple-300 font-semibold block">
-              المعادل بالدولار
-            </span>
-            <span className="text-lg sm:text-xl font-extrabold text-purple-700 dark:text-purple-400 wrap-break-word">
-              {safeTotalUSD ? `$${formatMoney(safeTotalUSD, "USD")}` : "غير متاح"}
+          <div className="rounded-xl border border-purple-200 bg-purple-50 p-3">
+            <span className="block text-[11px] font-semibold text-purple-800">المعادل بالدولار</span>
+            <span className="mt-0.5 block wrap-break-word text-xl font-extrabold leading-tight text-purple-700 sm:text-2xl">
+              {safeTotalUSD ? (
+                <Money value={safeTotalUSD} currency="USD" />
+              ) : (
+                <span className="text-base font-bold text-purple-400">غير متاح</span>
+              )}
             </span>
           </div>
         </div>
 
-        {/* Step 1: Payment Mode Toggles */}
+        {/* Step 1: Payment Mode */}
         <div className="space-y-2">
-          <Label className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
-            نوع السداد
-          </Label>
-          {/*
-            [FIX — mobile clipping] Three Arabic labels — including
-            "على الحساب (دين)" — plus an amount line, squeezed into
-            `grid-cols-3` at a fixed `h-11`, is workable on a tablet/
-            desktop-width dialog but too tight on a 320-375px phone: the
-            label can wrap inside a height that wasn't sized for two
-            lines, clipping it. Stacked to one column below `sm` (each
-            button becomes a full-width row with plenty of room) and back
-            to three columns from `sm` up. `min-h-11` (was `h-11`) lets a
-            button grow if its content ever needs a touch more vertical
-            space, without shrinking below a comfortable tap target.
-          */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-            <Button
-              type="button"
-              variant={mode === "FULL_CASH" ? "default" : "outline"}
+          <Label className="text-xs font-extrabold text-slate-700">نوع السداد</Label>
+          {/* One column below `sm` (each choice a full-width row), three from `sm` up. */}
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <ModeButton
+              active={mode === "FULL_CASH"}
+              tone="emerald"
+              icon={<Banknote className="size-4" aria-hidden />}
+              label="نقدي بالكامل"
+              sub={`${fmtMoney(totalSYPValue as string, "SYP")} ل.س`}
               onClick={() => handleModeChange("FULL_CASH")}
-              className={`min-h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_CASH"
-                ? "bg-emerald-600 hover:bg-emerald-700 text-white"
-                : ""
-                }`}
-            >
-              <div className="flex items-center gap-1">
-                <Banknote className="h-3.5 w-3.5" />
-                <span>نقدي بالكامل</span>
-              </div>
-              <span className="text-[10px] opacity-80">
-                {formatMoney(totalSYPValue as string, "SYP")} ل.س
-              </span>
-            </Button>
-
-            <Button
-              type="button"
-              variant={mode === "FULL_DEBT" ? "default" : "outline"}
+            />
+            <ModeButton
+              active={mode === "FULL_DEBT"}
+              tone="red"
+              icon={<CreditCard className="size-4" aria-hidden />}
+              label="على الحساب (دين)"
+              sub="0 ل.س مدفوع"
               onClick={() => handleModeChange("FULL_DEBT")}
-              className={`min-h-11 flex-col gap-0.5 text-xs font-bold ${mode === "FULL_DEBT"
-                ? "bg-red-600 hover:bg-red-700 text-white"
-                : ""
-                }`}
-            >
-              <div className="flex items-center gap-1">
-                <CreditCard className="h-3.5 w-3.5" />
-                <span>على الحساب (دين)</span>
-              </div>
-              <span className="text-[10px] opacity-80">0 ل.س مدفوع</span>
-            </Button>
-
-            <Button
-              type="button"
-              variant={mode === "PARTIAL" ? "default" : "outline"}
+            />
+            <ModeButton
+              active={mode === "PARTIAL"}
+              tone="blue"
+              icon={<DollarSign className="size-4" aria-hidden />}
+              label="دفع جزئي"
+              sub="كاش + دين"
               onClick={() => handleModeChange("PARTIAL")}
-              className={`min-h-11 flex-col gap-0.5 text-xs font-bold ${mode === "PARTIAL"
-                ? "bg-blue-600 hover:bg-blue-700 text-white"
-                : ""
-                }`}
-            >
-              <div className="flex items-center gap-1">
-                <DollarSign className="h-3.5 w-3.5" />
-                <span>دفع جزئي</span>
-              </div>
-              <span className="text-[10px] opacity-80">كاش + دين</span>
-            </Button>
+            />
           </div>
         </div>
 
         {/* Step 2: Partial Amount Inputs (if PARTIAL selected) */}
         {mode === "PARTIAL" && (
-          <div className="rounded-xl border border-blue-200 bg-blue-50/40 p-3 dark:border-blue-900/60 dark:bg-blue-950/20 space-y-2">
-            <Label className="text-xs font-bold text-blue-900 dark:text-blue-200">
+          <div className="animate-in space-y-2.5 rounded-xl border border-blue-200 bg-blue-50/60 p-3 duration-200 fade-in-0 slide-in-from-top-1 motion-reduce:animate-none">
+            <Label className="text-xs font-extrabold text-blue-900">
               المبلغ المدفوع حالياً (كاش / إلكتروني)
             </Label>
             <div className="grid grid-cols-2 gap-2">
               <div>
-                <span className="text-[10px] text-zinc-500 mb-1 block">
-                  المبلغ بالليرة (ل.س)
-                </span>
+                <span className="mb-1 block text-[11px] text-slate-600">المبلغ بالليرة (ل.س)</span>
                 <Input
                   type="number"
+                  lang="en"
+                  dir="ltr"
+                  inputMode="numeric"
                   step="1000"
                   min="0"
                   value={paidSYPInput}
                   onChange={(e) => handlePaidSYPChange(e.target.value)}
-                  className={`text-xs font-bold text-center bg-white dark:bg-zinc-900 font-mono ${paidValidationError ? "border-red-400 focus-visible:ring-red-400" : ""
-                    }`}
+                  className={cn(
+                    "h-10 bg-white text-center font-mono text-sm font-bold tabular-nums",
+                    paidValidationError && "border-red-400 focus-visible:ring-red-400"
+                  )}
                 />
               </div>
 
               <div>
-                <span className="text-[10px] text-zinc-500 mb-1 block">
-                  المعادل بالدولار ($)
-                </span>
+                <span className="mb-1 block text-[11px] text-slate-600">المعادل بالدولار ($)</span>
                 <Input
                   type="number"
+                  lang="en"
+                  dir="ltr"
+                  inputMode="decimal"
                   step="0.01"
                   min="0"
                   value={paidUSDInput}
                   onChange={(e) => handlePaidUSDChange(e.target.value)}
-                  className="text-xs font-bold text-center bg-white dark:bg-zinc-900 font-mono"
+                  className="h-10 bg-white text-center font-mono text-sm font-bold tabular-nums"
                 />
               </div>
             </div>
 
-            {/* [ADDED] Blocking validation message — replaces the old
-                silent clamp. The cashier must fix the number themselves;
-                nothing here quietly substitutes a different amount. */}
+            {/* [ADDED] Blocking validation message — replaces the old silent
+                clamp. The cashier must fix the number themselves; nothing here
+                quietly substitutes a different amount. */}
             {paidValidationError && (
-              <div className="flex items-center gap-1.5 text-[11px] text-red-700 dark:text-red-400 font-semibold">
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+              <div className="flex items-start gap-1.5 text-[11px] font-semibold text-red-700" role="alert">
+                <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
                 <span>{paidValidationError}</span>
               </div>
             )}
 
-            {/*
-              Calculated Breakdown.
-              [FIX — mobile overflow] Was a single `justify-between` row
-              with a long label on one side and a long, two-currency
-              figure ("270,000 ل.س (≈ $2.00)") on the other — the exact
-              combination most likely to overflow a narrow dialog. Allowed
-              wrapping and let the figure take its own line under the
-              label when space is tight, instead of forcing one line.
-            */}
-            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-xs pt-1 border-t border-blue-100 dark:border-blue-900">
-              <span className="text-zinc-600 dark:text-zinc-400">
-                المتبقي على الحساب (دين):
-              </span>
-              <span className="font-bold text-red-600 dark:text-red-400 font-mono">
-                {formatMoney(computedDebtSYP, "SYP")} ل.س
-                {computedDebtUSD ? ` (≈ $${formatMoney(computedDebtUSD, "USD")})` : ""}
+            {/* Calculated breakdown — wraps instead of overflowing on a narrow dialog. */}
+            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 border-t border-blue-100 pt-2 text-xs">
+              <span className="text-slate-600">المتبقي على الحساب (دين):</span>
+              <span className="font-extrabold text-red-600">
+                <Money value={computedDebtSYP} compact />
+                {computedDebtUSD && (
+                  <span className="ms-1.5 text-[11px] font-semibold text-red-500">
+                    (≈ <Money value={computedDebtUSD} currency="USD" />)
+                  </span>
+                )}
               </span>
             </div>
           </div>
@@ -730,29 +713,34 @@ export function PaymentModal({
 
         {/* Step 3: Cash-equivalent Rail Selection (if paid amount > 0) */}
         {mode !== "FULL_DEBT" && (
-          <div className="space-y-1.5">
-            <Label className="text-xs font-bold text-zinc-700 dark:text-zinc-300">
-              طريقة تسليم الدفعة النقدية (Payment Rail)
-            </Label>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <div className="space-y-2">
+            <Label className="text-xs font-extrabold text-slate-700">طريقة تسليم الدفعة</Label>
+            <div role="radiogroup" aria-label="طريقة الدفع" className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {PAYMENT_RAILS.map((rail) => {
                 const isSelected = selectedRail === rail.id;
                 const Icon = rail.icon;
                 return (
-                  <div
+                  <button
                     key={rail.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={isSelected}
                     onClick={() => setSelectedRail(rail.id)}
-                    className={`cursor-pointer rounded-lg border p-2 text-center transition-all ${isSelected
-                      ? "border-emerald-600 bg-emerald-50/70 text-emerald-900 dark:bg-emerald-950/50 dark:text-emerald-200 font-bold shadow-xs"
-                      : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:bg-zinc-850 text-zinc-700 dark:text-zinc-300"
-                      }`}
+                    className={cn(
+                      "rounded-xl border p-2.5 text-center transition-all duration-150 active:scale-[0.98]",
+                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50",
+                      isSelected
+                        ? "border-emerald-600 bg-emerald-50 text-emerald-900 shadow-sm"
+                        : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+                    )}
                   >
-                    <Icon className="mx-auto h-4 w-4 mb-1 text-emerald-600 dark:text-emerald-400" />
-                    <p className="text-[11px] font-semibold">{rail.label}</p>
-                    <p className="text-[9px] text-zinc-400 truncate">
-                      {rail.sub}
-                    </p>
-                  </div>
+                    <Icon
+                      className={cn("mx-auto mb-1 size-4", isSelected ? "text-emerald-700" : "text-slate-400")}
+                      aria-hidden
+                    />
+                    <p className="text-[11px] font-extrabold leading-tight">{rail.label}</p>
+                    <p className="mt-0.5 truncate text-[10px] text-slate-500">{rail.sub}</p>
+                  </button>
                 );
               })}
             </div>
@@ -760,37 +748,32 @@ export function PaymentModal({
         )}
 
         {/*
-          Final Confirmation Buttons.
-          [FIX — mobile overflow] Two buttons in a plain `justify-end` row
-          don't wrap or shrink — the confirm button's label changes
-          dynamically ("اختر زبوناً لإتمام الدين", "تأكيد وحفظ الفاتورة
-          محلياً") and some of those strings are long enough that, next to
-          the Cancel button, the pair can exceed a narrow dialog's width
-          with no fallback. Stacked full-width (confirm on top, since
-          it's the primary action) below `sm`, back to a compact
-          right-aligned row from `sm` up.
+          Final confirmation. Stacked full-width below `sm` (confirm on top,
+          since it's the primary action) because the confirm label changes
+          dynamically and some strings are long; a compact end-aligned row
+          from `sm` up.
         */}
-        <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-2 border-t border-zinc-200 dark:border-zinc-800">
+        <div className="flex flex-col-reverse gap-2 border-t border-slate-100 pt-3 sm:flex-row sm:justify-end">
           <Button
             type="button"
             variant="outline"
-            size="sm"
             onClick={() => guardedOnOpenChange(false)}
             disabled={isSubmitting}
-            className="text-xs w-full sm:w-auto"
+            className="h-11 w-full border-slate-200 text-sm font-semibold text-slate-700 sm:w-auto"
           >
             إلغاء
           </Button>
 
           <Button
             type="button"
-            size="sm"
             onClick={handleConfirm}
             disabled={isSubmitting || !canConfirm}
-            className={`text-xs font-bold px-5 w-full sm:w-auto ${!canConfirm
-              ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed"
-              : "bg-emerald-600 hover:bg-emerald-700 text-white"
-              }`}
+            className={cn(
+              "h-11 w-full px-6 text-sm font-extrabold transition-colors sm:w-auto",
+              !canConfirm
+                ? "cursor-not-allowed bg-slate-200 text-slate-500"
+                : "bg-emerald-600 text-white shadow-sm shadow-emerald-900/20 hover:bg-emerald-700"
+            )}
           >
             {isSubmitting
               ? "جاري الحفظ محلياً..."
@@ -798,7 +781,7 @@ export function PaymentModal({
                 ? "اختر زبوناً لإتمام الدين"
                 : paidValidationError
                   ? "صحّح المبلغ المدخل"
-                  : "تأكيد وحفظ الفاتورة محلياً"}
+                  : "تأكيد وحفظ الفاتورة"}
           </Button>
         </div>
       </DialogContent>

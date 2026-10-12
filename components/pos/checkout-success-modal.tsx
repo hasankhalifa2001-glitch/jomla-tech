@@ -8,7 +8,6 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   CheckCircle2,
   Printer,
@@ -20,13 +19,15 @@ import {
 import { getOfflineDb } from "@/lib/offline/db";
 import { useLocalInvoiceSyncStatus } from "@/lib/receipts/use-local-invoice-status";
 import type { OfflineInvoice, SelectedCustomer, CartLineItem } from "@/lib/offline";
-import { formatMoney, compareMoney, multiplyMoney } from "@/lib/utils/money";
+import { compareMoney, multiplyMoney } from "@/lib/utils/money";
 import { ReceiptActions } from "@/components/receipts/receipt-actions";
 import {
   buildLocalReceiptSource,
   itemNamesFromCartLines,
 } from "@/lib/receipts/local-receipt-source";
 import type { LocalReceiptSource } from "@/lib/receipts/receipt-model";
+import { fmtInt, fmtMoney, NUMBER_LOCALE } from "@/lib/utils/digits";
+import { Money } from "./money";
 
 interface CheckoutSuccessModalProps {
   open: boolean;
@@ -134,18 +135,16 @@ export function CheckoutSuccessModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="sm:max-w-xl max-h-[90vh] overflow-y-auto"
-        dir="rtl"
-      >
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-xl" dir="rtl">
         <DialogHeader>
-          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-600 mb-2">
-            <CheckCircle2 className="h-6 w-6" />
+          {/* Answers the cashier's action: a quick pop, once, when the sale lands. */}
+          <div className="mx-auto mb-1 flex size-14 animate-in items-center justify-center rounded-full bg-emerald-100 text-emerald-600 ring-8 ring-emerald-50 duration-300 zoom-in-50 motion-reduce:animate-none">
+            <CheckCircle2 className="size-7" aria-hidden />
           </div>
-          <DialogTitle className="text-center text-lg font-bold text-zinc-900 dark:text-zinc-100">
+          <DialogTitle className="text-center text-lg font-extrabold text-slate-900">
             تم حفظ الفاتورة محلياً بنجاح
           </DialogTitle>
-          <DialogDescription className="text-center text-xs text-zinc-500">
+          <DialogDescription className="text-center text-xs text-slate-500">
             تم تسجيل الفاتورة في قاعدة بيانات المتصفح (Dexie) وحفظها في طابور
             المزامنة المحلي.
           </DialogDescription>
@@ -159,179 +158,149 @@ export function CheckoutSuccessModal({
           unlocks itself — no reload, no second source of truth.
         */}
         {isSynced ? (
-          <div className="rounded-xl border border-emerald-300 bg-emerald-50/80 p-3 dark:border-emerald-900 dark:bg-emerald-950/40 space-y-1.5">
-            <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-bold text-xs">
-              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+          <div className="space-y-1 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+            <div className="flex items-center gap-2 text-xs font-extrabold text-emerald-800">
+              <CheckCircle2 className="size-4 shrink-0 text-emerald-600" aria-hidden />
               <span>تمت مزامنة الفاتورة مع السيرفر بنجاح</span>
             </div>
-            <p className="text-[11px] text-emerald-700 dark:text-emerald-400 leading-relaxed">
-              الفاتورة أصبحت مسجّلة على السيرفر المركزي، وزر مشاركة الإيصال
-              (PDF) متاح الآن.
+            <p className="text-[11px] leading-relaxed text-emerald-700">
+              الفاتورة أصبحت مسجّلة على السيرفر المركزي، وزر مشاركة الإيصال (PDF) متاح الآن.
             </p>
           </div>
         ) : (
-          <div className="rounded-xl border border-amber-300 bg-amber-50/80 p-3 dark:border-amber-900 dark:bg-amber-950/40 space-y-1.5">
-            <div className="flex items-center gap-2 text-amber-800 dark:text-amber-300 font-bold text-xs">
-              <CloudOff className="h-4 w-4 shrink-0 text-amber-600" />
-              <span>حالة الفاتورة: محفوظة محلياً — بانتظار المزامنة (PENDING)</span>
+          <div className="space-y-1 rounded-xl border border-amber-200 bg-amber-50 p-3">
+            <div className="flex items-center gap-2 text-xs font-extrabold text-amber-800">
+              <CloudOff className="size-4 shrink-0 text-amber-600" aria-hidden />
+              <span>محفوظة محلياً — بانتظار المزامنة</span>
             </div>
-            <p className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed">
-              ⚠️ تنبيه للكاشير: هذه الفاتورة{" "}
-              <strong>مخزنة على هذا الجهاز فقط</strong> حالياً. ستتم المزامنة
-              التلقائية مع السيرفر المركزي فور توفر اتصال بالإنترنت (T4c).
+            <p className="text-[11px] leading-relaxed text-amber-700">
+              هذه الفاتورة <strong>مخزنة على هذا الجهاز فقط</strong> حالياً. ستتم المزامنة
+              التلقائية مع السيرفر المركزي فور توفر اتصال بالإنترنت.
             </p>
           </div>
         )}
 
-        {/* Invoice Summary Printable Card */}
+        {/* Invoice summary — also the printable card (id is used by print CSS). */}
         <div
           id="printable-receipt"
-          className="rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 space-y-3 dark:border-zinc-800 dark:bg-zinc-900/60 text-xs"
+          className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 text-xs shadow-sm"
         >
           {/* Top metadata */}
-          <div className="grid grid-cols-2 gap-2 border-b border-zinc-200 pb-2.5 dark:border-zinc-800">
-            <div>
-              <span className="text-[10px] text-zinc-400 block">
-                رقم الفاتورة المحلي (UUID)
-              </span>
-              <span className="font-mono text-[11px] font-bold text-zinc-800 dark:text-zinc-200 truncate block">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 border-b border-slate-100 pb-3">
+            <div className="min-w-0">
+              <span className="block text-[11px] text-slate-500">رقم الفاتورة المحلي</span>
+              <span dir="ltr" className="block truncate text-start font-mono text-[11px] font-bold text-slate-800">
                 {invoice.offlineId}
               </span>
             </div>
 
-            <div className="text-left">
-              <span className="text-[10px] text-zinc-400 block">
-                التاريخ والوقت
-              </span>
-              <span className="text-[11px] text-zinc-600 dark:text-zinc-400 flex items-center justify-end gap-1">
-                <Calendar className="h-3 w-3" />
-                {new Date(invoice.createdAt).toLocaleTimeString("ar-SY", {
+            <div>
+              <span className="block text-[11px] text-slate-500">الوقت</span>
+              <span className="flex items-center gap-1 text-[12px] font-semibold tabular-nums text-slate-700">
+                <Calendar className="size-3 text-slate-400" aria-hidden />
+                {new Date(invoice.createdAt).toLocaleTimeString(NUMBER_LOCALE, {
                   hour: "2-digit",
                   minute: "2-digit",
                 })}
               </span>
             </div>
 
-            <div>
-              <span className="text-[10px] text-zinc-400 block">الزبون</span>
-              <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200 flex items-center gap-1">
-                <User className="h-3 w-3 text-zinc-400" />
-                {customer ? customer.name : "زبون نقدي عام"}
+            <div className="min-w-0">
+              <span className="block text-[11px] text-slate-500">الزبون</span>
+              <span className="flex items-center gap-1 text-[13px] font-extrabold text-slate-900">
+                <User className="size-3 shrink-0 text-slate-400" aria-hidden />
+                <span className="truncate">{customer ? customer.name : "زبون نقدي عام"}</span>
               </span>
             </div>
 
-            <div className="text-left">
-              <span className="text-[10px] text-zinc-400 block">
-                طريقة السداد
-              </span>
-              <Badge variant="outline" className="text-[10px] font-semibold">
+            <div>
+              <span className="block text-[11px] text-slate-500">طريقة السداد</span>
+              <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-bold text-slate-700">
                 {paymentLabel}
-              </Badge>
+              </span>
             </div>
           </div>
 
-          {/* Items Summary Table */}
-          <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-            <div className="grid grid-cols-12 text-[10px] font-bold text-zinc-400 pb-1 border-b border-zinc-200 dark:border-zinc-800">
+          {/* Items */}
+          <div className="max-h-40 space-y-0.5 overflow-y-auto">
+            <div className="grid grid-cols-12 border-b border-slate-100 pb-1 text-[11px] font-bold text-slate-500">
               <span className="col-span-6">الصنف / الوحدة</span>
               <span className="col-span-2 text-center">الكمية</span>
-              <span className="col-span-4 text-left">الإجمالي</span>
+              <span className="col-span-4 text-end">الإجمالي</span>
             </div>
 
             {items.map((item, idx) => {
-              // [v3.6] FIX — was `multiplyMoney(item.unitPriceUSD, ...)`.
-              // item.unitPriceUSD is `string | null` on CartLineItem
-              // (pos-service.ts) — it is only ever null when the item was
-              // added to the cart with no exchange rate cached yet. Calling
-              // multiplyMoney on `null` throws a MoneyError inside
-              // money.ts's toDecimal(), which would have crashed this
-              // entire modal the moment such an item appeared in a
-              // completed sale. item.unitPriceSYP is the always-present,
-              // authoritative field and is used for the actual line total.
-              //
-              // [FIX — SYP-only] The USD line total (lineUSD) is no longer
-              // computed at all — per product decision, no "≈ $X" appears
-              // anywhere in this modal (matches receipt-model.ts's own fix
-              // for the printed/shared receipt).
+              // [v3.6] item.unitPriceSYP is the always-present, authoritative
+              // field and is used for the line total. (item.unitPriceUSD is
+              // `string | null` — multiplyMoney(null, …) would throw inside
+              // money.ts's toDecimal() and crash this whole modal.)
+              // [FIX — SYP-only] No "≈ $X" appears anywhere in this modal
+              // (matches receipt-model.ts's own fix for the printed receipt).
               const lineSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
               return (
                 <div
                   key={idx}
-                  className="grid grid-cols-12 text-xs py-1 border-b border-zinc-100 dark:border-zinc-850"
+                  className="grid grid-cols-12 items-center border-b border-slate-50 py-1.5 text-xs last:border-0"
                 >
-                  <div className="col-span-6 truncate">
-                    <p className="font-semibold text-zinc-800 dark:text-zinc-200">
-                      {item.product.name}
-                    </p>
-                    <p className="text-[10px] text-zinc-400">{item.unitName}</p>
+                  <div className="col-span-6 min-w-0">
+                    <p className="truncate font-bold text-slate-900">{item.product.name}</p>
+                    <p className="text-[11px] text-slate-500">{item.unitName}</p>
                   </div>
-                  <span className="col-span-2 text-center font-mono">
-                    {item.quantity}
+                  <span className="col-span-2 text-center font-bold tabular-nums text-slate-700">
+                    {fmtInt(item.quantity)}
                   </span>
-                  <div className="col-span-4 text-left font-mono">
-                    <p className="font-bold text-zinc-800 dark:text-zinc-200">
-                      {formatMoney(lineSYP, "SYP")} ل.س
-                    </p>
-                  </div>
+                  <span className="col-span-4 text-end font-extrabold text-slate-900">
+                    <Money value={lineSYP} compact />
+                  </span>
                 </div>
               );
             })}
           </div>
 
           {/*
-            Financial Totals.
-            [FIX — SYP-only] Per product decision, the "(≈ $X)" secondary
-            USD figure is removed entirely from every row below (total,
-            paid, debt). The exchange-rate row is kept — it is a reference
-            rate, not a converted amount.
+            Financial totals. The "(≈ $X)" secondary USD figure stays removed
+            from every row (total, paid, debt). The exchange-rate row is kept —
+            it is a reference rate, not a converted amount.
           */}
-          <div className="space-y-1 pt-2 border-t border-zinc-200 dark:border-zinc-800">
-            <div className="flex justify-between text-xs font-bold">
-              <span className="text-zinc-600 dark:text-zinc-400">
-                إجمالي الفاتورة:
-              </span>
-              <span className="text-emerald-700 dark:text-emerald-400 font-extrabold font-mono">
-                {formatMoney(invoice.totalSYP, "SYP")} ل.س
-              </span>
+          <div className="space-y-1.5 border-t border-slate-100 pt-3">
+            <div className="flex items-end justify-between">
+              <span className="text-xs font-bold text-slate-600">إجمالي الفاتورة</span>
+              <Money value={invoice.totalSYP} className="text-xl font-extrabold text-emerald-700" />
             </div>
 
             <div className="flex justify-between text-xs">
-              <span className="text-zinc-500">سعر الصرف المعتمد:</span>
-              <span className="font-mono text-zinc-600 dark:text-zinc-400">
+              <span className="text-slate-500">سعر الصرف المعتمد</span>
+              <span className="font-semibold tabular-nums text-slate-600">
                 {invoice.exchangeRateUsed !== null
-                  ? `${formatMoney(invoice.exchangeRateUsed, "SYP")} ل.س / $`
+                  ? `${fmtMoney(invoice.exchangeRateUsed, "SYP")} ل.س / $`
                   : "—"}
               </span>
             </div>
 
             <div className="flex justify-between text-xs">
-              <span className="text-zinc-500">المبلغ المدفوع:</span>
-              <span className="font-bold text-emerald-600 font-mono">
-                {formatMoney(invoice.paidAmountSYP, "SYP")} ل.س
-              </span>
+              <span className="text-slate-500">المبلغ المدفوع</span>
+              <Money value={invoice.paidAmountSYP} compact className="font-bold text-emerald-700" />
             </div>
 
             {isDebtPresent && (
-              <div className="flex justify-between text-xs font-bold text-red-600 dark:text-red-400">
-                <span>المتبقي على الحساب (دين):</span>
-                <span className="font-mono">
-                  {formatMoney(invoice.debtAmountSYP, "SYP")} ل.س
-                </span>
+              <div className="flex justify-between rounded-lg bg-red-50 px-2.5 py-1.5 text-xs font-extrabold text-red-700">
+                <span>المتبقي على الحساب (دين)</span>
+                <Money value={invoice.debtAmountSYP} compact unitClassName="text-red-500" />
               </div>
             )}
           </div>
         </div>
 
-        {/* Action Buttons */}
-        <div className="space-y-2 pt-2">
+        {/* Actions */}
+        <div className="space-y-2 pt-1">
           {/*
             [T4f] Thermal ESC/POS printing (Web Bluetooth) + the gated PDF share.
 
-            [FIX] `source` is now a THUNK (buildCurrentReceiptSource), not a
-            static object — see that function's own comment above for why a
-            static object silently baked in a stale PENDING status even
-            after sync completed. receipt-actions.tsx already supports and
-            calls a thunk-shaped `source` at print/share TIME.
+            [FIX] `source` is a THUNK (buildCurrentReceiptSource), not a static
+            object — see that function's own comment above for why a static
+            object silently baked in a stale PENDING status even after sync
+            completed. receipt-actions.tsx already supports and calls a
+            thunk-shaped `source` at print/share TIME.
           */}
           <ReceiptActions
             source={buildCurrentReceiptSource}
@@ -341,35 +310,29 @@ export function CheckoutSuccessModal({
             onPrinterSetupRequired={onPrinterSetupRequired}
           />
 
-          {/*
-            [FIX] Responsive — was a fixed flex-row that squeezed both
-            buttons onto one cramped line at 375px width (iPhone SE). Now
-            stacks vertically on narrow screens, back to a row from sm: up.
-          */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          {/* Stacked on narrow screens, a row from sm: up. */}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <Button
               type="button"
               variant="outline"
-              size="sm"
               onClick={handlePrint}
-              className="text-xs gap-1.5 w-full sm:w-auto"
+              className="h-11 w-full gap-1.5 border-slate-200 text-xs font-semibold text-slate-700 sm:w-auto"
               title="طباعة الإيصال عبر نافذة المتصفح — بديل عند عدم دعم Web Bluetooth (مثل iOS)"
             >
-              <Printer className="h-4 w-4" />
+              <Printer className="size-4" aria-hidden />
               طباعة من المتصفح
             </Button>
 
             <Button
               type="button"
-              size="sm"
               onClick={() => {
                 onOpenChange(false);
                 onStartNewSale();
               }}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold gap-1.5 px-6 w-full sm:w-auto"
+              className="h-11 w-full gap-1.5 bg-emerald-600 px-6 text-sm font-extrabold text-white shadow-sm shadow-emerald-900/20 hover:bg-emerald-700 sm:w-auto"
             >
-              <PlusCircle className="h-4 w-4" />
-              فاتورة جديدة (جديد)
+              <PlusCircle className="size-4" aria-hidden />
+              فاتورة جديدة
             </Button>
           </div>
         </div>

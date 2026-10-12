@@ -13,10 +13,9 @@ import {
   resolveCartLinePrices,
   cartNeedsExchangeRate,
   useSyncWorker,
-  // [ADDED — camera + hardware barcode scanning] Re-exported via
-  // lib/offline/index.ts's `export * from "./barcode-lookup"` — imported
-  // from the barrel like everything else in this block, not a separate
-  // direct file import.
+  // [camera + hardware barcode scanning] Re-exported via lib/offline/index.ts's
+  // `export * from "./barcode-lookup"` — imported from the barrel like
+  // everything else in this block.
   findProductUnitByBarcode,
   type PosProductItem,
   type CachedProductUnit,
@@ -26,11 +25,12 @@ import {
   type PaymentMethod,
 } from "@/lib/offline";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
-import { ProductCatalog } from "./product-catalog";
+import { ProductCatalog, ProductSearchBar } from "./product-catalog";
 import { CartPanel } from "./cart-panel";
 import { WalkInCustomerModal } from "./walk-in-customer-modal";
 import { PaymentModal } from "./payment-modal";
 import { CheckoutSuccessModal } from "./checkout-success-modal";
+import { Money } from "./money";
 // [v4.1 — T4d] The OFFLINE void entry point. Deliberately a separate surface
 // from T4c2's online void flow: it reads only local Dexie data and calls
 // only the local submitOfflineVoid() service — never the server-side ledger
@@ -49,13 +49,10 @@ import {
   DrawerTitle,
   DrawerDescription,
 } from "@/components/ui/drawer";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   RefreshCw,
   CloudOff,
-  Keyboard,
-  DollarSign,
   AlertTriangle,
   ShoppingCart,
   ChevronUp,
@@ -66,7 +63,9 @@ import {
   Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { serializeMoney, formatMoney, compareMoney } from "@/lib/utils/money";
+import { compareMoney } from "@/lib/utils/money";
+import { cn } from "@/lib/utils";
+import { fmtInt, fmtMoney } from "@/lib/utils/digits";
 
 /** Where a barcode came from: the camera dialog, or a keyboard-wedge scanner. */
 type ScanSource = "camera" | "keyboard";
@@ -159,12 +158,12 @@ function ScanSessionPanel({
         <div
           key={banner.nonce}
           aria-live="polite"
-          className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-sm font-semibold animate-in fade-in zoom-in-95 duration-150 ${banner.kind === "ok"
-            ? "border-emerald-300 bg-emerald-50 text-emerald-900"
-            : banner.kind === "error"
-              ? "border-red-300 bg-red-50 text-red-800"
-              : "border-zinc-200 bg-zinc-50 text-zinc-700"
-            }`}
+          className={cn(
+            "flex animate-in items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-sm font-bold duration-150 fade-in zoom-in-95 motion-reduce:animate-none",
+            banner.kind === "ok" && "border-emerald-200 bg-emerald-50 text-emerald-900",
+            banner.kind === "error" && "border-red-200 bg-red-50 text-red-800",
+            banner.kind === "info" && "border-slate-200 bg-slate-50 text-slate-700"
+          )}
         >
           <span className="min-w-0 truncate">
             {banner.kind === "ok" ? "✓ " : banner.kind === "error" ? "✕ " : ""}
@@ -173,14 +172,14 @@ function ScanSessionPanel({
           {banner.kind === "ok" && bannerQty !== null && (
             <span
               dir="ltr"
-              className="shrink-0 rounded-full bg-emerald-600 px-2.5 py-0.5 text-xs font-bold tabular-nums text-white"
+              className="shrink-0 rounded-full bg-emerald-600 px-2.5 py-0.5 text-xs font-extrabold tabular-nums text-white"
             >
-              × {bannerQty}
+              × {fmtInt(bannerQty)}
             </span>
           )}
         </div>
       ) : (
-        <div className="rounded-xl border border-dashed border-zinc-200 px-3 py-2.5 text-center text-xs text-zinc-500">
+        <div className="rounded-xl border border-dashed border-slate-200 px-3 py-2.5 text-center text-xs text-slate-500">
           وجّه الكاميرا نحو الباركود — كل مسحة بتنضاف للسلة مباشرة.
         </div>
       )}
@@ -190,11 +189,11 @@ function ScanSessionPanel({
           {recent.map((item) => (
             <div
               key={item.id}
-              className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5"
+              className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5"
             >
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-semibold text-zinc-900">{item.product.name}</p>
-                <p className="text-[11px] text-zinc-500">{item.unitName}</p>
+                <p className="truncate text-sm font-bold text-slate-900">{item.product.name}</p>
+                <p className="text-[11px] text-slate-500">{item.unitName}</p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
                 <Button
@@ -203,12 +202,12 @@ function ScanSessionPanel({
                   size="icon"
                   onClick={() => onDecrement(item.id)}
                   aria-label="إنقاص الكمية"
-                  className="h-9 w-9"
+                  className="size-9 border-slate-200"
                 >
-                  <Minus className="h-4 w-4" />
+                  <Minus className="size-4" />
                 </Button>
-                <span dir="ltr" className="min-w-8 text-center text-sm font-bold tabular-nums">
-                  {item.quantity}
+                <span dir="ltr" className="min-w-8 text-center text-sm font-extrabold tabular-nums">
+                  {fmtInt(item.quantity)}
                 </span>
                 <Button
                   type="button"
@@ -216,25 +215,24 @@ function ScanSessionPanel({
                   size="icon"
                   onClick={() => onRemove(item.id)}
                   aria-label="حذف الصنف من السلة"
-                  className="h-9 w-9 text-red-600 hover:bg-red-50 hover:text-red-700"
+                  className="size-9 text-red-600 hover:bg-red-50 hover:text-red-700"
                 >
-                  <X className="h-4 w-4" />
+                  <X className="size-4" />
                 </Button>
               </div>
             </div>
           ))}
           {hiddenCount > 0 && (
-            <p className="text-center text-[11px] text-zinc-500">
-              و {hiddenCount} {hiddenCount === 1 ? "صنف" : "أصناف"} تانية بالسلة
+            <p className="text-center text-[11px] text-slate-500">
+              و {fmtInt(hiddenCount)} {hiddenCount === 1 ? "صنف" : "أصناف"} تانية بالسلة
             </p>
           )}
         </div>
       )}
 
       <div className="flex items-center justify-between gap-2">
-        <p className="text-xs text-zinc-600">
-          {items.length} أصناف ·{" "}
-          <span className="font-bold text-zinc-900">{totalLabel}</span>
+        <p className="text-xs text-slate-600">
+          {fmtInt(items.length)} أصناف · <span className="font-extrabold text-slate-900">{totalLabel}</span>
         </p>
         <Button
           type="button"
@@ -242,9 +240,9 @@ function ScanSessionPanel({
           size="sm"
           disabled={!canUndo}
           onClick={onUndo}
-          className="h-9 gap-1.5 text-xs"
+          className="h-9 gap-1.5 border-slate-200 text-xs font-semibold"
         >
-          <Undo2 className="h-3.5 w-3.5" />
+          <Undo2 className="size-3.5" />
           تراجع عن آخر مسحة
         </Button>
       </div>
@@ -306,7 +304,7 @@ export function PosLayout() {
   const [completedItems, setCompletedItems] = useState<CartLineItem[]>([]);
   const [allowSystemCustomer, setAllowSystemCustomer] = useState(true);
   const [reopenPaymentAfterCustomer, setReopenPaymentAfterCustomer] = useState(false);
-  // [ADDED] Camera barcode scanner modal open/close state.
+  // Camera barcode scanner modal open/close state.
   const [barcodeScannerOpen, setBarcodeScannerOpen] = useState(false);
   // [UX] State of the CURRENT camera scan session: the banner for the last scan,
   // and the cart-line ids added by camera scans (newest last) so "undo last
@@ -398,7 +396,7 @@ export function PosLayout() {
 
   // 1d. Opportunistic initial product sync from the server (Postgres ->
   // Dexie). Fires once per tenant/DB-open change, independent of
-  // searchQuery. [FIX] Now gated on `isDbOpen`, NOT `isDbReady`: on a
+  // searchQuery. [FIX] Gated on `isDbOpen`, NOT `isDbReady`: on a
   // brand-new tenant the cache is empty so `isDbReady` is false — gating
   // this on it meant an empty cache could never populate itself.
   //
@@ -432,6 +430,14 @@ export function PosLayout() {
     return calculateCartTotals(cartItems, dailyExchangeRate);
   }, [cartItems, dailyExchangeRate]);
 
+  // cart line id → quantity, so each unit button in the catalog can show how
+  // many of it are already in the cart. (Line ids are `${product.id}-${unit.id}`.)
+  const cartQuantities = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const item of cartItems) map[item.id] = item.quantity;
+    return map;
+  }, [cartItems]);
+
   // [T4b] True only when at least one cart line is USD-priced — the only
   // case where checkout legitimately requires a cached exchange rate.
   // A SYP-only cart must never be blocked by a missing rate.
@@ -457,6 +463,20 @@ export function PosLayout() {
   const scanBannerQty = scanBanner?.cartId
     ? (cartItems.find((item) => item.id === scanBanner.cartId)?.quantity ?? null)
     : null;
+
+  // Local-database status: a small dot on the sync button (colour) + its tooltip.
+  const dbDotClass = isDbReady
+    ? "bg-emerald-500"
+    : dbStatus === "NO_CACHED_DATA" || dbStatus === "PARTIAL"
+      ? "bg-amber-500"
+      : "bg-slate-300 animate-pulse";
+  const dbStatusText = isDbReady
+    ? "قاعدة البيانات المحلية جاهزة"
+    : dbStatus === "NO_CACHED_DATA"
+      ? "لا توجد بيانات مخزنة محلياً بعد — يرجى الاتصال بالإنترنت للمزامنة"
+      : dbStatus === "PARTIAL"
+        ? "بعض البيانات المحلية غير مكتملة بعد (مثل سعر الصرف أو الزبائن)"
+        : "جاري تهيئة قاعدة البيانات...";
 
   // 2. Keyboard Shortcuts (F2: Search, F4: Customer, F9: Checkout, Esc: Close)
   useEffect(() => {
@@ -508,7 +528,7 @@ export function PosLayout() {
   // authoritative, USD derived/nullable) are now captured and stored,
   // matching resolveCartLinePrices()'s real return shape.
   //
-  // [UX] Now RETURNS the outcome, and takes `silent` for the camera scanner:
+  // [UX] RETURNS the outcome, and takes `silent` for the camera scanner:
   // while scanning, toasts would pile up on top of the video, so the camera
   // path reports through its own banner instead. Every other caller (the
   // catalog's add buttons, the hardware scanner) keeps the toasts as before.
@@ -578,20 +598,19 @@ export function PosLayout() {
     return { ok: true, cartId: cartItemId };
   }
 
-  // [ADDED — barcode -> cart bridge]
+  // [barcode -> cart bridge]
   // The SINGLE resolution path shared by BOTH scan surfaces:
   //   1. The camera scanner (BarcodeScannerModal, mode="continuous" below)
-  //   2. The hardware keyboard-wedge scanner (ProductCatalog's search-input
-  //      Enter handler, wired via the onBarcodeEnter prop)
+  //   2. The hardware keyboard-wedge scanner (ProductSearchBar's Enter
+  //      handler, wired via the onBarcodeEnter prop)
   // Offline-first: tries the full local cache first (findProductUnitByBarcode
   // — NOT the debounced/filtered `products` state) and only reaches for the
   // network as a last resort, and only when actually online. Never blocks or
   // throws while offline.
   //
-  // Returns a boolean so ProductCatalog's Enter handler can distinguish
-  // "this was recognized as a barcode" (found, or found-but-rejected) from
-  // "this wasn't a barcode at all" (falls through to plain text-search
-  // behavior there).
+  // Returns a boolean so the Enter handler can distinguish "this was
+  // recognized as a barcode" (found, or found-but-rejected) from "this wasn't
+  // a barcode at all" (falls through to plain text-search behavior there).
   //
   // [UX] `source: "camera"` switches the reporting from toasts to the scan
   // banner under the video (see ScanSessionPanel). Both sources get the beep /
@@ -883,157 +902,102 @@ export function PosLayout() {
   }
 
   return (
-    <div className="flex flex-col h-[calc(100vh-8.5rem)] space-y-3 relative" dir="rtl">
+    <div className="relative flex h-[calc(100dvh-8.5rem)] flex-col gap-3" dir="rtl">
       {/*
-        Top POS Action & Status Bar — reworked for density on mobile.
+        Command bar — ONE row on every screen size:
+          [ search / hardware-scanner input ........ ] [scan] [sync] [printer]
+        The shortcuts hint strip is gone (F2/F4/F9 are printed on the controls
+        they trigger), and the exchange-rate chip is gone while a rate exists —
+        the app's top bar already shows it. Only the MISSING-rate warning (and
+        pending-sync count) appear, as chips in the row below, when relevant.
 
-        1. "قاعدة Dexie: جاهزة" is a small status dot with a tooltip.
-        2. The "فواتير بانتظار المزامنة" badge only renders when the count
-           is > 0.
-        3. The exchange-rate badge drops its label below the sm breakpoint.
-           [FIX] When the rate is missing it is now a non-blocking AMBER
-           warning (SYP sales never need a rate), not a red alarm.
-        4. Secondary buttons collapse to icon-only below lg.
-        5. Hover states on secondary buttons are neutral zinc so emerald
-           reads consistently as "primary".
-        6. A labeled "مسح باركود" button on lg+. On mobile the scan action is
-           the floating button above the cart bar (see below) — it is the most
-           used control on a phone, so it is not tucked in this bar.
+        On a phone the scan action is the floating button above the cart bar
+        (thumb reach); the labeled scan button here is lg+ only.
       */}
-      <div className="flex items-center justify-between gap-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 sm:p-3 dark:border-zinc-800 dark:bg-zinc-900 shadow-xs shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <div className="flex items-center gap-1.5 shrink-0">
-            <span
-              className={`inline-block h-2 w-2 rounded-full ${isDbReady
-                ? "bg-emerald-500"
-                : dbStatus === "NO_CACHED_DATA" || dbStatus === "PARTIAL"
-                  ? "bg-amber-500"
-                  : "bg-zinc-300 animate-pulse"
-                }`}
-              title={
-                isDbReady
-                  ? "قاعدة البيانات المحلية جاهزة"
-                  : dbStatus === "NO_CACHED_DATA"
-                    ? "لا توجد بيانات مخزنة محلياً بعد — يرجى الاتصال بالإنترنت للمزامنة"
-                    : dbStatus === "PARTIAL"
-                      ? "بعض البيانات المحلية غير مكتملة بعد (مثل سعر الصرف أو الزبائن)"
-                      : "جاري تهيئة قاعدة البيانات..."
-              }
-            />
-            {pendingInvoicesCount > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 px-2 py-0.5 text-[11px] border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800 font-semibold whitespace-nowrap"
-              >
-                <CloudOff className="h-3 w-3 text-amber-600" />
-                <span>{pendingInvoicesCount} بانتظار المزامنة</span>
-              </Badge>
-            )}
-          </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <ProductSearchBar
+          className="min-w-0 flex-1"
+          products={products}
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          onAddToCart={handleAddToCart}
+          searchInputRef={searchInputRef}
+          // Hardware keyboard-wedge scanner support — see handleBarcodeScan above.
+          onBarcodeEnter={handleBarcodeScan}
+        />
 
-          <div className="hidden lg:flex items-center gap-1.5 text-[11px] text-zinc-500 mr-1 shrink-0">
-            <Keyboard className="h-3.5 w-3.5 text-zinc-400" />
-            <span>
-              اختصارات:{" "}
-              <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">
-                F2
-              </kbd>{" "}
-              بحث •{" "}
-              <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">
-                F4
-              </kbd>{" "}
-              زبون •{" "}
-              <kbd className="font-mono bg-zinc-100 dark:bg-zinc-800 px-1 rounded border border-zinc-200 dark:border-zinc-700">
-                F9
-              </kbd>{" "}
-              دفع
+        <Button
+          type="button"
+          variant="outline"
+          onClick={openBarcodeScanner}
+          title="مسح باركود بالكاميرا وإضافة للسلة مباشرة"
+          className="hidden h-11 shrink-0 gap-1.5 rounded-xl border-emerald-200 bg-emerald-50 px-3.5 text-xs font-bold text-emerald-800 shadow-sm hover:bg-emerald-100 hover:text-emerald-900 lg:inline-flex"
+        >
+          <ScanLine className="size-4 text-emerald-600" aria-hidden />
+          مسح باركود
+        </Button>
+
+        {/* Sync products — icon-only, labeled from xl. The dot is the local-DB status. */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={handleSyncProducts}
+          disabled={isSyncingProducts}
+          title={`سحب أحدث الأصناف من السيرفر — ${dbStatusText}`}
+          aria-label="مزامنة الأصناف"
+          className="relative h-11 min-w-11 shrink-0 gap-1.5 rounded-xl border-slate-200 bg-white px-3 text-xs font-bold text-slate-700 shadow-sm hover:bg-slate-50 hover:text-slate-900"
+        >
+          <RefreshCw
+            className={cn("size-4 text-emerald-600", isSyncingProducts && "animate-spin")}
+            aria-hidden
+          />
+          <span className="hidden xl:inline">{isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}</span>
+          <span
+            className={cn("absolute -inset-e-1 -top-1 size-2.5 rounded-full ring-2 ring-white", dbDotClass)}
+            aria-hidden
+          />
+        </Button>
+
+        {/*
+          [T4f — Rule 4] The printer settings control. Deliberately NOT
+          role-gated: the printer's dots-per-line is a property of THIS device
+          (Dexie's `deviceSettings` table, which stores no tenantId and no
+          userId), and a cashier is the person who actually prints.
+
+          Its controlled `open` state lives in this component so a failed
+          thermal print can route the user straight here instead of leaving
+          them with a toast and no way forward.
+
+          The trigger itself already matches the command bar (44px, rounded-xl,
+          label from xl up like the sync button) — see its default classes.
+        */}
+        <PrinterSettingsPopover open={printerSettingsOpen} onOpenChange={setPrinterSettingsOpen} />
+      </div>
+
+      {(pendingInvoicesCount > 0 || isRateMissing) && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {pendingInvoicesCount > 0 && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-800">
+              <CloudOff className="size-3.5 text-amber-600" aria-hidden />
+              {fmtInt(pendingInvoicesCount)} بانتظار المزامنة
             </span>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {!isRateMissing ? (
-            <Badge className="bg-emerald-600 text-white gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap">
-              <DollarSign className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">سعر الصرف: </span>
-              <span>{formatMoney(dailyExchangeRate, "SYP")} ل.س</span>
-            </Badge>
-          ) : (
-            <Badge
-              variant="outline"
-              className="gap-1 text-[11px] sm:text-xs px-2 sm:px-2.5 py-1 font-semibold whitespace-nowrap border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800"
+          )}
+          {isRateMissing && (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-800"
               title="البيع بالليرة السورية متاح بدون سعر صرف. السعر مطلوب فقط للأصناف المسعّرة بالدولار."
             >
-              <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
-              <span className="hidden sm:inline">سعر الصرف غير محدد</span>
-              <span className="sm:hidden">بدون سعر صرف</span>
-            </Badge>
+              <AlertTriangle className="size-3.5 text-amber-600" aria-hidden />
+              سعر الصرف غير محدد
+            </span>
           )}
-
-          {/* [ADDED] Camera barcode scan — labeled button on lg+ only (mobile
-              uses the floating scan button). */}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={openBarcodeScanner}
-            className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-            title="مسح باركود بالكاميرا وإضافة للسلة مباشرة"
-          >
-            <ScanLine className="h-3.5 w-3.5 text-emerald-600" />
-            <span>مسح باركود</span>
-          </Button>
-
-          {/* Sync products — icon-only under lg, labeled button on lg+ */}
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={handleSyncProducts}
-            disabled={isSyncingProducts}
-            className="h-8 w-8 lg:hidden text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-            title="مزامنة الأصناف من السيرفر"
-          >
-            <RefreshCw
-              className={`h-3.5 w-3.5 text-emerald-600 ${isSyncingProducts ? "animate-spin" : ""}`}
-            />
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleSyncProducts}
-            disabled={isSyncingProducts}
-            className="hidden lg:flex text-xs h-8 gap-1.5 text-zinc-600 hover:text-zinc-900 hover:border-zinc-400"
-            title="سحب أحدث الأصناف من السيرفر إلى الذاكرة المحلية"
-          >
-            <RefreshCw
-              className={`h-3.5 w-3.5 text-emerald-600 ${isSyncingProducts ? "animate-spin" : ""}`}
-            />
-            <span>{isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}</span>
-          </Button>
-
-          {/*
-            [T4f — Rule 4] The printer settings control. Deliberately NOT
-            role-gated: the printer's dots-per-line is a property of THIS device
-            (Dexie's `deviceSettings` table, which stores no tenantId and no
-            userId), and a cashier is the person who actually prints.
-
-            Its controlled `open` state lives in this component so a failed
-            thermal print can route the user straight here instead of leaving
-            them with a toast and no way forward.
-          */}
-          <PrinterSettingsPopover
-            open={printerSettingsOpen}
-            onOpenChange={setPrinterSettingsOpen}
-          />
         </div>
-      </div>
+      )}
 
       {/*
         [v4.1 — T4d §6.3] Offline void panel.
 
-        Mounted directly under the top status bar so it is visible on BOTH the
+        Mounted directly under the command bar so it is visible on BOTH the
         mobile and desktop layouts of this screen. It is conditionally
         self-rendering: with zero not-yet-synced local invoices it returns null
         and is genuinely absent from the DOM (see offline-void-panel.tsx).
@@ -1051,19 +1015,18 @@ export function PosLayout() {
 
       {/*
         [FIX] Explicit "no local data yet" state, replacing the old endless
-        "جاري قراءة الأصناف من الذاكرة المحلية" spinner. Shown when Dexie is
-        open, the first read has finished, no search is active and there are
-        zero cached products — i.e. a brand-new tenant (or a device that has
-        never synced). It tells the user exactly what to do and offers the
-        sync action directly.
+        spinner. Shown when Dexie is open, the first read has finished, no
+        search is active and there are zero cached products — i.e. a brand-new
+        tenant (or a device that has never synced). It tells the user exactly
+        what to do and offers the sync action directly.
       */}
       {showEmptyCacheBanner && (
-        <div className="flex items-center justify-between gap-3 rounded-2xl border border-amber-300 bg-amber-50 px-3.5 py-3 text-amber-900 dark:border-amber-900 dark:bg-amber-950/50 dark:text-amber-200 shrink-0">
-          <div className="flex items-start gap-2.5 min-w-0">
-            <PackageSearch className="h-5 w-5 text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-0.5 min-w-0">
-              <p className="text-xs font-bold">لا توجد أصناف محلية بعد</p>
-              <p className="text-[11px] leading-relaxed text-amber-800 dark:text-amber-300">
+        <div className="flex shrink-0 items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-amber-900">
+          <div className="flex min-w-0 items-start gap-2.5">
+            <PackageSearch className="mt-0.5 size-5 shrink-0 text-amber-600" aria-hidden />
+            <div className="min-w-0 space-y-0.5">
+              <p className="text-xs font-extrabold">لا توجد أصناف محلية بعد</p>
+              <p className="text-[11px] leading-relaxed text-amber-800">
                 {typeof navigator !== "undefined" && !navigator.onLine
                   ? "لا يوجد اتصال بالإنترنت. اتصل بالإنترنت ثم اضغط مزامنة الأصناف."
                   : "اضغط مزامنة الأصناف لتحميل أصناف متجرك. إذا لم تضف أصنافاً بعد، أضفها من صفحة المخزون أولاً."}
@@ -1075,41 +1038,38 @@ export function PosLayout() {
             size="sm"
             onClick={handleSyncProducts}
             disabled={isSyncingProducts}
-            className="h-8 gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white shrink-0"
+            className="h-9 shrink-0 gap-1.5 bg-emerald-600 text-xs font-bold text-white hover:bg-emerald-700"
           >
-            <RefreshCw
-              className={`h-3.5 w-3.5 ${isSyncingProducts ? "animate-spin" : ""}`}
-            />
-            <span>{isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}</span>
+            <RefreshCw className={cn("size-3.5", isSyncingProducts && "animate-spin")} aria-hidden />
+            {isSyncingProducts ? "جاري المزامنة..." : "مزامنة الأصناف"}
           </Button>
         </div>
       )}
 
       {/*
-        Main Split Layout: Desktop 2-column, Mobile 1-column.
+        Main split: desktop 2-column, mobile 1-column.
 
-        [FIX — bottom-nav clearance] `pb-36` (144px) clears the floating
-        mobile cart bar, which sits above the app shell's bottom tab bar.
+        [FIX — bottom-nav clearance] The clearance for the mobile floating bars
+        now lives INSIDE the catalog's scroller (pb-44), not here: padding on
+        this grid permanently shrank the visible list to a sliver, while padding
+        inside the scroller lets the list use the full height and still scroll
+        its last card clear of the bars.
       */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 flex-1 overflow-hidden pb-36 lg:pb-0">
-        {/* RIGHT SIDE (60%-65% width on desktop, 100% on mobile): Product Catalog */}
-        <div className="col-span-1 lg:col-span-7 xl:col-span-8 flex flex-col overflow-hidden">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-hidden lg:grid-cols-12">
+        {/* RIGHT SIDE (in RTL): Product Catalog */}
+        <div className="col-span-1 flex min-h-0 flex-col overflow-hidden lg:col-span-7 xl:col-span-8">
           <ProductCatalog
             products={products}
             isLoading={isLoadingProducts}
             searchQuery={searchQuery}
-            onSearchChange={setSearchQuery}
             exchangeRate={dailyExchangeRate}
             onAddToCart={handleAddToCart}
-            searchInputRef={searchInputRef}
-            // [ADDED] Hardware keyboard-wedge scanner support — see
-            // handleBarcodeScan above and product-catalog.tsx's prop doc.
-            onBarcodeEnter={handleBarcodeScan}
+            cartQuantities={cartQuantities}
           />
         </div>
 
-        {/* LEFT SIDE (35%-40% width on desktop): Persistent Cart Panel */}
-        <div className="hidden lg:flex lg:col-span-5 xl:col-span-4 flex-col overflow-hidden">
+        {/* LEFT SIDE (in RTL): persistent cart panel */}
+        <div className="hidden min-h-0 flex-col overflow-hidden lg:col-span-5 lg:flex xl:col-span-4">
           <CartPanel
             items={cartItems}
             customer={selectedCustomer}
@@ -1128,80 +1088,82 @@ export function PosLayout() {
       {/*
         [UX] Mobile floating scan button. Scanning adds straight to the cart, so
         on a phone it is THE primary action: a large round button within thumb
-        reach (right side in RTL), just above the cart bar.
+        reach, just above the cart bar.
       */}
-      <div className="lg:hidden fixed bottom-36 start-3 z-30">
+      <div className="fixed bottom-36 inset-s-3 z-30 lg:hidden">
         <Button
           type="button"
           onClick={openBarcodeScanner}
           aria-label="مسح باركود بالكاميرا وإضافة للسلة"
-          className="h-14 w-14 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-600/30"
+          className="size-14 rounded-full bg-emerald-600 text-white shadow-lg shadow-emerald-900/25 ring-4 ring-white hover:bg-emerald-700"
         >
-          <ScanLine className="h-6 w-6" />
+          <ScanLine className="size-6" />
         </Button>
       </div>
 
       {/*
-        Mobile Floating Bottom Bar (Trigger for Cart Drawer).
+        Mobile floating cart bar (trigger for the cart drawer).
 
-        [FIX — hidden behind app shell bottom nav] Moved to `bottom-20`
-        (80px) so it sits ABOVE the app shell's own bottom tab bar instead
-        of overlapping it. NOTE: `bottom-20` is an estimate of the tab
+        [FIX — hidden behind app shell bottom nav] `bottom-20` (80px) sits ABOVE
+        the app shell's own bottom tab bar. NOTE: it is an estimate of the tab
         bar's height, not a measured constant — ideally replace it with a
         shared constant/CSS variable exported by the tab bar component.
       */}
-      <div className="lg:hidden fixed bottom-20 inset-x-3 z-30">
-        <Button
+      <div className="fixed inset-x-3 bottom-20 z-30 lg:hidden">
+        <button
           type="button"
           onClick={() => setIsMobileCartOpen(true)}
-          className="w-full h-13 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-600/30 flex items-center justify-between px-4"
+          aria-label="عرض سلة المبيعات"
+          className="flex w-full items-center justify-between gap-3 rounded-2xl border border-emerald-700 bg-linear-to-br from-emerald-600 to-emerald-800 px-3.5 py-2.5 text-white shadow-lg shadow-emerald-900/25 transition-transform active:scale-[0.99]"
         >
-          <div className="flex items-center gap-2.5">
-            <div className="relative flex h-8 w-8 items-center justify-center rounded-xl bg-emerald-700 text-white">
-              <ShoppingCart className="h-4 w-4" />
+          <span className="flex min-w-0 items-center gap-2.5">
+            <span className="relative flex size-9 shrink-0 items-center justify-center rounded-xl bg-white/20">
+              <ShoppingCart className="size-4.5" aria-hidden />
               {cartTotals.itemCount > 0 && (
-                <span className="absolute -top-1.5 -right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-amber-400 text-[10px] font-extrabold text-zinc-900 shadow-xs">
-                  {cartTotals.itemCount}
+                // Re-mounts on every change, so each scan / tap bumps the badge.
+                <span
+                  key={cartTotals.itemCount}
+                  className="absolute -inset-e-1.5 -top-1.5 flex h-5 min-w-5 animate-in items-center justify-center rounded-full bg-amber-400 px-1 text-[10px] font-extrabold tabular-nums text-amber-950 shadow-sm duration-200 zoom-in-50 motion-reduce:animate-none"
+                >
+                  {fmtInt(cartTotals.itemCount)}
                 </span>
               )}
-            </div>
-            <div className="text-right">
-              <p className="text-xs font-bold">عرض سلة المبيعات</p>
-              <p className="text-[10px] text-emerald-100">
-                {selectedCustomer ? selectedCustomer.name : "لم يتم اختيار زبون"} • {cartItems.length} أصناف
-              </p>
-            </div>
-          </div>
+            </span>
+            <span className="min-w-0 text-start">
+              <span className="block text-[13px] font-extrabold">عرض سلة المبيعات</span>
+              <span className="block truncate text-[11px] text-emerald-100">
+                {selectedCustomer ? selectedCustomer.name : "لم يتم اختيار زبون"} • {fmtInt(cartItems.length)} أصناف
+              </span>
+            </span>
+          </span>
 
-          {/*
-            [v3.6] SYP is the primary/large figure and USD the
-            secondary/derived one. Guards against `cartTotals.totalUSD`
-            being `null` (no exchange rate cached yet).
-          */}
-          <div className="flex items-center gap-2">
-            <div className="text-left">
-              <p className="text-xs font-extrabold font-mono">
-                {formatMoney(cartTotals.totalSYP, "SYP")} ل.س
-              </p>
+          {/* [v3.6] SYP is the primary figure and USD the secondary one; USD may be null. */}
+          <span className="flex shrink-0 items-center gap-2">
+            <span className="text-start">
+              <Money
+                value={cartTotals.totalSYP}
+                className="text-sm font-extrabold"
+                unitClassName="text-emerald-100"
+              />
               {cartTotals.totalUSD !== null && (
-                <p className="text-[10px] text-emerald-200">
-                  ≈ ${formatMoney(cartTotals.totalUSD, "USD")}
-                </p>
+                <span className="block text-[10px] text-emerald-100">
+                  ≈ <Money value={cartTotals.totalUSD} currency="USD" />
+                </span>
               )}
-            </div>
-            <ChevronUp className="h-4 w-4 text-emerald-200" />
-          </div>
-        </Button>
+            </span>
+            <ChevronUp className="size-4 text-emerald-100" aria-hidden />
+          </span>
+        </button>
       </div>
 
       {/* Mobile Cart Bottom Sheet Drawer */}
       <Drawer open={isMobileCartOpen} onOpenChange={setIsMobileCartOpen}>
-        <DrawerContent className="h-[85vh] p-0" dir="rtl">
+        <DrawerContent className="h-[85dvh] p-0" dir="rtl">
           <DrawerHeader className="sr-only">
             <DrawerTitle>سلة المبيعات</DrawerTitle>
             <DrawerDescription>تفاصيل الأصناف وإتمام الدفع</DrawerDescription>
           </DrawerHeader>
-          <div className="flex-1 overflow-hidden h-full flex flex-col pt-2">
+          <div className="flex h-full flex-1 flex-col overflow-hidden pt-2">
             <CartPanel
               items={cartItems}
               customer={selectedCustomer}
@@ -1297,11 +1259,11 @@ export function PosLayout() {
         /*
           [T4f] A thermal print with no confirmed printer width on this device
           lands here. The success dialog is CLOSED first, deliberately: the
-          printer popover lives in the top bar, and a modal Radix dialog makes
-          everything behind it inert — so opening the popover without closing
-          this dialog would render it unreachable. Closing the dialog reveals
-          the popover (and the receipt is already saved locally, so nothing is
-          lost by dismissing it).
+          printer popover lives in the command bar, and a modal Radix dialog
+          makes everything behind it inert — so opening the popover without
+          closing this dialog would render it unreachable. Closing the dialog
+          reveals the popover (and the receipt is already saved locally, so
+          nothing is lost by dismissing it).
         */
         onPrinterSetupRequired={() => {
           setIsSuccessModalOpen(false);
@@ -1310,14 +1272,14 @@ export function PosLayout() {
       />
 
       {/*
-        [ADDED] Camera barcode scanner — continuous mode so the cashier can
-        scan multiple items back-to-back without reopening this dialog per
-        item. feedback="silent" because this screen produces its own
-        feedback: a beep/vibration per scan, plus the live panel below the
-        video (last result with the line's quantity, the latest cart lines
-        with − / ×, the running total and an undo button) — see
-        ScanSessionPanel. Toasts are deliberately NOT used on the camera path:
-        they would pile up over the video.
+        Camera barcode scanner — continuous mode so the cashier can scan
+        multiple items back-to-back without reopening this dialog per item.
+        feedback="silent" because this screen produces its own feedback: a
+        beep/vibration per scan, plus the live panel below the video (last
+        result with the line's quantity, the latest cart lines with − / ×, the
+        running total and an undo button) — see ScanSessionPanel. Toasts are
+        deliberately NOT used on the camera path: they would pile up over the
+        video.
       */}
       <BarcodeScannerModal
         open={barcodeScannerOpen}
@@ -1335,7 +1297,7 @@ export function PosLayout() {
           banner={scanBanner}
           bannerQty={scanBannerQty}
           items={cartItems}
-          totalLabel={`${formatMoney(cartTotals.totalSYP, "SYP")} ل.س`}
+          totalLabel={`${fmtMoney(cartTotals.totalSYP, "SYP")} ل.س`}
           canUndo={scanStack.length > 0}
           onUndo={handleUndoLastScan}
           onDecrement={(cartId) => handleUpdateQuantity(cartId, -1)}

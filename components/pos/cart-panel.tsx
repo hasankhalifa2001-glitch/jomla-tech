@@ -1,8 +1,30 @@
 "use client";
 
-import { useMemo } from "react";
+/**
+ * components/pos/cart-panel.tsx
+ *
+ * Same props and same behaviour as before — only the presentation changed:
+ * light-only slate + emerald (matching the dashboard), Latin digits through
+ * <Money>, the "clear cart" action moved up to the header (away from the
+ * checkout button), and the total + checkout merged into one hero card that
+ * turns emerald when the sale is ready to go.
+ */
+
+import { useEffect, useMemo, useRef } from "react";
+import {
+  AlertTriangle,
+  ChevronLeft,
+  CreditCard,
+  Info,
+  Minus,
+  Plus,
+  ShoppingCart,
+  Trash2,
+  User,
+  UserPlus,
+} from "lucide-react";
+
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Select,
   SelectContent,
@@ -11,17 +33,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  ShoppingCart,
-  Trash2,
-  Plus,
-  Minus,
-  User,
-  AlertTriangle,
-  Info,
-  UserPlus,
-  CreditCard,
-} from "lucide-react";
-import {
   calculateCartTotals,
   resolveUnitPriceSYP,
   isSystemCashCustomer,
@@ -29,7 +40,10 @@ import {
   type CartLineItem,
   type SelectedCustomer,
 } from "@/lib/offline";
-import { formatMoney, compareMoney } from "@/lib/utils/money";
+import { compareMoney } from "@/lib/utils/money";
+import { cn } from "@/lib/utils";
+import { fmtInt, fmtMoney } from "@/lib/utils/digits";
+import { Money } from "./money";
 
 interface CartPanelProps {
   items: CartLineItem[];
@@ -45,11 +59,9 @@ interface CartPanelProps {
   isMobileDrawer?: boolean;
 }
 
-// [v3.6] FIX — same currency-primacy flip as ProductCatalog.tsx. Was
-// resolveUnitPriceUSD (USD-primary); now resolveUnitPriceSYP so the unit
-// switcher below shows the same authoritative price the cart/invoice
-// actually bills. Returns null (instead of throwing) when a USD-priced
-// unit has no valid cached exchange rate to convert into SYP with.
+// [v3.6] Same currency-primacy as the catalog: the unit switcher shows the SYP
+// price the cart/invoice actually bills. Returns null (instead of throwing)
+// when a USD-priced unit has no valid cached exchange rate to convert with.
 function resolvePriceOrNull(
   unit: CartLineItem["product"]["units"][number],
   product: CartLineItem["product"],
@@ -75,29 +87,20 @@ export function CartPanel({
   onOpenPaymentModal,
   isMobileDrawer = false,
 }: CartPanelProps) {
-  // [v3.4] Compute all totals through decimal.js wrappers
-  const totals = useMemo(() => {
-    return calculateCartTotals(items, exchangeRate);
-  }, [items, exchangeRate]);
+  // [v3.4] All totals go through decimal.js wrappers.
+  const totals = useMemo(() => calculateCartTotals(items, exchangeRate), [items, exchangeRate]);
 
-  const isRateMissing =
-    exchangeRate === null || compareMoney(exchangeRate, 0) <= 0;
+  const isRateMissing = exchangeRate === null || compareMoney(exchangeRate, 0) <= 0;
   const isCartEmpty = items.length === 0;
 
-  // [T4b FIX] A missing exchange rate is only a BLOCKER when the cart
-  // actually contains a USD-priced unit (the one case where a SYP figure
-  // cannot be computed without a rate). A SYP-only cart never needs a
-  // rate. Previously `isRateMissing` alone drove the red banner AND the
-  // disabled checkout button, blocking every sale on a tenant that had
-  // not yet entered a rate, even for SYP-only carts — contradicting T4b.
+  // [T4b] A missing exchange rate only BLOCKS when the cart contains a
+  // USD-priced unit; a SYP-only cart never needs a rate.
   const rateRequired = useMemo(() => cartNeedsExchangeRate(items), [items]);
   const isRateBlocking = rateRequired && isRateMissing;
   const isCheckoutDisabled = isCartEmpty || isRateBlocking;
+  const ready = !isCheckoutDisabled;
 
-  // [v3.6] Map item IDs to their calculated line totals for fast lookup.
-  // `syp` is authoritative (never null); `usd` is derived/display-only
-  // and may be null with no cached rate — flipped from the pre-v3.6 shape
-  // where `usd` was assumed always present and `syp` was the nullable one.
+  // [v3.6] `syp` is authoritative (never null); `usd` is derived and may be null.
   const lineTotalsMap = useMemo(() => {
     const map = new Map<string, { syp: string; usd: string | null }>();
     for (const lt of totals.lineItems) {
@@ -106,126 +109,147 @@ export function CartPanel({
     return map;
   }, [totals.lineItems]);
 
+  // When a line is ADDED, bring the new line into view (it is appended at the
+  // bottom of a scrolling list).
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const prevCount = useRef(items.length);
+  useEffect(() => {
+    const grew = items.length > prevCount.current;
+    prevCount.current = items.length;
+    if (!grew) return;
+    const el = listRef.current;
+    if (!el) return;
+    const reduce =
+      typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    el.scrollTo({ top: el.scrollHeight, behavior: reduce ? "auto" : "smooth" });
+  }, [items.length]);
+
   const isSystemCustomer = isSystemCashCustomer(customer);
   const customerLabel = isSystemCustomer
     ? customer?.name || "زبون نقدي عام"
     : customer
       ? customer.name
       : "لم يتم اختيار زبون";
-  const customerSubLabel = customer?.shopName ||
+  const customerSubLabel =
+    customer?.shopName ||
     customer?.phone ||
     (isSystemCustomer
-      ? "مبيعات نقدية مباشرة (مسموح بالدفع الكامل فقط)"
-      : "يجب اختيار زبون حقيقي للبيع على الحساب أو الدفع الجزئي");
+      ? "مبيعات نقدية مباشرة — الدفع الكامل فقط"
+      : "اختر زبوناً للبيع على الحساب أو الدفع الجزئي");
 
   return (
     <div
-      className={`flex flex-col h-full bg-white dark:bg-zinc-900 overflow-hidden ${isMobileDrawer
-        ? "rounded-t-2xl"
-        : "rounded-2xl border border-zinc-200 dark:border-zinc-800 shadow-xs"
-        }`}
+      className={cn(
+        "flex h-full min-h-0 flex-col overflow-hidden bg-white",
+        isMobileDrawer ? "rounded-t-2xl" : "rounded-xl border border-slate-200 shadow-sm"
+      )}
     >
-      {/* 1. Header with Active Customer Information */}
-      <div className="p-3.5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/80 dark:bg-zinc-850/50 shrink-0">
+      {/* ----------------------------------------------------- header */}
+      <div className="shrink-0 border-b border-slate-100 px-3.5 pb-3 pt-3.5">
         <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2.5 overflow-hidden">
-            <div
-              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${isSystemCustomer
-                ? "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
-                }`}
-            >
-              <User className="h-4 w-4" />
-            </div>
-            <div className="flex flex-col truncate">
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate">
-                  {customerLabel}
-                </span>
-                {customer?.type === "WALK_IN" && (
-                  <Badge
-                    variant="outline"
-                    className="text-[9px] px-1 py-0 text-amber-600 border-amber-300 bg-amber-50 dark:bg-amber-950/50"
-                  >
-                    زبون محلي
-                  </Badge>
-                )}
-                {isSystemCustomer && (
-                  <Badge
-                    variant="outline"
-                    className="text-[9px] px-1 py-0 text-zinc-500 border-zinc-300 bg-zinc-50 dark:bg-zinc-800"
-                  >
-                    نقدي فوري
-                  </Badge>
-                )}
-              </div>
-              <span className="text-[10px] text-zinc-500 truncate">
-                {customerSubLabel}
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-extrabold text-slate-900">سلة المبيعات</h2>
+            {!isCartEmpty && (
+              <span
+                key={items.length}
+                className="animate-in rounded-full bg-emerald-600 px-2 py-0.5 text-[11px] font-extrabold tabular-nums text-white duration-200 zoom-in-75 motion-reduce:animate-none"
+              >
+                {fmtInt(items.length)}
               </span>
-            </div>
+            )}
           </div>
 
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={onOpenCustomerModal}
-            className="text-xs h-9 gap-1 border-zinc-300 dark:border-zinc-700 shrink-0"
-            title="تحديد أو تسجيل زبون (F4)"
-          >
-            <UserPlus className="h-3.5 w-3.5 text-emerald-600" />
-            <span>تغيير (F4)</span>
-          </Button>
+          {!isCartEmpty && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onClearCart}
+              className="h-8 gap-1 px-2 text-xs font-semibold text-slate-500 hover:bg-red-50 hover:text-red-600"
+              title="إفراغ السلة بالكامل"
+              aria-label="إفراغ السلة بالكامل"
+            >
+              <Trash2 className="size-3.5" aria-hidden />
+              إفراغ
+            </Button>
+          )}
         </div>
+
+        {/* The whole row is the tap target for "change customer". */}
+        <button
+          type="button"
+          onClick={onOpenCustomerModal}
+          title="تحديد أو تسجيل زبون (F4)"
+          className="mt-2.5 flex w-full items-center gap-2.5 rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-start transition-colors hover:border-emerald-300 hover:bg-emerald-50/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50"
+        >
+          <span
+            className={cn(
+              "flex size-9 shrink-0 items-center justify-center rounded-lg",
+              isSystemCustomer ? "bg-slate-200 text-slate-600" : "bg-emerald-100 text-emerald-700"
+            )}
+            aria-hidden
+          >
+            <User className="size-4" />
+          </span>
+
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-1.5">
+              <span className="truncate text-[13px] font-extrabold text-slate-900">{customerLabel}</span>
+              {customer?.type === "WALK_IN" && (
+                <span className="shrink-0 rounded-full bg-amber-50 px-1.5 py-px text-[10px] font-bold text-amber-700 ring-1 ring-amber-200">
+                  زبون محلي
+                </span>
+              )}
+              {isSystemCustomer && (
+                <span className="shrink-0 rounded-full bg-slate-200 px-1.5 py-px text-[10px] font-bold text-slate-600">
+                  نقدي فوري
+                </span>
+              )}
+            </span>
+            <span className="block truncate text-[11px] text-slate-500">{customerSubLabel}</span>
+          </span>
+
+          <span className="flex shrink-0 items-center gap-1 text-xs font-bold text-emerald-700">
+            <UserPlus className="size-3.5" aria-hidden />
+            تغيير
+            <kbd className="hidden rounded border border-slate-200 bg-white px-1 font-mono text-[10px] font-normal text-slate-500 lg:inline-flex">
+              F4
+            </kbd>
+          </span>
+        </button>
       </div>
 
-      {/* 2. Cart Items List */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+      {/* -------------------------------------------------- line items */}
+      <div ref={listRef} className="min-h-0 flex-1 space-y-2.5 overflow-y-auto bg-slate-50/60 p-3">
         {isCartEmpty ? (
-          <div className="flex flex-col items-center justify-center h-full py-12 text-center text-zinc-400 space-y-2">
-            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800">
-              <ShoppingCart className="h-6 w-6 text-zinc-400" />
-            </div>
-            <p className="text-xs font-bold text-zinc-600 dark:text-zinc-400">
-              السلة فارغة حالياً
-            </p>
-            <p className="text-[11px] text-zinc-400 max-w-xs">
-              انقر على أي صنف أو وحدة لإضافتها، أو امسح الباركود مباشرة.
+          <div className="flex h-full flex-col items-center justify-center gap-2 py-10 text-center">
+            <span className="flex size-12 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+              <ShoppingCart className="size-6" aria-hidden />
+            </span>
+            <p className="text-sm font-extrabold text-slate-700">السلة فارغة</p>
+            <p className="max-w-xs text-xs leading-relaxed text-slate-500">
+              اضغط على وحدة أي صنف لإضافتها، أو امسح الباركود مباشرة.
             </p>
           </div>
         ) : (
           items.map((item) => {
-            // [v3.6] `syp` is authoritative (never null); `usd` may be
-            // null. The old default `{ usd: "0.0000", syp: null }` is
-            // flipped accordingly.
-            const lineTotal = lineTotalsMap.get(item.id) || {
-              syp: "0.0000",
-              usd: null,
-            };
+            const lineTotal = lineTotalsMap.get(item.id) || { syp: "0.0000", usd: null };
 
             return (
               <div
                 key={item.id}
-                className="rounded-xl border border-zinc-200 bg-white p-3 space-y-2 dark:border-zinc-800 dark:bg-zinc-900/90 shadow-2xs hover:border-zinc-300 dark:hover:border-zinc-700 transition-colors"
+                className="animate-in rounded-xl border border-slate-200 bg-white p-3 shadow-sm duration-300 fade-in-0 slide-in-from-top-2 motion-reduce:animate-none"
               >
-                {/* Top Row: Name, Price, and Delete Button */}
+                {/* name + unit price + delete */}
                 <div className="flex items-start justify-between gap-2">
-                  <div className="space-y-0.5 truncate flex-1">
-                    <p className="text-sm font-bold text-zinc-900 dark:text-zinc-100 truncate">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-extrabold text-slate-900">
                       {item.product.name}
                     </p>
-                    {/*
-                      [v3.6] The always-present, authoritative price is
-                      unitPriceSYP (pos-service.ts); unitPriceUSD is a
-                      nullable derived field, shown only when an exchange
-                      rate was cached. Reading a nullable field as if it
-                      were always present would call formatMoney(null, …).
-                    */}
-                    <div className="flex items-center gap-2 text-[11px] text-zinc-400">
-                      <span className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">
-                        سعر الجملة: <span dir="ltr">{formatMoney(item.unitPriceSYP, "SYP")}</span> ل.س
-                      </span>
-                    </div>
+                    <p className="mt-0.5 flex items-center gap-1 text-[11px] text-slate-500">
+                      <span>سعر الجملة</span>
+                      <Money value={item.unitPriceSYP} compact className="font-bold text-emerald-700" />
+                    </p>
                   </div>
 
                   <Button
@@ -233,115 +257,96 @@ export function CartPanel({
                     variant="ghost"
                     size="icon"
                     onClick={() => onRemoveItem(item.id)}
-                    // [UX — touch target] 40px on mobile, 32px from `sm:` up:
-                    // a deliberate, comfortable tap for a destructive action
-                    // next to the product name. (A hasty delete can be undone
-                    // from the toast the POS screen shows.)
-                    className="h-10 w-10 sm:h-8 sm:w-8 text-zinc-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 shrink-0"
+                    // 40px on mobile, 32px from `sm:` up.
+                    className="-me-1 -mt-1 size-10 shrink-0 text-slate-400 hover:bg-red-50 hover:text-red-600 sm:size-8"
                     title="حذف من السلة"
                     aria-label="حذف من السلة"
                   >
-                    <Trash2 className="h-4 w-4" />
+                    <Trash2 className="size-4" />
                   </Button>
                 </div>
 
-                {/*
-                  [FIX — mobile/narrow-column overflow] Two independent
-                  rows so neither exceeds ~300px:
-                  - Row 1: unit selector (flex-1, can shrink/truncate) +
-                    quantity stepper (shrink-0).
-                  - Row 2: line totals, right-aligned.
-                */}
-                <div className="pt-1 border-t border-zinc-100 dark:border-zinc-800 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    {/* Unit Selector */}
-                    <div className="flex-1 min-w-0">
-                      <Select
-                        value={item.unitId}
-                        onValueChange={(newUnitId) =>
-                          onChangeUnit(item.id, newUnitId)
-                        }
-                      >
-                        <SelectTrigger className="h-10 sm:h-8 text-xs px-2 bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700">
-                          <SelectValue placeholder="الوحدة" />
-                        </SelectTrigger>
-                        <SelectContent dir="rtl">
-                          {item.product.units?.filter((u) => u.isActive !== false).map((u) => {
+                {/* unit selector + quantity stepper */}
+                <div className="mt-2.5 flex items-center justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <Select
+                      value={item.unitId}
+                      onValueChange={(newUnitId) => onChangeUnit(item.id, newUnitId)}
+                    >
+                      <SelectTrigger className="h-10 w-full border-slate-200 bg-slate-50 px-2.5 text-xs font-semibold sm:h-9">
+                        <SelectValue placeholder="الوحدة" />
+                      </SelectTrigger>
+                      <SelectContent dir="rtl">
+                        {item.product.units
+                          ?.filter((u) => u.isActive !== false)
+                          .map((u) => {
                             const unitPriceSYP = resolvePriceOrNull(u, item.product, exchangeRate);
                             return (
-                              <SelectItem
-                                key={u.id}
-                                value={u.id}
-                                className="text-xs"
-                              >
+                              <SelectItem key={u.id} value={u.id} className="text-xs">
                                 {u.unitName}{" "}
                                 {unitPriceSYP !== null
-                                  ? `(${formatMoney(unitPriceSYP, "SYP")} ل.س)`
+                                  ? `(${fmtMoney(unitPriceSYP, "SYP")} ل.س)`
                                   : "(يتطلب سعر الصرف)"}
                               </SelectItem>
                             );
                           })}
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    {/* Quantity Stepper — 40px targets on mobile, 32px from sm: up */}
-                    <div className="flex items-center rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => onUpdateQuantity(item.id, -1)}
-                        className="flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                        title="إنقاص الكمية"
-                        aria-label="إنقاص الكمية"
-                      >
-                        <Minus className="h-4 w-4" />
-                      </button>
-                      <input
-                        type="number"
-                        min="1"
-                        inputMode="numeric"
-                        value={item.quantity}
-                        // Select the whole number on focus so typing REPLACES it
-                        // (the field ignores an empty value, so it can't be
-                        // cleared by backspacing).
-                        onFocus={(e) => e.target.select()}
-                        onChange={(e) => {
-                          const val = parseInt(e.target.value, 10);
-                          if (!isNaN(val) && val >= 1) {
-                            onSetQuantity(item.id, val);
-                          }
-                        }}
-                        className="h-10 sm:h-8 w-10 text-center font-bold text-sm bg-transparent border-0 focus:outline-none tabular-nums"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => onUpdateQuantity(item.id, 1)}
-                        className="flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                        title="زيادة الكمية"
-                        aria-label="زيادة الكمية"
-                      >
-                        <Plus className="h-4 w-4" />
-                      </button>
-                    </div>
+                      </SelectContent>
+                    </Select>
                   </div>
 
-                  {/*
-                    [v3.6] SYP is the primary/large line total; USD is the
-                    secondary "≈" derived figure and only rendered when
-                    not null.
-                  */}
-                  <div className="flex items-baseline justify-end gap-2">
-                    <p className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400">
-                      <span dir="ltr">{formatMoney(lineTotal.syp, "SYP")}</span> ل.س
-                    </p>
+                  <div className="flex shrink-0 items-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
+                    <button
+                      type="button"
+                      onClick={() => onUpdateQuantity(item.id, -1)}
+                      className="flex size-10 items-center justify-center text-slate-500 transition-colors hover:bg-white hover:text-slate-900 active:bg-slate-100 sm:size-9"
+                      title="إنقاص الكمية"
+                      aria-label="إنقاص الكمية"
+                    >
+                      <Minus className="size-4" />
+                    </button>
+                    <input
+                      type="number"
+                      min="1"
+                      inputMode="numeric"
+                      lang="en"
+                      dir="ltr"
+                      aria-label="الكمية"
+                      value={item.quantity}
+                      // Select the whole number on focus so typing REPLACES it
+                      // (the field ignores an empty value, so it can't be
+                      // cleared by backspacing).
+                      onFocus={(e) => e.target.select()}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value, 10);
+                        if (!isNaN(val) && val >= 1) {
+                          onSetQuantity(item.id, val);
+                        }
+                      }}
+                      className="h-10 w-11 border-0 bg-transparent text-center text-sm font-extrabold tabular-nums text-slate-900 [appearance:textfield] focus:outline-none sm:h-9 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => onUpdateQuantity(item.id, 1)}
+                      className="flex size-10 items-center justify-center text-slate-500 transition-colors hover:bg-emerald-50 hover:text-emerald-700 active:bg-emerald-100 sm:size-9"
+                      title="زيادة الكمية"
+                      aria-label="زيادة الكمية"
+                    >
+                      <Plus className="size-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* line total — SYP primary, USD secondary (may be null) */}
+                <div className="mt-2.5 flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
+                  <span className="text-[11px] font-semibold text-slate-500">الإجمالي</span>
+                  <span className="flex items-baseline gap-2">
                     {lineTotal.usd !== null && (
-                      <p className="text-[11px] text-purple-600 dark:text-purple-400 font-semibold">
-                        <span dir="ltr" className="inline-block">
-                          ≈ ${formatMoney(lineTotal.usd, "USD")}
-                        </span>
-                      </p>
+                      <span className="text-[11px] font-semibold text-purple-600">
+                        ≈ <Money value={lineTotal.usd} currency="USD" />
+                      </span>
                     )}
-                  </div>
+                    <Money value={lineTotal.syp} className="text-sm font-extrabold text-emerald-700" />
+                  </span>
                 </div>
               </div>
             );
@@ -349,120 +354,112 @@ export function CartPanel({
         )}
       </div>
 
-      {/*
-        3. Exchange Rate notices.
-        [T4b FIX] Two distinct states instead of one blanket blocker:
-        - isRateBlocking (a USD-priced line is in the cart AND no rate):
-          RED, the sale really is stopped.
-        - rate missing but the cart is SYP-only (or empty): AMBER and
-          informational — SYP sales work normally, only the USD
-          equivalent is unavailable.
-      */}
+      {/* ------------------------------------------------ rate notices
+                [T4b] Two distinct states:
+                - isRateBlocking (a USD-priced line AND no rate): RED, the sale
+                  really is stopped.
+                - rate missing but the cart is SYP-only (or empty): AMBER,
+                  informational — SYP sales work normally. */}
       {isRateBlocking && (
-        <div className="m-3 p-3 rounded-xl border border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/60 dark:text-red-200 text-xs space-y-1 shrink-0">
-          <div className="flex items-center gap-1.5 font-bold">
-            <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
+        <div className="mx-3 mt-3 shrink-0 space-y-1 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+          <div className="flex items-center gap-1.5 font-extrabold">
+            <AlertTriangle className="size-4 shrink-0 text-red-600" aria-hidden />
             <span>لا يمكن إتمام البيع: سعر الصرف اليومي غير محدد</span>
           </div>
-          <p className="text-[11px] leading-relaxed text-red-700 dark:text-red-300">
-            يوجد في السلة صنف مسعّر بالدولار، ولا يمكن تحويله إلى الليرة بدون
-            سعر صرف. يرجى تحديد سعر الصرف من الشريط العلوي، أو حذف هذا الصنف
-            من السلة.
+          <p className="text-[11px] leading-relaxed text-red-700">
+            يوجد في السلة صنف مسعّر بالدولار ولا يمكن تحويله إلى الليرة بدون سعر صرف. حدّد سعر الصرف من
+            الشريط العلوي، أو احذف هذا الصنف من السلة.
           </p>
         </div>
       )}
       {isRateMissing && !rateRequired && (
-        <div className="m-3 p-2.5 rounded-xl border border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/50 dark:text-amber-200 text-xs shrink-0">
+        <div className="mx-3 mt-3 shrink-0 rounded-xl border border-amber-200 bg-amber-50 p-2.5 text-amber-800">
           <div className="flex items-start gap-1.5">
-            <Info className="h-4 w-4 text-amber-600 shrink-0 mt-px" />
+            <Info className="mt-px size-4 shrink-0 text-amber-600" aria-hidden />
             <p className="text-[11px] leading-relaxed">
-              سعر الصرف غير محدد. البيع بالليرة السورية متاح بشكل طبيعي، لكن
-              المعادل بالدولار غير متاح. حدّد سعر الصرف من الشريط العلوي لعرضه.
+              سعر الصرف غير محدد. البيع بالليرة السورية متاح بشكل طبيعي، لكن المعادل بالدولار غير متاح.
+              حدّد سعر الصرف من الشريط العلوي لعرضه.
             </p>
           </div>
         </div>
       )}
 
-      {/* 4. Totals & Checkout Actions */}
-      <div className="p-3.5 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50/80 dark:bg-zinc-850/60 space-y-3 shrink-0">
-        {/*
-          [UX] The grand total is THE number on this panel: one big SYP figure,
-          with the counts above it as a quiet single line (the old
-          "عدد الأصناف في السلة (N قطعة)" row said the same thing twice) and the
-          USD equivalent below as secondary information.
-          [v3.6] SYP is authoritative; USD may be null (no cached rate).
-        */}
-        <div className="rounded-xl border border-zinc-200 bg-white p-3.5 dark:border-zinc-750 dark:bg-zinc-900 space-y-1.5 shadow-2xs">
-          <p className="text-[11px] text-zinc-500">
-            {items.length} أصناف · {totals.itemCount} قطعة
+      {/* ------------------------------------- total + checkout (hero) */}
+      <div className="shrink-0 bg-white p-3">
+        <div
+          className={cn(
+            "rounded-xl border p-3.5 transition-colors duration-300",
+            ready
+              ? "border-emerald-700 bg-linear-to-br from-emerald-600 to-emerald-800 text-white shadow-md shadow-emerald-900/20"
+              : "border-slate-200 bg-slate-100 text-slate-600"
+          )}
+        >
+          <p className={cn("text-[11px]", ready ? "text-emerald-100" : "text-slate-500")}>
+            {fmtInt(items.length)} أصناف · {fmtInt(totals.itemCount)} قطعة
           </p>
 
-          <div className="flex items-end justify-between gap-3">
-            <span className="text-xs font-bold text-zinc-600 dark:text-zinc-400">
+          <div className="mt-1 flex items-end justify-between gap-3">
+            <span className={cn("text-xs font-bold", ready ? "text-emerald-50" : "text-slate-600")}>
               المجموع الإجمالي
             </span>
-            <span className="text-2xl font-extrabold leading-none text-emerald-600 dark:text-emerald-400 tabular-nums">
-              <span dir="ltr">{formatMoney(totals.totalSYP, "SYP")}</span>{" "}
-              <span className="text-sm font-bold">ل.س</span>
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between pt-1.5 border-t border-zinc-100 dark:border-zinc-800">
-            <span className="text-xs text-zinc-500">المعادل بالدولار</span>
-            <span className="text-sm font-bold text-purple-600 dark:text-purple-400 tabular-nums">
-              {totals.totalUSD !== null ? (
-                <span dir="ltr" className="inline-block">
-                  ${formatMoney(totals.totalUSD, "USD")}
-                </span>
-              ) : (
-                <span className="text-xs font-medium text-zinc-400">غير متاح (لا يوجد سعر صرف)</span>
-              )}
-            </span>
-          </div>
-        </div>
-
-        {/* Buttons: Checkout & Clear */}
-        <div className="flex items-center gap-2">
-          {!isCartEmpty && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={onClearCart}
-              className="h-12 px-3 text-xs text-zinc-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 border-zinc-300 dark:border-zinc-700 shrink-0"
-              title="إفراغ السلة بالكامل"
-              aria-label="إفراغ السلة بالكامل"
+            {/* Re-mounts when the total changes: a quick "pop" that says
+                            the figure updated, without ever tweening the digits. */}
+            <span
+              key={totals.totalSYP}
+              className="animate-in duration-200 fade-in-0 zoom-in-95 motion-reduce:animate-none"
             >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          )}
+              <Money
+                value={totals.totalSYP}
+                className="text-2xl font-extrabold leading-none"
+                unitClassName={ready ? "text-emerald-100" : "text-slate-500"}
+              />
+            </span>
+          </div>
 
-          {/* [UX] The button always says WHY it is disabled, instead of just
-              fading out. */}
+          <div
+            className={cn(
+              "mt-2.5 flex items-center justify-between border-t pt-2 text-xs",
+              ready ? "border-white/20 text-emerald-100" : "border-slate-200 text-slate-500"
+            )}
+          >
+            <span>المعادل بالدولار</span>
+            {totals.totalUSD !== null ? (
+              <Money value={totals.totalUSD} currency="USD" className="text-sm font-bold" />
+            ) : (
+              <span className="text-[11px] font-medium">غير متاح (لا يوجد سعر صرف)</span>
+            )}
+          </div>
+
+          {/* The button always says WHY it is disabled instead of just fading out. */}
           <Button
             type="button"
             disabled={isCheckoutDisabled}
             onClick={onOpenPaymentModal}
-            className={`flex-1 h-12 text-sm font-bold shadow-md rounded-xl transition-all ${isCheckoutDisabled
-              ? "bg-zinc-300 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed shadow-none"
-              : "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20"
-              }`}
+            className={cn(
+              "mt-3 h-12 w-full rounded-xl text-sm font-extrabold transition-all",
+              ready
+                ? "bg-white text-emerald-800 shadow-sm hover:bg-emerald-50"
+                : "cursor-not-allowed bg-slate-200 text-slate-500 shadow-none"
+            )}
           >
-            <div className="flex items-center justify-between w-full px-1">
+            <span className="flex w-full items-center justify-between gap-2">
               <span className="flex items-center gap-1.5">
-                <CreditCard className="h-4 w-4" />
+                <CreditCard className="size-4" aria-hidden />
                 {isRateBlocking
                   ? "يلزم سعر صرف لصنف مسعّر بالدولار"
                   : isCartEmpty
                     ? "أضف أصنافاً للسلة أولاً"
-                    : "إتمام البيع والدفع (F9)"}
+                    : "إتمام البيع والدفع"}
               </span>
-              {!isCheckoutDisabled && (
-                <span className="text-xs font-mono font-extrabold bg-emerald-700/50 px-2 py-0.5 rounded-lg">
-                  <span dir="ltr">{formatMoney(totals.totalSYP, "SYP")}</span> ل.س
+              {ready && (
+                <span className="flex items-center gap-1.5">
+                  <kbd className="hidden rounded border border-emerald-200 bg-emerald-50 px-1.5 font-mono text-[10px] font-semibold text-emerald-700 lg:inline-flex">
+                    F9
+                  </kbd>
+                  <ChevronLeft className="size-4" aria-hidden />
                 </span>
               )}
-            </div>
+            </span>
           </Button>
         </div>
       </div>

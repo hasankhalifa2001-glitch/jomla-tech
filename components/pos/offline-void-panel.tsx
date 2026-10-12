@@ -14,11 +14,9 @@ import {
 // comment in sync-worker.ts for why this exists alongside the
 // /api/sync/route.ts classification fix rather than instead of it.
 import { retryFailedInvoice } from "@/lib/offline/sync-worker";
-import { formatMoney } from "@/lib/utils/money";
 import { ReceiptActions } from "@/components/receipts/receipt-actions";
 import { buildLocalReceiptSource } from "@/lib/receipts/local-receipt-source";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -35,13 +33,16 @@ import {
 } from "@/components/ui/drawer";
 import { Textarea } from "@/components/ui/textarea";
 import { CloudOff, AlertTriangle, RefreshCw, ChevronLeft, RotateCw } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { fmtInt, NUMBER_LOCALE } from "@/lib/utils/digits";
+import { Money } from "./money";
 
 /**
  * components/pos/offline-void-panel.tsx
  *
  * T4d v4.1 §6.3 — the ONLY entry point for voiding a local, not-yet-synced
  * invoice. Per the spec, mounted inside pos-layout.tsx directly under the
- * top status bar, so it's visible on both mobile and desktop layouts.
+ * command bar, so it's visible on both mobile and desktop layouts.
  *
  * [REDESIGN — mobile overflow fix] The previous version rendered every
  * pending/failed invoice as a single horizontal row (name + amount +
@@ -54,7 +55,7 @@ import { CloudOff, AlertTriangle, RefreshCw, ChevronLeft, RotateCw } from "lucid
  * offline sales in a day should not have their selling screen buried under
  * 20 stacked invoice rows.
  *
- * New structure, same data/logic underneath (usePendingOfflineInvoices,
+ * Structure, same data/logic underneath (usePendingOfflineInvoices,
  * submitOfflineVoid, canVoidOfflineInvoice, shouldShowOfflineVoidPanel,
  * ReceiptActions, buildLocalReceiptSource — none of that changed):
  *
@@ -72,10 +73,9 @@ import { CloudOff, AlertTriangle, RefreshCw, ChevronLeft, RotateCw } from "lucid
  *      narrow screen instead of overflowing it. The "إلغاء الفاتورة" button
  *      is UNCHANGED in behavior/visibility (still exactly
  *      canVoidOfflineInvoice() + the isAdmin gate — absent, not disabled,
- *      for a CASHIER) — it simply now sits in its own wrapping row instead
- *      of being squeezed into one unbreakable horizontal line.
+ *      for a CASHIER).
  *
- * [ADDED — retry for a FAILED invoice] A FAILED row now also gets an
+ * [ADDED — retry for a FAILED invoice] A FAILED row also gets an
  * "إعادة المحاولة" button in its action row. This is a manual safety net,
  * not a replacement for the real fix: /api/sync/route.ts's
  * isRetryableTxError() was previously blind to raw database CONNECTION
@@ -89,13 +89,9 @@ import { CloudOff, AlertTriangle, RefreshCw, ChevronLeft, RotateCw } from "lucid
  * triggerSync(), scoped to exactly that one invoice.
  *
  * [ASSUMPTION — please confirm/adjust] Import paths for
- * Button/Badge/Dialog/Drawer/Textarea assume a standard shadcn/ui setup
- * under components/ui/**, per T1's Dependencies list (shadcn/ui), and
- * mirror the same Drawer already used for the mobile cart sheet in
- * pos-layout.tsx. If this project's actual component paths or prop names
- * differ, only these import lines and the JSX prop names below need
- * adjusting — nothing else in this file (the data flow, the guards, the
- * role gate) depends on their exact shape.
+ * Button/Dialog/Drawer/Textarea assume a standard shadcn/ui setup under
+ * components/ui/**, per T1's Dependencies list (shadcn/ui), and mirror the
+ * same Drawer already used for the mobile cart sheet in pos-layout.tsx.
  *
  * Strict separation (T4d v4.1 §6.4): this file NEVER imports anything
  * from components/sales-log/**, and never references POST
@@ -113,6 +109,9 @@ import { CloudOff, AlertTriangle, RefreshCw, ChevronLeft, RotateCw } from "lucid
  * exactly (T4c2). `isAdmin` is passed in from the caller's own session
  * context — this component has no session access of its own, matching
  * every other role-gated component in this codebase.
+ *
+ * [STYLE] Light-only slate/amber (matching the dashboard); amounts go
+ * through <Money> so digits are Latin.
  */
 
 export interface OfflineVoidPanelProps {
@@ -132,6 +131,31 @@ export interface OfflineVoidPanelProps {
    * moment, to POST the same pending batch to /api/sync.
    */
   triggerSync: () => Promise<void>;
+}
+
+/** A small status pill. */
+function Pill({
+  tone,
+  children,
+  className,
+}: {
+  tone: "amber" | "red" | "slate";
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-bold",
+        tone === "amber" && "bg-amber-100 text-amber-800 ring-1 ring-amber-200",
+        tone === "red" && "bg-red-100 text-red-700 ring-1 ring-red-200",
+        tone === "slate" && "bg-slate-100 text-slate-600 ring-1 ring-slate-200",
+        className
+      )}
+    >
+      {children}
+    </span>
+  );
 }
 
 export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoidPanelProps) {
@@ -227,71 +251,69 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
         pending/failed invoices exist. This is the ONLY part of this
         component that renders inline in the main POS layout at all times.
       */}
-      <div className="flex items-center justify-between gap-2 rounded-2xl border border-amber-300 bg-amber-50 px-3 py-2 dark:border-amber-900 dark:bg-amber-950/40">
-        <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+      <div
+        className={cn(
+          "flex items-center justify-between gap-2 rounded-xl border px-3 py-2",
+          failedCount > 0 ? "border-red-200 bg-red-50" : "border-amber-200 bg-amber-50"
+        )}
+      >
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           {pendingCount > 0 && (
-            <Badge
-              variant="outline"
-              className="gap-1 px-2 py-0.5 text-[11px] border-amber-300 bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-800 font-semibold whitespace-nowrap"
-            >
-              <CloudOff className="h-3 w-3 text-amber-600" />
-              <span>{pendingCount} بانتظار المزامنة</span>
-            </Badge>
+            <Pill tone="amber">
+              <CloudOff className="size-3 text-amber-600" aria-hidden />
+              {fmtInt(pendingCount)} بانتظار المزامنة
+            </Pill>
           )}
           {failedCount > 0 && (
-            <Badge
-              variant="destructive"
-              className="gap-1 px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap"
-            >
-              <AlertTriangle className="h-3 w-3" />
-              <span>{failedCount} فشلت المزامنة</span>
-            </Badge>
+            <Pill tone="red">
+              <AlertTriangle className="size-3" aria-hidden />
+              {fmtInt(failedCount)} فشلت المزامنة
+            </Pill>
           )}
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex shrink-0 items-center gap-1.5">
           <Button
             type="button"
             variant="outline"
             size="sm"
             onClick={handleManualSync}
             disabled={isSyncing}
-            className="h-8 text-xs gap-1.5 text-amber-800 border-amber-300 hover:bg-amber-100 dark:text-amber-300 dark:border-amber-800"
+            aria-label="مزامنة الآن"
+            className="h-9 gap-1.5 border-amber-300 bg-white text-xs font-bold text-amber-800 hover:bg-amber-100"
           >
-            <RefreshCw className={`h-3.5 w-3.5 ${isSyncing ? "animate-spin" : ""}`} />
+            <RefreshCw className={cn("size-3.5", isSyncing && "animate-spin")} aria-hidden />
             <span className="hidden sm:inline">مزامنة الآن</span>
           </Button>
           <Button
             type="button"
             size="sm"
             onClick={() => setIsDetailsOpen(true)}
-            className="h-8 text-xs gap-1 bg-amber-600 hover:bg-amber-700 text-white"
+            className="h-9 gap-1 bg-amber-600 text-xs font-bold text-white shadow-sm hover:bg-amber-700"
           >
-            <span>عرض التفاصيل</span>
-            <ChevronLeft className="h-3.5 w-3.5" />
+            عرض التفاصيل
+            <ChevronLeft className="size-3.5" aria-hidden />
           </Button>
         </div>
       </div>
 
       {/*
-        [ADDED] The full invoice list lives ONLY inside this drawer now —
-        it never renders inline in the main POS layout, so it can never
-        push the search/cart/checkout UI around no matter how many pending
-        invoices exist.
+        [ADDED] The full invoice list lives ONLY inside this drawer — it never
+        renders inline in the main POS layout, so it can never push the
+        search/cart/checkout UI around no matter how many pending invoices
+        exist.
       */}
       <Drawer open={isDetailsOpen} onOpenChange={setIsDetailsOpen}>
-        <DrawerContent className="max-h-[85vh] p-0" dir="rtl">
-          <DrawerHeader className="text-right px-4 pt-4 pb-2">
-            <DrawerTitle className="text-amber-800 dark:text-amber-300">
-              فواتير لم تتم مزامنتها
-            </DrawerTitle>
-            <DrawerDescription>
-              بينها {originals.length} فاتورة بيع قابلة للإلغاء، و{localVoids.length} فاتورة
+        <DrawerContent className="max-h-[85dvh] p-0" dir="rtl">
+          <DrawerHeader className="px-4 pb-2 pt-4 text-start">
+            <DrawerTitle className="text-base font-extrabold text-slate-900">فواتير لم تتم مزامنتها</DrawerTitle>
+            <DrawerDescription className="text-xs text-slate-500">
+              بينها {fmtInt(originals.length)} فاتورة بيع قابلة للإلغاء، و{fmtInt(localVoids.length)} فاتورة
               إلغاء بانتظار التزامن.
             </DrawerDescription>
           </DrawerHeader>
 
-          <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-2">
+          <div className="flex-1 space-y-2.5 overflow-y-auto bg-slate-50/60 px-4 pb-4 pt-3">
             {rows.map((row) => {
               const canVoid = canVoidOfflineInvoice(
                 {
@@ -301,47 +323,38 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
                 isAdmin,
                 row.hasLocalVoid
               );
+              const isFailed = row.invoice.status === "FAILED";
 
               return (
                 <div
                   key={row.invoice.offlineId}
-                  className="rounded-xl border border-amber-200 bg-white p-3 space-y-2 dark:border-amber-900 dark:bg-zinc-900"
+                  className={cn(
+                    "space-y-2.5 rounded-xl border bg-white p-3 shadow-sm",
+                    isFailed ? "border-red-200" : "border-slate-200"
+                  )}
                 >
                   {/* Row 1: customer name + time */}
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-sm font-bold text-zinc-800 dark:text-zinc-200 truncate">
-                      {row.customerName}
-                    </span>
-                    <span className="text-xs text-zinc-400 whitespace-nowrap shrink-0">
-                      {row.invoice.createdAt.toLocaleTimeString("ar-SY")}
+                    <span className="truncate text-sm font-extrabold text-slate-900">{row.customerName}</span>
+                    <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-slate-500">
+                      {row.invoice.createdAt.toLocaleTimeString(NUMBER_LOCALE, {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
                     </span>
                   </div>
 
                   {/* Row 2: amount + status badges — wraps if narrow */}
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <span className="font-bold text-emerald-600 font-mono">
-                      {formatMoney(row.invoice.totalSYP, "SYP")} ل.س
-                    </span>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {row.invoice.status === "FAILED" ? (
-                        <Badge variant="destructive" className="text-[10px]">
-                          {row.invoice.failureReason || "فشل"}
-                        </Badge>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Money value={row.invoice.totalSYP} className="text-base font-extrabold text-emerald-700" />
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {isFailed ? (
+                        <Pill tone="red">{row.invoice.failureReason || "فشل"}</Pill>
                       ) : (
-                        <Badge variant="outline" className="text-[10px]">
-                          بانتظار المزامنة
-                        </Badge>
+                        <Pill tone="amber">بانتظار المزامنة</Pill>
                       )}
-                      {row.isLocalVoid && (
-                        <Badge variant="secondary" className="text-[10px]">
-                          فاتورة إلغاء محلية
-                        </Badge>
-                      )}
-                      {!row.isLocalVoid && row.hasLocalVoid && (
-                        <Badge variant="secondary" className="text-[10px]">
-                          ملغاة محلياً
-                        </Badge>
-                      )}
+                      {row.isLocalVoid && <Pill tone="slate">فاتورة إلغاء محلية</Pill>}
+                      {!row.isLocalVoid && row.hasLocalVoid && <Pill tone="slate">ملغاة محلياً</Pill>}
                     </div>
                   </div>
 
@@ -350,11 +363,10 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
                     "طباعة"/"مشاركة" (inside ReceiptActions) and "إلغاء
                     الفاتورة" fall onto their own line instead of
                     overflowing the card. The void button's visibility
-                    logic is UNCHANGED from the original single-row layout
-                    — still exactly canVoidOfflineInvoice() + isAdmin,
-                    ABSENT (not disabled) for a CASHIER.
+                    logic is UNCHANGED — still exactly canVoidOfflineInvoice()
+                    + isAdmin, ABSENT (not disabled) for a CASHIER.
                   */}
-                  <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-amber-100 dark:border-amber-900/60">
+                  <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-2.5">
                     <ReceiptActions
                       source={() =>
                         buildLocalReceiptSource({
@@ -375,17 +387,17 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
                       this specific invoice's retry is in flight, tracked
                       independently per-offlineId via retryingIds.
                     */}
-                    {row.invoice.status === "FAILED" && (
+                    {isFailed && (
                       <Button
                         size="sm"
                         variant="outline"
                         disabled={retryingIds.has(row.invoice.offlineId)}
                         onClick={() => void handleRetryInvoice(row.invoice.offlineId)}
-                        className="gap-1.5 text-amber-800 border-amber-300 hover:bg-amber-50 dark:text-amber-300 dark:border-amber-800"
+                        className="gap-1.5 border-amber-300 bg-white text-amber-800 hover:bg-amber-50"
                       >
                         <RotateCw
-                          className={`h-3.5 w-3.5 ${retryingIds.has(row.invoice.offlineId) ? "animate-spin" : ""
-                            }`}
+                          className={cn("size-3.5", retryingIds.has(row.invoice.offlineId) && "animate-spin")}
+                          aria-hidden
                         />
                         إعادة المحاولة
                       </Button>
@@ -414,28 +426,39 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
       </Drawer>
 
       <Dialog open={!!voidTarget} onOpenChange={(open) => !open && setVoidTarget(null)}>
-        <DialogContent dir="rtl">
+        <DialogContent dir="rtl" className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>إلغاء الفاتورة</DialogTitle>
+            <DialogTitle className="flex items-center gap-2.5 text-base font-extrabold text-slate-900">
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-red-100 text-red-700">
+                <AlertTriangle className="size-4.5" aria-hidden />
+              </span>
+              إلغاء الفاتورة
+            </DialogTitle>
           </DialogHeader>
 
           <Textarea
             placeholder="سبب الإلغاء (مطلوب)"
             value={voidReason}
             onChange={(e) => setVoidReason(e.target.value)}
+            className="min-h-24 border-slate-200 text-sm focus-visible:border-red-400 focus-visible:ring-red-400/20"
           />
 
-          {error && <p className="text-sm text-red-600">{error}</p>}
+          {error && (
+            <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700">
+              {error}
+            </p>
+          )}
 
-          <DialogFooter>
+          <DialogFooter className="gap-2 sm:gap-2">
             <Button
               variant="destructive"
               disabled={!voidReason.trim() || isSubmitting}
               onClick={handleConfirmVoid}
+              className="h-10 font-bold"
             >
               {isSubmitting ? "جارٍ الإلغاء..." : "تأكيد الإلغاء"}
             </Button>
-            <Button variant="outline" onClick={() => setVoidTarget(null)}>
+            <Button variant="outline" onClick={() => setVoidTarget(null)} className="h-10 border-slate-200">
               رجوع
             </Button>
           </DialogFooter>
