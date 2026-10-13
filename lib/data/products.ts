@@ -73,6 +73,19 @@
  *     from a truncated page.
  *  3. The "unknown product" placeholder is now ONE exported constant
  *     (UNKNOWN_PRODUCT_NAME), shared with lib/data/analytics.ts.
+ *
+ * [T5a review fixes — storefront helpers]
+ *  1. The listable gate's "at least one ACTIVE unit" half is applied IN THE
+ *     QUERY by both listStorefrontCatalogProducts() and
+ *     listStorefrontProductHeaders() (`units: { some: { isActive: true } }`),
+ *     so a product with no active unit can never appear in categories/counts
+ *     and then vanish from its card. It is a `where` filter, not a `select`,
+ *     so the light list stays light.
+ *  2. listStorefrontOrderLineUnits() validates its id lists with
+ *     requireIdList() like every other helper here.
+ *  3. listStorefrontUnitsForProducts() does not name `conversionFactor` as a
+ *     select key (banned outside units.ts); toDisplayUnits() reads it off the
+ *     row instead.
  */
 
 import type { Prisma, Product, ProductUnit, ProductUnitBarcode } from "@prisma/client";
@@ -1326,4 +1339,222 @@ export async function listDisplayUnitsForProducts(
         else byProductId.set(row.productId, [display]);
     }
     return byProductId;
+}
+
+// ----------------------------------------------------------------------------
+// [T5a] STOREFRONT read helpers — the public, no-login B2B storefront's ONLY
+// sanctioned path to Product / ProductUnit. `product`/`productUnit` model
+// access is banned outside this file (eslint.config.mjs PRODUCT_MODEL_RULES),
+// and lib/data/store.ts is a normal lib/** file, so it CANNOT call
+// `db.product.*` / `db.productUnit.*` directly — it imports these helpers
+// instead (spec §5.8 decision (b): route through the existing gateway, no
+// eslint.config.mjs change).
+//
+// Every helper deliberately exposes ONLY what a storefront card needs:
+// NO cost field, NO batch id/number, NO baseUnitId, and — unlike
+// listDisplayUnitsForProducts() above — NO `barcodes` relation at all (the
+// public payload must never carry barcode values; spec §6.2). The unit helper
+// returns units.ts DisplayUnit[] with `barcodes: []`, so a storefront caller
+// can feed it straight into breakdownForDisplay()/fromBaseUnit() without ever
+// touching `.conversionFactor` itself.
+// ----------------------------------------------------------------------------
+
+/**
+ * The light catalog list the storefront search/filter/category grouping runs
+ * over: id, name, category and createdAt ONLY. No units, no image, no stock —
+ * those are loaded later, for just the visible page's ids (spec §6.4/§6.5).
+ *
+ * LISTABLE (spec §6.2) = isPublic AND isActive AND imageUrl non-empty AND at
+ * least one ACTIVE unit. All four are applied HERE, in the query, so a product
+ * with no active unit can never show up in categories or result counts and
+ * then disappear from its card. The unit condition is a `where` filter, not a
+ * `select`, so the returned rows (and the cached list) stay light.
+ */
+export async function listStorefrontCatalogProducts(
+    tx: TxOrClient,
+    tenantId: string
+): Promise<
+    Array<{
+        id: string;
+        name: string;
+        category: string | null;
+        createdAt: Date;
+    }>
+> {
+    requireTenantId(tenantId, "listStorefrontCatalogProducts");
+
+    return tx.product.findMany({
+        where: {
+            tenantId,
+            isPublic: true,
+            isActive: true,
+            // Non-empty image only. `{ not: null }` alone would still admit the
+            // empty string, which the publishing gate forbids — so exclude ""
+            // too via AND (Prisma rejects a repeated `imageUrl` key).
+            imageUrl: { not: null },
+            AND: [{ imageUrl: { not: "" } }],
+            // At least one ACTIVE unit (spec §6.2).
+            units: { some: { isActive: true } },
+        },
+        select: { id: true, name: true, category: true, createdAt: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    });
+}
+
+/**
+ * The active units (wholesale price + pricing currency — never retail, never
+ * cost) for a set of product ids, shaped as units.ts DisplayUnit[] with
+ * `barcodes: []`. INACTIVE units are excluded here (spec §6.2: a deactivated
+ * unit must never appear).
+ *
+ * This is a bare findMany (no `select`, no `barcodes` include): the full unit
+ * row is what toDisplayUnits() needs, and we deliberately do NOT name
+ * `conversionFactor` as a select key — that is banned outside units.ts even in
+ * this gateway; toDisplayUnits() reads it off the row instead. The raw row
+ * never leaves this function and the public payload never carries barcodes.
+ */
+export async function listStorefrontUnitsForProducts(
+    tx: TxOrClient,
+    tenantId: string,
+    productIds: readonly string[]
+): Promise<Map<string, DisplayUnit[]>> {
+    requireTenantId(tenantId, "listStorefrontUnitsForProducts");
+    requireIdList(productIds, "listStorefrontUnitsForProducts");
+
+    const byProductId = new Map<string, DisplayUnit[]>();
+    if (productIds.length === 0) return byProductId;
+
+    const rows = await tx.productUnit.findMany({
+        where: { tenantId, productId: { in: [...productIds] }, isActive: true },
+    });
+
+    for (const row of rows) {
+        const display = toDisplayUnits([{ ...row, barcodes: [] }])[0];
+        const list = byProductId.get(row.productId);
+        if (list) list.push(display);
+        else byProductId.set(row.productId, [display]);
+    }
+    return byProductId;
+}
+
+/**
+ * The card header for a set of product ids: id, name, category and imageUrl
+ * ONLY (no cost, batch or barcode). The full listable filter (including "at
+ * least one ACTIVE unit") is re-applied here, so a product that stopped being
+ * listable between the cached light-list read and this read can never leak
+ * onto the page.
+ */
+export async function listStorefrontProductHeaders(
+    tx: TxOrClient,
+    tenantId: string,
+    productIds: readonly string[]
+): Promise<
+    Map<
+        string,
+        { id: string; name: string; category: string | null; imageUrl: string | null }
+    >
+> {
+    requireTenantId(tenantId, "listStorefrontProductHeaders");
+    requireIdList(productIds, "listStorefrontProductHeaders");
+
+    const byId = new Map<
+        string,
+        { id: string; name: string; category: string | null; imageUrl: string | null }
+    >();
+    if (productIds.length === 0) return byId;
+
+    const rows = await tx.product.findMany({
+        where: {
+            tenantId,
+            id: { in: [...productIds] },
+            isPublic: true,
+            isActive: true,
+            imageUrl: { not: null },
+            AND: [{ imageUrl: { not: "" } }],
+            units: { some: { isActive: true } },
+        },
+        select: { id: true, name: true, category: true, imageUrl: true },
+    });
+
+    for (const row of rows) byId.set(row.id, row);
+    return byId;
+}
+
+/**
+ * T5a §6.8 step 7 — server-side re-read of the exact (productId, unitId) pairs
+ * a submitted order names, to build FROZEN price snapshots from the DB and
+ * reject any line whose product is not public+active or whose unit is inactive
+ * or does not belong to that product. Never trusts a client price/currency.
+ *
+ * Returns only what the order needs: product liveness, the unit's own
+ * wholesale price + currency, and the unit→product ownership check. NO cost,
+ * NO barcode, NO conversionFactor (the quantity→base conversion happens at
+ * approval in T5c, from the unit row's own factor via units.ts — not here).
+ *
+ * NOTE for the caller: a row with productPublic/productActive/unitActive false
+ * or unitBelongsToProduct false MUST be rejected as INVALID_LINE before any
+ * snapshot is built from its priceWholesale.
+ */
+export async function listStorefrontOrderLineUnits(
+    tx: TxOrClient,
+    tenantId: string,
+    pairs: ReadonlyArray<{ productId: string; unitId: string }>
+): Promise<
+    Array<{
+        productId: string;
+        unitId: string;
+        productPublic: boolean;
+        productActive: boolean;
+        unitActive: boolean;
+        unitBelongsToProduct: boolean;
+        priceWholesale: string;
+        pricingCurrency: "SYP" | "USD";
+    }>
+> {
+    requireTenantId(tenantId, "listStorefrontOrderLineUnits");
+    requireIdList(pairs.map((p) => p.productId), "listStorefrontOrderLineUnits");
+    requireIdList(pairs.map((p) => p.unitId), "listStorefrontOrderLineUnits");
+
+    const unitIds = [...new Set(pairs.map((p) => p.unitId))];
+    const productIds = [...new Set(pairs.map((p) => p.productId))];
+    if (unitIds.length === 0 || productIds.length === 0) return [];
+
+    // Two indexed reads (never per-pair): the units, then the owning products'
+    // public/active flags. Joined in the application below.
+    const [unitRows, productRows] = await Promise.all([
+        tx.productUnit.findMany({
+            where: { tenantId, id: { in: unitIds } },
+            select: {
+                id: true,
+                productId: true,
+                isActive: true,
+                pricingCurrency: true,
+                priceWholesale: true,
+            },
+        }),
+        tx.product.findMany({
+            where: { tenantId, id: { in: productIds } },
+            select: { id: true, isPublic: true, isActive: true },
+        }),
+    ]);
+
+    const unitById = new Map(unitRows.map((u) => [u.id, u]));
+    const productById = new Map(productRows.map((p) => [p.id, p]));
+
+    return pairs.map((pair) => {
+        const unit = unitById.get(pair.unitId);
+        const product = productById.get(pair.productId);
+        return {
+            productId: pair.productId,
+            unitId: pair.unitId,
+            productPublic: product?.isPublic ?? false,
+            productActive: product?.isActive ?? false,
+            unitActive: unit?.isActive ?? false,
+            unitBelongsToProduct: unit?.productId === pair.productId,
+            // A missing product/unit yields a safe non-listable row; the caller
+            // rejects it as INVALID_LINE before any snapshot is built.
+            priceWholesale: unit ? unit.priceWholesale.toString() : "0",
+            pricingCurrency: (unit?.pricingCurrency ?? "SYP") as "SYP" | "USD",
+        };
+    });
 }

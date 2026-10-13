@@ -307,6 +307,7 @@ CREATE TABLE "B2BOrderRequestItem" (
     "productId" TEXT NOT NULL,
     "unitId" TEXT NOT NULL,
     "quantity" DECIMAL(18,4) NOT NULL,
+    "approvedQuantity" DECIMAL(18,4),
     "priceWholesaleSnapshot" DECIMAL(18,4) NOT NULL,
     "pricingCurrencySnapshot" "PricingCurrency" NOT NULL,
 
@@ -477,9 +478,6 @@ CREATE INDEX "Customer_tenantId_isSystemGenerated_idx" ON "Customer"("tenantId",
 CREATE UNIQUE INDEX "VerifiedRetailer_phone_key" ON "VerifiedRetailer"("phone");
 
 -- CreateIndex
-CREATE INDEX "VerifiedRetailer_phone_idx" ON "VerifiedRetailer"("phone");
-
--- CreateIndex
 CREATE INDEX "ProductCatalogEntry_addedByTenantId_idx" ON "ProductCatalogEntry"("addedByTenantId");
 
 -- CreateIndex
@@ -549,10 +547,7 @@ CREATE INDEX "Subscription_status_idx" ON "Subscription"("status");
 CREATE UNIQUE INDEX "B2BOrderRequest_resultingInvoiceId_key" ON "B2BOrderRequest"("resultingInvoiceId");
 
 -- CreateIndex
-CREATE INDEX "B2BOrderRequest_tenantId_idx" ON "B2BOrderRequest"("tenantId");
-
--- CreateIndex
-CREATE INDEX "B2BOrderRequest_tenantId_status_idx" ON "B2BOrderRequest"("tenantId", "status");
+CREATE INDEX "B2BOrderRequest_tenantId_status_createdAt_idx" ON "B2BOrderRequest"("tenantId", "status", "createdAt");
 
 -- CreateIndex
 CREATE INDEX "B2BOrderRequest_tenantId_retailerPhone_status_idx" ON "B2BOrderRequest"("tenantId", "retailerPhone", "status");

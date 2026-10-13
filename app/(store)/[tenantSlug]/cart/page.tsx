@@ -1,41 +1,47 @@
-import Link from "next/link";
-import { Button } from "@/components/ui/button";
-import { ArrowRight, ShoppingCart } from "lucide-react";
+import type { Metadata } from "next";
+import { resolveStorefrontTenantOnce } from "@/lib/data/store-request";
+import { toStoreInfoDTO } from "@/lib/data/store-dto";
+import { storeHref } from "@/lib/utils/store-href";
+import { CartPageView } from "@/components/store/Cartpageview";
+import { StoreNotFound, StoreUnavailable } from "@/components/store/Storestatus";
 
-type StorefrontCartProps = {
-  params: Promise<{ tenantSlug: string }>;
-};
+/**
+ * app/(store)/[tenantSlug]/cart/page.tsx — the cart PAGE (T5a §6.7). The cart is
+ * a drawer; this page runs the same tenant gate as every store page and gives
+ * the cart a link-able entry. Gate is a fresh DB read (§6.1/§6.10).
+ */
 
-export default async function StorefrontCartPage({ params }: StorefrontCartProps) {
-  const { tenantSlug } = await params;
+type PageProps = { params: Promise<{ tenantSlug: string }> };
 
-  return (
-    <main className="mx-auto flex min-h-screen max-w-4xl flex-col p-6 py-12">
-      <div className="flex items-center gap-2 mb-6 text-sm text-zinc-500">
-        <Link href={`/store/${tenantSlug}`} className="hover:underline flex items-center gap-1">
-          <ArrowRight className="h-4 w-4" />
-          <span>العودة للمتجر ({tenantSlug})</span>
-        </Link>
-      </div>
+export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
+    const { tenantSlug } = await params;
+    const resolution = await resolveStorefrontTenantOnce(tenantSlug);
+    if (resolution.kind !== "tenant") {
+        return { title: "طلبي", robots: { index: false, follow: false } };
+    }
+    const { tenant } = resolution;
+    return {
+        title: `طلبي — ${tenant.name}`,
+        description: `راجع طلبك من ${tenant.name} وأرسله للمتجر.`,
+        // D16: every store page is noindex/nofollow by default.
+        robots: { index: false, follow: false },
+        alternates: { canonical: storeHref(tenant.slug, "cart") },
+        openGraph: {
+            title: `طلبي — ${tenant.name}`,
+            description: `راجع طلبك من ${tenant.name}.`,
+            url: storeHref(tenant.slug, "cart"),
+            images: tenant.logo ? [{ url: tenant.logo }] : undefined,
+        },
+    };
+}
 
-      <div className="flex items-center gap-3">
-        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
-          <ShoppingCart className="h-6 w-6" />
-        </div>
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">سلة الطلبات الذاتية</h1>
-          <p className="text-xs text-zinc-500">مراجعة المنتجات وإرسال الطلب المباشر للمتجر.</p>
-        </div>
-      </div>
+export default async function StorefrontCartPage({ params }: PageProps) {
+    const { tenantSlug } = await params;
 
-      <div className="mt-8 rounded-2xl border border-zinc-200 bg-white p-8 text-center shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-        <ShoppingCart className="mx-auto h-12 w-12 text-zinc-300 dark:text-zinc-600" />
-        <h2 className="mt-4 text-lg font-bold">السلة فارغة حالياً</h2>
-        <p className="mt-1 text-xs text-zinc-500">قم بتصفح المنتجات في الكتالوج وإضافتها إلى السلة.</p>
-        <Button asChild className="mt-6 bg-emerald-600 hover:bg-emerald-700 text-white">
-          <Link href={`/store/${tenantSlug}`}>تصفح الكتالوج</Link>
-        </Button>
-      </div>
-    </main>
-  );
+    // 1. Tenant gate — fresh read, before anything else.
+    const resolution = await resolveStorefrontTenantOnce(tenantSlug);
+    if (resolution.kind === "not_found") return <StoreNotFound slug={tenantSlug} />;
+    if (resolution.kind === "unavailable") return <StoreUnavailable />;
+
+    return <CartPageView store={toStoreInfoDTO(resolution.tenant)} />;
 }

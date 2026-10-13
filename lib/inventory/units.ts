@@ -506,3 +506,50 @@ export function saleQuantityFromBase(
             .toString(),
     };
 }
+
+/**
+ * APPEND THIS TO lib/inventory/units.ts (it is the only file allowed to do
+ * arithmetic on / name `conversionFactor`).
+ *
+ * Why here: the storefront shows each unit's size ("= 24 قطعة") and wants the
+ * units ordered smallest -> largest. Both need the conversion factor, and the
+ * project rule is that factor math lives ONLY in this file. lib/data/store-dto.ts
+ * calls this instead of touching `.conversionFactor` itself.
+ */
+
+export interface StorefrontUnitLabel {
+    unitId: string;
+    /** "= 24 قطعة" for a packaging unit; null for the base unit (or when the
+     *  base unit is not among the given units, e.g. it is inactive). */
+    factorText: string | null;
+}
+
+/**
+ * Display order (smallest unit first) + size captions for a storefront card's
+ * ACTIVE units. Display-only — never written to any table.
+ */
+export function storefrontUnitLabels(units: DisplayUnit[]): StorefrontUnitLabel[] {
+    const usable = units.filter((u) => {
+        try {
+            return new Decimal(u.conversionFactor).gt(0);
+        } catch {
+            return false;
+        }
+    });
+    const sorted = [...usable].sort((a, b) =>
+        new Decimal(a.conversionFactor).comparedTo(new Decimal(b.conversionFactor))
+    );
+    const base = sorted.find((u) => new Decimal(u.conversionFactor).equals(1));
+
+    return sorted.map((u) => {
+        const factor = new Decimal(u.conversionFactor);
+        const isBase = factor.equals(1);
+        return {
+            unitId: u.id,
+            factorText:
+                isBase || !base
+                    ? null
+                    : `= ${factor.toDecimalPlaces(4).toString()} ${base.unitName}`,
+        };
+    });
+}

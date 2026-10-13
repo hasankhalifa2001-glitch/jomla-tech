@@ -12,6 +12,10 @@ interface ImageCropModalProps {
   onCropComplete: (url: string) => void;
 }
 
+// Output canvas size (square). The whole image is fitted inside it
+// (no cropping) on a TRANSPARENT background.
+const CANVAS_SIZE = 500;
+
 export function ImageCropModal({ open, onOpenChange, onCropComplete }: ImageCropModalProps) {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [rotation, setRotation] = useState<number>(0);
@@ -20,20 +24,9 @@ export function ImageCropModal({ open, onOpenChange, onCropComplete }: ImageCrop
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Previously this reset ran inside a `useEffect` watching `open`, which
-  // React's lint rule flags: "Calling setState synchronously within an
-  // effect can trigger cascading renders." An effect is for synchronizing
-  // with something external — reacting to a prop AFTER it changed just to
-  // immediately set more state is exactly the pattern the rule warns
-  // against, and it's pure overhead here since we already know the reset
-  // is needed at the moment the modal closes.
-  //
-  // Fixed by moving the reset into a local `handleOpenChange` wrapper —
-  // the exact same pattern already used in AddProductModal.tsx. Every
-  // internal close path (Cancel button, successful upload) now goes
-  // through this wrapper instead of calling the `onOpenChange` prop
-  // directly, so the reset happens as part of the same state transition,
-  // not as a delayed reaction to it.
+  // Reset happens in this wrapper (not in an effect) so it is part of the
+  // same state transition as the close action. Every internal close path
+  // goes through it instead of calling the `onOpenChange` prop directly.
   const handleOpenChange = (nextOpen: boolean) => {
     if (!nextOpen) {
       setImageSrc(null);
@@ -65,22 +58,28 @@ export function ImageCropModal({ open, onOpenChange, onCropComplete }: ImageCrop
     img.crossOrigin = "anonymous";
     img.src = imageSrc;
     img.onload = () => {
-      canvas.width = 400;
-      canvas.height = 400;
+      canvas.width = CANVAS_SIZE;
+      canvas.height = CANVAS_SIZE;
+
+      // Transparent background (previously filled with white, which is
+      // what produced the white box around PNG products).
+      ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
       ctx.save();
       ctx.filter = `brightness(${brightness}%)`;
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, 400, 400);
-
-      ctx.translate(200, 200);
+      ctx.translate(CANVAS_SIZE / 2, CANVAS_SIZE / 2);
       ctx.rotate((rotation * Math.PI) / 180);
 
-      const minDim = Math.min(img.width, img.height);
-      const sx = (img.width - minDim) / 2;
-      const sy = (img.height - minDim) / 2;
+      // Fit the WHOLE image (no center-crop). At 90°/270° the image's
+      // width and height swap on screen, so the scale accounts for that.
+      const swapped = rotation % 180 !== 0;
+      const iw = swapped ? img.height : img.width;
+      const ih = swapped ? img.width : img.height;
+      const scale = Math.min(CANVAS_SIZE / iw, CANVAS_SIZE / ih);
+      const w = img.width * scale;
+      const h = img.height * scale;
 
-      ctx.drawImage(img, sx, sy, minDim, minDim, -200, -200, 400, 400);
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
       ctx.restore();
     };
   };
@@ -100,8 +99,9 @@ export function ImageCropModal({ open, onOpenChange, onCropComplete }: ImageCrop
 
     setUploading(true);
     try {
+      // WebP keeps transparency (JPEG does not) and stays small.
       const blob = await new Promise<Blob | null>((resolve) => {
-        canvasRef.current!.toBlob((b) => resolve(b), "image/jpeg", 0.85);
+        canvasRef.current!.toBlob((b) => resolve(b), "image/webp", 0.9);
       });
 
       if (!blob) {
@@ -109,7 +109,7 @@ export function ImageCropModal({ open, onOpenChange, onCropComplete }: ImageCrop
       }
 
       const formData = new FormData();
-      formData.append("file", blob, "product-image.jpg");
+      formData.append("file", blob, "product-image.webp");
       formData.append("type", "product");
 
       const res = await fetch("/api/upload/receipt", {
@@ -124,8 +124,6 @@ export function ImageCropModal({ open, onOpenChange, onCropComplete }: ImageCrop
 
       onCropComplete(data.url);
       toast.success("تم رفع صورة المنتج بنجاح.");
-      // Routes through the local wrapper (not the raw prop) so the reset
-      // happens immediately as part of this same close action.
       handleOpenChange(false);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "حدث خطأ أثناء رفع الصورة.";

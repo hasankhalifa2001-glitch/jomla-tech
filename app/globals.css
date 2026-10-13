@@ -157,3 +157,39 @@ body {
     @apply font-sans;
   }
 }
+
+/* ───────── Storefront motion (store-*) ───────── */
+@keyframes store-fade-up {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes store-float {
+    0%, 100% { transform: translateY(0) rotate(var(--store-rot, 0deg)); }
+    50%      { transform: translateY(-10px) rotate(var(--store-rot, 0deg)); }
+}
+@keyframes store-pop {
+    0%   { transform: scale(1); }
+    45%  { transform: scale(1.22); }
+    100% { transform: scale(1); }
+}
+@keyframes store-pulse-ring {
+    0%   { box-shadow: 0 0 0 0 rgb(52 211 153 / 0.55); }
+    100% { box-shadow: 0 0 0 8px rgb(52 211 153 / 0); }
+}
+
+.store-fade-up  { animation: store-fade-up 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both; animation-delay: var(--d, 0ms); }
+.store-float    { animation: store-float 6s ease-in-out infinite; animation-delay: var(--d, 0ms); }
+.store-pop      { animation: store-pop 0.35s ease-out; }
+.store-live-dot { animation: store-pulse-ring 1.8s ease-out infinite; }
+
+[data-reveal] {
+    transition: opacity 0.6s ease, transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1);
+    transition-delay: var(--d, 0ms);
+}
+[data-reveal="hidden"] { opacity: 0; transform: translateY(18px); }
+
+@media (prefers-reduced-motion: reduce) {
+    .store-fade-up, .store-float, .store-pop, .store-live-dot { animation: none; }
+    [data-reveal] { transition: none; }
+    [data-reveal="hidden"] { opacity: 1; transform: none; }
+}
