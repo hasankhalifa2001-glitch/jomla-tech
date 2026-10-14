@@ -47,7 +47,7 @@ import { unstable_cache } from "next/cache";
 import { prisma } from "@/lib/db";
 import { getTenantDb } from "@/lib/db/tenant-scope";
 import type { TxOrClient } from "@/lib/db/tenant-scope";
-import { callGroupBy } from "@/lib/db/call-group-by";
+import { loadAvailableBaseQuantities } from "@/lib/data/stock-availability";
 import {
     STORE_BESTSELLERS_CACHE_SECONDS,
     STORE_BESTSELLERS_MIN_PRODUCTS,
@@ -336,6 +336,13 @@ export async function getStorefrontNewestIds(
 // exactly zero. USD-priced and SYP-priced products rank on the same SYP
 // basis because every InvoiceItem carries its own frozen unitPriceSYP.
 //
+// ORDER OF OPERATIONS (fixed): eligibility is applied BEFORE the top-N cut.
+// A product that is no longer listable (unpublished / inactive / no image /
+// no active unit) or whose net value is ≤ 0 is removed first, and only then
+// are the top STORE_HOME_BESTSELLERS_COUNT taken. Cutting first would let a
+// blocked top seller occupy a slot and shrink (or hide) the section even
+// though valid lower-ranked products exist.
+//
 // The public payload is the ranked product ids ONLY — hydration into cards
 // (via hydrateStorefrontCards) carries no sales figures, counts or revenue.
 // Fewer than STORE_BESTSELLERS_MIN_PRODUCTS qualifying products → [] (the
@@ -405,25 +412,28 @@ export async function getStorefrontBestSellerIds(
             // REUSED core: collapses FIFO-split lines, nets voids to zero.
             const aggregates = buildProductAggregates(items, nameById, factorByUnitId);
 
-            // Non-listable products (unpublished / inactive / no image / no
-            // active unit) are excluded — best sellers must never surface a
-            // product the catalog would not show.
+            // Listable products only (published / active / has image / has an
+            // active unit) — best sellers must never surface a product the
+            // catalog would not show.
             const headers = await listStorefrontProductHeaders(
                 db,
                 tenantId,
                 aggregates.map((a) => a.productId)
             );
 
-            const ranked = rankTopBySalesValue(aggregates, STORE_HOME_BESTSELLERS_COUNT);
-            const qualifying = ranked.filter((a) => {
+            // 1) Eligibility FIRST: listable AND net value > 0 (a voided-out or
+            //    fully returned product drops out).
+            const eligible = aggregates.filter((a) => {
                 if (!headers.has(a.productId)) return false;
                 try {
-                    // Net value ≤ 0 (voided-out, fully returned) drops out.
                     return compareMoney(a.salesSYP, 0) > 0;
                 } catch {
                     return false;
                 }
             });
+
+            // 2) THEN rank and cut to the top N.
+            const qualifying = rankTopBySalesValue(eligible, STORE_HOME_BESTSELLERS_COUNT);
 
             if (qualifying.length < STORE_BESTSELLERS_MIN_PRODUCTS) return [];
             return qualifying.map((a) => a.productId);
@@ -437,37 +447,12 @@ export async function getStorefrontBestSellerIds(
 }
 
 /**
- * Available base-unit quantity per product (spec §6.5, D1/D2): SUM of
- * `quantity` over the product's batches WHERE quantity > 0 (positives only —
- * negatives count as 0), with NO expiry filter (expired batches still count).
- * ONE grouped query via the shared callGroupBy helper for all page ids — no
- * N+1. The result is cast to the row shape at the call site (the helper's
- * return type is `unknown` by design).
- *
- * Because the query itself filters `quantity > 0`, a product appears in the
- * returned map IF AND ONLY IF it has positive stock; absence means "0".
+ * [T5b] Re-export shim: loadAvailableBaseQuantities moved to
+ * lib/data/stock-availability.ts so the admin orders gateway
+ * (lib/data/orders.ts) reuses the same query without duplicating it.
+ * Kept here so existing T5a call sites keep working unchanged.
  */
-async function loadAvailableBaseQuantities(
-    db: TxOrClient,
-    tenantId: string,
-    productIds: readonly string[]
-): Promise<Map<string, string>> {
-    const byId = new Map<string, string>();
-    if (productIds.length === 0) return byId;
-
-    type StockGroupRow = { productId: string; _sum: { quantity: unknown } | null };
-    const rows = (await callGroupBy(db.productBatch.groupBy, {
-        by: ["productId"],
-        where: { tenantId, productId: { in: [...productIds] }, quantity: { gt: 0 } },
-        _sum: { quantity: true },
-    })) as StockGroupRow[];
-
-    for (const row of rows) {
-        const sum = row._sum?.quantity;
-        byId.set(row.productId, sum != null ? String(sum) : "0");
-    }
-    return byId;
-}
+export { loadAvailableBaseQuantities } from "@/lib/data/stock-availability";
 
 /**
  * Hydrate a set of product ids into render-ready cards: image header, active
@@ -949,4 +934,3 @@ export async function createStorefrontOrder(
         matchedCustomerId,
     };
 }
-

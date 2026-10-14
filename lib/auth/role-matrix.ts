@@ -15,6 +15,11 @@ export type AppAction =
   | "ledger:view_failed_sync"
   | "orders:view"
   | "orders:manage"
+  // [ADDED — T5b] /dashboard/orders — reject a pending B2B order.
+  // ADMIN-only; CASHIER is read-only. Split out from the legacy
+  // "orders:manage" row (kept for the pre-existing status route) so the
+  // T5b reject route asserts its own capability.
+  | "orders:reject"
   | "settings:manage"
   // [ADDED — T4c2] /dashboard/sales-log — an ADMIN filtering the invoice
   // log by a staff member OTHER than themselves. Not needed for: an ADMIN
@@ -109,6 +114,14 @@ export const ROLE_CAPABILITY_MATRIX: Record<AppAction, Record<UserRole, boolean>
   },
   // /dashboard/orders (T5) — approve or reject B2B requests
   "orders:manage": {
+    ADMIN: true,
+    CASHIER: false,
+  },
+  // [ADDED — T5b] /dashboard/orders — reject a pending B2B order.
+  // ADMIN-only; CASHIER is read-only (list/detail are read-only).
+  // Kept separate from "orders:manage" (legacy status route) and from the
+  // future T5c "orders:approve" row.
+  "orders:reject": {
     ADMIN: true,
     CASHIER: false,
   },

@@ -33,12 +33,8 @@ export function HomeView({ data }: { data: HomeData }) {
                         <div className={cx(styles.topbar, styles.rise)}>
                             <div className={styles.brand}>
                                 <span className={styles.logo}>
-                                    {store.logoUrl ? (
-                                        // eslint-disable-next-line @next/next/no-img-element
-                                        <img className={styles.logoImg} src={store.logoUrl} alt="" />
-                                    ) : (
-                                        initial
-                                    )}
+                                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                                    <img className={styles.logoImg} src={store.logoUrl ?? "/jumla-logo-on-dark.svg"} alt="" />
                                 </span>
                                 <span className={styles.bname}>{store.name}</span>
                             </div>

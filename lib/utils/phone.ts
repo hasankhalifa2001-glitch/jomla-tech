@@ -21,7 +21,13 @@
 // Arabic-Indic (U+0660-0669) and Extended Arabic-Indic / Persian (U+06F0-06F9)
 // digits -> ASCII. Done FIRST so a phone typed with Arabic numerals is treated
 // identically to its ASCII spelling.
-function foldArabicDigits(raw: string): string {
+/** Digits-only ASCII fold for free-text search fallbacks. */
+export function foldPhoneDigits(raw: string | null | undefined): string {
+  if (raw == null) return '';
+  return foldArabicDigits(String(raw)).replace(/\D/g, '');
+}
+
+export function foldArabicDigits(raw: string): string {
   let out = "";
   for (const ch of raw) {
     const code = ch.codePointAt(0)!;

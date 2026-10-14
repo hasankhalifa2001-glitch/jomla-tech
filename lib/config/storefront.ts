@@ -39,7 +39,13 @@ export const STORE_ERROR = {
   INVALID_CUSTOMER: "INVALID_CUSTOMER",
   INVALID_PAYMENT: "INVALID_PAYMENT",
   FORBIDDEN: "FORBIDDEN",
+  // [T5b — additive] 401 (no session). FORBIDDEN stays 403-only.
+  UNAUTHORIZED: "UNAUTHORIZED",
   TENANT_NOT_WRITABLE: "TENANT_NOT_WRITABLE",
+  // [T5b — additive] Needed for the admin orders queue/detail/reject routes.
+  // Missing before: admin routes had no NOT_FOUND / INTERNAL_ERROR codes.
+  NOT_FOUND: "NOT_FOUND",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
 } as const;
 
 export type StoreErrorCode = (typeof STORE_ERROR)[keyof typeof STORE_ERROR];

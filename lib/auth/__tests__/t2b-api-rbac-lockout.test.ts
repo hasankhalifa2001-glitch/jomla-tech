@@ -20,6 +20,15 @@ const { mockTenant, mockRawPrisma, mockSessionState } =
     const mockProductBatch = {
       create: vi.fn(),
     };
+    const mockB2BOrderRequest = {
+      findMany: vi.fn(async () => []),
+      findFirst: vi.fn(async () => null),
+      count: vi.fn(async () => 0),
+      updateMany: vi.fn(async () => ({ count: 0 })),
+    };
+    const mockB2BOrderRequestItem = {
+      findMany: vi.fn(async () => []),
+    };
     const mockUser = {
       findUnique: vi.fn(async () => ({ isActive: true })),
     };
@@ -29,6 +38,8 @@ const { mockTenant, mockRawPrisma, mockSessionState } =
       product: mockProduct,
       productUnit: mockProductUnit,
       productBatch: mockProductBatch,
+      b2BOrderRequest: mockB2BOrderRequest,
+      b2BOrderRequestItem: mockB2BOrderRequestItem,
     };
     mockRawPrisma.$transaction = vi.fn(async (cb: (tx: any) => Promise<any>) => cb(mockRawPrisma));
 
@@ -270,11 +281,14 @@ describe("T2b API Mutation Security Boundary & Role Enforcement", () => {
       expect(orderPatchRes.status).toBe(403);
       expect((await orderPatchRes.json()).error).toBe("FORBIDDEN");
 
-      const ordersGetRes = await ordersHandler();
+      const { NextRequest } = await import("next/server");
+      const ordersGetRes = await ordersHandler(
+        new NextRequest("http://localhost/api/orders?status=PENDING_REVIEW")
+      );
       expect(ordersGetRes.status).toBe(200);
       const json = await ordersGetRes.json();
       expect(json.success).toBe(true);
-      expect(Array.isArray(json.orders)).toBe(true);
+      expect(Array.isArray(json.items)).toBe(true);
     });
   });
 });
