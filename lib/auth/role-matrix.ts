@@ -14,12 +14,15 @@ export type AppAction =
   | "ledger:merge_customers"
   | "ledger:view_failed_sync"
   | "orders:view"
-  | "orders:manage"
   // [ADDED — T5b] /dashboard/orders — reject a pending B2B order.
   // ADMIN-only; CASHIER is read-only. Split out from the legacy
-  // "orders:manage" row (kept for the pre-existing status route) so the
+  // "orders:manage" row (retired in T5c Phase 4 with D19) so the
   // T5b reject route asserts its own capability.
   | "orders:reject"
+  // [ADDED — T5c] /dashboard/orders — approve a pending B2B order (ADMIN only).
+  // CASHIER keeps read-only queue/detail access. Distinct from orders:reject
+  // and from the legacy orders:manage row (retired in Phase 4 with D19).
+  | "orders:approve"
   | "settings:manage"
   // [ADDED — T4c2] /dashboard/sales-log — an ADMIN filtering the invoice
   // log by a staff member OTHER than themselves. Not needed for: an ADMIN
@@ -112,16 +115,20 @@ export const ROLE_CAPABILITY_MATRIX: Record<AppAction, Record<UserRole, boolean>
     ADMIN: true,
     CASHIER: true,
   },
-  // /dashboard/orders (T5) — approve or reject B2B requests
-  "orders:manage": {
-    ADMIN: true,
-    CASHIER: false,
-  },
+  // [T5c Phase 4, D19] The legacy "orders:manage" row (pre-spec PATCH
+  // /api/orders/[id]/status approve+reject) is RETIRED with the route
+  // itself. Reject asserts "orders:reject", approve asserts
+  // "orders:approve" — nothing references "orders:manage" anymore.
   // [ADDED — T5b] /dashboard/orders — reject a pending B2B order.
   // ADMIN-only; CASHIER is read-only (list/detail are read-only).
   // Kept separate from "orders:manage" (legacy status route) and from the
   // future T5c "orders:approve" row.
   "orders:reject": {
+    ADMIN: true,
+    CASHIER: false,
+  },
+  // [ADDED — T5c] approve a pending B2B order. ADMIN-only (D20).
+  "orders:approve": {
     ADMIN: true,
     CASHIER: false,
   },
@@ -184,7 +191,7 @@ export function assertRolePermission(
 // [FIX] `action` is now an explicit (optional) parameter instead of being
 // hardcoded to "settings:manage" on every call. Previously, any call site
 // enforcing ADMIN-only access for a DIFFERENT action (e.g. ledger:void_invoice,
-// orders:manage) would still record "settings:manage" on the thrown
+// orders:approve) would still record "settings:manage" on the thrown
 // ForbiddenRoleError — misleading for logging/monitoring and for anyone
 // inspecting the error downstream. Defaults to "settings:manage" only for
 // backward compatibility with call sites that genuinely are settings-related

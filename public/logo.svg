@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" width="512" height="512" role="img" aria-label="Store logo">
+  <rect width="72" height="72" rx="21" fill="#0f172a"/>
+  <!-- store body (drawn first; the awning overlaps its top) -->
+  <path d="M13.5 25.5V54a4.5 4.5 0 0 0 4.5 4.5h36a4.5 4.5 0 0 0 4.5-4.5V25.5" fill="none" stroke="#ffffff" stroke-width="3.9" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- awning -->
+  <path d="M13 22.5a6 6 0 0 1 6-6h34a6 6 0 0 1 6 6v2.83a7.67 7.67 0 0 1-15.33 0a7.67 7.67 0 0 1-15.34 0a7.67 7.67 0 0 1-15.33 0z" fill="#10b981"/>
+  <!-- products -->
+  <rect x="21.3" y="39.9" width="12.4" height="12.4" rx="3" fill="#ffffff"/>
+  <rect x="38.3" y="39.9" width="12.4" height="12.4" rx="3" fill="#10b981"/>
+</svg>

@@ -152,6 +152,28 @@ export function serializeMoney(value: MoneyInput): string {
   return toDecimal(value).toFixed(4);
 }
 
+/**
+ * Truncates a monetary value TOWARD ZERO to 4 decimal places, using
+ * decimal.js's own named `Decimal.ROUND_DOWN` constant (never a bare numeric
+ * literal). Contrast `serializeMoney`, which rounds HALF_UP.
+ *
+ * "Toward zero" == "down" for every NON-NEGATIVE value, which is the only
+ * class of value this is used for (a positive available-stock figure). For a
+ * negative input it would round toward zero (i.e. up in magnitude terms), so
+ * do NOT reach for this to floor a possibly-negative amount — use an explicit
+ * ROUND_FLOOR path if that case ever arises.
+ *
+ * WHY it exists (T5c approval): a "how much is available" figure shown to the
+ * admin must truncate so an admin who retypes exactly that number into the
+ * approve form requests at most what is truly on hand. Rounding up (e.g.
+ * 70 / 24 = 2.91666… shown as "2.9167") would let them request 2.9167 and then
+ * be rejected again by the very check that produced the figure. Truncating
+ * makes the displayed figure a value the sufficiency check accepts.
+ */
+export function truncateMoney(value: MoneyInput): string {
+  return toDecimal(value).toDecimalPlaces(4, Decimal.ROUND_DOWN).toFixed(4);
+}
+
 /** Adds two monetary values and returns the result as a Decimal string. */
 export function addMoney(a: MoneyInput, b: MoneyInput): string {
   return toDecimal(a).plus(toDecimal(b)).toFixed(4);

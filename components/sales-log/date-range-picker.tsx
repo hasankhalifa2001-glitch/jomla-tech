@@ -32,10 +32,16 @@
  * Both bounds are local-midnight / local-end-of-day at the moment they are
  * applied (sales-log-utils.ts) so the request carries an explicit,
  * timezone-correct window rather than relying on the route's UTC fallback.
+ *
+ * [v4.5 — polish pass, presentation only] The trigger is 40px tall to match
+ * the other filter controls and shows a chevron; the presets are pills that
+ * highlight when they match the current range; a "تم" button closes the
+ * popover (handy on phones, where tapping outside is awkward); the popover
+ * never overflows a narrow viewport. Selection logic is unchanged.
  */
 
 import { useState } from "react";
-import { CalendarRange } from "lucide-react";
+import { CalendarRange, ChevronDown } from "lucide-react";
 import type { DateRange } from "react-day-picker";
 import { ar } from "react-day-picker/locale";
 
@@ -69,6 +75,14 @@ const PRESETS: Array<{ label: string; getRange: () => DateRangeValue }> = [
     { label: "هذا الشهر", getRange: startOfMonthLocalRange },
 ];
 
+/** Presentation only: does the current value equal this preset's range? */
+function matchesPreset(value: DateRangeValue, preset: DateRangeValue): boolean {
+    return (
+        value.from.toDateString() === preset.from.toDateString() &&
+        value.to.toDateString() === preset.to.toDateString()
+    );
+}
+
 export function DateRangePicker({ value, onChange, disabled }: DateRangePickerProps) {
     const [open, setOpen] = useState(false);
 
@@ -101,6 +115,8 @@ export function DateRangePicker({ value, onChange, disabled }: DateRangePickerPr
         onChange({ from: startOfLocalDay(range.from), to: endOfLocalDay(range.to) });
     };
 
+    const isRange = value.from.toDateString() !== value.to.toDateString();
+
     return (
         <Popover
             open={open}
@@ -119,39 +135,60 @@ export function DateRangePicker({ value, onChange, disabled }: DateRangePickerPr
                     variant="outline"
                     size="sm"
                     disabled={disabled}
-                    className={cn("h-9 gap-2 text-xs font-semibold justify-start")}
+                    aria-expanded={open}
+                    className={cn(
+                        "h-10 w-full justify-between gap-2 rounded-lg text-xs font-semibold transition-all active:scale-[0.99]",
+                        open && "border-emerald-500 ring-2 ring-emerald-500/20"
+                    )}
                 >
-                    <CalendarRange className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                    <span>
-                        {formatDayLabel(value.from)}
-                        {value.from.toDateString() !== value.to.toDateString() &&
-                            ` — ${formatDayLabel(value.to)}`}
+                    <span className="flex min-w-0 items-center gap-2">
+                        <CalendarRange className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                        <span className="truncate">
+                            {formatDayLabel(value.from)}
+                            {isRange && ` — ${formatDayLabel(value.to)}`}
+                        </span>
                     </span>
+                    <ChevronDown
+                        className={cn(
+                            "h-3.5 w-3.5 shrink-0 text-zinc-400 transition-transform duration-200",
+                            open && "rotate-180"
+                        )}
+                    />
                 </Button>
             </PopoverTrigger>
 
-            <PopoverContent align="start" className="w-auto p-0">
-                <div className="flex flex-wrap gap-1.5 border-b border-zinc-200 p-2 dark:border-zinc-800">
-                    {PRESETS.map((preset) => (
-                        <Button
-                            key={preset.label}
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 px-2 text-[11px] font-semibold"
-                            onClick={() => {
-                                // [FIX] A preset supersedes any in-progress
-                                // manual selection — without this, the
-                                // Calendar would keep showing the abandoned
-                                // single-day "open" state instead of the
-                                // preset's actual range.
-                                setPendingFrom(null);
-                                onChange(preset.getRange());
-                            }}
-                        >
-                            {preset.label}
-                        </Button>
-                    ))}
+            <PopoverContent
+                align="start"
+                className="w-auto max-w-[calc(100vw-1.5rem)] overflow-hidden rounded-2xl border-zinc-200 p-0 shadow-lg"
+            >
+                <div className="flex flex-wrap gap-1.5 border-b border-zinc-100 bg-zinc-50/60 p-2.5">
+                    {PRESETS.map((preset) => {
+                        const active = !pendingFrom && matchesPreset(value, preset.getRange());
+                        return (
+                            <button
+                                key={preset.label}
+                                type="button"
+                                aria-pressed={active}
+                                className={cn(
+                                    "h-8 rounded-full border px-3 text-[11px] font-bold transition-all duration-200 active:scale-95",
+                                    active
+                                        ? "border-emerald-600 bg-emerald-600 text-white shadow-sm"
+                                        : "border-zinc-200 bg-white text-zinc-700 hover:border-emerald-300 hover:bg-emerald-50"
+                                )}
+                                onClick={() => {
+                                    // [FIX] A preset supersedes any in-progress
+                                    // manual selection — without this, the
+                                    // Calendar would keep showing the abandoned
+                                    // single-day "open" state instead of the
+                                    // preset's actual range.
+                                    setPendingFrom(null);
+                                    onChange(preset.getRange());
+                                }}
+                            >
+                                {preset.label}
+                            </button>
+                        );
+                    })}
                 </div>
 
                 <Calendar
@@ -162,6 +199,24 @@ export function DateRangePicker({ value, onChange, disabled }: DateRangePickerPr
                     numberOfMonths={1}
                     className="p-3"
                 />
+
+                <div className="flex items-center justify-between gap-2 border-t border-zinc-100 px-3 py-2.5">
+                    <span className="text-[11px] font-medium text-zinc-500">
+                        {pendingFrom ? "اختر اليوم الأخير من الفترة" : "اختر يوماً، ثم يوماً ثانياً لفترة أطول"}
+                    </span>
+                    <Button
+                        type="button"
+                        size="sm"
+                        className="h-8 rounded-lg bg-emerald-600 px-4 text-xs font-bold text-white hover:bg-emerald-700 active:scale-95"
+                        onClick={() => {
+                            // Same cleanup the Popover's own close path does.
+                            setOpen(false);
+                            setPendingFrom(null);
+                        }}
+                    >
+                        تم
+                    </Button>
+                </div>
             </PopoverContent>
         </Popover>
     );

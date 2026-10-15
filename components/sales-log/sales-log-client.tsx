@@ -87,6 +87,14 @@
  * animates in (fade + slight upward slide) instead of snapping open. No
  * dark-mode classes anywhere in this file: intentionally not on the
  * roadmap yet.
+ *
+ * [v4.5 — polish pass, presentation only] Header icon gets a gradient tile;
+ * the filter card gains a small title row with a "مسح الفلاتر" action (only
+ * shown while a non-default filter is active — it resets paging and the
+ * filter states, nothing else); the customer-name input gets a search icon
+ * and an inline clear button; selects are 40px tall for touch; the results
+ * summary is a pill with a live count; "load more" is full-width on phones.
+ * All fetching / derived-loading / re-walk logic above is untouched.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -95,9 +103,12 @@ import {
     ListFilter,
     Loader2,
     RefreshCw,
+    RotateCcw,
     ScrollText,
+    Search,
     ShieldCheck,
     SlidersHorizontal,
+    X,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -145,6 +156,12 @@ type LoadResult = {
     items: InvoiceLogRow[];
     nextCursor: string | null;
 };
+
+/** Shared look for the filter labels. */
+const FILTER_LABEL = "text-[11px] font-bold text-zinc-500";
+/** Shared look for the select triggers (40px: comfortable touch target). */
+const FILTER_TRIGGER =
+    "h-10 w-full rounded-lg text-xs font-medium transition-shadow focus:border-emerald-500 focus:ring-emerald-500/20";
 
 export function SalesLogClient() {
     const { data: session, status: sessionStatus } = useSessionWithOfflineFallback();
@@ -388,6 +405,17 @@ export function SalesLogClient() {
     // both the new VOIDED row and the now-cross-linked original appear.
     const handleVoidSuccess = () => setReloadToken((token) => token + 1);
 
+    // [v4.5] Back to the default filters (the date range is intentionally
+    // left alone: it is the required filter, not an optional narrowing one).
+    // Clearing the draft lets the debounce effect clear the committed name.
+    const handleClearFilters = () => {
+        resetPaging();
+        setStatusFilter("ALL");
+        setPaymentFilter("ALL");
+        setStaffFilter("ALL");
+        setCustomerNameDraft("");
+    };
+
     const hasMore = Boolean(nextCursor) && !loading;
 
     return (
@@ -395,12 +423,12 @@ export function SalesLogClient() {
             {/* Header */}
             <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="flex items-start gap-3">
-                    <div className="rounded-xl bg-emerald-100 p-2.5">
-                        <ScrollText className="h-6 w-6 text-emerald-600" />
+                    <div className="rounded-2xl bg-linear-to-br from-emerald-500 to-emerald-700 p-2.5 shadow-sm shadow-emerald-600/25">
+                        <ScrollText className="h-6 w-6 text-white" />
                     </div>
                     <div>
-                        <h1 className="text-xl font-bold text-zinc-900">سجل المبيعات</h1>
-                        <p className="mt-0.5 text-xs text-zinc-500">
+                        <h1 className="text-xl font-extrabold text-zinc-900">سجل المبيعات</h1>
+                        <p className="mt-0.5 max-w-xl text-xs leading-relaxed text-zinc-500">
                             كل فاتورة أُنشئت في المتجر — نقدية أو على الحساب، بما فيها الفواتير الملغاة.
                         </p>
                     </div>
@@ -414,12 +442,16 @@ export function SalesLogClient() {
                         variant="outline"
                         size="sm"
                         onClick={() => setFiltersOpen((o) => !o)}
-                        className="h-9 gap-1.5 text-xs font-semibold transition-colors md:hidden"
+                        aria-expanded={filtersOpen}
+                        className={cn(
+                            "h-10 gap-1.5 rounded-xl text-xs font-semibold transition-all active:scale-[0.97] md:hidden",
+                            filtersOpen && "border-emerald-300 bg-emerald-50 text-emerald-700"
+                        )}
                     >
                         <SlidersHorizontal className="h-3.5 w-3.5" />
                         <span>الفلاتر</span>
                         {activeFilterCount > 0 && (
-                            <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-600 px-1 text-[10px] font-bold text-white">
+                            <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-600 px-1 text-[10px] font-bold text-white motion-safe:animate-in zoom-in-50 duration-200">
                                 {activeFilterCount}
                             </span>
                         )}
@@ -437,7 +469,7 @@ export function SalesLogClient() {
                         size="sm"
                         onClick={handleRefresh}
                         disabled={loading}
-                        className="h-9 gap-1.5 text-xs font-semibold transition-colors"
+                        className="h-10 gap-1.5 rounded-xl text-xs font-semibold transition-all active:scale-[0.97]"
                     >
                         {loading ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -453,8 +485,8 @@ export function SalesLogClient() {
                 server-side; this only tells the user why the list is smaller
                 than the store's full history. */}
             {role === "CASHIER" && (
-                <div className="flex items-start gap-2 rounded-lg border border-blue-200 bg-blue-50/60 p-2.5 text-[11px] font-medium text-blue-800">
-                    <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <div className="flex items-start gap-2.5 rounded-xl border border-blue-200 bg-blue-50/70 p-3 text-xs font-medium leading-relaxed text-blue-800 motion-safe:animate-in fade-in slide-in-from-top-1 duration-300">
+                    <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
                     <span>تظهر هنا فواتيرك أنت فقط. يمكن لمدير المتجر عرض فواتير جميع الموظفين.</span>
                 </div>
             )}
@@ -469,131 +501,187 @@ export function SalesLogClient() {
                 that breakpoint). */}
             <div
                 className={cn(
-                    "grid grid-cols-2 gap-3 rounded-xl border border-zinc-200 bg-white p-4 shadow-sm sm:grid-cols-3 lg:grid-cols-5",
+                    "rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm",
                     filtersOpen
                         ? "animate-in fade-in slide-in-from-top-2 duration-200"
-                        : "hidden md:grid"
+                        : "hidden md:block"
                 )}
             >
-                <div className="col-span-2 flex flex-col gap-1.5 sm:col-span-1">
-                    <Label className="text-[11px] font-bold text-zinc-500">الفترة الزمنية</Label>
-                    <DateRangePicker
-                        value={range}
-                        disabled={loading}
-                        onChange={(next) => {
-                            resetPaging();
-                            setRange(next);
-                        }}
-                    />
+                <div className="mb-3 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-extrabold text-zinc-800">
+                        <span className="grid size-6 place-items-center rounded-md bg-emerald-50 text-emerald-600">
+                            <SlidersHorizontal className="h-3.5 w-3.5" />
+                        </span>
+                        تصفية السجل
+                    </div>
+                    {activeFilterCount > 0 && (
+                        <button
+                            type="button"
+                            onClick={handleClearFilters}
+                            className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-emerald-700 transition-all hover:bg-emerald-50 active:scale-95 motion-safe:animate-in fade-in zoom-in-95 duration-200"
+                        >
+                            <RotateCcw className="h-3 w-3" />
+                            مسح الفلاتر
+                        </button>
+                    )}
                 </div>
 
-                {/* [v4.2] customerName filter — debounced free-text search. */}
-                <div className="flex flex-col gap-1.5">
-                    <Label className="text-[11px] font-bold text-zinc-500">اسم الزبون</Label>
-                    <Input
-                        type="text"
-                        value={customerNameDraft}
-                        onChange={(e) => setCustomerNameDraft(e.target.value)}
-                        placeholder="ابحث بالاسم..."
-                        disabled={loading}
-                        className="h-9 w-full text-xs transition-shadow focus-visible:shadow-sm"
-                        dir="rtl"
-                    />
-                </div>
-
-                <div className="flex flex-col gap-1.5">
-                    <Label className="text-[11px] font-bold text-zinc-500">حالة الفاتورة</Label>
-                    <Select
-                        value={statusFilter}
-                        onValueChange={(value: StatusFilter) => {
-                            resetPaging();
-                            setStatusFilter(value);
-                        }}
-                    >
-                        <SelectTrigger className="h-9 w-full text-xs font-medium">
-                            <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent dir="rtl">
-                            <SelectItem value="ALL" className="text-xs">
-                                كل الحالات
-                            </SelectItem>
-                            {(Object.keys(INVOICE_STATUS_LABELS) as InvoiceStatusValue[]).map((value) => (
-                                <SelectItem key={value} value={value} className="text-xs">
-                                    {INVOICE_STATUS_LABELS[value]}
-                                </SelectItem>
-                            ))}
-                        </SelectContent>
-                    </Select>
-                </div>
-
-                <div className="flex flex-col gap-1.5">
-                    <Label className="text-[11px] font-bold text-zinc-500">حالة الدفع</Label>
-                    <Select
-                        value={paymentFilter}
-                        onValueChange={(value: PaymentFilter) => {
-                            resetPaging();
-                            setPaymentFilter(value);
-                        }}
-                    >
-                        <SelectTrigger className="h-9 w-full text-xs font-medium">
-                            <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent dir="rtl">
-                            <SelectItem value="ALL" className="text-xs">
-                                كل حالات الدفع
-                            </SelectItem>
-                            {(Object.keys(PAYMENT_STATUS_LABELS) as PaymentStatusBadgeValue[]).map((value) => (
-                                <SelectItem key={value} value={value} className="text-xs">
-                                    {PAYMENT_STATUS_LABELS[value]}
-                                </SelectItem>
-                            ))}
-                        </SelectContent>
-                    </Select>
-                </div>
-
-                {/* ADMIN-only per T2b's Role Capability Matrix. Absent — not
-                    disabled — for a CASHIER, who is server-side scoped to
-                    their own invoices regardless. The options come from the
-                    already-existing ADMIN-gated GET /api/staff. */}
-                {isAdmin && (
-                    <div className="flex flex-col gap-1.5">
-                        <Label className="text-[11px] font-bold text-zinc-500">الموظف</Label>
-                        <Select
-                            value={staffFilter}
-                            onValueChange={(value: string) => {
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+                    <div className="col-span-2 flex flex-col gap-1.5 sm:col-span-1">
+                        <Label className={FILTER_LABEL}>الفترة الزمنية</Label>
+                        <DateRangePicker
+                            value={range}
+                            disabled={loading}
+                            onChange={(next) => {
                                 resetPaging();
-                                setStaffFilter(value);
+                                setRange(next);
+                            }}
+                        />
+                    </div>
+
+                    {/* [v4.2] customerName filter — debounced free-text search. */}
+                    <div className="flex flex-col gap-1.5">
+                        <Label className={FILTER_LABEL}>اسم الزبون</Label>
+                        <div className="group relative">
+                            <Search
+                                className="pointer-events-none absolute end-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-400 transition-colors group-focus-within:text-emerald-600"
+                                aria-hidden
+                            />
+                            <Input
+                                type="text"
+                                value={customerNameDraft}
+                                onChange={(e) => setCustomerNameDraft(e.target.value)}
+                                placeholder="ابحث بالاسم..."
+                                disabled={loading}
+                                className="h-10 w-full rounded-lg ps-8 pe-9 text-xs transition-shadow focus-visible:border-emerald-500 focus-visible:shadow-sm focus-visible:ring-emerald-500/20"
+                                dir="rtl"
+                            />
+                            {customerNameDraft && (
+                                <button
+                                    type="button"
+                                    aria-label="مسح اسم الزبون"
+                                    onClick={() => setCustomerNameDraft("")}
+                                    className="absolute start-1.5 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded-md text-zinc-400 transition-all hover:bg-zinc-100 hover:text-zinc-700 active:scale-90 motion-safe:animate-in fade-in zoom-in-75 duration-150"
+                                >
+                                    <X className="h-3.5 w-3.5" />
+                                </button>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="flex flex-col gap-1.5">
+                        <Label className={FILTER_LABEL}>حالة الفاتورة</Label>
+                        <Select
+                            value={statusFilter}
+                            onValueChange={(value: StatusFilter) => {
+                                resetPaging();
+                                setStatusFilter(value);
                             }}
                         >
-                            <SelectTrigger className="h-9 w-full text-xs font-medium">
+                            <SelectTrigger
+                                className={cn(
+                                    FILTER_TRIGGER,
+                                    statusFilter !== "ALL" && "border-emerald-300 bg-emerald-50/50"
+                                )}
+                            >
                                 <SelectValue />
                             </SelectTrigger>
                             <SelectContent dir="rtl">
                                 <SelectItem value="ALL" className="text-xs">
-                                    كل الموظفين
+                                    كل الحالات
                                 </SelectItem>
-                                {staffOptions.map((staff) => (
-                                    <SelectItem key={staff.id} value={staff.id} className="text-xs">
-                                        {staff.name}
-                                        {staff.role === "ADMIN" ? " (مدير)" : ""}
-                                        {!staff.isActive ? " — معطّل" : ""}
+                                {(Object.keys(INVOICE_STATUS_LABELS) as InvoiceStatusValue[]).map((value) => (
+                                    <SelectItem key={value} value={value} className="text-xs">
+                                        {INVOICE_STATUS_LABELS[value]}
                                     </SelectItem>
                                 ))}
                             </SelectContent>
                         </Select>
                     </div>
-                )}
+
+                    <div className="flex flex-col gap-1.5">
+                        <Label className={FILTER_LABEL}>حالة الدفع</Label>
+                        <Select
+                            value={paymentFilter}
+                            onValueChange={(value: PaymentFilter) => {
+                                resetPaging();
+                                setPaymentFilter(value);
+                            }}
+                        >
+                            <SelectTrigger
+                                className={cn(
+                                    FILTER_TRIGGER,
+                                    paymentFilter !== "ALL" && "border-emerald-300 bg-emerald-50/50"
+                                )}
+                            >
+                                <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent dir="rtl">
+                                <SelectItem value="ALL" className="text-xs">
+                                    كل حالات الدفع
+                                </SelectItem>
+                                {(Object.keys(PAYMENT_STATUS_LABELS) as PaymentStatusBadgeValue[]).map((value) => (
+                                    <SelectItem key={value} value={value} className="text-xs">
+                                        {PAYMENT_STATUS_LABELS[value]}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                    </div>
+
+                    {/* ADMIN-only per T2b's Role Capability Matrix. Absent — not
+                        disabled — for a CASHIER, who is server-side scoped to
+                        their own invoices regardless. The options come from the
+                        already-existing ADMIN-gated GET /api/staff. */}
+                    {isAdmin && (
+                        <div className="flex flex-col gap-1.5">
+                            <Label className={FILTER_LABEL}>الموظف</Label>
+                            <Select
+                                value={staffFilter}
+                                onValueChange={(value: string) => {
+                                    resetPaging();
+                                    setStaffFilter(value);
+                                }}
+                            >
+                                <SelectTrigger
+                                    className={cn(
+                                        FILTER_TRIGGER,
+                                        staffFilter !== "ALL" && "border-emerald-300 bg-emerald-50/50"
+                                    )}
+                                >
+                                    <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent dir="rtl">
+                                    <SelectItem value="ALL" className="text-xs">
+                                        كل الموظفين
+                                    </SelectItem>
+                                    {staffOptions.map((staff) => (
+                                        <SelectItem key={staff.id} value={staff.id} className="text-xs">
+                                            {staff.name}
+                                            {staff.role === "ADMIN" ? " (مدير)" : ""}
+                                            {!staff.isActive ? " — معطّل" : ""}
+                                        </SelectItem>
+                                    ))}
+                                </SelectContent>
+                            </Select>
+                        </div>
+                    )}
+                </div>
             </div>
 
             {/* Results summary + pagination state */}
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500">
                 <span
                     className={cn(
-                        "inline-flex items-center gap-1.5 font-semibold",
+                        "inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-2.5 py-1 font-bold text-zinc-700 transition-colors",
                         !loading && rows.length === 0 && "text-zinc-400"
                     )}
                 >
-                    <ListFilter className="h-3.5 w-3.5" />
+                    {loading ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-600" />
+                    ) : (
+                        <ListFilter className="h-3.5 w-3.5" />
+                    )}
                     {loading
                         ? "جارٍ الجلب..."
                         : `عرض ${rows.length.toLocaleString("ar-SY")} فاتورة`}
@@ -610,15 +698,14 @@ export function SalesLogClient() {
             />
 
             {hasMore && (
-                <div className="flex justify-center">
+                <div className="flex justify-center pt-1">
                     <Button
                         type="button"
                         variant="outline"
-                        size="sm"
                         onClick={handleLoadMore}
-                        className="h-9 gap-1.5 text-xs font-bold transition-colors"
+                        className="h-11 w-full gap-1.5 rounded-xl text-sm font-bold transition-all active:scale-[0.98] sm:w-auto sm:px-10"
                     >
-                        <ChevronDown className="h-3.5 w-3.5" />
+                        <ChevronDown className="h-4 w-4" />
                         <span>تحميل المزيد</span>
                     </Button>
                 </div>

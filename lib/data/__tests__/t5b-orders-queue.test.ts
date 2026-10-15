@@ -320,12 +320,52 @@ describe("T5b detail", () => {
         for (const f of ["app/api/orders/route.ts", "app/api/orders/[id]/route.ts", "app/api/orders/[id]/reject/route.ts"]) {
             const content = fs.readFileSync(f, "utf-8");
             // No approve CONTROL: the APPROVED status enum value is fine, but
-            // no approve action/route/button may exist in T5b.
+            // no approve action/route/button may exist in T5b surfaces. The
+            // T5c approve route + approval UI are the ONLY allowed mentions
+            // (narrowed in Phase 4 — see the suite below).
             expect(content).not.toMatch(/approv(e|al|ing)[a-z]*\s*(order|button|action|route|handler)/i);
             expect(content).not.toMatch(/orders:approve/);
         }
     });
-    it("UI wording: no trust labels, shared constants, no approve control", async () => {
+    it("approve mentions live ONLY in the approve route + approval UI (T5c Phase 4)", () => {
+        // Allow-list: POST /api/orders/[id]/approve + the approval dialog +
+        // orders-client wiring. Everything else (queue, detail route, reject
+        // route, drawer shell) must still not mention approval.
+        const allowed = new Set([
+            "app/api/orders/[id]/approve/route.ts",
+            "components/orders/approve-order-dialog.tsx",
+            "components/orders/orders-client.tsx",
+            "lib/data/orders-approval.ts",
+            "lib/data/orders-approval-tx.ts",
+            "lib/db/tx-retry.ts",
+        ]);
+        const candidates = [
+            "app/api/orders/route.ts",
+            "app/api/orders/[id]/route.ts",
+            "app/api/orders/[id]/reject/route.ts",
+            "app/api/orders/[id]/approve/route.ts",
+            "components/orders/orders-client.tsx",
+            "components/orders/order-detail-drawer.tsx",
+            "components/orders/approve-order-dialog.tsx",
+            "components/orders/reject-order-dialog.tsx",
+        ];
+        for (const f of candidates) {
+            let content = "";
+            try {
+                content = fs.readFileSync(f, "utf-8");
+            } catch {
+                continue;
+            }
+            const mentions =
+                /orders:approve/.test(content) || /\/approve\b/.test(content);
+            if (allowed.has(f)) {
+                expect(mentions, `${f} should mention approval`).toBe(true);
+            } else {
+                expect(content).not.toMatch(/orders:approve/);
+            }
+        }
+    });
+    it("UI wording: no trust labels, shared constants, approve only in dialog wiring", async () => {
         const uiFiles = [
             "components/orders/orders-client.tsx",
             "components/orders/order-detail-drawer.tsx",
@@ -336,7 +376,13 @@ describe("T5b detail", () => {
             const content = fs.readFileSync(f, "utf-8");
             expect(content).not.toContain("موثوق");
             expect(content).not.toContain("موثّق");
-            expect(content).not.toMatch(/orders:approve/);
+        }
+        // orders:approve is asserted in orders-client wiring (T5c); the
+        // drawer shell stays presentational and never names the capability.
+        // The approval dialog is the only component besides orders-client
+        // allowed to carry approval strings.
+        for (const f of ["components/orders/order-detail-drawer.tsx", "components/orders/reject-order-dialog.tsx"]) {
+            expect(fs.readFileSync(f, "utf-8")).not.toMatch(/orders:approve/);
         }
         const drawer = fs.readFileSync("components/orders/order-detail-drawer.tsx", "utf-8");
         expect(drawer).toContain("PRIOR_APPROVAL_BADGE_LABEL");

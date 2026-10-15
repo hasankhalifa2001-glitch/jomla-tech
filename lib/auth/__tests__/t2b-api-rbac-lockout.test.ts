@@ -113,7 +113,11 @@ import { POST as repaymentHandler } from "@/app/api/ledger/repayments/route";
 import { POST as voidHandler } from "@/app/api/ledger/voids/route";
 import { POST as mergeHandler } from "@/app/api/ledger/merge/route";
 import { GET as failedSyncHandler } from "@/app/api/ledger/failed-sync/route";
-import { PATCH as orderStatusHandler } from "@/app/api/orders/[id]/status/route";
+// [T5c Phase 4, D19] Legacy PATCH /api/orders/[id]/status retired. The
+// lockout suite now pins the approve/reject split: CASHIER is 403 on both,
+// and the legacy path no longer exists.
+import { POST as approveHandler } from "@/app/api/orders/[id]/approve/route";
+import { POST as rejectHandler } from "@/app/api/orders/[id]/reject/route";
 import { GET as ordersHandler } from "@/app/api/orders/route";
 
 describe("T2b API Mutation Security Boundary & Role Enforcement", () => {
@@ -270,16 +274,33 @@ describe("T2b API Mutation Security Boundary & Role Enforcement", () => {
     });
 
     it("rejects CASHIER from approving/rejecting orders, but permits reading orders queue", async () => {
-      const orderPatchRes = await orderStatusHandler(
-        new Request("http://localhost/api/orders/o-1/status", {
-          method: "PATCH",
+      mockSessionState.session = {
+        user: { id: "user-cashier", role: "CASHIER", tenantId: "tenant-1", subscriptionStatus: "ACTIVE" },
+      };
+      const approveRes = await approveHandler(
+        new Request("http://localhost/api/orders/o-1/approve", {
+          method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: "APPROVED" }),
+          body: JSON.stringify({
+            lines: [{ itemId: "i-1", approvedQuantity: "1" }],
+            customer: { mode: "NEW", name: "زبون اختبار", phone: "0944123456" },
+            payment: { mode: "FULL_CREDIT" },
+          }),
         }),
         { params: Promise.resolve({ id: "o-1" }) }
       );
-      expect(orderPatchRes.status).toBe(403);
-      expect((await orderPatchRes.json()).error).toBe("FORBIDDEN");
+      expect(approveRes.status).toBe(403);
+      expect((await approveRes.json()).code).toBe("FORBIDDEN");
+
+      const rejectRes = await rejectHandler(
+        new Request("http://localhost/api/orders/o-1/reject", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "سبب رفض صالح للاختبار" }),
+        }),
+        { params: Promise.resolve({ id: "o-1" }) }
+      );
+      expect(rejectRes.status).toBe(403);
 
       const { NextRequest } = await import("next/server");
       const ordersGetRes = await ordersHandler(

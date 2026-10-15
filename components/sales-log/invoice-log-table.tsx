@@ -29,9 +29,15 @@
  * skeleton rows instead, which reads as "content incoming" rather than
  * "something is stuck"), and every row/card fades and slides in gently on
  * first paint. No dark-mode classes: intentionally not on the roadmap yet.
+ *
+ * [v4.5 — polish pass, presentation only] Customer initial avatars; a
+ * coloured status dot on every row; mobile cards lead with the customer and
+ * a large total; the loading placeholder mirrors the real layout (table rows
+ * on desktop, cards on phones); the empty state is friendlier. Row/void/
+ * cross-link behaviour and canVoidInvoice() are unchanged.
  */
 
-import { Clock, Loader2, Ban, Link2, User, Receipt } from "lucide-react";
+import { Ban, Clock, Link2, Loader2, Receipt, User } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -75,12 +81,43 @@ function canVoidInvoice(row: InvoiceLogRow, isAdmin: boolean): boolean {
     return isAdmin && row.status === "COMPLETED" && !row.voidsInvoiceId && !row.voidedByInvoiceId;
 }
 
-function TotalsCell({ row }: { row: InvoiceLogRow }) {
+/** Small coloured dot summarising the invoice status at a glance. */
+function StatusDot({ status }: { status: InvoiceLogRow["status"] }) {
     return (
-        <div className="flex flex-col text-left md:text-right">
+        <span
+            aria-hidden
+            className={cn(
+                "inline-block size-2 shrink-0 rounded-full",
+                status === "VOIDED" ? "bg-red-500" : status === "COMPLETED" ? "bg-emerald-500" : "bg-amber-500"
+            )}
+        />
+    );
+}
+
+function CustomerAvatar({ name, voided }: { name: string; voided: boolean }) {
+    return (
+        <span
+            aria-hidden
+            className={cn(
+                "grid size-9 shrink-0 place-items-center rounded-xl text-sm font-extrabold ring-1 ring-inset",
+                voided
+                    ? "bg-red-50 text-red-600 ring-red-100"
+                    : "bg-emerald-50 text-emerald-700 ring-emerald-100"
+            )}
+        >
+            {name.trim().charAt(0).toUpperCase() || "؟"}
+        </span>
+    );
+}
+
+function TotalsCell({ row, large }: { row: InvoiceLogRow; large?: boolean }) {
+    return (
+        <div className="flex flex-col items-start gap-0.5">
             <span
+                dir="ltr"
                 className={cn(
-                    "font-mono text-sm font-extrabold text-zinc-900",
+                    "font-mono font-extrabold tabular-nums text-zinc-900",
+                    large ? "text-base" : "text-sm",
                     row.status === "VOIDED" && "text-zinc-500 line-through decoration-red-400"
                 )}
             >
@@ -88,7 +125,7 @@ function TotalsCell({ row }: { row: InvoiceLogRow }) {
             </span>
             {/* [v4.9] Omit secondary USD entirely when no rate was frozen. */}
             {row.totalUSD !== null && (
-                <span className="text-[11px] font-semibold text-purple-600">
+                <span dir="ltr" className="text-[11px] font-semibold tabular-nums text-purple-600">
                     ≈ ${formatMoney(row.totalUSD, "USD")}
                 </span>
             )}
@@ -119,7 +156,7 @@ function CrossLinks({ row, onOpenDetail }: { row: InvoiceLogRow; onOpenDetail: (
     if (!row.voidsInvoiceId && !row.voidedByInvoiceId) return null;
 
     const chipClass =
-        "inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50/60 px-1.5 py-0.5 text-[10px] font-bold text-red-700 transition-colors hover:bg-red-100";
+        "inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50/60 px-1.5 py-0.5 text-[10px] font-bold text-red-700 transition-all hover:bg-red-100 active:scale-95";
 
     return (
         <div className="flex flex-wrap items-center gap-1.5">
@@ -175,7 +212,7 @@ function VoidButton({
                 e.stopPropagation();
                 onVoid(row);
             }}
-            className="h-7 gap-1 border-red-200 px-2 text-[11px] font-bold text-red-600 transition-colors hover:border-red-300 hover:bg-red-50"
+            className="h-8 gap-1 rounded-lg border-red-200 px-2.5 text-[11px] font-bold text-red-600 transition-all hover:border-red-300 hover:bg-red-50 hover:text-red-700 active:scale-95"
         >
             <Ban className="h-3 w-3" />
             <span>إلغاء الفاتورة</span>
@@ -183,34 +220,64 @@ function VoidButton({
     );
 }
 
-/** Three staged, gently pulsing placeholder rows — reads as "loading content" rather than a bare spinner. */
+/** Placeholder that mirrors the real layout: rows on desktop, cards on phones. */
 function LoadingRows() {
     return (
-        <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-3">
-            <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold text-zinc-400">
+        <div aria-busy="true">
+            <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold text-zinc-400">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-500" />
                 <span>جارٍ تحميل سجل الفواتير...</span>
             </div>
-            {[0, 1, 2].map((i) => (
-                <div
-                    key={i}
-                    className="h-14 animate-pulse rounded-lg bg-zinc-100"
-                    style={{ animationDelay: `${i * 120}ms` }}
-                />
-            ))}
+
+            <div className="hidden divide-y divide-zinc-100 overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm md:block">
+                {[0, 1, 2, 3].map((i) => (
+                    <div
+                        key={i}
+                        className="flex items-center gap-4 px-4 py-4 animate-pulse"
+                        style={{ animationDelay: `${i * 120}ms` }}
+                    >
+                        <div className="h-3.5 w-20 rounded bg-zinc-100" />
+                        <div className="h-3.5 w-24 rounded bg-zinc-100" />
+                        <div className="size-9 rounded-xl bg-zinc-100" />
+                        <div className="h-3.5 flex-1 rounded bg-zinc-100" />
+                        <div className="h-4 w-28 rounded bg-zinc-100" />
+                        <div className="h-5 w-24 rounded-full bg-zinc-100" />
+                    </div>
+                ))}
+            </div>
+
+            <div className="space-y-3 md:hidden">
+                {[0, 1, 2].map((i) => (
+                    <div
+                        key={i}
+                        className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm animate-pulse"
+                        style={{ animationDelay: `${i * 120}ms` }}
+                    >
+                        <div className="flex items-center gap-3">
+                            <div className="size-9 rounded-xl bg-zinc-100" />
+                            <div className="flex-1 space-y-2">
+                                <div className="h-3.5 w-1/2 rounded bg-zinc-100" />
+                                <div className="h-3 w-1/3 rounded bg-zinc-100" />
+                            </div>
+                            <div className="h-5 w-20 rounded bg-zinc-100" />
+                        </div>
+                        <div className="h-5 w-40 rounded-full bg-zinc-100" />
+                    </div>
+                ))}
+            </div>
         </div>
     );
 }
 
 function EmptyState() {
     return (
-        <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-zinc-300 bg-white py-16 text-center animate-in fade-in duration-300">
-            <div className="grid h-12 w-12 place-items-center rounded-full bg-zinc-100">
-                <Receipt className="h-6 w-6 text-zinc-400" />
+        <div className="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-zinc-300 bg-white px-6 py-16 text-center motion-safe:animate-in fade-in zoom-in-95 duration-300">
+            <div className="grid h-14 w-14 place-items-center rounded-2xl bg-emerald-50 motion-safe:animate-in zoom-in-50 duration-500 delay-100 fill-mode-backwards">
+                <Receipt className="h-7 w-7 text-emerald-600" />
             </div>
             <div>
-                <p className="text-sm font-bold text-zinc-700">لا توجد فواتير ضمن الفترة المحددة</p>
-                <p className="mt-1 text-xs text-zinc-500">جرّب توسيع نطاق التاريخ أو إزالة الفلاتر.</p>
+                <p className="text-sm font-extrabold text-zinc-800">لا توجد فواتير ضمن الفترة المحددة</p>
+                <p className="mt-1 text-xs leading-relaxed text-zinc-500">جرّب توسيع نطاق التاريخ أو إزالة الفلاتر.</p>
             </div>
         </div>
     );
@@ -247,20 +314,23 @@ export function InvoiceLogTable({
         },
     });
 
+    const focusRing =
+        "outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40";
+
     return (
         <>
             {/* Desktop / tablet table */}
-            <div className="hidden overflow-x-auto rounded-xl border border-zinc-200 bg-white shadow-sm md:block">
-                <table className="w-full text-right text-xs">
+            <div className="hidden overflow-x-auto rounded-2xl border border-zinc-200 bg-white shadow-sm md:block">
+                <table className="w-full text-start text-xs">
                     <thead className="border-b border-zinc-200 bg-zinc-50/75 font-bold text-zinc-500">
                         <tr>
-                            <th className="px-4 py-3">الوقت</th>
-                            <th className="px-4 py-3">مرجع الفاتورة</th>
-                            <th className="px-4 py-3">الموظف</th>
-                            <th className="px-4 py-3">الزبون</th>
-                            <th className="px-4 py-3">الإجمالي</th>
-                            <th className="px-4 py-3">الدفع / الحالة</th>
-                            <th className="px-4 py-3">إجراءات</th>
+                            <th className="px-4 py-3 text-start">الوقت</th>
+                            <th className="px-4 py-3 text-start">مرجع الفاتورة</th>
+                            <th className="px-4 py-3 text-start">الزبون</th>
+                            <th className="px-4 py-3 text-start">الموظف</th>
+                            <th className="px-4 py-3 text-start">الإجمالي</th>
+                            <th className="px-4 py-3 text-start">الدفع / الحالة</th>
+                            <th className="px-4 py-3 text-start">إجراءات</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-zinc-100 font-medium">
@@ -269,25 +339,44 @@ export function InvoiceLogTable({
                                 key={row.id}
                                 {...rowHandlers(row)}
                                 className={cn(
-                                    "cursor-pointer transition-colors duration-150 hover:bg-emerald-50/60 animate-in fade-in slide-in-from-bottom-1",
+                                    "cursor-pointer transition-colors duration-150 hover:bg-emerald-50/60 focus-visible:bg-emerald-50/60 focus-visible:ring-inset animate-in fade-in slide-in-from-bottom-1",
+                                    focusRing,
                                     i % 2 === 1 && "bg-zinc-50/50",
                                     row.status === "VOIDED" && "bg-red-50/40 hover:bg-red-50/70"
                                 )}
                                 style={{ animationDelay: `${Math.min(i, 12) * 25}ms`, animationDuration: "250ms" }}
                             >
                                 <td className="whitespace-nowrap px-4 py-3 text-zinc-600">
-                                    <span className="inline-flex items-center gap-1.5 font-mono">
+                                    <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
+                                        <StatusDot status={row.status} />
                                         <Clock className="h-3.5 w-3.5 text-zinc-400" />
-                                        {formatRowTime(row.createdAt)}
+                                        <span dir="ltr">{formatRowTime(row.createdAt)}</span>
                                     </span>
                                 </td>
 
                                 <td className="px-4 py-3">
-                                    <div className="flex flex-col gap-1">
-                                        <span className="font-mono text-xs font-bold text-zinc-900">
+                                    <div className="flex flex-col items-start gap-1">
+                                        <span className="rounded-md bg-zinc-100 px-2 py-0.5 font-mono text-xs font-bold text-zinc-800">
                                             {invoiceReference(row.id)}
                                         </span>
                                         <CrossLinks row={row} onOpenDetail={onOpenDetail} />
+                                    </div>
+                                </td>
+
+                                <td className="px-4 py-3">
+                                    <div className="flex items-center gap-2.5">
+                                        <CustomerAvatar name={row.customer.name} voided={row.status === "VOIDED"} />
+                                        <div className="flex min-w-0 flex-col gap-1">
+                                            <span className="font-bold text-zinc-900">{row.customer.name}</span>
+                                            {row.customer.isSystemGenerated && (
+                                                <Badge
+                                                    variant="secondary"
+                                                    className="w-fit bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600"
+                                                >
+                                                    زبون نقدي عام
+                                                </Badge>
+                                            )}
+                                        </div>
                                     </div>
                                 </td>
 
@@ -296,20 +385,6 @@ export function InvoiceLogTable({
                                         <User className="h-3.5 w-3.5 text-zinc-400" />
                                         {row.user.name}
                                     </span>
-                                </td>
-
-                                <td className="px-4 py-3">
-                                    <div className="flex flex-col gap-1">
-                                        <span className="font-semibold text-zinc-800">{row.customer.name}</span>
-                                        {row.customer.isSystemGenerated && (
-                                            <Badge
-                                                variant="secondary"
-                                                className="w-fit bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600"
-                                            >
-                                                زبون نقدي عام
-                                            </Badge>
-                                        )}
-                                    </div>
                                 </td>
 
                                 <td className="px-4 py-3">
@@ -336,47 +411,59 @@ export function InvoiceLogTable({
                         key={row.id}
                         {...rowHandlers(row)}
                         className={cn(
-                            "cursor-pointer rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition-all duration-150 active:scale-[0.99] animate-in fade-in slide-in-from-bottom-1",
-                            row.status === "VOIDED" && "border-red-200 bg-red-50/40"
+                            "cursor-pointer rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm transition-all duration-150 active:scale-[0.99] active:bg-zinc-50 animate-in fade-in slide-in-from-bottom-1",
+                            focusRing,
+                            row.status === "VOIDED" && "border-red-200 bg-red-50/40 active:bg-red-50/70"
                         )}
                         style={{ animationDelay: `${Math.min(i, 12) * 30}ms`, animationDuration: "250ms" }}
                     >
-                        <div className="flex items-start justify-between gap-2">
-                            <div className="flex flex-col gap-1">
-                                <span className="font-mono text-xs font-bold text-zinc-900">
+                        {/* Who + how much */}
+                        <div className="flex items-center gap-3">
+                            <CustomerAvatar name={row.customer.name} voided={row.status === "VOIDED"} />
+                            <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className="truncate text-sm font-extrabold text-zinc-900">
+                                        {row.customer.name}
+                                    </span>
+                                    {row.customer.isSystemGenerated && (
+                                        <Badge
+                                            variant="secondary"
+                                            className="bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600"
+                                        >
+                                            زبون نقدي عام
+                                        </Badge>
+                                    )}
+                                </div>
+                                <span className="mt-0.5 inline-block rounded-md bg-zinc-100 px-1.5 py-0.5 font-mono text-[11px] font-bold text-zinc-700">
                                     {invoiceReference(row.id)}
                                 </span>
-                                <span className="inline-flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-500">
-                                    <Clock className="h-3 w-3" />
-                                    {formatRowTime(row.createdAt)}
-                                    <span className="text-zinc-300">|</span>
-                                    <User className="h-3 w-3" />
-                                    {row.user.name}
-                                </span>
                             </div>
-                            <TotalsCell row={row} />
+                            <TotalsCell row={row} large />
                         </div>
 
-                        <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-600">
-                            <span className="font-semibold text-zinc-800">{row.customer.name}</span>
-                            {row.customer.isSystemGenerated && (
-                                <Badge
-                                    variant="secondary"
-                                    className="bg-zinc-100 px-1.5 py-0 text-[10px] font-bold text-zinc-600"
-                                >
-                                    زبون نقدي عام
-                                </Badge>
-                            )}
+                        {/* Time + staff */}
+                        <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-zinc-50 px-3 py-2 text-[11px] text-zinc-600">
+                            <span className="inline-flex items-center gap-1.5">
+                                <StatusDot status={row.status} />
+                                <Clock className="h-3 w-3 text-zinc-400" />
+                                <span dir="ltr" className="tabular-nums">{formatRowTime(row.createdAt)}</span>
+                            </span>
+                            <span className="inline-flex items-center gap-1.5">
+                                <User className="h-3 w-3 text-zinc-400" />
+                                {row.user.name}
+                            </span>
                         </div>
 
                         <div className="mt-2.5">
                             <BadgesCell row={row} />
                         </div>
 
-                        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2.5">
-                            <CrossLinks row={row} onOpenDetail={onOpenDetail} />
-                            <VoidButton row={row} isAdmin={isAdmin} onVoid={onVoid} />
-                        </div>
+                        {(row.voidsInvoiceId || row.voidedByInvoiceId || canVoidInvoice(row, isAdmin)) && (
+                            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-2.5">
+                                <CrossLinks row={row} onOpenDetail={onOpenDetail} />
+                                <VoidButton row={row} isAdmin={isAdmin} onVoid={onVoid} />
+                            </div>
+                        )}
                     </div>
                 ))}
             </div>

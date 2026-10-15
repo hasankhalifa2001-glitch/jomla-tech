@@ -135,6 +135,14 @@ vi.mock("@/lib/db/tenant-scope", () => ({
     getTenantDb: vi.fn(() => mockDb),
     tenantScopedRawQuery: vi.fn(async () => []),
 }));
+// [T5c Phase 4] The approve route opens its transaction on the RAW prisma
+// client (category-5: lock/FIFO helpers need Prisma.TransactionClient).
+// Route it to the same tenant-enforcing fake — never a real database.
+vi.mock("@/lib/db", () => ({
+    prisma: mockDb,
+    getTenantDb: vi.fn(() => mockDb),
+    tenantScopedRawQuery: vi.fn(async () => []),
+}));
 vi.mock("@/auth", () => ({ auth: vi.fn(async () => mockSession.current) }));
 vi.mock("@/lib/auth/tenant", async (importOriginal) => {
     const actual = await importOriginal<any>();
@@ -144,6 +152,9 @@ vi.mock("@/lib/auth/tenant", async (importOriginal) => {
 import { GET as listHandler } from "@/app/api/orders/route";
 import { GET as detailHandler } from "@/app/api/orders/[id]/route";
 import { POST as rejectHandler } from "@/app/api/orders/[id]/reject/route";
+// [T5c Phase 4] Approve route joins the cross-tenant suite: a foreign order
+// id must 404 with zero writes.
+import { POST as approveHandler } from "@/app/api/orders/[id]/approve/route";
 
 function setSession(role: "ADMIN" | "CASHIER") {
     mockSession.current = { user: { id: ADMIN_A, role, tenantId: TENANT_A } };
@@ -222,6 +233,27 @@ describe("T7 cross-tenant isolation — T5b orders", () => {
         expect(after.reviewedByUserId).toBeUndefined();
         // The conditional write carried A's tenantId, so it matched zero B rows.
         expect(mockDb.b2BOrderRequest.updateMany.mock.calls[0][0].where.tenantId).toBe(TENANT_A);
+    });
+
+    it("approve of a tenant-B id under tenant A -> 404 and B's row is left untouched", async () => {
+        setSession("ADMIN");
+        expect(ORDERS.find((o) => o.id === "b-1")!.status).toBe("PENDING_REVIEW");
+        const res = await approveHandler(
+            new Request(`http://localhost/api/orders/b-1/approve`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    lines: [{ itemId: "item-b1", approvedQuantity: "9" }],
+                    customer: { mode: "EXISTING", customerId: "cust-a" },
+                    payment: { mode: "FULL_CREDIT" },
+                }),
+            }),
+            detailCtx("b-1")
+        );
+        expect(res.status).toBe(404);
+        const after = ORDERS.find((o) => o.id === "b-1")!;
+        expect(after.status).toBe("PENDING_REVIEW");
+        expect(after.resultingInvoiceId).toBeNull();
     });
 
     it("reject of tenant A's own pending order succeeds and only touches A", async () => {

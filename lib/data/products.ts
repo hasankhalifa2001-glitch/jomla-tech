@@ -1342,7 +1342,61 @@ export async function listDisplayUnitsForProducts(
 }
 
 // ----------------------------------------------------------------------------
+// [T5c Phase 3] Batched active-flag lookups for B2B order approval.
+//
+// The approval transaction validates "every product and unit still active"
+// for up to STORE_MAX_LINES_PER_ORDER lines. Two batched findMany calls
+// replace the per-item findProductById()/findProductUnitById() loop (N+1).
+// Same narrow-read posture as listProductNamesByIds()/listUnitNamesByIds()
+// above: ONE query per model, id -> flag only. A missing id simply has no
+// map entry; the caller treats it as inactive (409 PRODUCT_INACTIVE).
+// ----------------------------------------------------------------------------
+
+/** productId -> isActive for the given ids (this tenant only). */
+export async function listProductsActiveFlags(
+    tx: TxOrClient,
+    tenantId: string,
+    productIds: readonly string[]
+): Promise<Map<string, boolean>> {
+    requireTenantId(tenantId, "listProductsActiveFlags");
+    requireIdList(productIds, "listProductsActiveFlags");
+
+    const flags = new Map<string, boolean>();
+    if (productIds.length === 0) return flags;
+
+    const rows = await tx.product.findMany({
+        where: { tenantId, id: { in: [...new Set(productIds)] } },
+        select: { id: true, isActive: true },
+    });
+
+    for (const row of rows) flags.set(row.id, row.isActive);
+    return flags;
+}
+
+/** unitId -> { isActive, productId } for the given ids (this tenant only). */
+export async function listUnitsActiveFlags(
+    tx: TxOrClient,
+    tenantId: string,
+    unitIds: readonly string[]
+): Promise<Map<string, { isActive: boolean; productId: string }>> {
+    requireTenantId(tenantId, "listUnitsActiveFlags");
+    requireIdList(unitIds, "listUnitsActiveFlags");
+
+    const flags = new Map<string, { isActive: boolean; productId: string }>();
+    if (unitIds.length === 0) return flags;
+
+    const rows = await tx.productUnit.findMany({
+        where: { tenantId, id: { in: [...new Set(unitIds)] } },
+        select: { id: true, isActive: true, productId: true },
+    });
+
+    for (const row of rows) flags.set(row.id, { isActive: row.isActive, productId: row.productId });
+    return flags;
+}
+
+// ----------------------------------------------------------------------------
 // [T5a] STOREFRONT read helpers — the public, no-login B2B storefront's ONLY
+
 // sanctioned path to Product / ProductUnit. `product`/`productUnit` model
 // access is banned outside this file (eslint.config.mjs PRODUCT_MODEL_RULES),
 // and lib/data/store.ts is a normal lib/** file, so it CANNOT call

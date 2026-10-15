@@ -46,6 +46,12 @@ export const STORE_ERROR = {
   // Missing before: admin routes had no NOT_FOUND / INTERNAL_ERROR codes.
   NOT_FOUND: "NOT_FOUND",
   INTERNAL_ERROR: "INTERNAL_ERROR",
+  // [T5c — additive] A retryable transaction failure (Prisma P2034 write
+  // conflict / deadlock, or P2028 transaction-interactive timeout). Surfaced
+  // as its own code so the admin UI can show "حاول مرة ثانية" and offer a
+  // retry, distinct from a generic INTERNAL_ERROR. The transaction is fully
+  // rolled back and the order stays PENDING_REVIEW.
+  TX_RETRY: "TX_RETRY",
 } as const;
 
 export type StoreErrorCode = (typeof STORE_ERROR)[keyof typeof STORE_ERROR];

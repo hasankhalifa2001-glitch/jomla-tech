@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-syntax */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import fs from "fs";
 import path from "path";
@@ -26,6 +27,7 @@ const {
   const fakeCustomer: any = {
     findFirst: vi.fn(),
     update: vi.fn(),
+    create: vi.fn(async ({ data }: any) => ({ id: "cust-new", ...data })),
   };
 
   const fakeInvoice: any = {
@@ -37,16 +39,56 @@ const {
 
   // [T5] Everything the approval path needs beyond the status flip.
   const fakeInvoiceItem: any = { create: vi.fn() };
-  const fakeProductBatch: any = { update: vi.fn() };
+  const fakeProductBatch: any = {
+    update: vi.fn(),
+    // Locked-batch productId read ({ id, productId } for locked ids).
+    findMany: vi.fn(async ({ where }: any) => {
+      const ids: string[] = where?.id?.in ?? [];
+      return ids.includes("batch-1") ? [{ id: "batch-1", productId: "prod-1" }] : [];
+    }),
+  };
   const fakeProductUnit: any = { findUniqueOrThrow: vi.fn() };
   const fakeTenant: any = { findUnique: vi.fn() };
-  const fakeB2BOrderRequestItem: any = { findMany: vi.fn() };
+  const fakeB2BOrderRequestItem: any = {
+    findMany: vi.fn(),
+    update: vi.fn(async ({ where, data }: any) => ({ id: where?.id, ...data })),
+  };
 
   const fakeCustomerPayment: any = {
     findMany: vi.fn(),
     updateMany: vi.fn(),
     // [T5] written only when an approval captures a payment
     create: vi.fn(),
+  };
+
+  // [T5c Phase 4] The approve gateway reads product/unit active flags +
+  // names + sold-unit factors through batched products.ts helpers. These
+  // fakes return tenant-scoped rows with the requested fields only.
+  const fakeProduct: any = {
+    findMany: vi.fn(async ({ where, select }: any) => {
+      const ids: string[] = where?.id?.in ?? [];
+      const rows: any[] = [];
+      if (ids.includes("prod-1")) {
+        rows.push({ id: "prod-1", ...(select?.isActive !== false ? { isActive: true } : {}), ...(select?.name ? { name: "منتج" } : {}) });
+      }
+      return rows;
+    }),
+  };
+  const fakeProductUnitFull: any = {
+    findMany: vi.fn(async ({ where, select }: any) => {
+      const ids: string[] = where?.id?.in ?? [];
+      const rows: any[] = [];
+      if (ids.includes("unit-carton")) {
+        rows.push({
+          id: "unit-carton",
+          ...(select?.isActive !== false ? { isActive: true } : {}),
+          ...(select?.productId ? { productId: "prod-1" } : {}),
+          ...(select?.unitName ? { unitName: "طرد" } : {}),
+          ...(select?.conversionFactor ? { conversionFactor: "24" } : {}),
+        });
+      }
+      return rows;
+    }),
   };
 
   const fakeCustomerMergeLog: any = {
@@ -60,6 +102,7 @@ const {
 
   const fakeB2BOrderRequest: any = {
     findFirst: vi.fn(),
+    findUnique: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
   };
@@ -80,7 +123,8 @@ const {
     invoice: fakeInvoice,
     invoiceItem: fakeInvoiceItem,
     productBatch: fakeProductBatch,
-    productUnit: fakeProductUnit,
+    product: fakeProduct,
+    productUnit: fakeProductUnitFull,
     tenant: fakeTenant,
     customerPayment: fakeCustomerPayment,
     customerMergeLog: fakeCustomerMergeLog,
@@ -153,17 +197,21 @@ vi.mock("@/lib/db", async (importOriginal) => {
 });
 
 // [T5] Inventory helpers that would otherwise need real ProductBatch rows
-// through the fake tx. lib/inventory/units.ts stays REAL.
+// through the fake tx. lib/inventory/units.ts stays REAL. The allocation
+// carries the batch's cost basis (the real allocator reads it off the
+// locked row) so the invoice-item build matches production shape.
 vi.mock("@/lib/inventory/fifo", () => ({
   commitFifoAllocation: vi.fn(async (_tx: any, args: any) => ({
-    allocations: [{ batchId: "batch-1", allocatedQty: args.requestedQty }],
+    allocations: [{ batchId: "batch-1", allocatedQty: args.requestedQty, costPricePerBaseUnit: "10.0000" }],
     isSufficient: true,
     remainingQty: "0",
   })),
 }));
 
 vi.mock("@/lib/inventory/batch-locking", () => ({
-  lockBatchesForFifoAllocations: vi.fn(async () => new Map()),
+  // [T5c Phase 4] Return the one seeded batch as locked with ample stock
+  // so the approval integration reaches the invoice assertions.
+  lockBatchesForFifoAllocations: vi.fn(async () => new Map([["batch-1", "100.0000"]])),
 }));
 
 vi.mock("@/lib/inventory/base-unit", async (importOriginal) => {
@@ -176,7 +224,10 @@ vi.mock("@/lib/inventory/base-unit", async (importOriginal) => {
 
 // Import route handlers
 import { POST as mergePost } from "@/app/api/ledger/merge/route";
-import { PATCH as orderStatusPatch } from "@/app/api/orders/[id]/status/route";
+// [T5c Phase 4, D19] Legacy PATCH /api/orders/[id]/status retired. The T5
+// approval integration below now exercises POST /api/orders/[id]/approve
+// (the single approval path) through the same fakes.
+import { POST as approvePost } from "@/app/api/orders/[id]/approve/route";
 
 describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
   beforeEach(() => {
@@ -439,25 +490,30 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
     });
   });
 
-  describe("3. T5 B2B Order Approval Integration", () => {
-    it("resolves matchedCustomerId to surviving customer upon approval after status guard", async () => {
-      // Mock order in PENDING_REVIEW with matchedCustomerId = cust-duplicate
-      fakeB2BOrderRequest.findFirst.mockResolvedValueOnce({
-        id: "order-1",
-        status: "PENDING_REVIEW",
-        matchedCustomerId: "cust-duplicate",
+  describe("3. T5c B2B Order Approval Integration (POST /api/orders/[id]/approve)", () => {
+    // The T5c approve body: every line exactly once, admin-chosen customer,
+    // full-credit payment (default). The claim + merge-redirect run inside
+    // the single approval transaction.
+    const approveBody = {
+      lines: [{ itemId: "item-1", approvedQuantity: "3" }],
+      customer: { mode: "EXISTING", customerId: "cust-duplicate" },
+      payment: { mode: "FULL_CREDIT" },
+    };
+    const approveReq = () =>
+      new Request("http://localhost/api/orders/order-1/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(approveBody),
       });
+    const approveCtx = { params: Promise.resolve({ id: "order-1" }) };
 
-      // Merge log shows cust-duplicate was merged into cust-survivor
-      fakeCustomerMergeLog.findFirst.mockResolvedValueOnce({
-        survivingCustomerId: "cust-survivor",
-      });
-
-      // [T5] The approval path is now the FULL flow (claim → FIFO → invoice →
-      // stock → link), so every dependency it touches must be arranged.
+    it("resolves customerId to surviving customer upon approval after status guard", async () => {
+      // Mock order in PENDING_REVIEW with retailer phone; the approval
+      // resolves cust-duplicate -> cust-survivor at write time.
       fakeB2BOrderRequest.updateMany.mockResolvedValueOnce({ count: 1 });
       fakeB2BOrderRequestItem.findMany.mockResolvedValueOnce([
         {
+          id: "item-1",
           productId: "prod-1",
           unitId: "unit-carton",
           quantity: "3",
@@ -465,38 +521,43 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
           pricingCurrencySnapshot: "SYP",
         },
       ]);
-      fakeTenant.findUnique.mockResolvedValueOnce({ dailyExchangeRate: "15000.0000" });
-      fakeCustomer.findFirst.mockResolvedValueOnce({ isSystemGenerated: false });
+      fakeTenant.findUnique.mockResolvedValueOnce({ dailyExchangeRate: null });
+      fakeCustomer.findFirst.mockResolvedValueOnce({
+        id: "cust-survivor",
+        isActive: true,
+        isSystemGenerated: false,
+      });
+
+      // Merge log shows cust-duplicate was merged into cust-survivor
+      fakeCustomerMergeLog.findFirst.mockResolvedValueOnce({
+        survivingCustomerId: "cust-survivor",
+      });
+
+      // [T5c] The approval path is the FULL flow (claim → FIFO → invoice →
+      // stock → link), so every dependency it touches must be arranged.
+      fakeProductUnit.findUniqueOrThrow.mockResolvedValueOnce({ conversionFactor: "24" });
       fakeProductUnit.findUniqueOrThrow.mockResolvedValueOnce({ conversionFactor: "24" });
       fakeInvoice.create.mockResolvedValueOnce({ id: "inv-1" });
       fakeInvoiceItem.create.mockResolvedValue({});
       fakeProductBatch.update.mockResolvedValue({});
-      fakeB2BOrderRequest.update.mockResolvedValueOnce({
-        id: "order-1",
-        status: "APPROVED",
-        matchedCustomerId: "cust-survivor",
-        resultingInvoiceId: "inv-1",
-      });
+      fakeB2BOrderRequestItem.findMany.mockResolvedValueOnce([]);
+      fakeB2BOrderRequest.findUnique.mockResolvedValueOnce({ retailerPhone: "0944123456" });
 
-      const req = new Request("http://localhost/api/orders/order-1/status", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "APPROVED" }),
-      });
-
-      const params = Promise.resolve({ id: "order-1" });
-      const res = await orderStatusPatch(req, { params });
+      const res = await approvePost(approveReq(), approveCtx);
       expect(res.status).toBe(200);
 
-      // The status CLAIM (race-safe conditional update) froze the resolved
-      // active customer ID onto the row.
+      // The status CLAIM (race-safe conditional update) froze the claim.
       expect(fakeB2BOrderRequest.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: "order-1", tenantId: "tenant-1", status: "PENDING_REVIEW" },
-          data: expect.objectContaining({
-            status: "APPROVED",
-            matchedCustomerId: "cust-survivor",
-          }),
+          data: expect.objectContaining({ status: "APPROVED" }),
+        })
+      );
+
+      // ...the invoice lands on the SURVIVOR (merge-redirect at write time)...
+      expect(fakeInvoice.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ customerId: "cust-survivor" }),
         })
       );
 
@@ -508,17 +569,11 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
     });
 
     it("rejects approval if order is not in PENDING_REVIEW before customer resolution", async () => {
+      fakeB2BOrderRequest.updateMany.mockResolvedValueOnce({ count: 0 });
       fakeB2BOrderRequest.findFirst.mockResolvedValueOnce(null);
 
-      const req = new Request("http://localhost/api/orders/order-1/status", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "APPROVED" }),
-      });
-
-      const params = Promise.resolve({ id: "order-1" });
-      const res = await orderStatusPatch(req, { params });
-      expect(res.status).toBe(400);
+      const res = await approvePost(approveReq(), approveCtx);
+      expect(res.status).toBe(404);
 
       // Customer resolution must not have run, and no invoice may be created
       // for an order that never existed in a reviewable state.
@@ -543,10 +598,13 @@ describe("T4e Addendum (v4.2) — Customer Merge & Auto-Redirect", () => {
       expect(source).toContain('from "@/lib/customers/resolve-active"');
     });
 
-    it("app/api/orders/[id]/status/route.ts invokes resolveActiveCustomerId", () => {
-      const source = readSource("app/api/orders/[id]/status/route.ts");
-      expect(source).toContain("resolveActiveCustomerId");
-      expect(source).toContain('from "@/lib/customers/resolve-active"');
+    it("app/api/orders/[id]/approve/route.ts invokes resolveActiveCustomerId", () => {
+      const source = readSource("app/api/orders/[id]/approve/route.ts");
+      expect(source).not.toContain("resolveActiveCustomerId");
+      // The route delegates to the gateway; the gateway resolves.
+      const gateway = readSource("lib/data/orders-approval-tx.ts");
+      expect(gateway).toContain("resolveActiveCustomerId");
+      expect(gateway).toContain('from "@/lib/customers/resolve-active"');
     });
 
     it("lib/db/tenant-scope.ts includes CustomerMergeLogItem in TENANT_SCOPED_MODELS", () => {

@@ -78,8 +78,13 @@ describe("T2b — Role Capability Matrix & Tenant Assertions", () => {
 
       expect(ROLE_CAPABILITY_MATRIX["orders:view"].ADMIN).toBe(true);
       expect(ROLE_CAPABILITY_MATRIX["orders:view"].CASHIER).toBe(true);
-      expect(ROLE_CAPABILITY_MATRIX["orders:manage"].ADMIN).toBe(true);
-      expect(ROLE_CAPABILITY_MATRIX["orders:manage"].CASHIER).toBe(false);
+      // [T5c Phase 4, D19] orders:manage retired with the legacy
+      // PATCH /api/orders/[id]/status route. Reject/approve rows remain.
+      expect((ROLE_CAPABILITY_MATRIX as Record<string, unknown>)["orders:manage"]).toBeUndefined();
+      expect(ROLE_CAPABILITY_MATRIX["orders:reject"].ADMIN).toBe(true);
+      expect(ROLE_CAPABILITY_MATRIX["orders:reject"].CASHIER).toBe(false);
+      expect(ROLE_CAPABILITY_MATRIX["orders:approve"].ADMIN).toBe(true);
+      expect(ROLE_CAPABILITY_MATRIX["orders:approve"].CASHIER).toBe(false);
 
       expect(ROLE_CAPABILITY_MATRIX["settings:manage"].ADMIN).toBe(true);
       expect(ROLE_CAPABILITY_MATRIX["settings:manage"].CASHIER).toBe(false);
@@ -129,12 +134,12 @@ describe("T2b — Role Capability Matrix & Tenant Assertions", () => {
 
       it("defaults the role on the thrown error to 'CASHIER' when role is null/undefined", () => {
         try {
-          assertAdmin(null, "orders:manage");
+          assertAdmin(null, "orders:approve");
           throw new Error("assertAdmin should have thrown");
         } catch (err) {
           expect(err).toBeInstanceOf(ForbiddenRoleError);
           expect((err as ForbiddenRoleError).role).toBe("CASHIER");
-          expect((err as ForbiddenRoleError).action).toBe("orders:manage");
+          expect((err as ForbiddenRoleError).action).toBe("orders:approve");
         }
       });
     });
