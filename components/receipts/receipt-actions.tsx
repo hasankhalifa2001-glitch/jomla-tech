@@ -60,13 +60,20 @@
  * duplicated artifact. This keeps the fast path to zero extra requests instead
  * of adding a second lightweight "does this invoice already have a PDF"
  * lookup, at the cost of that rare redundant upload.
+ *
+ * [v4.5 — presentation only] The two actions share the row equally (two
+ * columns on phones, content-width from `sm`), 44px tall for touch, with a
+ * solid emerald print action and an outline share action. The gate message is
+ * a small amber notice with an icon instead of loose text. Light mode only.
+ * Every handler and the gate wiring above are untouched.
  */
 
 import { useState } from "react";
-import { Loader2, Printer, Share2 } from "lucide-react";
+import { Info, Loader2, Printer, Share2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { renderReceiptPngBlob, rasterizeReceipt } from "@/components/receipts/receipt-canvas";
 import { buildReceiptModel, type ReceiptSource } from "@/lib/receipts/receipt-model";
 import { assertRasterMatchesConfiguredWidth, buildRasterCommands } from "@/lib/receipts/escpos";
@@ -293,23 +300,32 @@ export function ReceiptActions({
   }
 
   const inlineMessage = gateMessage ?? gateReason;
+  const compact = size === "sm";
+  const btnSize = compact ? "sm" : "default";
+  const btnBase = cn(
+    "w-full gap-1.5 rounded-xl font-bold transition-all active:scale-[0.98] sm:w-auto",
+    compact ? "h-8 text-[11px]" : "h-11 text-xs"
+  );
 
   return (
     <div className={className}>
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="grid grid-cols-2 items-center gap-2 sm:flex sm:flex-wrap">
         <Button
           type="button"
           variant="outline"
-          size={size === "sm" ? "sm" : "default"}
+          size={btnSize}
           onClick={handleThermalPrint}
           disabled={busy !== null}
-          className={size === "sm" ? "gap-1.5 text-[11px]" : "gap-1.5 text-xs"}
+          className={cn(
+            btnBase,
+            "border-emerald-200 text-emerald-700 hover:bg-emerald-50 hover:text-emerald-800"
+          )}
           title="طباعة حرارية مباشرة (58/80 مم) عبر البلوتوث — لا تحتاج اتصالاً بالإنترنت"
         >
           {busy === "print" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="h-4 w-4 animate-spin" />
           ) : (
-            <Printer className="h-3.5 w-3.5" />
+            <Printer className="h-4 w-4" />
           )}
           <span>طباعة حرارية</span>
         </Button>
@@ -323,17 +339,17 @@ export function ReceiptActions({
         <Button
           type="button"
           variant="outline"
-          size={size === "sm" ? "sm" : "default"}
+          size={btnSize}
           onClick={handleShare}
           disabled={!gate.allowed || busy !== null}
           aria-disabled={!gate.allowed}
-          className={size === "sm" ? "gap-1.5 text-[11px]" : "gap-1.5 text-xs"}
+          className={btnBase}
           title={gate.allowed ? "فتح أو إنشاء ملف PDF للإيصال ومشاركته" : gateReason ?? undefined}
         >
           {busy === "share" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="h-4 w-4 animate-spin" />
           ) : (
-            <Share2 className="h-3.5 w-3.5" />
+            <Share2 className="h-4 w-4" />
           )}
           <span>مشاركة الإيصال (PDF)</span>
         </Button>
@@ -342,9 +358,10 @@ export function ReceiptActions({
       {inlineMessage && (
         <p
           role="status"
-          className="mt-1.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+          className="mt-2 flex items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold leading-relaxed text-amber-800 motion-safe:animate-in fade-in slide-in-from-top-1 duration-200"
         >
-          {inlineMessage}
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span>{inlineMessage}</span>
         </p>
       )}
     </div>

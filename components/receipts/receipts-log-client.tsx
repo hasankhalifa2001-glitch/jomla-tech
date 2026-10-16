@@ -39,9 +39,18 @@
  *    then date + total; the entry time only repeats the date when it differs.
  *  - Arabic plurals are handled (استلام / استلامان / استلامات / استلاماً).
  *  - Chevrons point in the RTL "forward" direction (left).
+ *
+ * [v4.8 — polish pass, presentation only] Matches the sales-log screen: a
+ * gradient header tile, the filters inside one card (40px controls), a
+ * results pill, supplier initials, skeletons that mirror the real layout,
+ * friendlier empty/error states and a light staggered entrance. One small
+ * behaviour fix: a keydown that bubbles up from the row's edit button no
+ * longer also opens the detail modal (the row only reacts to keys pressed on
+ * the row itself, and now also to Space). Fetching, derived loading, abort,
+ * append-pagination and the failure-folding logic are unchanged.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronLeft,
@@ -75,6 +84,10 @@ import { ReceiptEditModal } from "./receipt-edit-modal";
 
 const PAGE_SIZE = 25;
 const SUPPLIER_DEBOUNCE_MS = 300;
+
+/** Entrance for list rows: a short stagger per page, skipped for reduced motion. */
+const ROW_ENTER = "motion-safe:animate-in fade-in slide-in-from-bottom-1 duration-300 fill-mode-backwards";
+const rowStyle = (i: number) => ({ animationDelay: `${Math.min(i % PAGE_SIZE, 10) * 30}ms` });
 
 interface LogResult {
   /** Identifies which request produced this result — see header. */
@@ -115,6 +128,15 @@ function entryLabel(row: ReceiptListRow): string {
   return created.startsWith(purchase) ? created.slice(purchase.length).trim() || created : created;
 }
 
+/** Row keyboard activation: Enter / Space, only when the key was pressed on the row itself. */
+function activateOnKey(e: KeyboardEvent<HTMLElement>, fn: () => void) {
+  if (e.target !== e.currentTarget) return;
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    fn();
+  }
+}
+
 function DeletedBadge({ row, long }: { row: ReceiptListRow; long?: boolean }) {
   if (row.deletedCount <= 0) return null;
   const all = row.lineCount === 0;
@@ -133,9 +155,25 @@ function DeletedBadge({ row, long }: { row: ReceiptListRow; long?: boolean }) {
 
 function SupplierText({ name, className }: { name: string | null; className?: string }) {
   return name ? (
-    <span className={cn("truncate font-semibold text-zinc-800", className)}>{name}</span>
+    <span className={cn("truncate font-bold text-zinc-900", className)}>{name}</span>
   ) : (
     <span className={cn("truncate text-zinc-400", className)}>بدون مورّد</span>
+  );
+}
+
+function SupplierAvatar({ name }: { name: string | null }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "grid size-9 shrink-0 place-items-center rounded-xl text-sm font-extrabold ring-1 ring-inset transition-colors",
+        name
+          ? "bg-emerald-50 text-emerald-700 ring-emerald-100 group-hover:bg-emerald-100"
+          : "bg-zinc-100 text-zinc-400 ring-zinc-200"
+      )}
+    >
+      {name ? name.trim().charAt(0).toUpperCase() || "؟" : <Package className="size-4" />}
+    </span>
   );
 }
 
@@ -152,6 +190,40 @@ function filterParams(
   }
   if (supplier) params.set("supplierName", supplier);
   return params;
+}
+
+/** First-load placeholder that mirrors the real layout (rows / cards). */
+function LogSkeleton() {
+  return (
+    <div aria-hidden>
+      <div className="hidden divide-y divide-zinc-100 overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm md:block">
+        {Array.from({ length: 5 }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 px-4 py-4">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="size-9 rounded-xl" />
+            <Skeleton className="h-4 flex-1" />
+            <Skeleton className="h-4 w-20" />
+            <Skeleton className="h-4 w-28" />
+          </div>
+        ))}
+      </div>
+      <div className="space-y-2.5 md:hidden">
+        {Array.from({ length: 4 }, (_, i) => (
+          <div key={i} className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+            <div className="flex items-center gap-3">
+              <Skeleton className="size-9 rounded-xl" />
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-4 w-1/2" />
+                <Skeleton className="h-3 w-1/3" />
+              </div>
+              <Skeleton className="h-5 w-20" />
+            </div>
+            <Skeleton className="h-8 w-full rounded-lg" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 /* ─────────────────────────────────── component ─────────────────────────────────── */
@@ -268,14 +340,16 @@ export function ReceiptsLogClient() {
     <section className="w-full min-w-0 max-w-full space-y-4" aria-busy={loading}>
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <h1 className="flex items-center gap-2 text-xl font-bold text-zinc-900">
-            <ClipboardList className="size-5 shrink-0 text-emerald-600" aria-hidden />
-            سجل الاستلام
-          </h1>
-          <p className="mt-1 text-xs leading-relaxed text-zinc-500">
-            كل عملية استلام بضاعة — التاريخ، المورّد، الأصناف المستلمة، وما تبقّى منها اليوم.
-          </p>
+        <div className="flex min-w-0 flex-1 items-start gap-3">
+          <div className="shrink-0 rounded-2xl bg-linear-to-br from-emerald-500 to-emerald-700 p-2.5 shadow-sm shadow-emerald-600/25">
+            <ClipboardList className="size-6 text-white" aria-hidden />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-xl font-extrabold text-zinc-900">سجل الاستلام</h1>
+            <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">
+              كل عملية استلام بضاعة — التاريخ، المورّد، الأصناف المستلمة، وما تبقّى منها اليوم.
+            </p>
+          </div>
         </div>
         <Button
           type="button"
@@ -284,7 +358,7 @@ export function ReceiptsLogClient() {
           onClick={() => setReloadToken((token) => token + 1)}
           disabled={loading}
           aria-label="تحديث"
-          className="h-9 shrink-0 gap-1.5 text-xs font-bold"
+          className="h-10 shrink-0 gap-1.5 rounded-xl text-xs font-bold transition-all active:scale-[0.97]"
         >
           {loading ? (
             <Loader2 className="size-3.5 animate-spin" aria-hidden />
@@ -295,15 +369,15 @@ export function ReceiptsLogClient() {
         </Button>
       </div>
 
-      {/* Filters — column on mobile, one row from sm: up */}
-      <div className="grid min-w-0 gap-2 sm:flex sm:flex-wrap sm:items-center">
+      {/* Filters — one card: column on mobile, one row from sm: up */}
+      <div className="grid min-w-0 gap-2.5 rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm sm:flex sm:flex-wrap sm:items-center">
         <div className="flex min-w-0 items-center gap-2">
           <div
             className={cn(
               "min-w-0 flex-1 transition-opacity sm:flex-none",
               // Local overrides of the SHARED picker's trigger (the picker file
               // itself is untouched): full width on mobile, long label truncates.
-              "[&>button]:w-full [&>button]:min-w-0 sm:[&>button]:w-auto [&>button>span]:min-w-0 [&>button>span]:truncate",
+              "[&>button]:w-full [&>button]:min-w-0 sm:[&>button]:w-auto sm:[&>button]:min-w-52 [&>button>span]:min-w-0 [&>button>span]:truncate",
               allPeriods && "opacity-50"
             )}
           >
@@ -316,8 +390,8 @@ export function ReceiptsLogClient() {
             onClick={() => setAllPeriods((on) => !on)}
             disabled={loading}
             className={cn(
-              "h-9 shrink-0 gap-1.5 text-xs font-semibold",
-              allPeriods && "bg-emerald-600 hover:bg-emerald-700"
+              "h-10 shrink-0 gap-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97]",
+              allPeriods && "bg-emerald-600 shadow-sm shadow-emerald-600/25 hover:bg-emerald-700"
             )}
             aria-pressed={allPeriods}
           >
@@ -326,9 +400,9 @@ export function ReceiptsLogClient() {
           </Button>
         </div>
 
-        <div className="relative min-w-0 sm:w-72">
+        <div className="group relative min-w-0 sm:w-72">
           <Search
-            className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-slate-400"
+            className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-zinc-400 transition-colors group-focus-within:text-emerald-600"
             aria-hidden
           />
           <Input
@@ -338,14 +412,14 @@ export function ReceiptsLogClient() {
             aria-label="بحث باسم المورّد"
             value={supplierInput}
             onChange={(e) => setSupplierInput(e.target.value)}
-            className="h-9 bg-white ps-9 pe-9 text-sm"
+            className="h-10 rounded-lg bg-white ps-9 pe-9 text-sm transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
           />
           {supplierInput && (
             <button
               type="button"
               onClick={() => setSupplierInput("")}
               aria-label="مسح البحث"
-              className="absolute end-1.5 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+              className="absolute end-1.5 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-lg text-zinc-400 transition-all hover:bg-zinc-100 hover:text-zinc-700 active:scale-90 motion-safe:animate-in fade-in zoom-in-75 duration-150"
             >
               <X className="size-3.5" aria-hidden />
             </button>
@@ -355,29 +429,29 @@ export function ReceiptsLogClient() {
 
       {/* Results summary */}
       <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-500">
-        <span className="font-semibold">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-2.5 py-1 font-bold text-zinc-700">
+          {loading ? (
+            <Loader2 className="size-3.5 animate-spin text-emerald-600" aria-hidden />
+          ) : (
+            <ClipboardList className="size-3.5" aria-hidden />
+          )}
           {loading ? "جارٍ الجلب..." : `عرض ${receiptCountLabel(rows.length)}`}
         </span>
         <span className="hidden sm:inline">من الأحدث إلى الأقدم</span>
       </div>
 
       {/* First-load skeleton */}
-      {firstLoad && (
-        <div className="space-y-2" aria-hidden>
-          {Array.from({ length: 5 }, (_, i) => (
-            <Skeleton key={i} className="h-16 w-full rounded-xl" />
-          ))}
-        </div>
-      )}
+      {firstLoad && <LogSkeleton />}
 
       {/* First-ever failure */}
       {!loading && loadError && rows.length === 0 && (
-        <div className="flex flex-col items-center gap-3 rounded-xl border border-red-200 bg-red-50/60 px-6 py-12 text-center">
+        <div className="flex flex-col items-center gap-3 rounded-2xl border border-red-200 bg-red-50/60 px-6 py-12 text-center motion-safe:animate-in fade-in zoom-in-95 duration-300">
           <p className="text-sm font-bold text-red-700">{loadError}</p>
           <Button
             type="button"
             size="sm"
             variant="outline"
+            className="rounded-xl"
             onClick={() => setReloadToken((token) => token + 1)}
           >
             إعادة المحاولة
@@ -387,14 +461,14 @@ export function ReceiptsLogClient() {
 
       {/* Empty state */}
       {showEmpty && (
-        <div className="flex flex-col items-center gap-3 rounded-xl border border-slate-200 bg-white px-6 py-14 text-center">
-          <div className="flex size-14 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+        <div className="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-zinc-300 bg-white px-6 py-14 text-center motion-safe:animate-in fade-in zoom-in-95 duration-300">
+          <div className="flex size-14 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-600 motion-safe:animate-in zoom-in-50 duration-500 delay-100 fill-mode-backwards">
             <ClipboardList className="size-7" aria-hidden />
           </div>
-          <h2 className="text-sm font-bold text-slate-800">
+          <h2 className="text-sm font-extrabold text-zinc-800">
             {filtered ? "ما في نتائج مطابقة" : "ما في عمليات استلام بعد"}
           </h2>
-          <p className="max-w-xs text-xs leading-relaxed text-slate-500">
+          <p className="max-w-xs text-xs leading-relaxed text-zinc-500">
             {filtered
               ? "جرّب توسيع الفترة أو مسح بحث المورّد."
               : "أول عملية استلام بضاعة (من شاشة المخزون أو استيراد CSV) رح تظهر هون مع تفاصيلها."}
@@ -406,33 +480,35 @@ export function ReceiptsLogClient() {
       {rows.length > 0 && (
         <div
           className={cn(
-            "hidden overflow-x-auto rounded-xl border border-zinc-200 bg-white transition-opacity md:block",
+            "hidden overflow-x-auto rounded-2xl border border-zinc-200 bg-white shadow-sm transition-opacity md:block",
             refreshing && "opacity-60"
           )}
         >
           <table className="w-full min-w-[720px] table-fixed border-collapse text-sm">
             <thead>
               <tr className="border-b border-zinc-200 bg-zinc-50 text-xs font-bold text-zinc-500">
-                <th scope="col" className="w-[16%] px-4 py-2.5 text-start">التاريخ</th>
-                <th scope="col" className="w-[24%] px-4 py-2.5 text-start">المورّد</th>
-                <th scope="col" className="w-[20%] px-4 py-2.5 text-start">المستلم</th>
-                <th scope="col" className="w-[16%] px-4 py-2.5 text-start">الأصناف</th>
-                <th scope="col" className="w-[16%] px-4 py-2.5 text-start">الإجمالي</th>
-                <th scope="col" className="w-[84px] px-2 py-2.5">
+                <th scope="col" className="w-[16%] px-4 py-3 text-start">التاريخ</th>
+                <th scope="col" className="w-[24%] px-4 py-3 text-start">المورّد</th>
+                <th scope="col" className="w-[20%] px-4 py-3 text-start">المستلم</th>
+                <th scope="col" className="w-[16%] px-4 py-3 text-start">الأصناف</th>
+                <th scope="col" className="w-[16%] px-4 py-3 text-start">الإجمالي</th>
+                <th scope="col" className="w-[84px] px-2 py-3">
                   <span className="sr-only">إجراءات</span>
                 </th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((row) => (
+              {rows.map((row, i) => (
                 <tr
                   key={row.id}
                   tabIndex={0}
                   onClick={() => setDetailId(row.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") setDetailId(row.id);
-                  }}
-                  className="group cursor-pointer border-b border-zinc-100 transition-colors last:border-0 hover:bg-emerald-50/50 focus-visible:bg-emerald-50/50 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-emerald-500"
+                  onKeyDown={(e) => activateOnKey(e, () => setDetailId(row.id))}
+                  style={rowStyle(i)}
+                  className={cn(
+                    "group cursor-pointer border-b border-zinc-100 transition-colors last:border-0 hover:bg-emerald-50/50 focus-visible:bg-emerald-50/50 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-emerald-500",
+                    ROW_ENTER
+                  )}
                 >
                   <td className="px-4 py-3 align-middle">
                     {/* inline-block inside a plain div: a `block` dir=ltr element
@@ -449,7 +525,10 @@ export function ReceiptsLogClient() {
                     </span>
                   </td>
                   <td className="max-w-0 px-4 py-3 align-middle">
-                    <SupplierText name={row.supplierName} className="block" />
+                    <span className="flex min-w-0 items-center gap-2.5">
+                      <SupplierAvatar name={row.supplierName} />
+                      <SupplierText name={row.supplierName} className="min-w-0 flex-1" />
+                    </span>
                   </td>
                   <td className="px-4 py-3 align-middle text-zinc-600">
                     <span className="flex min-w-0 items-center gap-1.5">
@@ -459,7 +538,7 @@ export function ReceiptsLogClient() {
                   </td>
                   <td className="px-4 py-3 align-middle">
                     <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-semibold text-zinc-700">
+                      <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-bold text-zinc-700">
                         {lineCountLabel(row.lineCount)}
                       </span>
                       <DeletedBadge row={row} />
@@ -477,7 +556,7 @@ export function ReceiptsLogClient() {
                         variant="ghost"
                         size="icon"
                         aria-label="تعديل بيانات الاستلام"
-                        className="size-8 text-zinc-400 hover:bg-emerald-50 hover:text-emerald-700"
+                        className="size-8 rounded-lg text-zinc-400 transition-all hover:bg-emerald-50 hover:text-emerald-700 active:scale-90"
                         onClick={(e) => {
                           e.stopPropagation();
                           setEditTarget({
@@ -490,7 +569,7 @@ export function ReceiptsLogClient() {
                         <Pencil className="size-3.5" aria-hidden />
                       </Button>
                       <ChevronLeft
-                        className="size-4 text-zinc-300 transition-colors group-hover:text-emerald-500"
+                        className="size-4 text-zinc-300 transition-all group-hover:-translate-x-0.5 group-hover:text-emerald-500"
                         aria-hidden
                       />
                     </span>
@@ -504,28 +583,31 @@ export function ReceiptsLogClient() {
 
       {/* Mobile cards (375px-safe) */}
       {rows.length > 0 && (
-        <ul className={cn("space-y-2 transition-opacity md:hidden", refreshing && "opacity-60")}>
-          {rows.map((row) => (
-            <li key={row.id} className="min-w-0">
+        <ul className={cn("space-y-2.5 transition-opacity md:hidden", refreshing && "opacity-60")}>
+          {rows.map((row, i) => (
+            <li key={row.id} style={rowStyle(i)} className={cn("min-w-0", ROW_ENTER)}>
               <button
                 type="button"
                 onClick={() => setDetailId(row.id)}
-                className="block w-full min-w-0 rounded-xl border border-zinc-200 bg-white p-3 text-start transition-colors active:bg-emerald-50/60 hover:border-emerald-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-500"
+                className="group block w-full min-w-0 rounded-2xl border border-zinc-200 bg-white p-4 text-start shadow-sm transition-all active:scale-[0.99] active:bg-emerald-50/60 hover:border-emerald-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-500"
               >
                 {/* Row 1: supplier + total */}
-                <div className="flex items-start justify-between gap-3">
-                  <SupplierText name={row.supplierName} className="min-w-0 flex-1 text-sm" />
+                <div className="flex items-center gap-3">
+                  <SupplierAvatar name={row.supplierName} />
+                  <div className="min-w-0 flex-1">
+                    <SupplierText name={row.supplierName} className="block text-sm" />
+                    <Ltr className="text-xs font-bold text-zinc-500">
+                      {formatPurchaseDate(row.purchaseDate)}
+                    </Ltr>
+                  </div>
                   <span className="shrink-0 whitespace-nowrap text-sm font-extrabold tabular-nums text-emerald-700">
                     {formatMoney(row.totalCostSYP, "SYP")} ل.س
                   </span>
                 </div>
 
-                {/* Row 2: date • lines */}
-                <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
-                  <Ltr className="font-bold text-zinc-700">
-                    {formatPurchaseDate(row.purchaseDate)}
-                  </Ltr>
-                  <span className="flex items-center gap-1">
+                {/* Row 2: lines + deleted */}
+                <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl bg-zinc-50 px-3 py-2 text-xs text-zinc-600">
+                  <span className="flex items-center gap-1.5 font-semibold">
                     <Package className="size-3.5 text-zinc-400" aria-hidden />
                     {lineCountLabel(row.lineCount)}
                   </span>
@@ -533,7 +615,7 @@ export function ReceiptsLogClient() {
                 </div>
 
                 {/* Row 3: receiver • entry time • chevron */}
-                <div className="mt-2 flex items-center gap-3 border-t border-zinc-100 pt-2 text-[11px] text-zinc-400">
+                <div className="mt-2.5 flex items-center gap-3 text-[11px] text-zinc-400">
                   <span className="flex min-w-0 flex-1 items-center gap-1">
                     <User className="size-3.5 shrink-0" aria-hidden />
                     <span className="truncate">{row.receivedByName || "—"}</span>
@@ -542,7 +624,10 @@ export function ReceiptsLogClient() {
                     <Clock className="size-3" aria-hidden />
                     <Ltr>{entryLabel(row)}</Ltr>
                   </span>
-                  <ChevronLeft className="size-4 shrink-0 text-zinc-300" aria-hidden />
+                  <ChevronLeft
+                    className="size-4 shrink-0 text-zinc-300 transition-transform group-active:-translate-x-0.5"
+                    aria-hidden
+                  />
                 </div>
               </button>
             </li>
@@ -556,15 +641,14 @@ export function ReceiptsLogClient() {
           <Button
             type="button"
             variant="outline"
-            size="sm"
             onClick={handleLoadMore}
             disabled={appending}
-            className="h-10 w-full gap-1.5 text-xs font-bold sm:w-auto sm:min-w-40"
+            className="h-11 w-full gap-1.5 rounded-xl text-sm font-bold transition-all active:scale-[0.98] sm:w-auto sm:min-w-44"
           >
             {appending ? (
-              <Loader2 className="size-3.5 animate-spin" aria-hidden />
+              <Loader2 className="size-4 animate-spin" aria-hidden />
             ) : (
-              <ChevronDown className="size-3.5" aria-hidden />
+              <ChevronDown className="size-4" aria-hidden />
             )}
             عرض المزيد
           </Button>

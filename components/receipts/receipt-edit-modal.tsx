@@ -23,10 +23,15 @@
  * first/top is handled by DialogFooter's flex-col-reverse), the date input
  * is an LTR field (browsers render yyyy-mm-dd / dd/mm/yyyy LTR), the bounds
  * hint is an LTR island, and inputs are 44px tall for touch.
+ *
+ * [v4.8 — polish pass, presentation only] A gradient header with an icon,
+ * the allowed range as a small info strip, a character counter on the
+ * supplier field, and a bordered footer. All state handling, the render-phase
+ * prefill, the date checks and the PATCH call are unchanged.
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Loader2, Save } from "lucide-react";
+import { CalendarDays, Info, Loader2, Pencil, Save, Store } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -40,6 +45,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 import { formatDbDate } from "@/lib/inventory/date-utils";
 import type { EditTarget, ReceivingDefaults } from "./types";
 
@@ -48,6 +54,8 @@ interface ReceiptEditModalProps {
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
 }
+
+const SUPPLIER_MAX = 120;
 
 export function ReceiptEditModal({ target, onOpenChange, onSaved }: ReceiptEditModalProps) {
   const open = target !== null;
@@ -144,19 +152,32 @@ export function ReceiptEditModal({ target, onOpenChange, onSaved }: ReceiptEditM
       });
   }, [target, submitting, purchaseDate, defaults, supplierName, onSaved]);
 
+  const nearLimit = supplierName.length >= SUPPLIER_MAX - 20;
+
   return (
     <Dialog open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
-      <DialogContent dir="rtl" className="max-h-[calc(100dvh-2rem)] gap-4 overflow-y-auto p-4 sm:max-w-md sm:p-6 [&>*]:min-w-0">
-        <DialogHeader className="pe-8 text-start">
-          <DialogTitle className="text-base font-bold text-zinc-900">تعديل بيانات الاستلام</DialogTitle>
-          <DialogDescription className="text-xs leading-relaxed text-zinc-500">
-            تاريخ الشراء واسم المورّد فقط — كميات وتكاليف الاستلام غير قابلة للتعديل.
-          </DialogDescription>
+      <DialogContent
+        dir="rtl"
+        className="flex max-h-[calc(100dvh-2rem)] w-[calc(100%-1.5rem)] flex-col gap-0 overflow-hidden rounded-2xl border-zinc-200 p-0 sm:max-w-md [&>*]:min-w-0"
+      >
+        <DialogHeader className="gap-0 border-b border-zinc-100 bg-linear-to-b from-emerald-50/70 to-white px-4 pb-3 pt-4 pe-14 text-start sm:px-6">
+          <div className="flex items-center gap-3">
+            <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-emerald-600 text-white shadow-sm shadow-emerald-600/25">
+              <Pencil className="size-5" aria-hidden />
+            </div>
+            <div className="min-w-0 flex-1">
+              <DialogTitle className="text-base font-extrabold text-zinc-900">تعديل بيانات الاستلام</DialogTitle>
+              <DialogDescription className="mt-0.5 text-xs leading-relaxed text-zinc-500">
+                تاريخ الشراء واسم المورّد فقط — كميات وتكاليف الاستلام غير قابلة للتعديل.
+              </DialogDescription>
+            </div>
+          </div>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="receipt-purchase-date" className="text-xs font-bold text-zinc-700">
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6">
+          <div className="space-y-2">
+            <Label htmlFor="receipt-purchase-date" className="flex items-center gap-1.5 text-xs font-bold text-zinc-700">
+              <CalendarDays className="size-3.5 text-emerald-600" aria-hidden />
               تاريخ الشراء
             </Label>
             <Input
@@ -170,53 +191,73 @@ export function ReceiptEditModal({ target, onOpenChange, onSaved }: ReceiptEditM
               max={defaults?.businessDate}
               disabled={!defaults || submitting}
               onChange={(e) => setPurchaseDate(e.target.value)}
-              className="h-11 text-start text-sm sm:h-10"
+              className="h-11 rounded-xl text-start text-sm transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20 sm:h-10"
             />
-            <p className="text-[11px] leading-relaxed text-zinc-400">
-              {defaultsError ? (
-                "تعذّر جلب الحدود المسموحة من الخادم — أعد فتح النافذة للمحاولة."
-              ) : defaults ? (
-                <>
-                  النطاق المسموح: من{" "}
-                  <span dir="ltr" className="inline-block tabular-nums [unicode-bidi:isolate]">
-                    {defaults.minDate}
-                  </span>{" "}
-                  حتى{" "}
-                  <span dir="ltr" className="inline-block tabular-nums [unicode-bidi:isolate]">
-                    {defaults.businessDate}
-                  </span>
-                </>
-              ) : (
-                "جارٍ جلب النطاق المسموح من الخادم..."
+            <p
+              className={cn(
+                "flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] leading-relaxed",
+                defaultsError ? "bg-red-50 font-semibold text-red-700" : "bg-zinc-50 text-zinc-500"
               )}
+            >
+              <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              <span>
+                {defaultsError ? (
+                  "تعذّر جلب الحدود المسموحة من الخادم — أعد فتح النافذة للمحاولة."
+                ) : defaults ? (
+                  <>
+                    النطاق المسموح: من{" "}
+                    <span dir="ltr" className="inline-block font-semibold tabular-nums [unicode-bidi:isolate]">
+                      {defaults.minDate}
+                    </span>{" "}
+                    حتى{" "}
+                    <span dir="ltr" className="inline-block font-semibold tabular-nums [unicode-bidi:isolate]">
+                      {defaults.businessDate}
+                    </span>
+                  </>
+                ) : (
+                  "جارٍ جلب النطاق المسموح من الخادم..."
+                )}
+              </span>
             </p>
           </div>
 
-          <div className="space-y-1.5">
-            <Label htmlFor="receipt-supplier" className="text-xs font-bold text-zinc-700">
-              المورّد <span className="font-normal text-zinc-400">(اختياري)</span>
-            </Label>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="receipt-supplier" className="flex items-center gap-1.5 text-xs font-bold text-zinc-700">
+                <Store className="size-3.5 text-emerald-600" aria-hidden />
+                المورّد <span className="font-normal text-zinc-400">(اختياري)</span>
+              </Label>
+              <span
+                dir="ltr"
+                className={cn(
+                  "text-[11px] font-semibold tabular-nums transition-colors",
+                  nearLimit ? "text-amber-600" : "text-zinc-400"
+                )}
+              >
+                {supplierName.length}/{SUPPLIER_MAX}
+              </span>
+            </div>
             <Input
               id="receipt-supplier"
               type="text"
               value={supplierName}
-              maxLength={120}
+              maxLength={SUPPLIER_MAX}
               disabled={submitting}
               placeholder="مثال: شركة الفجر للتجارة"
               onChange={(e) => setSupplierName(e.target.value)}
-              className="h-11 text-sm sm:h-10"
+              className="h-11 rounded-xl text-sm transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20 sm:h-10"
             />
           </div>
         </div>
 
-        <DialogFooter className="gap-2 pt-2">
+        <DialogFooter className="gap-2 border-t border-zinc-100 bg-white px-4 py-3 sm:px-6">
           <Button
             type="button"
             variant="outline"
             size="sm"
             disabled={submitting}
             onClick={() => onOpenChange(false)}
-            className="h-10 w-full text-xs font-bold sm:h-9 sm:w-auto"
+            className="h-11 w-full rounded-xl text-xs font-bold transition-transform active:scale-[0.98] sm:h-10 sm:w-auto sm:px-6"
           >
             إلغاء
           </Button>
@@ -225,7 +266,7 @@ export function ReceiptEditModal({ target, onOpenChange, onSaved }: ReceiptEditM
             size="sm"
             disabled={submitting || !defaults || !purchaseDate}
             onClick={handleSubmit}
-            className="h-10 w-full gap-1.5 bg-emerald-600 text-xs font-bold hover:bg-emerald-700 sm:h-9 sm:w-auto"
+            className="h-11 w-full gap-1.5 rounded-xl bg-emerald-600 text-xs font-bold shadow-sm shadow-emerald-600/25 transition-all hover:bg-emerald-700 active:scale-[0.98] sm:h-10 sm:w-auto sm:px-8"
           >
             {submitting ? (
               <Loader2 className="size-3.5 animate-spin" aria-hidden />

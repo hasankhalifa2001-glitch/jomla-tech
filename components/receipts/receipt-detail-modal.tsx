@@ -34,18 +34,23 @@
  *  - Dates / batch numbers are LTR islands so bidi can't reorder them.
  *  - Mobile cards: 2×2 figures grid, "متبقي" emphasised, cost labelled,
  *    expiry shown only when there is one.
+ *
+ * [v4.8 — polish pass, presentation only] Same structure as the invoice
+ * detail dialog: a fixed header, a body that scrolls, and a real footer for
+ * the edit action (no more sticky-with-negative-margins hack). The meta is
+ * one aligned card, the table gets a clearer "متبقي" column, and sections
+ * rise in with a light stagger. The `sm:max-w-4xl` width fix above is kept.
+ * Fetching, derived loading and every rendered figure are unchanged.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
-  CalendarDays,
-  Clock,
+  ClipboardList,
   Pencil,
+  Package,
   RefreshCw,
-  Store,
   Trash2,
-  User,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -63,6 +68,10 @@ interface ReceiptDetailModalProps {
   onOpenChange: (open: boolean) => void;
   onEdit: (target: EditTarget) => void;
 }
+
+/** Gentle staggered entrance for the body blocks. */
+const RISE = "motion-safe:animate-in fade-in slide-in-from-bottom-2 duration-300 fill-mode-backwards";
+const rise = (i: number) => ({ animationDelay: `${i * 60}ms` });
 
 /** LTR island for dates / batch numbers so RTL bidi never reorders them. */
 function Ltr({ children, className }: { children: ReactNode; className?: string }) {
@@ -101,14 +110,14 @@ function Figures({ line }: { line: ReceiptDetailLine }) {
         <div
           key={cell.label}
           className={cn(
-            "min-w-0 rounded-lg px-2.5 py-1.5",
-            cell.strong ? "bg-emerald-50 ring-1 ring-emerald-100" : "bg-zinc-50"
+            "min-w-0 rounded-xl px-3 py-2",
+            cell.strong ? "bg-emerald-50 ring-1 ring-inset ring-emerald-100" : "bg-zinc-50"
           )}
         >
-          <span className="block text-[10px] font-bold text-zinc-400">{cell.label}</span>
+          <span className="block text-[11px] font-semibold text-zinc-500">{cell.label}</span>
           <span
             className={cn(
-              "block truncate text-sm font-bold tabular-nums",
+              "block truncate text-sm font-extrabold tabular-nums",
               cell.strong ? "text-emerald-700" : "text-zinc-800"
             )}
           >
@@ -149,14 +158,24 @@ function Breakdown({ line }: { line: ReceiptDetailLine }) {
   return <p className="text-[11px] font-semibold text-zinc-400">يعادل {text}</p>;
 }
 
-function MetaTile({ icon, label, children }: { icon: ReactNode; label: string; children: ReactNode }) {
+/** One label / value cell of the meta grid. */
+function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="min-w-0 rounded-lg border border-zinc-200 bg-zinc-50/70 p-3">
-      <span className="flex items-center gap-1.5 text-[11px] font-bold text-zinc-400">
-        {icon}
-        {label}
-      </span>
-      <span className="mt-1 block truncate text-sm font-bold text-zinc-800">{children}</span>
+    <div className="min-w-0 space-y-1">
+      <dt className="text-[11px] font-semibold text-zinc-500">{label}</dt>
+      <dd className="truncate text-sm font-bold text-zinc-900">{children}</dd>
+    </div>
+  );
+}
+
+function SectionTitle({ icon, children, aside }: { icon: ReactNode; children: ReactNode; aside?: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <h3 className="flex items-center gap-2 text-sm font-extrabold text-zinc-900">
+        <span className="grid size-7 place-items-center rounded-lg bg-emerald-50 text-emerald-600">{icon}</span>
+        {children}
+      </h3>
+      {aside}
     </div>
   );
 }
@@ -256,238 +275,262 @@ export function ReceiptDetailModal({ receiptId, onOpenChange, onEdit }: ReceiptD
         // All overrides are LOCAL (components/ui/dialog.tsx is shared and
         // untouched). `sm:max-w-4xl` (NOT bare max-w-4xl) must target the
         // same variant as dialog.tsx's baked-in `sm:max-w-md`, or twMerge
-        // keeps the latter. max-h + overflow-y-auto: the dialog scrolls
-        // instead of being cut off. `[&>*]:min-w-0`: grid items default to
-        // min-width:auto, so a wide table would otherwise stretch the grid.
-        className="max-h-[calc(100dvh-2rem)] gap-4 overflow-y-auto overscroll-contain p-4 sm:max-w-4xl sm:p-6 [&>*]:min-w-0"
+        // keeps the latter. The dialog is a flex column: header and footer
+        // are fixed, only the middle section scrolls.
+        className="flex max-h-[calc(100dvh-2rem)] w-[calc(100%-1.5rem)] flex-col gap-0 overflow-hidden rounded-2xl border-zinc-200 p-0 sm:max-w-4xl [&>*]:min-w-0"
       >
-        <DialogHeader className="pe-8 text-start">
-          <DialogTitle className="flex flex-wrap items-center gap-x-2 gap-y-1 text-base font-bold text-zinc-900">
-            تفاصيل الاستلام
-            {detail && (
-              <Ltr className="text-xs font-semibold text-zinc-400">
-                {formatPurchaseDate(detail.purchaseDate)}
-              </Ltr>
-            )}
-          </DialogTitle>
-          <DialogDescription className="text-xs leading-relaxed text-zinc-500">
-            الأسطر المستلمة وما تبقّى منها. الأسطر المحذوفة تُعرض للشفافية فقط ولا تدخل في الإجمالي.
-          </DialogDescription>
+        <DialogHeader className="gap-0 border-b border-zinc-100 bg-linear-to-b from-emerald-50/70 to-white px-4 pb-3 pt-4 pe-14 text-start sm:px-6">
+          <div className="flex items-center gap-3">
+            <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-emerald-600 text-white shadow-sm shadow-emerald-600/25">
+              <ClipboardList className="size-5" aria-hidden />
+            </div>
+            <div className="min-w-0 flex-1">
+              <DialogTitle className="flex flex-wrap items-center gap-x-2 gap-y-1 text-base font-extrabold text-zinc-900">
+                تفاصيل الاستلام
+                {detail && (
+                  <Ltr className="rounded-md bg-zinc-100 px-2 py-0.5 text-xs font-bold text-zinc-600">
+                    {formatPurchaseDate(detail.purchaseDate)}
+                  </Ltr>
+                )}
+              </DialogTitle>
+              <DialogDescription className="mt-0.5 text-xs leading-relaxed text-zinc-500">
+                الأسطر المستلمة وما تبقّى منها. الأسطر المحذوفة تُعرض للشفافية فقط ولا تدخل في الإجمالي.
+              </DialogDescription>
+            </div>
+          </div>
         </DialogHeader>
 
-        {loading && !detail && (
-          <div className="space-y-2" aria-hidden>
-            {Array.from({ length: 4 }, (_, i) => (
-              <Skeleton key={i} className="h-16 w-full rounded-lg" />
-            ))}
-          </div>
-        )}
-
-        {!loading && loadError && !detail && (
-          <div className="flex flex-col items-center gap-3 rounded-xl border border-red-200 bg-red-50/60 px-4 py-10 text-center">
-            <p className="text-sm font-bold text-red-700">{loadError}</p>
-            <Button type="button" size="sm" variant="outline" onClick={handleRetry}>
-              <RefreshCw className="size-3.5" aria-hidden />
-              إعادة المحاولة
-            </Button>
-          </div>
-        )}
-
-        {detail && (
-          <div className="min-w-0 space-y-4">
-            {/* Total — shown ONCE, the primary SYP figure */}
-            <div className="flex flex-col items-start gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-              <div className="min-w-0">
-                <p className="text-xs font-bold text-emerald-800">إجمالي الاستلام</p>
-                <p className="text-[11px] leading-relaxed text-emerald-700/70">
-                  الأسطر المتبقية فقط — المحذوفة غير محتسبة.
-                </p>
-              </div>
-              <span className="shrink-0 whitespace-nowrap text-2xl font-extrabold tabular-nums text-emerald-700 sm:text-xl">
-                {formatMoney(detail.totalCostSYP, "SYP")} ل.س
-              </span>
+        {/* Scrollable body */}
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
+          {loading && !detail && (
+            <div className="space-y-2.5" aria-hidden>
+              <Skeleton className="h-16 w-full rounded-xl" />
+              <Skeleton className="h-24 w-full rounded-xl" />
+              {Array.from({ length: 3 }, (_, i) => (
+                <Skeleton key={i} className="h-16 w-full rounded-xl" />
+              ))}
             </div>
+          )}
 
-            {/* Meta — supplier first: it's what the merchant recognises */}
-            <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-              <MetaTile icon={<Store className="size-3.5" aria-hidden />} label="المورّد">
-                {detail.supplierName || <span className="text-zinc-400">بدون مورّد</span>}
-              </MetaTile>
-              <MetaTile
-                icon={<CalendarDays className="size-3.5 text-emerald-600" aria-hidden />}
-                label="تاريخ الشراء"
-              >
-                <Ltr>{formatPurchaseDate(detail.purchaseDate)}</Ltr>
-              </MetaTile>
-              <MetaTile icon={<User className="size-3.5" aria-hidden />} label="المستلم">
-                {detail.receivedBy.name || "—"}
-              </MetaTile>
-              <MetaTile icon={<Clock className="size-3.5" aria-hidden />} label="وقت الإدخال">
-                <Ltr>{formatCreatedAt(detail.createdAt)}</Ltr>
-              </MetaTile>
-            </div>
-
-            {/* Reconciliation warning — surfaced, never hidden */}
-            {anyReconcileIssue && (
-              <div
-                role="alert"
-                className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-xs font-bold leading-relaxed text-amber-800"
-              >
-                <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
-                <span>
-                  تنبيه: كمية واحدة أو أكثر لا تطابق قاعدة المطابقة (المتبقي = المستلم − المباع + التسويات).
-                  راجع الأسطر المعلّمة أدناه.
-                </span>
-              </div>
-            )}
-
-            {/* All lines deleted — explanatory row, receipt stays visible */}
-            {allDeleted && (
-              <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-6 text-center">
-                <p className="text-sm font-bold text-zinc-600">جميع أسطر هذا الاستلام محذوفة</p>
-                <p className="mt-1 text-xs leading-relaxed text-zinc-400">
-                  تظهر الأسطر المحذوفة أدناه للشفافية فقط، وليست محتسبة في إجمالي الاستلام.
-                </p>
-              </div>
-            )}
-
-            {/* Live lines */}
-            {detail.lines.length > 0 && (
-              <div className="space-y-2">
-                <h3 className="text-sm font-bold text-zinc-700">
-                  أسطر الاستلام
-                  <span className="ms-1.5 text-xs font-semibold text-zinc-400">
-                    ({detail.liveLineCount.toLocaleString("ar-SY")})
-                  </span>
-                </h3>
-
-                {/* Desktop table — its own scroll container */}
-                <div className="hidden overflow-x-auto rounded-xl border border-zinc-200 md:block">
-                  <table className="w-full min-w-[760px] border-collapse text-xs">
-                    <thead>
-                      <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] font-bold text-zinc-500">
-                        <th scope="col" className="px-3 py-2.5 text-start">الصنف</th>
-                        <th scope="col" className="w-24 px-3 py-2.5 text-start">مستلم</th>
-                        <th scope="col" className="w-24 px-3 py-2.5 text-start">مباع (صافي)</th>
-                        <th scope="col" className="w-24 px-3 py-2.5 text-start">تسويات</th>
-                        <th scope="col" className="w-24 px-3 py-2.5 text-start">متبقي</th>
-                        <th scope="col" className="w-32 px-3 py-2.5 text-start">التكلفة</th>
-                        <th scope="col" className="w-28 px-3 py-2.5 text-start">الانتهاء</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {detail.lines.map((line) => (
-                        <tr
-                          key={line.batchId}
-                          className="border-b border-zinc-100 last:border-0 odd:bg-white even:bg-zinc-50/60"
-                        >
-                          <td className="px-3 py-3 align-top">
-                            <p className="text-sm font-bold text-zinc-800">{line.productName}</p>
-                            <Ltr className="text-[10px] text-zinc-400">{line.batchNumber}</Ltr>
-                            <Breakdown line={line} />
-                            <div className="mt-1 empty:hidden">
-                              <LineBadges line={line} />
-                            </div>
-                          </td>
-                          <td className="px-3 py-3 align-top font-bold tabular-nums text-zinc-900">
-                            {formatQty(line.initialQuantity, line.unitName)}
-                          </td>
-                          <td className="px-3 py-3 align-top tabular-nums text-zinc-700">
-                            {formatQty(line.netSold, line.unitName)}
-                          </td>
-                          <td className="px-3 py-3 align-top tabular-nums text-zinc-700">
-                            {formatQty(line.adjustments, line.unitName)}
-                          </td>
-                          <td className="px-3 py-3 align-top font-bold tabular-nums text-emerald-700">
-                            {formatQty(line.remaining, line.unitName)}
-                          </td>
-                          <td className="px-3 py-3 align-top">
-                            <Money value={line.totalCostSYP} />
-                          </td>
-                          <td className="px-3 py-3 align-top text-zinc-500">
-                            {formatExpiryDate(line.expiryDate)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                {/* Mobile cards (375px-safe) */}
-                <div className="space-y-2.5 md:hidden">
-                  {detail.lines.map((line) => (
-                    <div
-                      key={line.batchId}
-                      className="space-y-2.5 rounded-xl border border-zinc-200 bg-white p-3"
-                    >
-                      <div className="min-w-0">
-                        <p className="text-sm font-bold leading-snug text-zinc-800">
-                          {line.productName}
-                        </p>
-                        <Ltr className="text-[10px] text-zinc-400">{line.batchNumber}</Ltr>
-                      </div>
-                      <Figures line={line} />
-                      <Breakdown line={line} />
-                      <LineBadges line={line} />
-                      <div className="flex items-center justify-between gap-2 border-t border-zinc-100 pt-2.5">
-                        <div className="min-w-0">
-                          <span className="block text-[10px] font-bold text-zinc-400">التكلفة</span>
-                          <Money value={line.totalCostSYP} />
-                        </div>
-                        {line.expiryDate && (
-                          <div className="text-end">
-                            <span className="block text-[10px] font-bold text-zinc-400">الانتهاء</span>
-                            <span className="text-xs font-semibold text-zinc-600">
-                              {formatExpiryDate(line.expiryDate)}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Deleted lines — greyed, never counted in the total */}
-            {detail.deletedLines.length > 0 && (
-              <div className="space-y-2">
-                <h3 className="flex flex-wrap items-center gap-1.5 text-xs font-bold text-zinc-500">
-                  <Trash2 className="size-3.5 text-zinc-400" aria-hidden />
-                  أسطر محذوفة
-                  <span className="text-zinc-400">({detail.deletedLineCount.toLocaleString("ar-SY")})</span>
-                  <span className="text-[11px] font-semibold text-zinc-400">— غير محتسبة في الإجمالي</span>
-                </h3>
-
-                <div className="overflow-hidden rounded-xl border border-dashed border-zinc-300">
-                  <ul className="divide-y divide-zinc-200/70">
-                    {detail.deletedLines.map((line) => (
-                      <DeletedLineRow key={`${line.batchId}-${line.deletedAt}`} line={line} />
-                    ))}
-                  </ul>
-                </div>
-              </div>
-            )}
-
-            {/* Sticky footer — only the action (the total lives at the top) */}
-            <div className="sticky bottom-0 -mx-4 -mb-4 flex justify-end border-t border-zinc-200 bg-popover px-4 py-3 sm:-mx-6 sm:-mb-6 sm:px-6">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-10 w-full gap-1.5 text-xs font-bold sm:h-9 sm:w-auto"
-                onClick={() =>
-                  onEdit({
-                    id: detail.id,
-                    purchaseDate: detail.purchaseDate,
-                    supplierName: detail.supplierName,
-                  })
-                }
-              >
-                <Pencil className="size-3.5" aria-hidden />
-                تعديل بيانات الاستلام
+          {!loading && loadError && !detail && (
+            <div className="flex flex-col items-center gap-3 rounded-2xl border border-red-200 bg-red-50/60 px-4 py-10 text-center motion-safe:animate-in fade-in duration-200">
+              <p className="text-sm font-bold text-red-700">{loadError}</p>
+              <Button type="button" size="sm" variant="outline" className="rounded-xl" onClick={handleRetry}>
+                <RefreshCw className="size-3.5" aria-hidden />
+                إعادة المحاولة
               </Button>
             </div>
+          )}
+
+          {detail && (
+            <div className="min-w-0 space-y-5">
+              {/* Total — shown ONCE, the primary SYP figure */}
+              <div
+                style={rise(0)}
+                className={cn(
+                  "flex flex-col items-start gap-1.5 rounded-2xl border border-emerald-200 bg-emerald-50/70 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:gap-3",
+                  RISE
+                )}
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-extrabold text-emerald-800">إجمالي الاستلام</p>
+                  <p className="text-[11px] leading-relaxed text-emerald-700/70">
+                    الأسطر المتبقية فقط — المحذوفة غير محتسبة.
+                  </p>
+                </div>
+                <span className="shrink-0 whitespace-nowrap text-2xl font-extrabold tabular-nums text-emerald-700">
+                  {formatMoney(detail.totalCostSYP, "SYP")} ل.س
+                </span>
+              </div>
+
+              {/* Meta — one aligned card; supplier first: it's what the merchant recognises */}
+              <dl
+                style={rise(1)}
+                className={cn(
+                  "grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 lg:grid-cols-4",
+                  RISE
+                )}
+              >
+                <Fact label="المورّد">
+                  {detail.supplierName || <span className="font-semibold text-zinc-400">بدون مورّد</span>}
+                </Fact>
+                <Fact label="تاريخ الشراء">
+                  <Ltr>{formatPurchaseDate(detail.purchaseDate)}</Ltr>
+                </Fact>
+                <Fact label="المستلم">{detail.receivedBy.name || "—"}</Fact>
+                <Fact label="وقت الإدخال">
+                  <Ltr>{formatCreatedAt(detail.createdAt)}</Ltr>
+                </Fact>
+              </dl>
+
+              {/* Reconciliation warning — surfaced, never hidden */}
+              {anyReconcileIssue && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2.5 rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-3 text-xs font-bold leading-relaxed text-amber-800"
+                >
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
+                  <span>
+                    تنبيه: كمية واحدة أو أكثر لا تطابق قاعدة المطابقة (المتبقي = المستلم − المباع + التسويات).
+                    راجع الأسطر المعلّمة أدناه.
+                  </span>
+                </div>
+              )}
+
+              {/* All lines deleted — explanatory row, receipt stays visible */}
+              {allDeleted && (
+                <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-6 text-center">
+                  <p className="text-sm font-bold text-zinc-600">جميع أسطر هذا الاستلام محذوفة</p>
+                  <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+                    تظهر الأسطر المحذوفة أدناه للشفافية فقط، وليست محتسبة في إجمالي الاستلام.
+                  </p>
+                </div>
+              )}
+
+              {/* Live lines */}
+              {detail.lines.length > 0 && (
+                <section style={rise(2)} className={cn("space-y-2.5", RISE)}>
+                  <SectionTitle
+                    icon={<Package className="size-4" aria-hidden />}
+                    aside={
+                      <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-bold tabular-nums text-zinc-600">
+                        {detail.liveLineCount.toLocaleString("ar-SY")}
+                      </span>
+                    }
+                  >
+                    أسطر الاستلام
+                  </SectionTitle>
+
+                  {/* Desktop table — its own scroll container */}
+                  <div className="hidden overflow-x-auto rounded-xl border border-zinc-200 bg-white md:block">
+                    <table className="w-full min-w-[760px] border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] font-bold text-zinc-500">
+                          <th scope="col" className="px-3 py-2.5 text-start">الصنف</th>
+                          <th scope="col" className="w-24 px-3 py-2.5 text-start">مستلم</th>
+                          <th scope="col" className="w-24 px-3 py-2.5 text-start">مباع (صافي)</th>
+                          <th scope="col" className="w-24 px-3 py-2.5 text-start">تسويات</th>
+                          <th scope="col" className="w-24 bg-emerald-50/70 px-3 py-2.5 text-start text-emerald-700">متبقي</th>
+                          <th scope="col" className="w-32 px-3 py-2.5 text-start">التكلفة</th>
+                          <th scope="col" className="w-28 px-3 py-2.5 text-start">الانتهاء</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {detail.lines.map((line) => (
+                          <tr
+                            key={line.batchId}
+                            className="border-b border-zinc-100 transition-colors last:border-0 hover:bg-zinc-50/60"
+                          >
+                            <td className="px-3 py-3 align-top">
+                              <p className="text-sm font-extrabold text-zinc-900">{line.productName}</p>
+                              <Ltr className="text-[10px] text-zinc-400">{line.batchNumber}</Ltr>
+                              <Breakdown line={line} />
+                              <div className="mt-1 empty:hidden">
+                                <LineBadges line={line} />
+                              </div>
+                            </td>
+                            <td className="px-3 py-3 align-top font-bold tabular-nums text-zinc-900">
+                              {formatQty(line.initialQuantity, line.unitName)}
+                            </td>
+                            <td className="px-3 py-3 align-top tabular-nums text-zinc-700">
+                              {formatQty(line.netSold, line.unitName)}
+                            </td>
+                            <td className="px-3 py-3 align-top tabular-nums text-zinc-700">
+                              {formatQty(line.adjustments, line.unitName)}
+                            </td>
+                            <td className="bg-emerald-50/40 px-3 py-3 align-top font-extrabold tabular-nums text-emerald-700">
+                              {formatQty(line.remaining, line.unitName)}
+                            </td>
+                            <td className="px-3 py-3 align-top">
+                              <Money value={line.totalCostSYP} />
+                            </td>
+                            <td className="px-3 py-3 align-top text-zinc-500">
+                              {formatExpiryDate(line.expiryDate)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Mobile cards (375px-safe) */}
+                  <div className="space-y-2.5 md:hidden">
+                    {detail.lines.map((line) => (
+                      <div
+                        key={line.batchId}
+                        className="space-y-3 rounded-xl border border-zinc-200 bg-white p-3"
+                      >
+                        <div className="min-w-0">
+                          <p className="text-sm font-extrabold leading-snug text-zinc-900">
+                            {line.productName}
+                          </p>
+                          <Ltr className="text-[10px] text-zinc-400">{line.batchNumber}</Ltr>
+                        </div>
+                        <Figures line={line} />
+                        <Breakdown line={line} />
+                        <LineBadges line={line} />
+                        <div className="flex items-center justify-between gap-2 border-t border-zinc-100 pt-2.5">
+                          <div className="min-w-0">
+                            <span className="block text-[11px] font-semibold text-zinc-500">التكلفة</span>
+                            <Money value={line.totalCostSYP} />
+                          </div>
+                          {line.expiryDate && (
+                            <div className="text-end">
+                              <span className="block text-[11px] font-semibold text-zinc-500">الانتهاء</span>
+                              <span className="text-xs font-bold text-zinc-700">
+                                {formatExpiryDate(line.expiryDate)}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {/* Deleted lines — greyed, never counted in the total */}
+              {detail.deletedLines.length > 0 && (
+                <section style={rise(3)} className={cn("space-y-2.5", RISE)}>
+                  <h3 className="flex flex-wrap items-center gap-1.5 text-xs font-bold text-zinc-500">
+                    <Trash2 className="size-3.5 text-zinc-400" aria-hidden />
+                    أسطر محذوفة
+                    <span className="text-zinc-400">({detail.deletedLineCount.toLocaleString("ar-SY")})</span>
+                    <span className="text-[11px] font-semibold text-zinc-400">— غير محتسبة في الإجمالي</span>
+                  </h3>
+
+                  <div className="overflow-hidden rounded-xl border border-dashed border-zinc-300">
+                    <ul className="divide-y divide-zinc-200/70">
+                      {detail.deletedLines.map((line) => (
+                        <DeletedLineRow key={`${line.batchId}-${line.deletedAt}`} line={line} />
+                      ))}
+                    </ul>
+                  </div>
+                </section>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Footer — only the action (the total lives at the top) */}
+        {detail && (
+          <div className="flex justify-end border-t border-zinc-100 bg-white px-4 py-3 sm:px-6">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-11 w-full gap-1.5 rounded-xl text-xs font-bold transition-all active:scale-[0.98] sm:h-10 sm:w-auto sm:px-6"
+              onClick={() =>
+                onEdit({
+                  id: detail.id,
+                  purchaseDate: detail.purchaseDate,
+                  supplierName: detail.supplierName,
+                })
+              }
+            >
+              <Pencil className="size-3.5" aria-hidden />
+              تعديل بيانات الاستلام
+            </Button>
           </div>
         )}
       </DialogContent>
