@@ -432,6 +432,43 @@ datasource db {
 // `prisma migrate reset`, then `prisma generate`.
 // ============================================================================
 
+// ============================================================================
+// [v6.0] T6 SUBSCRIPTION BILLING — one authorized change, backing T6a
+// (merchant checkout), T6b (Super-Admin review + platform rate) and T6c
+// (expiry / grace / lockout):
+//
+//  - SubscriptionRecordStatus gains REJECTED.
+//  - Subscription gains: durationDays, amountSYP, exchangeRateUsed,
+//    rejectionReason, reviewedByUserId (+ reviewedByUser relation),
+//    reviewedAt. User gains the back-relation reviewedSubscriptions.
+//  - Subscription index @@index([status]) is REPLACED by
+//    @@index([status, createdAt]) — it serves the Super-Admin queue
+//    (status tab, newest first, cursor-paginated). (tenantId, status) is
+//    unchanged.
+//
+// SEMANTICS:
+//  - receiptImageURL keeps its name but stores the PRIVATE STORAGE OBJECT
+//    KEY (e.g. receipts/{tenantId}/{subscriptionId}-{random}.jpg), never a
+//    public URL. It is NULL until the merchant uploads the receipt; a
+//    request with a NULL receipt is an "offer". Access is only through
+//    short-lived signed URLs (<= 5 minutes) generated on demand.
+//  - durationDays, amountUSD, amountSYP and exchangeRateUsed are written
+//    ONCE at creation (from config + the platform rate, never from the
+//    client) and never updated. amountSYP is the exact SYP amount the
+//    merchant must transfer; exchangeRateUsed is the platform rate used to
+//    compute it (Tenant.dailyExchangeRate of the "platform-internal"
+//    tenant). Approval uses THIS row's durationDays, never the live config.
+//  - Subscription.expiresAt is set only at approval (stacking rule:
+//    max(now, tenant.expiresAt if in the future) + durationDays).
+//  - rejectionReason is String? here but REQUIRED (trimmed, 3-500) by the
+//    reject route. reviewedByUserId is NULL for a system rejection (stale
+//    receipt-less offer); reviewedAt is set on every rejection/approval.
+//  - Subscription.amountUSD stays USD (the platform's own revenue).
+//
+// No data migration: all data is test data. Edit the baseline migration in
+// place, then `prisma migrate reset`, then `prisma generate`.
+// ============================================================================
+
 enum UserRole {
   ADMIN
   CASHIER
@@ -453,6 +490,7 @@ enum SubscriptionRecordStatus {
   PENDING_APPROVAL
   ACTIVE
   EXPIRED
+  REJECTED
 }
 
 enum PaymentMethod {
@@ -553,6 +591,8 @@ model User {
   costPriceChangeLogs      CostPriceChangeLog[]
   // [v4.7]
   productReceipts          ProductReceipt[]
+  // [v6.0] subscriptions this user (a platform admin) approved/rejected
+  reviewedSubscriptions    Subscription[]
 
   @@index([tenantId])
 }
@@ -1210,22 +1250,35 @@ model CustomerPayment {
   @@index([offlineId])
 }
 
+// ============================================================================
+// [v6.0] Subscription — see the [v6.0] header note near the top of this file
+// for the full semantics (receiptImageURL = private storage object key;
+// frozen fields written once at creation; expiresAt set only at approval).
+// ============================================================================
 model Subscription {
-  id              String                   @id @default(cuid())
-  tenantId        String
-  tier            String
-  receiptImageURL String?
-  amountUSD       Decimal                  @db.Decimal(18, 4)
-  referenceCode   String                   @unique
-  status          SubscriptionRecordStatus @default(PENDING_APPROVAL)
-  expiresAt       DateTime?
-  createdAt       DateTime                 @default(now())
-  updatedAt       DateTime                 @updatedAt
+  id               String                   @id @default(cuid())
+  tenantId         String
+  tier             String
+  durationDays     Int
+  receiptImageURL  String?
+  amountUSD        Decimal                  @db.Decimal(18, 4)
+  amountSYP        Decimal                  @db.Decimal(18, 4)
+  exchangeRateUsed Decimal                  @db.Decimal(18, 4)
+  referenceCode    String                   @unique
+  status           SubscriptionRecordStatus @default(PENDING_APPROVAL)
+  expiresAt        DateTime?
+  rejectionReason  String?
+  reviewedByUserId String?
+  reviewedAt       DateTime?
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
 
-  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant         Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reviewedByUser User?  @relation(fields: [reviewedByUserId], references: [id], onDelete: Restrict)
 
   @@index([tenantId, status])
-  @@index([status])
+  // [v6.0] replaces @@index([status]) — serves the Super-Admin queue
+  @@index([status, createdAt])
 }
 
 // ============================================================================

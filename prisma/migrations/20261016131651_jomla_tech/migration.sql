@@ -8,7 +8,7 @@ CREATE TYPE "InvoiceStatus" AS ENUM ('COMPLETED', 'PENDING_REVIEW', 'VOIDED');
 CREATE TYPE "TenantSubscriptionStatus" AS ENUM ('ACTIVE', 'EXPIRED', 'PENDING');
 
 -- CreateEnum
-CREATE TYPE "SubscriptionRecordStatus" AS ENUM ('PENDING_APPROVAL', 'ACTIVE', 'EXPIRED');
+CREATE TYPE "SubscriptionRecordStatus" AS ENUM ('PENDING_APPROVAL', 'ACTIVE', 'EXPIRED', 'REJECTED');
 
 -- CreateEnum
 CREATE TYPE "PaymentMethod" AS ENUM ('CASH', 'SHAM_CASH', 'SYRIATEL_CASH', 'BANK_TRANSFER', 'OTHER');
@@ -270,11 +270,17 @@ CREATE TABLE "Subscription" (
     "id" TEXT NOT NULL,
     "tenantId" TEXT NOT NULL,
     "tier" TEXT NOT NULL,
+    "durationDays" INTEGER NOT NULL,
     "receiptImageURL" TEXT,
     "amountUSD" DECIMAL(18,4) NOT NULL,
+    "amountSYP" DECIMAL(18,4) NOT NULL,
+    "exchangeRateUsed" DECIMAL(18,4) NOT NULL,
     "referenceCode" TEXT NOT NULL,
     "status" "SubscriptionRecordStatus" NOT NULL DEFAULT 'PENDING_APPROVAL',
     "expiresAt" TIMESTAMP(3),
+    "rejectionReason" TEXT,
+    "reviewedByUserId" TEXT,
+    "reviewedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -541,7 +547,7 @@ CREATE UNIQUE INDEX "Subscription_referenceCode_key" ON "Subscription"("referenc
 CREATE INDEX "Subscription_tenantId_status_idx" ON "Subscription"("tenantId", "status");
 
 -- CreateIndex
-CREATE INDEX "Subscription_status_idx" ON "Subscription"("status");
+CREATE INDEX "Subscription_status_createdAt_idx" ON "Subscription"("status", "createdAt");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "B2BOrderRequest_resultingInvoiceId_key" ON "B2BOrderRequest"("resultingInvoiceId");
@@ -701,6 +707,9 @@ ALTER TABLE "CustomerPayment" ADD CONSTRAINT "CustomerPayment_invoiceId_fkey" FO
 
 -- AddForeignKey
 ALTER TABLE "Subscription" ADD CONSTRAINT "Subscription_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Subscription" ADD CONSTRAINT "Subscription_reviewedByUserId_fkey" FOREIGN KEY ("reviewedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "B2BOrderRequest" ADD CONSTRAINT "B2BOrderRequest_matchedCustomerId_fkey" FOREIGN KEY ("matchedCustomerId") REFERENCES "Customer"("id") ON DELETE SET NULL ON UPDATE CASCADE;
