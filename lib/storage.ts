@@ -286,3 +286,30 @@ export async function removeFileFromStorage(key: string): Promise<void> {
         throw new Error(`Cloud storage delete failed: ${error.message}`);
     }
 }
+/**
+ * Creates a short-lived signed URL for a private object. Supabase Storage
+ * signed URLs work on non-public buckets (or public ones) and expire after
+ * `seconds`. Used for T6 subscription receipts: receiptImageURL stores the
+ * *object key* (never a public URL), and downloaders get a ≤5-minute signed
+ * link on demand.
+ */
+export async function createSignedUrl(params: {
+    key: string;
+    /** Seconds until expiry. Callers must cap this (T6: ≤ 300s / 5 min). */
+    seconds: number;
+}): Promise<string> {
+    assertStorageEnv();
+    const client = getSupabaseClient();
+    const bucket = process.env.SUPABASE_BUCKET_NAME as string;
+
+    const { data, error } = await client.storage
+        .from(bucket)
+        .createSignedUrl(params.key, params.seconds);
+
+    if (error || !data?.signedUrl) {
+        throw new Error(
+            `Cloud storage signed URL failed: ${error?.message ?? "no signed URL returned"}`
+        );
+    }
+    return data.signedUrl;
+}

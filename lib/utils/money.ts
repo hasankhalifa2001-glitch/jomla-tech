@@ -351,3 +351,15 @@ export function formatMoney(
 export function sumMoney(values: MoneyInput[]): string {
   return values.reduce<string>((acc, v) => addMoney(acc, v), "0");
 }
+
+/**
+ * Rounds a monetary value to a whole lira (zero decimal places), HALF_UP,
+ * using this module's decimal.js wrapper (ROUND_HALF_UP). Used to freeze the
+ * SYP amount at subscription-request time: priceUSD × exchangeRate, rounded
+ * to a whole lira, never a native JS number and never client-supplied.
+ *
+ * Returns a Decimal string with no fractional part (e.g. "172500").
+ */
+export function roundToWholeLira(value: MoneyInput): string {
+  return toDecimal(value).toFixed(0);
+}

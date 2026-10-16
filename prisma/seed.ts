@@ -379,7 +379,10 @@ async function main() {
         data: {
             tenantId: tenantAlBaraka.id,
             tier: "STANDARD",
+            durationDays: 365,
             amountUSD: 25,
+            amountSYP: "0",
+            exchangeRateUsed: "0",
             referenceCode: "REF-ALBARAKA-0001",
             status: SubscriptionRecordStatus.ACTIVE,
             expiresAt: albarakaExpiresAt,
@@ -775,7 +778,10 @@ async function main() {
         data: {
             tenantId: tenantAlFajr.id,
             tier: "STANDARD",
+            durationDays: 30,
             amountUSD: 25,
+            amountSYP: "0",
+            exchangeRateUsed: "0",
             referenceCode: "REF-ALFAJR-0001",
             status: SubscriptionRecordStatus.PENDING_APPROVAL,
         },

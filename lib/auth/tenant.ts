@@ -84,3 +84,35 @@ export async function getFreshExchangeRate(
   return tenant?.dailyExchangeRate != null ? tenant.dailyExchangeRate.toString() : null;
 }
 
+/**
+ * T6a — named, narrow lockout-exemption list for the subscription checkout
+ * API surface. These paths are deliberately allowed for PENDING/EXPIRED
+ * tenants because that surface's whole purpose is to let a locked merchant
+ * create a subscription request and upload a receipt to unlock.
+ *
+ * This is NOT a weakening of assertTenantWritable(): every route on this
+ * list simply does NOT call assertTenantWritable(). Every other mutating
+ * route continues to call it unconditionally. The list exists so the
+ * exemption is explicit, auditable, and confined to exactly these prefixes
+ * rather than scattered or implicit.
+ */
+export const SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES = [
+  "/api/billing/subscriptions",
+  "/api/billing/status",
+] as const;
+
+/**
+ * True when `pathname` is one of the T6a subscription-checkout API routes
+ * that are exempt from the EXPIRED/PENDING write block. Such routes still
+ * require an authenticated ADMIN session and a fresh isActive user check.
+ */
+export function isLockoutExemptPath(pathname: string): boolean {
+  return SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES.some((prefix) => {
+    if (pathname === prefix) return true;
+    if (pathname.startsWith(prefix + "/")) return true;
+    // Handle /api/billing/subscriptions/[id]/receipt (an id segment follows)
+    return false;
+  });
+}
+
+
