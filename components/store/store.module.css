@@ -877,37 +877,64 @@
   background: var(--g950);
   color: var(--g200);
   border-radius: 40px 40px 0 0;
-  padding-block: 36px 44px;
+  padding-block: 36px 28px;
 }
-.fgrid {
+.ftop {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
+  padding-bottom: 24px;
+  border-bottom: 1px solid rgba(110, 231, 183, 0.16);
 }
 .fbrand {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
   color: #fff;
-  font-weight: 700;
 }
-.fmark {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
+.flogo {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
   background: var(--g300);
-  color: var(--g950);
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.fname {
   font-weight: 800;
+  font-size: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fact {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.foot .ibtn {
+  text-decoration: none;
+  font-weight: inherit;
+}
+.fbottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 20px;
 }
 .foot small {
   font-size: 14px;
+  color: var(--g200);
 }
-.foot a {
+.fpower a {
   color: #fff;
   font-weight: 700;
   text-decoration: underline;
@@ -1838,9 +1865,21 @@
     flex: 0 0 80%;
     scroll-snap-align: start;
   }
-  .foot {
+    .foot {
     margin-top: 48px;
     border-radius: 28px 28px 0 0;
+    padding-block: 28px 24px;
+  }
+  .ftop {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 16px;
+  }
+  .fbottom {
+    flex-direction: column;
+    text-align: center;
+    gap: 6px;
   }
   .reorder {
     padding: 14px 16px;

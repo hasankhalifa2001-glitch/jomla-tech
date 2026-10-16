@@ -226,14 +226,44 @@ export function HomeView({ data }: { data: HomeData }) {
                 </main>
 
                 <footer className={styles.foot}>
-                    <div className={cx(styles.wrap, styles.fgrid)}>
-                        <div className={styles.fbrand}>
-                            <span className={styles.fmark}>{initial}</span>
-                            {store.name}
+                    <div className={styles.wrap}>
+                        <div className={styles.ftop}>
+                            <div className={styles.fbrand}>
+                                <span className={styles.flogo}>
+                                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                                    <img className={styles.logoImg} src={store.logoUrl ?? "/icon-B-light.svg"} alt="" />
+                                </span>
+                                <span className={styles.fname}>{store.name}</span>
+                            </div>
+
+                            {(store.phone || store.whatsappNumber) && (
+                                <div className={styles.fact}>
+                                    {store.phone && (
+                                        <a className={styles.ibtn} href={`tel:${store.phone}`} aria-label="اتصال بالتاجر">
+                                            <PhoneIcon />
+                                        </a>
+                                    )}
+                                    {store.whatsappNumber && (
+                                        <a
+                                            className={styles.ibtn}
+                                            href={`https://wa.me/${store.whatsappNumber}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            aria-label="واتساب"
+                                        >
+                                            <WhatsAppIcon />
+                                        </a>
+                                    )}
+                                </div>
+                            )}
                         </div>
-                        <small>
-                            متجر مبني على <a href={store.platformHref}>جملة تك</a>
-                        </small>
+
+                        <div className={styles.fbottom}>
+                            <small>© {new Date().getFullYear()} {store.name}</small>
+                            <small className={styles.fpower}>
+                                متجر مبني على <a href={store.platformHref}>جملة تك</a>
+                            </small>
+                        </div>
                     </div>
                 </footer>
             </StoreShell>

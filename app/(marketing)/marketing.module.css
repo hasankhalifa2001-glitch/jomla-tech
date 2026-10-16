@@ -66,6 +66,11 @@
   outline-offset: 3px;
 }
 
+/* Anchor jumps should not hide the heading under the sticky header. */
+.page :where(section[id]) {
+  scroll-margin-top: 72px;
+}
+
 .container {
   width: 100%;
   max-width: 72rem;
@@ -221,6 +226,18 @@
   }
   100% {
     box-shadow: 0 0 0 14px rgba(52, 211, 153, 0);
+  }
+}
+@keyframes fabPulse {
+  0% {
+    box-shadow:
+      0 10px 24px rgba(37, 211, 102, 0.4),
+      0 0 0 0 rgba(37, 211, 102, 0.5);
+  }
+  100% {
+    box-shadow:
+      0 10px 24px rgba(37, 211, 102, 0.4),
+      0 0 0 16px rgba(37, 211, 102, 0);
   }
 }
 @keyframes blink {
@@ -474,13 +491,14 @@
 }
 .nav {
   display: none;
-  gap: 32px;
+  gap: 28px;
   font-size: 0.875rem;
   font-weight: 600;
   color: var(--slate-600);
 }
 .nav a {
   position: relative;
+  white-space: nowrap;
   padding-block: 4px;
   transition: color 0.2s;
 }
@@ -505,6 +523,12 @@
 @media (min-width: 768px) {
   .nav {
     display: flex;
+    gap: 20px;
+  }
+}
+@media (min-width: 960px) {
+  .nav {
+    gap: 32px;
   }
 }
 .headerActions {
@@ -1433,6 +1457,22 @@
   line-height: 1.9;
   color: var(--amber-900);
 }
+.helpLine {
+  margin-top: 20px;
+  font-size: 0.9375rem;
+  line-height: 1.9;
+  color: var(--slate-600);
+}
+.helpLine a {
+  font-weight: 700;
+  color: var(--emerald-700);
+  text-decoration: underline;
+  text-underline-offset: 5px;
+  transition: color 0.2s;
+}
+.helpLine a:hover {
+  color: var(--emerald-800);
+}
 
 /* ---------------------------------------------------------------- faq */
 
@@ -1503,6 +1543,90 @@
   line-height: 2;
   color: var(--slate-600);
   animation: answerIn 0.35s var(--ease-out);
+}
+
+/* ------------------------------------------------------------ contact */
+
+.contactGrid {
+  margin-top: 40px;
+  display: grid;
+  gap: 16px;
+  max-width: 44rem;
+}
+@media (min-width: 640px) {
+  .contactGrid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.contactCard {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 22px 20px;
+  border: 1px solid var(--slate-200);
+  border-radius: 14px;
+  background: #fff;
+  transition:
+    transform 0.3s var(--ease-out),
+    box-shadow 0.3s,
+    border-color 0.3s;
+}
+.contactCard:hover {
+  transform: translateY(-4px);
+  border-color: var(--emerald-600);
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.08);
+}
+.contactIcon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: var(--slate-200);
+  color: var(--slate-700);
+  flex-shrink: 0;
+}
+.contactWa .contactIcon {
+  background: #25d366;
+  color: #fff;
+}
+.contactTitle {
+  display: block;
+  font-size: 1.125rem;
+  font-weight: 800;
+}
+.contactText {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.875rem;
+  line-height: 1.7;
+  color: var(--slate-500);
+}
+
+/* Floating WhatsApp button: mobile only (the header nav is hidden there). */
+.fab {
+  position: fixed;
+  bottom: 20px;
+  inset-inline-start: 20px;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: #25d366;
+  color: #fff;
+  box-shadow: 0 10px 24px rgba(37, 211, 102, 0.4);
+  animation: fabPulse 2.4s ease-out infinite;
+  transition: transform 0.2s var(--ease-out);
+}
+.fab:hover {
+  transform: translateY(-3px) scale(1.05);
+}
+@media (min-width: 768px) {
+  .fab {
+    display: none;
+  }
 }
 
 /* ------------------------------------------------------ cta + footer */
@@ -1660,7 +1784,8 @@
 .split > *,
 .faqGrid > *,
 .row > *,
-.stepsGrid > * {
+.stepsGrid > *,
+.contactGrid > * {
   min-width: 0;
 }
 

@@ -7,7 +7,9 @@ import {
   Check,
   ChevronDown,
   Coins,
+  MessageCircle,
   Minus,
+  Phone,
   Printer,
   Store,
   WifiOff,
@@ -20,7 +22,7 @@ import s from "./marketing.module.css";
 /**
  * app/(marketing)/page.tsx
  * + app/(marketing)/marketing.module.css
- * + app/(marketing)/OfflineSection.tsx  (the only client component)
+ * + app/(marketing)/OfflineSection.tsx  (the only client component, unchanged)
  *
  * Server component. Styling and motion live in marketing.module.css so the
  * layout does not depend on Tailwind's class generation. Colors follow the
@@ -37,6 +39,17 @@ export const metadata: Metadata = {
 };
 
 const delay = (seconds: number): CSSProperties => ({ animationDelay: `${seconds}s` });
+
+/* ------------------------------------------------------------------ */
+/* Support contact                                                     */
+/* ------------------------------------------------------------------ */
+
+const SUPPORT_PHONE_DISPLAY = "0997 931 652";
+const SUPPORT_PHONE_TEL = "+963997931652";
+const SUPPORT_HOURS = "يومياً من 9 صباحاً حتى 9 مساءً، عدا الجمعة";
+
+const whatsappUrl = (text: string) =>
+  `https://wa.me/963997931652?text=${encodeURIComponent(text)}`;
 
 /* ------------------------------------------------------------------ */
 /* Small building blocks                                               */
@@ -348,6 +361,10 @@ const faqs = [
     q: "ماذا يحدث إذا انتهى اشتراكي؟",
     a: "يتحول الحساب إلى وضع القراءة: لا تُسجَّل عمليات جديدة حتى التجديد، وتبقى بياناتك محفوظة. يُوجَّه المدير إلى صفحة الاشتراك، ويرى الكاشير رسالة توضيحية.",
   },
+  {
+    q: "كيف أتواصل مع الدعم إذا واجهتني مشكلة؟",
+    a: `راسلنا على واتساب أو اتصل بنا على الرقم ${SUPPORT_PHONE_DISPLAY}، ${SUPPORT_HOURS}. يمكنك أيضاً طلب استشارة في تنظيم مخزونك وديونك قبل الاشتراك.`,
+  },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -369,6 +386,7 @@ export default function MarketingPage() {
             <a href="#offline">العمل بدون إنترنت</a>
             <a href="#start">طريقة الاشتراك</a>
             <a href="#faq">الأسئلة الشائعة</a>
+            <a href="#contact">تواصل معنا</a>
           </nav>
 
           <div className={s.headerActions}>
@@ -534,6 +552,16 @@ export default function MarketingPage() {
             <p className={`${s.notice} ${s.reveal}`}>
               يبقى الحساب في وضع الانتظار من لحظة التسجيل حتى مراجعة أول حوالة، ثم يُفعَّل مباشرة.
             </p>
+            <p className={`${s.helpLine} ${s.reveal}`}>
+              تحتاج مساعدة في الحوالة أو التسجيل؟{" "}
+              <a
+                href={whatsappUrl("مرحباً، أحتاج مساعدة في الاشتراك")}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                راسلنا على واتساب
+              </a>
+            </p>
           </div>
         </section>
 
@@ -557,6 +585,56 @@ export default function MarketingPage() {
           </div>
         </section>
 
+        {/* Contact */}
+        <section id="contact" className={s.borderTop}>
+          <div className={`${s.container} ${s.section}`}>
+            <div className={`${s.headBlock} ${s.reveal}`}>
+              <h2 className={s.h2}>عندك سؤال أو واجهتك مشكلة؟ نحن بالقرب منك</h2>
+              <p className={s.sectionLead}>
+                سواء كنت تفكر بالاشتراك، أو تحتاج مساعدة في الحوالة، أو تريد استشارة في تنظيم مخزونك وديونك، راسلنا وسنرد عليك.
+              </p>
+            </div>
+
+            <div className={s.contactGrid}>
+              <a
+                href={whatsappUrl("مرحباً، عندي استفسار عن النظام")}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`${s.contactCard} ${s.contactWa} ${s.revealPop}`}
+              >
+                <span className={s.contactIcon}>
+                  <MessageCircle size={24} aria-hidden />
+                </span>
+                <span>
+                  <strong className={s.contactTitle}>واتساب</strong>
+                  <span className={s.contactText}>
+                    أسرع طريقة للرد، ويمكنك إرسال صورة المشكلة
+                  </span>
+                </span>
+              </a>
+
+              <a
+                href={`tel:${SUPPORT_PHONE_TEL}`}
+                className={`${s.contactCard} ${s.revealPop}`}
+              >
+                <span className={s.contactIcon}>
+                  <Phone size={24} aria-hidden />
+                </span>
+                <span>
+                  <strong className={s.contactTitle}>اتصال هاتفي</strong>
+                  <span className={`${s.contactText} ${s.num}`} dir="ltr">
+                    {SUPPORT_PHONE_DISPLAY}
+                  </span>
+                </span>
+              </a>
+            </div>
+
+            {/* <p className={`${s.tableNote} ${s.reveal}`}>
+              أوقات الرد: {SUPPORT_HOURS}.
+            </p> */}
+          </div>
+        </section>
+
         {/* Final CTA */}
         <section className={s.ctaSection}>
           <div className={s.container}>
@@ -570,6 +648,14 @@ export default function MarketingPage() {
               <div className={s.ctaActions}>
                 <Link href="/register" className={s.btnLight}>أنشئ حساب متجرك</Link>
                 <Link href="/login" className={s.btnGhost}>تسجيل الدخول</Link>
+                <a
+                  href={whatsappUrl("مرحباً، عندي استفسار عن النظام")}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={s.btnGhost}
+                >
+                  تواصل عبر واتساب
+                </a>
               </div>
             </div>
           </div>
@@ -586,11 +672,26 @@ export default function MarketingPage() {
             <a href="#features">المزايا</a>
             <a href="#start">طريقة الاشتراك</a>
             <a href="#faq">الأسئلة الشائعة</a>
+            <a href="#contact">تواصل معنا</a>
+            <a href={`tel:${SUPPORT_PHONE_TEL}`} dir="ltr">
+              {SUPPORT_PHONE_DISPLAY}
+            </a>
             <Link href="/login">تسجيل الدخول</Link>
           </nav>
           <p className={s.copy}>© {new Date().getFullYear()} جملة تك</p>
         </div>
       </footer>
+
+      {/* Floating WhatsApp button (mobile only, the header nav is hidden there) */}
+      <a
+        href={whatsappUrl("مرحباً، عندي استفسار")}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={s.fab}
+        aria-label="تواصل معنا عبر واتساب"
+      >
+        <MessageCircle size={26} aria-hidden />
+      </a>
     </div>
   );
 }
