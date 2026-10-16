@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { randomBytes } from "node:crypto";
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
 import { auth } from "@/auth";
@@ -20,9 +21,9 @@ import {
   SUBSCRIPTION_OFFER_VALIDITY_HOURS,
 } from "@/lib/config/subscription";
 import {
-  uploadFileToStorage,
-  removeFileFromStorage,
-  createSignedUrl,
+  uploadPrivateReceipt,
+  removePrivateReceipt,
+  createReceiptSignedUrl,
 } from "@/lib/storage";
 
 const upstashConfigured = Boolean(
@@ -31,48 +32,39 @@ const upstashConfigured = Boolean(
 
 const receiptRatelimit = upstashConfigured
   ? new Ratelimit({
-      redis: new Redis({
-        url: process.env.UPSTASH_REDIS_REST_URL as string,
-        token: process.env.UPSTASH_REDIS_REST_TOKEN as string,
-      }),
-      limiter: Ratelimit.slidingWindow(
-        SUBSCRIPTION_RATE_LIMIT.requests,
-        `${SUBSCRIPTION_RATE_LIMIT.windowMinutes} m`
-      ),
-      prefix: "ratelimit:billing:receipt",
-    })
+    redis: new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL as string,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN as string,
+    }),
+    limiter: Ratelimit.slidingWindow(
+      SUBSCRIPTION_RATE_LIMIT.requests,
+      `${SUBSCRIPTION_RATE_LIMIT.windowMinutes} m`
+    ),
+    prefix: "ratelimit:billing:receipt",
+  })
   : null;
 
 function invalidFile(message: string) {
-  return NextResponse.json(
-    { error: "INVALID_FILE", message },
-    { status: 400 }
-  );
+  return NextResponse.json({ error: "INVALID_FILE", message }, { status: 400 });
 }
 
-function offerExpired() {
-  return NextResponse.json(
-    {
-      error: "OFFER_EXPIRED",
-      message: "انتهت صلاحية العرض، أنشئ طلباً جديداً.",
-    },
-    { status: 409 }
-  );
+function serverError(message: string) {
+  return NextResponse.json({ error: "SERVER_ERROR", message }, { status: 500 });
+}
+
+function notFound(message = "طلب الاشتراك غير موجود.") {
+  return NextResponse.json({ error: "NOT_FOUND", message }, { status: 404 });
 }
 
 /**
- * Magic-byte verification. Never trusts the client-supplied mime/filename.
- * Returns the extension ("jpg" | "png" | "webp") when the buffer's magic
- * bytes match an allowed image type, otherwise null.
+ * Magic-byte verification. Never trusts the client mime/filename.
+ * Returns the extension when the bytes match an allowed image type.
  */
 function detectImageExtension(buffer: Buffer): "jpg" | "png" | "webp" | null {
   if (buffer.length < 12) return null;
 
-  // JPEG: FF D8 FF
-  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return "jpg";
-  }
-  // PNG: 89 50 4E 47
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "jpg";
+
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
@@ -81,7 +73,7 @@ function detectImageExtension(buffer: Buffer): "jpg" | "png" | "webp" | null {
   ) {
     return "png";
   }
-  // WEBP: RIFF (52 49 46 46) .... WEBP (57 45 42 50 at offset 8)
+
   if (
     buffer[0] === 0x52 &&
     buffer[1] === 0x49 &&
@@ -97,14 +89,11 @@ function detectImageExtension(buffer: Buffer): "jpg" | "png" | "webp" | null {
   return null;
 }
 
-function randomHex(length = 16): string {
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  let out = "";
-  for (let i = 0; i < length; i++) out += bytes[i].toString(16).padStart(2, "0");
-  return out;
-}
-
+const CONTENT_TYPE_BY_EXT = {
+  jpg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+} as const;
 
 export async function POST(
   req: Request,
@@ -125,18 +114,14 @@ export async function POST(
   try {
     assertAdmin(session.user.role);
   } catch (error) {
-    if (error instanceof ForbiddenRoleError) {
-      return forbiddenRoleResponse(error);
-    }
+    if (error instanceof ForbiddenRoleError) return forbiddenRoleResponse(error);
     throw error;
   }
 
   try {
     await assertUserActive(tenantId, userId);
   } catch (error) {
-    if (error instanceof UserInactiveError) {
-      return userInactiveResponse(error);
-    }
+    if (error instanceof UserInactiveError) return userInactiveResponse(error);
     throw error;
   }
 
@@ -146,18 +131,25 @@ export async function POST(
     );
     if (!success) {
       return NextResponse.json(
-        {
-          error: "RATE_LIMITED",
-          message: "تم تجاوز عدد الطلبات المسموح. حاول لاحقاً.",
-        },
+        { error: "RATE_LIMITED", message: "تم تجاوز عدد الطلبات المسموح. حاول لاحقاً." },
         { status: 429 }
       );
     }
+  } else if (process.env.NODE_ENV === "production") {
+    console.error("[billing/receipt] Upstash is not configured in production.");
+    return serverError("حدث خطأ، حاول لاحقاً.");
   }
 
-  // ── Parse multipart or base64 body ──
-  // NOTE: the client filename/mime are deliberately NOT read — the file type
-  // comes only from server-side magic-byte detection below.
+  // Cheap guard BEFORE the body is read into memory. base64 inflates by ~1.37x
+  // and multipart adds boundaries, hence the allowance. The exact size is
+  // re-checked below on the real bytes.
+  const declaredLength = Number(req.headers.get("content-length") ?? "0");
+  const maxBody = Math.ceil(SUBSCRIPTION_RECEIPT_MAX_BYTES * 1.4) + 16 * 1024;
+  if (Number.isFinite(declaredLength) && declaredLength > maxBody) {
+    return invalidFile("حجم الملف يتجاوز الحد المسموح.");
+  }
+
+  // The client filename/mime are deliberately NOT read.
   let fileBuffer: Buffer;
   const contentType = req.headers.get("content-type") || "";
 
@@ -167,28 +159,21 @@ export async function POST(
     if (!(file instanceof File)) {
       return invalidFile("لم يتم إرفاق ملف صورة صالح.");
     }
-    const arrayBuffer = await file.arrayBuffer();
-    fileBuffer = Buffer.from(arrayBuffer);
+    fileBuffer = Buffer.from(await file.arrayBuffer());
   } else {
-    // Base64 JSON body: { file: "base64..." | "data:image/jpeg;base64,..." }
     let body: { file?: string };
     try {
       body = await req.json();
     } catch {
       return invalidFile("جسم الطلب غير صالح.");
     }
-    if (!body.file) {
+    if (!body.file || typeof body.file !== "string") {
       return invalidFile("لم يتم تزويد محتوى الملف.");
     }
     const base64 = body.file.replace(/^data:image\/[a-z]+;base64,/i, "");
-    try {
-      fileBuffer = Buffer.from(base64, "base64");
-    } catch {
-      return invalidFile("محتوى الملف غير صالح.");
-    }
+    fileBuffer = Buffer.from(base64, "base64");
   }
 
-  // ── Size re-validation (server-side backstop) ──
   if (fileBuffer.byteLength > SUBSCRIPTION_RECEIPT_MAX_BYTES) {
     return invalidFile(
       `حجم الملف يتجاوز الحد المسموح (${Math.floor(
@@ -197,19 +182,14 @@ export async function POST(
     );
   }
 
-  // ── Magic-byte verification (never trust client mime/filename) ──
   const ext = detectImageExtension(fileBuffer);
   if (!ext) {
-    return invalidFile(
-      "صيغة الملف غير مدعومة. الصيغ المسموحة: JPEG، PNG، WEBP."
-    );
+    return invalidFile("صيغة الملف غير مدعومة. الصيغ المسموحة: JPEG، PNG، WEBP.");
   }
 
   const db = getTenantDb(tenantId);
 
-  // Ownership + status lookup (never another tenant's row).
-  // findFirst (not findUnique): the tenant Client Extension injects tenantId
-  // into the where clause, which would break a unique lookup shape.
+  // findFirst: the tenant extension injects tenantId into the where clause.
   const subscription = await db.subscription.findFirst({
     where: { id },
     select: {
@@ -221,38 +201,9 @@ export async function POST(
     },
   });
 
-  if (!subscription) {
-    return NextResponse.json(
-      { error: "NOT_FOUND", message: "طلب الاشتراك غير موجود." },
-      { status: 404 }
-    );
-  }
+  // Defense in depth on top of the extension.
+  if (!subscription || subscription.tenantId !== tenantId) return notFound();
 
-  // Cross-tenant guard: the subscription must belong to this tenant.
-  if (subscription.tenantId !== tenantId) {
-    return NextResponse.json(
-      { error: "NOT_FOUND", message: "طلب الاشتراك غير موجود." },
-      { status: 404 }
-    );
-  }
-
-  const now = new Date();
-  const validityExpiry = new Date(
-    subscription.createdAt.getTime() +
-      SUBSCRIPTION_OFFER_VALIDITY_HOURS * 60 * 60 * 1000
-  );
-  const pastValidity = now > validityExpiry;
-
-  // An offer past its validity window WITHOUT a receipt → OFFER_EXPIRED.
-  if (
-    pastValidity &&
-    !subscription.receiptImageURL &&
-    subscription.status === "PENDING_APPROVAL"
-  ) {
-    return offerExpired();
-  }
-
-  // Can only upload/replace on a still-pending request.
   if (subscription.status !== "PENDING_APPROVAL") {
     return NextResponse.json(
       {
@@ -263,49 +214,60 @@ export async function POST(
     );
   }
 
-  // ── Upload object ──
-  const key = `receipts/${tenantId}/${id}-${randomHex()}.${ext}`;
-  await uploadFileToStorage({
-    buffer: fileBuffer,
-    key,
-    contentType: ext === "jpg" ? "image/jpeg" : ext === "png" ? "image/png" : "image/webp",
-  });
-
-  const oldKey = subscription.receiptImageURL || undefined;
-
-  // ── Conditional update: only one PENDING_APPROVAL row for this tenant+id ──
-  const updateResult = await db.subscription.updateMany({
-    where: {
-      id,
-      tenantId,
-      status: "PENDING_APPROVAL",
-    },
-    data: {
-      receiptImageURL: key,
-    },
-  });
-
-  if (updateResult.count !== 1) {
-    // The request is no longer pending (e.g. approved/rejected concurrently).
-    // Delete the just-uploaded object and 409.
-    await removeFileFromStorage(key).catch(() => {
-      /* best-effort cleanup */
-    });
+  const validityExpiry = new Date(
+    subscription.createdAt.getTime() +
+    SUBSCRIPTION_OFFER_VALIDITY_HOURS * 60 * 60 * 1000
+  );
+  if (new Date() > validityExpiry && !subscription.receiptImageURL) {
     return NextResponse.json(
-      {
-        error: "INVALID_REQUEST",
-        message: "طلب الاشتراك لم يعد قابلاً للتعديل.",
-      },
+      { error: "OFFER_EXPIRED", message: "انتهت صلاحية العرض، أنشئ طلباً جديداً." },
       { status: 409 }
     );
   }
 
-  // ── Delete the old object AFTER the DB write succeeds (replace allowed) ──
-  if (oldKey) {
-    await removeFileFromStorage(oldKey).catch(() => {
-      /* best-effort cleanup of orphaned old object */
+  const key = `receipts/${tenantId}/${id}-${randomBytes(16).toString("hex")}.${ext}`;
+  const oldKey = subscription.receiptImageURL ?? null;
+
+  try {
+    await uploadPrivateReceipt({
+      buffer: fileBuffer,
+      key,
+      contentType: CONTENT_TYPE_BY_EXT[ext],
     });
+  } catch (error) {
+    console.error("[billing/receipt] upload failed:", error);
+    return serverError("تعذّر رفع الإيصال، حاول مجدداً.");
   }
+
+  let updated: { count: number };
+  try {
+    // Pinned to the receipt value we read: a concurrent replace makes this
+    // count 0 for the loser instead of silently orphaning an object.
+    updated = await db.subscription.updateMany({
+      where: {
+        id,
+        tenantId,
+        status: "PENDING_APPROVAL",
+        receiptImageURL: oldKey,
+      },
+      data: { receiptImageURL: key },
+    });
+  } catch (error) {
+    console.error("[billing/receipt] db update failed:", error);
+    await removePrivateReceipt(key);
+    return serverError("تعذّر حفظ الإيصال، حاول مجدداً.");
+  }
+
+  if (updated.count !== 1) {
+    await removePrivateReceipt(key);
+    return NextResponse.json(
+      { error: "INVALID_REQUEST", message: "طلب الاشتراك لم يعد قابلاً للتعديل." },
+      { status: 409 }
+    );
+  }
+
+  // Delete the replaced object only AFTER the DB write succeeded.
+  if (oldKey) await removePrivateReceipt(oldKey);
 
   return NextResponse.json({
     success: true,
@@ -314,7 +276,7 @@ export async function POST(
 }
 
 export async function GET(
-  req: Request,
+  _req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -332,62 +294,41 @@ export async function GET(
   try {
     assertAdmin(session.user.role);
   } catch (error) {
-    if (error instanceof ForbiddenRoleError) {
-      return forbiddenRoleResponse(error);
-    }
+    if (error instanceof ForbiddenRoleError) return forbiddenRoleResponse(error);
     throw error;
   }
 
   try {
     await assertUserActive(tenantId, userId);
   } catch (error) {
-    if (error instanceof UserInactiveError) {
-      return userInactiveResponse(error);
-    }
+    if (error instanceof UserInactiveError) return userInactiveResponse(error);
     throw error;
   }
 
   const db = getTenantDb(tenantId);
 
-  // Ownership lookup: only this tenant's subscription, never another tenant's.
-  // findFirst (not findUnique): the tenant Client Extension injects tenantId.
   const subscription = await db.subscription.findFirst({
     where: { id },
-    select: {
-      id: true,
-      tenantId: true,
-      receiptImageURL: true,
-      status: true,
-    },
+    select: { id: true, tenantId: true, receiptImageURL: true },
   });
 
-  if (!subscription) {
-    return NextResponse.json(
-      { error: "NOT_FOUND", message: "طلب الاشتراك غير موجود." },
-      { status: 404 }
-    );
-  }
-
-  if (subscription.tenantId !== tenantId) {
-    return NextResponse.json(
-      { error: "NOT_FOUND", message: "طلب الاشتراك غير موجود." },
-      { status: 404 }
-    );
-  }
+  if (!subscription || subscription.tenantId !== tenantId) return notFound();
 
   if (!subscription.receiptImageURL) {
-    return NextResponse.json(
-      { error: "NOT_FOUND", message: "لا يوجد إيصال مرفق بهذا الطلب." },
-      { status: 404 }
-    );
+    return notFound("لا يوجد إيصال مرفق بهذا الطلب.");
   }
 
-  // Signed URL valid for at most 5 minutes (300 seconds).
-  const url = await createSignedUrl({
-    key: subscription.receiptImageURL,
-    seconds: 300,
-  });
+  // The key must live under this tenant's prefix before anything is signed.
+  if (!subscription.receiptImageURL.startsWith(`receipts/${tenantId}/`)) {
+    console.error("[billing/receipt] key outside tenant prefix:", id);
+    return notFound("لا يوجد إيصال مرفق بهذا الطلب.");
+  }
 
-  return NextResponse.json({ url });
+  try {
+    const url = await createReceiptSignedUrl(subscription.receiptImageURL);
+    return NextResponse.json({ url });
+  } catch (error) {
+    console.error("[billing/receipt] signed url failed:", error);
+    return serverError("تعذّر تحميل الإيصال.");
+  }
 }
-

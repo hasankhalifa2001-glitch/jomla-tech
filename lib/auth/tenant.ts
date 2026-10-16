@@ -107,12 +107,9 @@ export const SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES = [
  * require an authenticated ADMIN session and a fresh isActive user check.
  */
 export function isLockoutExemptPath(pathname: string): boolean {
-  return SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES.some((prefix) => {
-    if (pathname === prefix) return true;
-    if (pathname.startsWith(prefix + "/")) return true;
-    // Handle /api/billing/subscriptions/[id]/receipt (an id segment follows)
-    return false;
-  });
+  return SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(prefix + "/")
+  );
 }
 
 

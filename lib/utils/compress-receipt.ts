@@ -1,40 +1,39 @@
-/**
- * lib/utils/compress-receipt.ts
- *
- * T6a — client-side receipt compression wrapper around
- * `browser-image-compression`. Target: output < 300 KB so the server-side
- * 400 KB ceiling (SUBSCRIPTION_RECEIPT_MAX_BYTES) is never hit by a
- * legitimate upload. Client compression is a UX nicety only — the server
- * re-validates size + magic bytes independently.
- */
-
 import imageCompression from "browser-image-compression";
 
-/** Target ceiling for the compressed output (< server max of 400 KB). */
 export const RECEIPT_COMPRESSED_MAX_BYTES = 300 * 1024;
+/** Server hard limit (SUBSCRIPTION_RECEIPT_MAX_BYTES). The UI must block above this. */
+export const RECEIPT_HARD_MAX_BYTES = 400 * 1024;
 
-export interface CompressReceiptResult {
-  file: File;
-  /** True when the output still exceeds the target (caller should warn). */
-  stillOversize: boolean;
-}
+export type CompressReceiptResult =
+  | { ok: true; file: File; overTarget: boolean }
+  | { ok: false; reason: "UNREADABLE" | "TOO_LARGE" };
 
-/**
- * Compresses an image file to under RECEIPT_COMPRESSED_MAX_BYTES.
- * Always outputs JPEG/PNG/WEBP (never trusts the input extension alone —
- * the library re-encodes from decoded pixels).
- */
 export async function compressReceiptImage(file: File): Promise<CompressReceiptResult> {
-  const compressed: Blob = await imageCompression(file, {
-    maxSizeMB: RECEIPT_COMPRESSED_MAX_BYTES / (1024 * 1024),
-    maxWidthOrHeight: 1600,
-    useWebWorker: true,
-  });
+  let compressed: Blob;
+  try {
+    compressed = await imageCompression(file, {
+      maxSizeMB: RECEIPT_COMPRESSED_MAX_BYTES / (1024 * 1024),
+      maxWidthOrHeight: 1600,
+      // The worker script is fetched from a CDN by default; on a weak or
+      // filtered connection that can fail. One small image does not need it.
+      useWebWorker: false,
+      // Always re-encode to JPEG: PNG screenshots barely shrink with quality.
+      fileType: "image/jpeg",
+    });
+  } catch {
+    // e.g. HEIC from an iPhone, or a corrupt file.
+    return { ok: false, reason: "UNREADABLE" };
+  }
+
   const out =
     compressed instanceof File
       ? compressed
       : new File([compressed], file.name.replace(/\.[a-zA-Z0-9]+$/, "") + ".jpg", {
-          type: (compressed as Blob).type || "image/jpeg",
-        });
-  return { file: out, stillOversize: out.size >= RECEIPT_COMPRESSED_MAX_BYTES };
+        type: "image/jpeg",
+      });
+
+  if (out.size > RECEIPT_HARD_MAX_BYTES) {
+    return { ok: false, reason: "TOO_LARGE" };
+  }
+  return { ok: true, file: out, overTarget: out.size >= RECEIPT_COMPRESSED_MAX_BYTES };
 }

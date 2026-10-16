@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { Ratelimit } from "@upstash/ratelimit";
@@ -32,7 +31,10 @@ import {
   isReferenceCodeCollision,
   MAX_RETRIES,
 } from "@/lib/utils/subscription-reference";
+import { getPlatformExchangeRate } from "@/lib/data/platform-rate";
 
+// Non-strict on purpose: extra client keys (price/amount) are stripped and
+// ignored. The SYP amount is always computed server-side.
 const createSchema = z.object({
   tier: z.string().trim().min(1),
 });
@@ -58,7 +60,34 @@ const subscribeRatelimit = upstashConfigured
 class OpenRequestExistsError extends Error {
   constructor() {
     super("OPEN_REQUEST_EXISTS");
-    this.name = "OPEN_REQUEST_EXISTS";
+    this.name = "OpenRequestExistsError";
+  }
+}
+
+function rateUnavailable() {
+  return NextResponse.json(
+    { error: "RATE_UNAVAILABLE", message: "سعر الصرف غير محدد حالياً." },
+    { status: 422 }
+  );
+}
+
+function serverError() {
+  return NextResponse.json(
+    { error: "SERVER_ERROR", message: "حدث خطأ أثناء إنشاء طلب الاشتراك." },
+    { status: 500 }
+  );
+}
+
+/** Platform rate (never the merchant's own rate). null when unusable. */
+async function resolvePlatformRate(tenantId: string): Promise<string | null> {
+  const raw = await getPlatformExchangeRate(tenantId);
+  if (!raw) return null;
+  try {
+    const dec = toDecimal(raw);
+    if (dec.isZero() || dec.isNegative()) return null;
+    return dec.toString();
+  } catch {
+    return null;
   }
 }
 
@@ -78,9 +107,7 @@ export async function POST(req: Request) {
   try {
     assertAdmin(session.user.role);
   } catch (error) {
-    if (error instanceof ForbiddenRoleError) {
-      return forbiddenRoleResponse(error);
-    }
+    if (error instanceof ForbiddenRoleError) return forbiddenRoleResponse(error);
     throw error;
   }
 
@@ -88,32 +115,27 @@ export async function POST(req: Request) {
   try {
     await assertUserActive(tenantId, userId);
   } catch (error) {
-    if (error instanceof UserInactiveError) {
-      return userInactiveResponse(error);
-    }
+    if (error instanceof UserInactiveError) return userInactiveResponse(error);
     throw error;
   }
 
-  // Per-tenant rate limit.
+  // Per-tenant rate limit. Skipped only outside production; in production a
+  // missing limiter fails closed instead of silently disabling the control.
   if (subscribeRatelimit) {
     const { success } = await subscribeRatelimit.limit(
       subscriptionRateLimitKey(tenantId)
     );
     if (!success) {
       return NextResponse.json(
-        {
-          error: "RATE_LIMITED",
-          message: "تم تجاوز عدد الطلبات المسموح. حاول لاحقاً.",
-        },
+        { error: "RATE_LIMITED", message: "تم تجاوز عدد الطلبات المسموح. حاول لاحقاً." },
         { status: 429 }
       );
     }
+  } else if (process.env.NODE_ENV === "production") {
+    console.error("[billing/subscriptions] Upstash is not configured in production.");
+    return serverError();
   }
 
-  // ── zod validation ──
-  // Non-strict on purpose: extra client keys (price/amount) are stripped and
-  // ignored — the SYP amount is always computed server-side from the tier +
-  // fresh platform rate, never taken from the client.
   let body: { tier: string };
   try {
     body = createSchema.parse(await req.json());
@@ -124,7 +146,14 @@ export async function POST(req: Request) {
     );
   }
 
-  const tierConfig = SUBSCRIPTION_TIERS[body.tier];
+  // Own-property check: names like "constructor" must not resolve to
+  // Object.prototype members.
+  const tierConfig = Object.prototype.hasOwnProperty.call(
+    SUBSCRIPTION_TIERS,
+    body.tier
+  )
+    ? SUBSCRIPTION_TIERS[body.tier]
+    : undefined;
   if (!tierConfig) {
     return NextResponse.json(
       { error: "INVALID_TIER", message: "الباقة المختارة غير صالحة." },
@@ -132,43 +161,13 @@ export async function POST(req: Request) {
     );
   }
 
-  // ── Read the platform rate fresh (D3). Never trust a client-supplied rate/price. ──
-  const dbForRate = getTenantDb(tenantId);
-  const tenantRateRow = await dbForRate.tenant.findUnique({
-    where: { id: tenantId },
-    select: { dailyExchangeRate: true },
-  });
-  const rateStr =
-    tenantRateRow?.dailyExchangeRate != null
-      ? tenantRateRow.dailyExchangeRate.toString()
-      : null;
+  // Platform rate, read fresh (D3). Never a client value, never the
+  // merchant's own dailyExchangeRate.
+  const rate = await resolvePlatformRate(tenantId);
+  if (!rate) return rateUnavailable();
 
-  if (!rateStr) {
-    return NextResponse.json(
-      { error: "RATE_UNAVAILABLE", message: "سعر الصرف غير محدد حالياً." },
-      { status: 422 }
-    );
-  }
-
-  let rate: ReturnType<typeof toDecimal>;
-  try {
-    rate = toDecimal(rateStr);
-  } catch {
-    return NextResponse.json(
-      { error: "RATE_UNAVAILABLE", message: "سعر الصرف غير محدد حالياً." },
-      { status: 422 }
-    );
-  }
-  if (rate.isZero() || rate.isNegative()) {
-    return NextResponse.json(
-      { error: "RATE_UNAVAILABLE", message: "سعر الصرف غير محدد حالياً." },
-      { status: 422 }
-    );
-  }
-
-  const amountSYP = roundToWholeLira(
-    multiplyMoney(tierConfig.priceUSD, rate.toString())
-  );
+  // Multiply, then round ONCE to a whole lira.
+  const amountSYP = roundToWholeLira(multiplyMoney(tierConfig.priceUSD, rate));
   const amountUSD = tierConfig.priceUSD;
 
   const now = new Date();
@@ -177,91 +176,74 @@ export async function POST(req: Request) {
 
   const db = getTenantDb(tenantId);
 
-  try {
-    const result = await db.$transaction(async (tx) => {
-      // 1. System-reject this tenant's stale offers (PENDING_APPROVAL, no
-      // receipt, older than the validity window).
-      await tx.subscription.updateMany({
-        where: {
-          tenantId,
-          status: "PENDING_APPROVAL",
-          receiptImageURL: null,
-          createdAt: { lt: validityCutoff },
-        },
-        data: {
-          status: "REJECTED",
-          rejectionReason: "انتهت صلاحية العرض",
-          reviewedByUserId: null,
-          reviewedAt: now,
-        },
+  // The retry loop wraps the WHOLE transaction. In Postgres a unique
+  // violation aborts the surrounding transaction, so retrying inside it
+  // would fail with "current transaction is aborted".
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const referenceCode = generateReferenceCode();
+    try {
+      const created = await db.$transaction(async (tx) => {
+        // 1. System-reject this tenant's stale offers (no receipt, past validity).
+        await tx.subscription.updateMany({
+          where: {
+            tenantId,
+            status: "PENDING_APPROVAL",
+            receiptImageURL: null,
+            createdAt: { lt: validityCutoff },
+          },
+          data: {
+            status: "REJECTED",
+            rejectionReason: "انتهت صلاحية العرض",
+            reviewedByUserId: null,
+            reviewedAt: now,
+          },
+        });
+
+        // 2. One open request per tenant (D12).
+        const pendingCount = await tx.subscription.count({
+          where: { tenantId, status: "PENDING_APPROVAL" },
+        });
+        if (pendingCount > 0) throw new OpenRequestExistsError();
+
+        // 3. One top-level create.
+        return tx.subscription.create({
+          data: {
+            tenantId,
+            tier: body.tier,
+            durationDays: tierConfig.durationDays,
+            amountUSD,
+            amountSYP,
+            exchangeRateUsed: rate,
+            referenceCode,
+            status: "PENDING_APPROVAL",
+            expiresAt: null,
+          },
+        });
       });
 
-      // 2. Count remaining PENDING_APPROVAL requests of this tenant.
-      const pendingCount = await tx.subscription.count({
-        where: { tenantId, status: "PENDING_APPROVAL" },
+      return NextResponse.json({
+        id: created.id,
+        referenceCode,
+        amountSYP,
+        amountUSD,
+        tier: body.tier,
+        expiresOfferAt: new Date(created.createdAt.getTime() + validityMs),
+        wallet: SHAM_CASH_WALLET,
       });
-      if (pendingCount > 0) {
-        throw new OpenRequestExistsError();
+    } catch (error) {
+      if (error instanceof OpenRequestExistsError) {
+        return NextResponse.json(
+          { error: "OPEN_REQUEST_EXISTS", message: "لديك طلب اشتراك قيد الدراسة بالفعل." },
+          { status: 409 }
+        );
       }
-
-      // 3. One top-level subscription.create with a unique reference code.
-      let created: any;
-      let lastError: unknown;
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const referenceCode = generateReferenceCode();
-        try {
-          created = await tx.subscription.create({
-            data: {
-              tenantId,
-              tier: body.tier,
-              durationDays: tierConfig.durationDays,
-              amountUSD: amountUSD,
-              amountSYP: amountSYP,
-              exchangeRateUsed: rate.toString(),
-              referenceCode,
-              status: "PENDING_APPROVAL",
-              expiresAt: null,
-            },
-          });
-          return { created, referenceCode };
-        } catch (error) {
-          lastError = error;
-          if (!isReferenceCodeCollision(error)) throw error;
-          // referenceCode collision → regenerate and retry.
-          if (attempt === MAX_RETRIES - 1) throw error;
-        }
+      if (isReferenceCodeCollision(error) && attempt < MAX_RETRIES - 1) {
+        continue; // new code, new transaction
       }
-      throw lastError;
-    });
-
-    const expiresOfferAt = new Date(
-      result.created.createdAt.getTime() + validityMs
-    );
-
-    return NextResponse.json({
-      id: result.created.id,
-      referenceCode: result.referenceCode,
-      amountSYP,
-      amountUSD,
-      tier: body.tier,
-      expiresOfferAt,
-      wallet: SHAM_CASH_WALLET,
-    });
-  } catch (error) {
-    if (error instanceof OpenRequestExistsError) {
-      return NextResponse.json(
-        {
-          error: "OPEN_REQUEST_EXISTS",
-          message: "لديك طلب اشتراك قيد الدراسة بالفعل.",
-        },
-        { status: 409 }
-      );
+      console.error("[billing/subscriptions] create failed:", error);
+      return serverError();
     }
-    console.error("[billing/subscriptions] create failed:", error);
-    return NextResponse.json(
-      { error: "SERVER_ERROR", message: "حدث خطأ أثناء إنشاء طلب الاشتراك." },
-      { status: 500 }
-    );
   }
-}
 
+  return serverError();
+}

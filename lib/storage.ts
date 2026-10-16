@@ -313,3 +313,75 @@ export async function createSignedUrl(params: {
     }
     return data.signedUrl;
 }
+
+
+// ============================================================================
+// [T6a] PRIVATE RECEIPTS BUCKET — subscription payment receipts.
+// A separate, NON-public bucket (SUPABASE_RECEIPTS_BUCKET_NAME). Objects here
+// are never exposed through getPublicUrl(); the DB stores only the object KEY
+// and downloads go through short-lived signed URLs (D11, max 300 seconds).
+// ============================================================================
+
+export const RECEIPT_SIGNED_URL_MAX_SECONDS = 300;
+
+function assertReceiptsStorageEnv(): string {
+    const missing = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_RECEIPTS_BUCKET_NAME"].filter(
+        (key) => !process.env[key]
+    );
+    if (missing.length > 0) {
+        throw new Error(
+            `Receipts storage is not configured — missing environment variable(s): ${missing.join(", ")}.`
+        );
+    }
+    return process.env.SUPABASE_RECEIPTS_BUCKET_NAME as string;
+}
+
+/**
+ * Uploads a receipt to the PRIVATE bucket and returns the object KEY (never a
+ * URL). `upsert: false`: a key collision fails loudly instead of overwriting.
+ */
+export async function uploadPrivateReceipt(params: UploadFileParams): Promise<string> {
+    const bucket = assertReceiptsStorageEnv();
+    const client = getSupabaseClient();
+
+    const { error } = await client.storage.from(bucket).upload(params.key, params.buffer, {
+        contentType: params.contentType,
+        upsert: false,
+    });
+    if (error) {
+        throw new Error(`Receipt upload failed: ${error.message}`);
+    }
+    return params.key;
+}
+
+/**
+ * Signed URL for a private receipt. The cap is enforced HERE, not left to
+ * callers: any `seconds` above RECEIPT_SIGNED_URL_MAX_SECONDS is clamped.
+ */
+export async function createReceiptSignedUrl(key: string, seconds: number = RECEIPT_SIGNED_URL_MAX_SECONDS): Promise<string> {
+    const bucket = assertReceiptsStorageEnv();
+    const client = getSupabaseClient();
+    const ttl = Math.max(1, Math.min(Math.floor(seconds), RECEIPT_SIGNED_URL_MAX_SECONDS));
+
+    const { data, error } = await client.storage.from(bucket).createSignedUrl(key, ttl);
+    if (error || !data?.signedUrl) {
+        throw new Error(`Receipt signed URL failed: ${error?.message ?? "no signed URL returned"}`);
+    }
+    return data.signedUrl;
+}
+
+/**
+ * Best-effort delete of a private receipt (replacement / failed-write cleanup).
+ * Never throws: a failed delete costs storage, not correctness, and must not
+ * turn a successful request into an error. Returns whether it succeeded.
+ */
+export async function removePrivateReceipt(key: string): Promise<boolean> {
+    try {
+        const bucket = assertReceiptsStorageEnv();
+        const client = getSupabaseClient();
+        const { error } = await client.storage.from(bucket).remove([key]);
+        return !error;
+    } catch {
+        return false;
+    }
+}

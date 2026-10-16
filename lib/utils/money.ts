@@ -360,6 +360,10 @@ export function sumMoney(values: MoneyInput[]): string {
  *
  * Returns a Decimal string with no fractional part (e.g. "172500").
  */
+
+//  NOTE: pass the RAW product(priceUSD × rate) to avoid double rounding.The
+//  intermediate multiplyMoney() already rounds to 4 dp; with $10 / $100 and a
+//  4 - dp rate this is exact, but keep the order "multiply, then round once".
 export function roundToWholeLira(value: MoneyInput): string {
   return toDecimal(value).toFixed(0);
 }

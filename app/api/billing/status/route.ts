@@ -12,86 +12,32 @@ import {
   userInactiveResponse,
 } from "@/lib/auth/user";
 import {
+  SUBSCRIPTION_TIERS,
   SUBSCRIPTION_GRACE_DAYS,
   SUBSCRIPTION_RENEWAL_WARNING_DAYS,
   SUBSCRIPTION_OFFER_VALIDITY_HOURS,
   SHAM_CASH_WALLET,
 } from "@/lib/config/subscription";
+import {
+  getEffectiveTenantStatus,
+  type EffectiveTenantStatusResult,
+} from "@/lib/subscription/effective-status";
+import { getPlatformExchangeRate } from "@/lib/data/platform-rate";
+import { multiplyMoney, roundToWholeLira, toDecimal } from "@/lib/utils/money";
 
-export type EffectiveSubscriptionStatus =
-  | "ACTIVE"
-  | "GRACE"
-  | "EXPIRED"
-  | "PENDING";
+const OFFER_VALIDITY_MS = SUBSCRIPTION_OFFER_VALIDITY_HOURS * 60 * 60 * 1000;
 
-interface EffectiveStatusResult {
-  status: EffectiveSubscriptionStatus;
-  label: string;
-  daysLeft: number | null;
-  expiresAt: string | null;
-}
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-export function computeEffectiveSubscriptionStatus(
-  subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING" | null,
-  expiresAt: Date | null
-): EffectiveStatusResult {
-  const now = Date.now();
-
-  if (subscriptionStatus === "PENDING") {
-    return {
-      status: "PENDING",
-      label: "بانتظار تفعيل حسابك",
-      daysLeft: null,
-      expiresAt: null,
-    };
+function statusLabel(effective: EffectiveTenantStatusResult): string {
+  switch (effective.status) {
+    case "PENDING":
+      return "بانتظار تفعيل حسابك";
+    case "GRACE":
+      return `انتهى اشتراكك، متبقي ${effective.graceDaysLeft ?? 0} يوم قبل إيقاف النظام`;
+    case "EXPIRED":
+      return "انتهى الاشتراك";
+    default:
+      return "اشتراك نشط";
   }
-
-  if (subscriptionStatus === "EXPIRED") {
-    return {
-      status: "EXPIRED",
-      label: "انتهى الاشتراك",
-      daysLeft: null,
-      expiresAt: expiresAt ? expiresAt.toISOString() : null,
-    };
-  }
-
-  if (expiresAt) {
-    const expiryMs = expiresAt.getTime();
-    if (now > expiryMs) {
-      const graceEndMs = expiryMs + SUBSCRIPTION_GRACE_DAYS * DAY_MS;
-      if (now <= graceEndMs) {
-        const daysLeft = Math.ceil((graceEndMs - now) / DAY_MS);
-        return {
-          status: "GRACE",
-          label: `انتهى اشتراكك، متبقي ${Math.max(daysLeft, 0)} يوم قبل إيقاف النظام`,
-          daysLeft: Math.max(daysLeft, 0),
-          expiresAt: expiresAt.toISOString(),
-        };
-      }
-      return {
-        status: "EXPIRED",
-        label: "انتهى الاشتراك",
-        daysLeft: null,
-        expiresAt: expiresAt.toISOString(),
-      };
-    }
-    const daysLeft = Math.ceil((expiryMs - now) / DAY_MS);
-    return {
-      status: "ACTIVE",
-      label: "اشتراك نشط",
-      daysLeft: Math.max(daysLeft, 0),
-      expiresAt: expiresAt.toISOString(),
-    };
-  }
-
-  return {
-    status: "ACTIVE",
-    label: "اشتراك نشط",
-    daysLeft: null,
-    expiresAt: null,
-  };
 }
 
 export async function GET() {
@@ -109,18 +55,14 @@ export async function GET() {
   try {
     assertAdmin(session.user.role);
   } catch (error) {
-    if (error instanceof ForbiddenRoleError) {
-      return forbiddenRoleResponse(error);
-    }
+    if (error instanceof ForbiddenRoleError) return forbiddenRoleResponse(error);
     throw error;
   }
 
   try {
     await assertUserActive(tenantId, userId);
   } catch (error) {
-    if (error instanceof UserInactiveError) {
-      return userInactiveResponse(error);
-    }
+    if (error instanceof UserInactiveError) return userInactiveResponse(error);
     throw error;
   }
 
@@ -129,11 +71,7 @@ export async function GET() {
   const [tenant, openRequest, recentRequests] = await Promise.all([
     db.tenant.findUnique({
       where: { id: tenantId },
-      select: {
-        id: true,
-        subscriptionStatus: true,
-        expiresAt: true,
-      },
+      select: { id: true, subscriptionStatus: true, expiresAt: true },
     }),
     db.subscription.findFirst({
       where: { tenantId, status: "PENDING_APPROVAL" },
@@ -145,8 +83,8 @@ export async function GET() {
         amountUSD: true,
         referenceCode: true,
         status: true,
+        receiptImageURL: true, // only to compute hasReceipt; never returned
         createdAt: true,
-        expiresAt: true,
       },
     }),
     db.subscription.findMany({
@@ -157,7 +95,9 @@ export async function GET() {
         id: true,
         tier: true,
         amountSYP: true,
+        amountUSD: true,
         status: true,
+        receiptImageURL: true, // only to compute hasReceipt; never returned
         rejectionReason: true,
         createdAt: true,
         updatedAt: true,
@@ -172,34 +112,63 @@ export async function GET() {
     );
   }
 
-  const effective = computeEffectiveSubscriptionStatus(
-    tenant.subscriptionStatus,
-    tenant.expiresAt
-  );
+  const now = new Date();
+  const effective = getEffectiveTenantStatus(tenant, now);
+
+  // Platform rate (never the merchant's own rate). Used ONLY for the
+  // informational SYP preview on the plan cards; the charged amount is
+  // computed and frozen by POST /api/billing/subscriptions.
+  let usableRate: string | null = null;
+  const platformRaw = await getPlatformExchangeRate(tenantId);
+  if (platformRaw) {
+    try {
+      const d = toDecimal(platformRaw);
+      if (!d.isZero() && !d.isNegative()) usableRate = d.toString();
+    } catch {
+      usableRate = null;
+    }
+  }
+
+  const plans = Object.entries(SUBSCRIPTION_TIERS).map(([tier, cfg]) => ({
+    tier,
+    label: (cfg as { label?: string }).label ?? tier,
+    priceUSD: String(cfg.priceUSD),
+    durationDays: cfg.durationDays,
+    priceSYPPreview: usableRate
+      ? roundToWholeLira(multiplyMoney(cfg.priceUSD, usableRate))
+      : null,
+  }));
 
   const openRequestView = openRequest
-    ? {
+    ? (() => {
+      const expiresOfferAt = new Date(
+        openRequest.createdAt.getTime() + OFFER_VALIDITY_MS
+      );
+      const hasReceipt = Boolean(openRequest.receiptImageURL);
+      return {
         id: openRequest.id,
         tier: openRequest.tier,
         amountSYP: openRequest.amountSYP.toString(),
         amountUSD: openRequest.amountUSD.toString(),
         referenceCode: openRequest.referenceCode,
         status: openRequest.status,
+        hasReceipt,
         createdAt: openRequest.createdAt.toISOString(),
-        // Subscription.expiresAt stays null for offers; validity is derived
-        // from createdAt + the offer window (same as POST /subscriptions).
-        expiresOfferAt: new Date(
-          openRequest.createdAt.getTime() +
-            SUBSCRIPTION_OFFER_VALIDITY_HOURS * 60 * 60 * 1000
-        ).toISOString(),
-      }
+        expiresOfferAt: expiresOfferAt.toISOString(),
+        // An expired offer WITH a receipt still awaits a human decision;
+        // the UI shows it as stale for the reviewer, not as dead.
+        isOfferExpired: now > expiresOfferAt,
+      };
+    })()
     : null;
 
   const recent = recentRequests.map((r) => ({
     id: r.id,
     tier: r.tier,
     amountSYP: r.amountSYP.toString(),
+    amountUSD: r.amountUSD.toString(),
     status: r.status,
+    hasReceipt: Boolean(r.receiptImageURL),
     rejectionReason: r.rejectionReason ?? null,
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
@@ -207,14 +176,22 @@ export async function GET() {
 
   return NextResponse.json({
     status: effective.status,
-    label: effective.label,
+    writable: effective.writable,
+    label: statusLabel(effective),
     daysLeft: effective.daysLeft,
-    expiresAt: effective.expiresAt,
+    graceDaysLeft: effective.graceDaysLeft,
+    expiresAt: tenant.expiresAt ? tenant.expiresAt.toISOString() : null,
+    lockAt: effective.lockAt ? effective.lockAt.toISOString() : null,
     graceDays: SUBSCRIPTION_GRACE_DAYS,
     renewalWarningDays: SUBSCRIPTION_RENEWAL_WARNING_DAYS,
+    renewalWarning:
+      effective.status === "ACTIVE" &&
+      effective.daysLeft !== null &&
+      effective.daysLeft <= SUBSCRIPTION_RENEWAL_WARNING_DAYS,
+    rateAvailable: usableRate !== null,
+    plans,
     wallet: SHAM_CASH_WALLET,
     openRequest: openRequestView,
     recentRequests: recent,
   });
 }
-
