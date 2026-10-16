@@ -11,10 +11,11 @@
  * stays PENDING_REVIEW. Every response is { code, message } (+ optional details),
  * Arabic, never carrying raw exception text.
  *
- * Ambiguous-commit recovery: if a RETRY (attempt > 1) hits ALREADY_REVIEWED, or
- * retries are exhausted on a transient error, the order is re-read; when it was
- * approved by THIS user a moment ago and has an invoice, the committed result is
- * returned as a normal 200 instead of a misleading 409/503.
+ * IDEMPOTENT RESUBMISSION: when the transaction reports ALREADY_REVIEWED, the
+ * route checks (read-only) whether THIS admin already committed an IDENTICAL
+ * approval within the last 2 minutes (same quantities, payment mode and
+ * customer). If so it answers with the committed result, so a retry after a
+ * lost response never looks like a failure. Any difference stays a 409.
  *
  * Reject remains POST /api/orders/[id]/reject (T5b). This is the ONLY approval
  * path (the legacy PATCH /api/orders/[id]/status route is retired — D19).
@@ -40,6 +41,8 @@ import {
     ApprovalProductInactiveError,
     ApprovalRateRequiredError,
     ApprovalValidationError,
+    type ApproveOrderBody,
+    type ApproveOrderResult,
 } from "@/lib/data/orders-approval";
 import { approveOrderInTransaction, recoverCommittedApproval } from "@/lib/data/orders-approval-tx";
 
@@ -47,12 +50,46 @@ export const dynamic = "force-dynamic";
 
 const CODES = APPROVAL_STORE_ERROR_CODES;
 
-/** Body-size bound (bytes). 50 lines x (id + 4dp qty) + customer/payment is a few KB. */
+/** Body-size bound. 50 lines x (id + 4dp qty) + customer/payment is a few KB. */
 const MAX_BODY_BYTES = 32 * 1024;
 
-/** Domain errors are NEVER retried — every Approval* + Zod + MoneyError. */
+/** Retryable Prisma transaction failures → a clear "try again", never FORBIDDEN. */
+function isApprovalRetryable(err: unknown): boolean {
+    return isRetryableTxError(err);
+}
+
+/**
+ * Domain errors are NEVER retried. ONE base class covers every typed approval
+ * failure, so a newly added error class can never be retried by accident.
+ */
 function isApprovalFatal(err: unknown): boolean {
-    return err instanceof z.ZodError || err instanceof MoneyError || err instanceof ApprovalDomainError;
+    return err instanceof ApprovalDomainError || err instanceof z.ZodError || err instanceof MoneyError;
+}
+
+function successResponse(result: ApproveOrderResult) {
+    return NextResponse.json({
+        success: true,
+        invoiceId: result.invoiceId,
+        totalSYP: result.totalSYP,
+        paidAmountSYP: result.paidAmountSYP,
+        debtAmountSYP: result.debtAmountSYP,
+        customerId: result.customerId,
+    });
+}
+
+/** Never lets a recovery failure mask the original 409. */
+async function tryRecover(params: {
+    orderId: string;
+    tenantId: string;
+    userId: string;
+    body: ApproveOrderBody;
+}): Promise<ApproveOrderResult | null> {
+    try {
+        return await recoverCommittedApproval(prisma, params);
+    } catch (error) {
+        console.error("Approval recovery check failed:", error);
+        return null;
+    }
 }
 
 export async function POST(
@@ -122,14 +159,13 @@ export async function POST(
 
     // ---- 5. The ONE approval transaction (retried on transient only) ------
     // withTxRetries re-runs the WHOLE closure (claim included) up to 3
-    // attempts (P2028 failures capped at 2). Domain errors rethrow
-    // immediately via isFatal.
-    let attempts = 0;
+    // attempts (P2028 capped at 2 failures). Domain errors rethrow immediately
+    // via isFatal — INSUFFICIENT_STOCK / ALREADY_REVIEWED / validation never
+    // retry.
     try {
         const result = await withTxRetries(
-            () => {
-                attempts += 1;
-                return prisma.$transaction(
+            () =>
+                prisma.$transaction(
                     (tx) =>
                         approveOrderInTransaction(tx, {
                             orderId: id,
@@ -138,55 +174,22 @@ export async function POST(
                             body: body.data,
                         }),
                     APPROVAL_TX_OPTIONS
-                );
-            },
+                ),
             { isFatal: isApprovalFatal }
         );
-        return NextResponse.json({
-            success: true,
-            invoiceId: result.invoiceId,
-            totalSYP: result.totalSYP,
-            paidAmountSYP: result.paidAmountSYP,
-            debtAmountSYP: result.debtAmountSYP,
-            customerId: result.customerId,
-        });
+        return successResponse(result);
     } catch (error) {
-        // ---- Ambiguous-commit recovery ------------------------------------
-        // (a) a RETRY (attempt > 1) found the order already APPROVED: the
-        //     earlier attempt may have committed before its response was lost;
-        // (b) retries were exhausted on a transient error: the last attempt
-        //     may have committed. Never applied on a first-attempt 409.
-        const maybeCommitted =
-            (error instanceof ApprovalAlreadyReviewedError && attempts > 1) ||
-            (isRetryableTxError(error) && attempts >= 1);
-        if (maybeCommitted) {
-            try {
-                const recovered = await recoverCommittedApproval(prisma, {
-                    orderId: id,
-                    tenantId,
-                    userId,
-                });
-                if (recovered) {
-                    return NextResponse.json({
-                        success: true,
-                        invoiceId: recovered.invoiceId,
-                        totalSYP: recovered.totalSYP,
-                        paidAmountSYP: recovered.paidAmountSYP,
-                        debtAmountSYP: recovered.debtAmountSYP,
-                        customerId: recovered.customerId,
-                    });
-                }
-            } catch (recoveryError) {
-                console.error("Recovery check failed after approval error:", recoveryError);
-            }
-        }
-
-        // ---- Typed domain errors → their specific HTTP code ---------------
-        // Mapping happens HERE, outside the transaction (already rolled back).
+        // Typed domain errors → their specific HTTP code. Mapping happens HERE,
+        // outside the transaction, so the tx has already fully rolled back.
         if (error instanceof ApprovalOrderNotFoundError) {
             return NextResponse.json({ code: CODES.notFound, message: error.message }, { status: 404 });
         }
         if (error instanceof ApprovalAlreadyReviewedError) {
+            // Identical resubmission by the same admin within the window (e.g.
+            // the first attempt committed but its response was lost): answer
+            // with the committed result. Anything else stays a 409.
+            const recovered = await tryRecover({ orderId: id, tenantId, userId, body: body.data });
+            if (recovered) return successResponse(recovered);
             return NextResponse.json({ code: CODES.alreadyReviewed, message: error.message }, { status: 409 });
         }
         if (error instanceof ApprovalInsufficientStockError) {
@@ -210,18 +213,10 @@ export async function POST(
         if (error instanceof ApprovalValidationError) {
             return NextResponse.json({ code: CODES.validation, message: error.message }, { status: 400 });
         }
-        // A malformed monetary figure is a client-actionable validation problem,
-        // never a server fault and never raw exception text.
-        if (error instanceof MoneyError) {
-            console.error("Invalid monetary value approving B2B order:", error);
-            return NextResponse.json(
-                { code: CODES.validation, message: "قيمة مالية غير صالحة في بيانات الموافقة." },
-                { status: 400 }
-            );
-        }
-        // A retryable transaction failure (after retries) → clear Arabic
-        // "try again", fully rolled back, never FORBIDDEN.
-        if (isRetryableTxError(error)) {
+        // A retryable transaction failure → clear Arabic "try again" (503),
+        // fully rolled back, never FORBIDDEN. Reached only after withTxRetries
+        // exhausted its attempts.
+        if (isApprovalRetryable(error)) {
             console.error("Retryable tx failure approving B2B order:", error);
             return NextResponse.json(
                 { code: CODES.txRetry, message: "تعذّر إتمام العملية بسبب ضغط على الخادم، حاول مرة ثانية." },

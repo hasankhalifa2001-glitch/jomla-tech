@@ -19,7 +19,7 @@
  *    transaction back — the order stays PENDING_REVIEW.
  *  - Money via lib/utils/money.ts only; unit conversion via lib/inventory/
  *    units.ts only; FIFO via lib/inventory/fifo.ts; the sold line's OWN factor
- *    via getUnitConversionFactor — never requireBaseUnit()'s factor.
+ *    via the batched unit-factor reader — never requireBaseUnit()'s factor.
  *  - The caller applies batch decrements (commitFifoAllocation is read-only):
  *    one `tx.productBatch.update({ decrement })` per allocation row, per line,
  *    immediately — later lines see earlier decrements. A running balance per
@@ -51,6 +51,7 @@ import {
     groupLockedQuantitiesByProduct,
     normalizeRate,
     resolveApprovalPayment,
+    type ApproveOrderBody,
     type ApproveOrderInput,
     type ApproveOrderResult,
     type SufficiencyLineInput,
@@ -417,7 +418,7 @@ export async function approveOrderInTransaction(
     // ---- Step 13: persist approvedQuantity once, per line ----------------
     for (const lp of linePlans) {
         // Writes ONLY approvedQuantity. quantity and the price snapshots are
-        // NEVER touched here (static test).
+        // NEVER touched here (static + runtime test).
         await tx.b2BOrderRequestItem.update({
             where: { id: lp.itemId, tenantId },
             data: { approvedQuantity: lp.approvedQuantity },
@@ -461,21 +462,38 @@ export async function approveOrderInTransaction(
 }
 
 /**
- * Ambiguous-commit recovery. If the approval transaction COMMITTED but the
- * response (or the connection) was lost, a retry hits the step-1 claim and
- * would report ALREADY_REVIEWED although the invoice exists. This returns the
- * committed result ONLY when the order is APPROVED by THIS user, has a
- * resulting invoice, and was reviewed within the last RECOVERY_WINDOW_MS —
- * otherwise null (the caller keeps its original error).
+ * Ambiguous-commit recovery (idempotent resubmission).
+ *
+ * If the approval transaction COMMITTED but the response (or the connection)
+ * was lost, a retry hits the step-1 claim and would report ALREADY_REVIEWED
+ * although the invoice exists. This returns the committed result ONLY when the
+ * resubmitted request is IDENTICAL to what was committed:
+ *   - the order is APPROVED by THIS user, has a resulting invoice, and was
+ *     reviewed within the last RECOVERY_WINDOW_MS;
+ *   - EVERY line's stored approvedQuantity equals the submitted one;
+ *   - the invoice's paid amount matches the submitted payment mode;
+ *   - the invoice's customer matches the submitted customer.
+ * Any difference -> null (the caller keeps its ALREADY_REVIEWED 409), so a
+ * different request can never be answered with "success".
+ *
+ * Success from this function means "your earlier identical approval is already
+ * committed" — NOT "this request created the invoice".
  *
  * Read-only. `db` is the raw client; every query carries tenantId.
  */
 export async function recoverCommittedApproval(
     db: Prisma.TransactionClient,
-    params: { orderId: string; tenantId: string; userId: string; now?: Date }
+    params: {
+        orderId: string;
+        tenantId: string;
+        userId: string;
+        body: ApproveOrderBody;
+        now?: Date;
+    }
 ): Promise<ApproveOrderResult | null> {
-    const { orderId, tenantId, userId } = params;
+    const { orderId, tenantId, userId, body } = params;
     const now = params.now ?? new Date();
+
     const order = await db.b2BOrderRequest.findFirst({
         where: {
             id: orderId,
@@ -489,6 +507,21 @@ export async function recoverCommittedApproval(
     });
     if (!order?.resultingInvoiceId) return null;
 
+    // (a) every line's committed approvedQuantity must equal the submitted one.
+    const items = await db.b2BOrderRequestItem.findMany({
+        where: { orderRequestId: orderId, tenantId },
+        select: { id: true, approvedQuantity: true },
+    });
+    const submitted = new Map(body.lines.map((l) => [l.itemId, l.approvedQuantity]));
+    if (items.length === 0 || items.length !== submitted.size) return null;
+    for (const item of items) {
+        const wanted = submitted.get(item.id);
+        if (wanted === undefined || item.approvedQuantity == null) return null;
+        if (compareMoney(serializeMoney(item.approvedQuantity.toString()), serializeMoney(wanted)) !== 0) {
+            return null;
+        }
+    }
+
     const invoice = await db.invoice.findFirst({
         where: { id: order.resultingInvoiceId, tenantId },
         select: {
@@ -501,10 +534,34 @@ export async function recoverCommittedApproval(
     });
     if (!invoice) return null;
 
+    // (b) the committed payment must match the submitted payment mode.
+    const total = serializeMoney(invoice.totalSYP.toString());
+    const paid = serializeMoney(invoice.paidAmountSYP.toString());
+    if (body.payment.mode === "FULL_CASH") {
+        if (compareMoney(paid, total) !== 0) return null;
+    } else if (body.payment.mode === "FULL_CREDIT") {
+        if (compareMoney(paid, "0") !== 0) return null;
+    } else {
+        if (body.payment.paidAmountSYP === undefined) return null;
+        if (compareMoney(paid, serializeMoney(body.payment.paidAmountSYP)) !== 0) return null;
+    }
+
+    // (c) the committed customer must match the submitted customer.
+    if (body.customer.mode === "EXISTING") {
+        const resolvedId = await resolveActiveCustomerId(db, tenantId, body.customer.customerId);
+        if (resolvedId !== invoice.customerId) return null;
+    } else {
+        const customer = await db.customer.findFirst({
+            where: { id: invoice.customerId, tenantId },
+            select: { phone: true },
+        });
+        if (!customer || customer.phone !== normalizePhone(body.customer.phone)) return null;
+    }
+
     return {
         invoiceId: invoice.id,
-        totalSYP: serializeMoney(invoice.totalSYP.toString()),
-        paidAmountSYP: serializeMoney(invoice.paidAmountSYP.toString()),
+        totalSYP: total,
+        paidAmountSYP: paid,
         debtAmountSYP: serializeMoney(invoice.debtAmountSYP.toString()),
         customerId: invoice.customerId,
     };

@@ -1,9 +1,10 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { Users, Search, RefreshCw, AlertCircle } from "lucide-react";
+import { Users, Search, RefreshCw, AlertCircle, BookOpen, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { MergeCustomersModal, type CustomerSummaryItem } from "./merge-customers-modal";
 import { usePendingRepaymentTotals, useFailedOfflineRepayments } from "@/lib/offline/pending-offline-payments";
 import { CustomerCard, type RepaymentAppliedResult } from "./customer-card";
@@ -12,6 +13,19 @@ interface LedgerClientProps {
   tenantId: string;
   isAdmin: boolean;
 }
+
+/**
+ * [v4.5 — polish pass, presentation only] Gradient icon tile header, a search
+ * field with a clear button and a count pill, mirrored skeleton cards while
+ * loading, a retryable error banner, and a light staggered entrance for the
+ * cards. Every fetch, state transition and prop passed to CustomerCard /
+ * MergeCustomersModal below is unchanged.
+ */
+
+/** Gentle entrance; the delay is capped so long lists don't feel slow. */
+const CARD_ENTER =
+  "motion-safe:animate-in fade-in slide-in-from-bottom-2 duration-300 fill-mode-backwards";
+const cardStyle = (i: number) => ({ animationDelay: `${Math.min(i, 8) * 50}ms` });
 
 /**
  * Pure network helper: no React state is touched here, so it can be called from
@@ -28,6 +42,23 @@ async function requestCustomers(): Promise<CustomerSummaryItem[]> {
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : "حدث خطأ أثناء تحميل البيانات.";
+}
+
+/** Placeholder card that mirrors CustomerCard's rough silhouette. */
+function CardSkeleton() {
+  return (
+    <div className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-4" aria-hidden>
+      <div className="flex items-center gap-3">
+        <Skeleton className="size-11 rounded-xl" />
+        <div className="flex-1 space-y-2">
+          <Skeleton className="h-4 w-2/3" />
+          <Skeleton className="h-3 w-1/3" />
+        </div>
+      </div>
+      <Skeleton className="h-16 w-full rounded-xl" />
+      <Skeleton className="h-10 w-full rounded-xl" />
+    </div>
+  );
 }
 
 export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
@@ -107,14 +138,19 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
   }, [customers, searchQuery]);
 
   return (
-    <div dir="rtl" className="space-y-6">
+    <div dir="rtl" className="space-y-5">
       {/* Top Header */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b pb-4">
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-900">دفتر الديون</h1>
-          <p className="mt-1 text-sm text-zinc-600">
-            تتبع ديون العملاء وسجل الدفعات غير القابل للتعديل وإدارة الحسابات.
-          </p>
+      <div className="flex flex-col items-stretch justify-between gap-4 border-b border-zinc-100 pb-4 sm:flex-row sm:items-center">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-linear-to-br from-emerald-500 to-emerald-700 text-white shadow-sm shadow-emerald-600/25">
+            <BookOpen className="size-5" aria-hidden />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-xl font-extrabold text-zinc-900 sm:text-2xl">دفتر الديون</h1>
+            <p className="mt-0.5 text-xs leading-relaxed text-zinc-500 sm:text-sm">
+              تتبع ديون العملاء وسجل الدفعات غير القابل للتعديل وإدارة الحسابات.
+            </p>
+          </div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -122,9 +158,9 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
             <Button
               variant="default"
               onClick={() => setIsMergeModalOpen(true)}
-              className="bg-zinc-900 hover:bg-zinc-800 text-white flex items-center gap-2 text-sm"
+              className="h-10 flex-1 gap-2 rounded-xl bg-zinc-900 text-sm font-bold text-white transition-all hover:bg-zinc-800 active:scale-[0.98] sm:flex-none"
             >
-              <Users className="w-4 h-4" />
+              <Users className="size-4" aria-hidden />
               <span>دمج حسابات مكررة</span>
             </Button>
           )}
@@ -135,62 +171,109 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
             onClick={fetchCustomers}
             disabled={isLoading}
             title="تحديث البيانات"
+            aria-label="تحديث البيانات"
+            className="size-10 shrink-0 rounded-xl border-zinc-200 text-zinc-600 transition-all hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-700 active:scale-95"
           >
-            <RefreshCw className={`w-4 h-4 ${isLoading ? "animate-spin" : ""}`} />
+            <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
           </Button>
         </div>
       </div>
 
       {/* Filter / Search Bar */}
-      <div className="flex items-center gap-3">
-        <div className="relative flex-1 max-w-md">
-          <Search className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative min-w-0 flex-1 sm:max-w-md">
+          <Search
+            className="pointer-events-none absolute inset-e-3 top-1/2 size-4 -translate-y-1/2 text-zinc-400"
+            aria-hidden
+          />
           <Input
             placeholder="البحث بالاسم، المحل، أو رقم الهاتف..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="pr-9 text-sm"
+            className="h-11 rounded-xl border-zinc-200 pe-10 ps-10 text-sm transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20 sm:h-10"
           />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery("")}
+              aria-label="مسح البحث"
+              className="absolute inset-s-2 top-1/2 grid size-7 -translate-y-1/2 place-items-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-700"
+            >
+              <X className="size-3.5" />
+            </button>
+          )}
         </div>
-        <span className="text-xs text-zinc-500">
-          إجمالي الزبائن: {filteredCustomers.length}
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-bold text-zinc-600">
+          إجمالي الزبائن
+          <span className="tabular-nums text-emerald-700">{filteredCustomers.length}</span>
         </span>
       </div>
 
       {/* Error state */}
       {fetchError && (
-        <div className="p-3 bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg flex items-center gap-2">
-          <AlertCircle className="w-4 h-4 shrink-0" />
-          <span>{fetchError}</span>
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3.5 py-3 text-sm text-red-700 motion-safe:animate-in fade-in slide-in-from-top-1 duration-200"
+        >
+          <AlertCircle className="size-4 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1 font-semibold">{fetchError}</span>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={fetchCustomers}
+            disabled={isLoading}
+            className="h-8 gap-1.5 rounded-lg border-red-200 bg-white text-xs font-bold text-red-700 hover:bg-red-50"
+          >
+            <RefreshCw className="size-3.5" aria-hidden />
+            إعادة المحاولة
+          </Button>
         </div>
       )}
 
       {/* Customers List / Grid */}
       {isLoading ? (
-        <div className="p-8 text-center text-sm text-zinc-500">
-          <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-zinc-400" />
-          جارٍ تحميل بيانات دفتر الديون...
+        <div role="status" aria-label="جارٍ تحميل بيانات دفتر الديون">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {Array.from({ length: 6 }, (_, i) => (
+              <CardSkeleton key={i} />
+            ))}
+          </div>
         </div>
       ) : filteredCustomers.length === 0 ? (
-        <div className="p-12 text-center border-2 border-dashed border-zinc-200 rounded-xl">
-          <Users className="w-10 h-10 mx-auto text-zinc-300 mb-2" />
-          <p className="text-sm font-medium text-zinc-600">لا يوجد زبائن مطابقين</p>
-          <p className="text-xs text-zinc-400 mt-1">
+        <div className="rounded-2xl border-2 border-dashed border-zinc-200 bg-zinc-50/40 px-4 py-14 text-center motion-safe:animate-in fade-in duration-300">
+          <div className="mx-auto mb-3 grid size-14 place-items-center rounded-2xl bg-white text-zinc-300 ring-1 ring-zinc-200">
+            <Users className="size-7" aria-hidden />
+          </div>
+          <p className="text-sm font-bold text-zinc-700">لا يوجد زبائن مطابقين</p>
+          <p className="mt-1 text-xs leading-relaxed text-zinc-400">
             لم يتم العثور على أي زبون بناءً على معايير البحث الحالية.
           </p>
+          {searchQuery && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setSearchQuery("")}
+              className="mt-4 h-9 rounded-xl text-xs font-bold"
+            >
+              مسح البحث
+            </Button>
+          )}
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredCustomers.map((customer) => (
-            <CustomerCard
-              key={customer.id}
-              tenantId={tenantId}
-              customer={customer}
-              isAdmin={isAdmin}
-              pendingRepaymentSYP={pendingRepaymentTotals[customer.id]}
-              failedRepayments={failedRepayments.filter((row) => row.customerId === customer.id)}
-              onRepaymentApplied={handleRepaymentApplied}
-            />
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {filteredCustomers.map((customer, i) => (
+            <div key={customer.id} style={cardStyle(i)} className={`min-w-0 ${CARD_ENTER}`}>
+              <CustomerCard
+                tenantId={tenantId}
+                customer={customer}
+                isAdmin={isAdmin}
+                pendingRepaymentSYP={pendingRepaymentTotals[customer.id]}
+                failedRepayments={failedRepayments.filter((row) => row.customerId === customer.id)}
+                onRepaymentApplied={handleRepaymentApplied}
+              />
+            </div>
           ))}
         </div>
       )}
