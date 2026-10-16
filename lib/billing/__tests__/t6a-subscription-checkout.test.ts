@@ -192,7 +192,10 @@ describe("T6a gates + exemption", () => {
   });
   it("unauthenticated 401 everywhere", async () => {
     S.session = null;
+    const seededId = "sub-seeded";
     expect((await createSubscription(jsonReq({ tier: "monthly" }))).status).toBe(401);
+    expect((await uploadReceipt(multipartReq(JPEG, "r.jpg", "image/jpeg"), paramsFor(seededId))).status).toBe(401);
+    expect((await getReceiptUrl(new Request("http://test/") as any, paramsFor(seededId))).status).toBe(401);
     expect((await getBillingStatus()).status).toBe(401);
   });
   it("PENDING and EXPIRED ADMIN can create + upload", async () => {
@@ -407,6 +410,43 @@ describe("T6a receipt", () => {
     const res = await getReceiptUrl(new Request("http://test/") as any, paramsFor(sub.id));
     expect(res.status).toBe(404);
     expect(S.signedArgs.length).toBe(0);
+  });
+  it("base64 body: real jpeg accepted, exe bytes rejected", async () => {
+    setSession("ADMIN", TENANT_A);
+    const a = seedSub();
+    const jpegB64 = "data:image/jpeg;base64," + JPEG.toString("base64");
+    const ok = await uploadReceipt(
+      new Request("http://test/x", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: jpegB64 }),
+      }) as any,
+      paramsFor(a.id)
+    );
+    expect(ok.status).toBe(200);
+    const b = seedSub();
+    const bad = await uploadReceipt(
+      new Request("http://test/x", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: EXE.toString("base64") }),
+      }) as any,
+      paramsFor(b.id)
+    );
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toBe("INVALID_FILE");
+  });
+  it("missing file in both bodies 400", async () => {
+    setSession("ADMIN", TENANT_A);
+    const a = seedSub();
+    const fd = new FormData();
+    expect((await uploadReceipt(new Request("http://test/x", { method: "POST", body: fd }) as any, paramsFor(a.id))).status).toBe(400);
+    const b = seedSub();
+    const bad = await uploadReceipt(
+      new Request("http://test/x", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}),
+      }) as any,
+      paramsFor(b.id)
+    );
+    expect(bad.status).toBe(400);
   });
 });
 

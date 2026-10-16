@@ -12,6 +12,10 @@ import {
   userInactiveResponse,
 } from "@/lib/auth/user";
 import {
+  isLockoutExemptPath,
+  SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES,
+} from "@/lib/auth/tenant";
+import {
   SUBSCRIPTION_TIERS,
   SUBSCRIPTION_GRACE_DAYS,
   SUBSCRIPTION_RENEWAL_WARNING_DAYS,
@@ -51,6 +55,17 @@ export async function GET() {
 
   const tenantId = session.user.tenantId;
   const userId = session.user.id;
+
+  // T6a lockout exemption: the billing page's data calls must work for
+  // PENDING/EXPIRED tenants. Deliberately no assertTenantWritable() here.
+  if (!isLockoutExemptPath("/api/billing/status")) {
+    console.error("[billing/status] missing lockout exemption; failing closed.");
+    return NextResponse.json(
+      { error: "SERVER_ERROR", message: "حدث خطأ، حاول لاحقاً." },
+      { status: 500 }
+    );
+  }
+  void SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES;
 
   try {
     assertAdmin(session.user.role);

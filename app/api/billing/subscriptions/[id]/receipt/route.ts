@@ -15,6 +15,10 @@ import {
   userInactiveResponse,
 } from "@/lib/auth/user";
 import {
+  isLockoutExemptPath,
+  SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES,
+} from "@/lib/auth/tenant";
+import {
   SUBSCRIPTION_RATE_LIMIT,
   subscriptionRateLimitKey,
   SUBSCRIPTION_RECEIPT_MAX_BYTES,
@@ -111,6 +115,15 @@ export async function POST(
   const tenantId = session.user.tenantId;
   const userId = session.user.id;
 
+  // T6a lockout exemption: PENDING/EXPIRED ADMINs must be able to upload and
+  // view receipts — the checkout's whole purpose. Deliberately no
+  // assertTenantWritable() here. Fails closed if the named list drifts.
+  if (!isLockoutExemptPath(`/api/billing/subscriptions/${id}/receipt`)) {
+    console.error("[billing/receipt] missing lockout exemption; failing closed.");
+    return serverError("حدث خطأ، حاول لاحقاً.");
+  }
+  void SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES;
+
   try {
     assertAdmin(session.user.role);
   } catch (error) {
@@ -126,13 +139,14 @@ export async function POST(
   }
 
   if (receiptRatelimit) {
-    const { success } = await receiptRatelimit.limit(
+    const { success, reset } = await receiptRatelimit.limit(
       subscriptionRateLimitKey(tenantId)
     );
     if (!success) {
+      const retryAfter = Math.max(1, Math.ceil((reset - Date.now()) / 1000));
       return NextResponse.json(
         { error: "RATE_LIMITED", message: "تم تجاوز عدد الطلبات المسموح. حاول لاحقاً." },
-        { status: 429 }
+        { status: 429, headers: { "Retry-After": String(retryAfter) } }
       );
     }
   } else if (process.env.NODE_ENV === "production") {
@@ -290,6 +304,13 @@ export async function GET(
 
   const tenantId = session.user.tenantId;
   const userId = session.user.id;
+
+  // T6a lockout exemption (same named list as POST above).
+  if (!isLockoutExemptPath(`/api/billing/subscriptions/${id}/receipt`)) {
+    console.error("[billing/receipt] missing lockout exemption; failing closed.");
+    return serverError("تعذّر تحميل الإيصال.");
+  }
+  void SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES;
 
   try {
     assertAdmin(session.user.role);

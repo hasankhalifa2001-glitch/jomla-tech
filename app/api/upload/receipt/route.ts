@@ -28,8 +28,12 @@ import {
 // images" rather than a receipt-only route.
 //
 // [FIX] LOCKOUT ENFORCEMENT MUST HAPPEN HERE, PER-TYPE, NOT ONLY IN
-// MIDDLEWARE. This path is listed in the middleware's
-// WRITE_ALLOWED_WHEN_LOCKED_PREFIXES allowlist — deliberately, because a
+// MIDDLEWARE. (Historical note: middleware.ts deliberately performs NO
+// API-mutation subscription-lock check — it only has the stale JWT snapshot,
+// so the real boundary is assertTenantWritable() inside each mutating route.
+// Billing checkout routes are exempt via the named list
+// SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES in lib/auth/tenant.ts.)
+// This path must stay reachable while locked, because a
 // PENDING tenant has a chicken-and-egg problem: they need to upload their
 // FIRST subscription receipt (T6) precisely while still locked out. The
 // middleware can only see the URL path, not the FormData body, so it has

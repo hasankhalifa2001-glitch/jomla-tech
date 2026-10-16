@@ -15,6 +15,10 @@ import {
   userInactiveResponse,
 } from "@/lib/auth/user";
 import {
+  isLockoutExemptPath,
+  SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES,
+} from "@/lib/auth/tenant";
+import {
   SUBSCRIPTION_TIERS,
   SUBSCRIPTION_RATE_LIMIT,
   SUBSCRIPTION_OFFER_VALIDITY_HOURS,
@@ -119,16 +123,29 @@ export async function POST(req: Request) {
     throw error;
   }
 
+  // T6a lockout exemption (lib/auth/tenant.ts): this route is listed in
+  // SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES, so a PENDING/EXPIRED tenant's
+  // ADMIN can reach it — that is the whole purpose of the checkout. It
+  // deliberately does NOT call assertTenantWritable(). The invariant below
+  // keeps the exemption explicit and auditable: if this path ever drops off
+  // the named list, the route fails closed instead of silently drifting.
+  if (!isLockoutExemptPath("/api/billing/subscriptions")) {
+    console.error("[billing/subscriptions] missing lockout exemption; failing closed.");
+    return serverError();
+  }
+  void SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES;
+
   // Per-tenant rate limit. Skipped only outside production; in production a
   // missing limiter fails closed instead of silently disabling the control.
   if (subscribeRatelimit) {
-    const { success } = await subscribeRatelimit.limit(
+    const { success, reset } = await subscribeRatelimit.limit(
       subscriptionRateLimitKey(tenantId)
     );
     if (!success) {
+      const retryAfter = Math.max(1, Math.ceil((reset - Date.now()) / 1000));
       return NextResponse.json(
         { error: "RATE_LIMITED", message: "تم تجاوز عدد الطلبات المسموح. حاول لاحقاً." },
-        { status: 429 }
+        { status: 429, headers: { "Retry-After": String(retryAfter) } }
       );
     }
   } else if (process.env.NODE_ENV === "production") {
