@@ -34,7 +34,7 @@ export function HomeView({ data }: { data: HomeData }) {
                             <div className={styles.brand}>
                                 <span className={styles.logo}>
                                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                                    <img className={styles.logoImg} src={store.logoUrl ?? "/logo.svg"} alt="" />
+                                    <img className={styles.logoImg} src={store.logoUrl ?? "/icon-B-light.svg"} alt="" />
                                 </span>
                                 <span className={styles.bname}>{store.name}</span>
                             </div>
