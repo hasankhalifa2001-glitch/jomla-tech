@@ -91,7 +91,10 @@ function resetAll() {
     s.invoiceItem = [];
     s.payment = [];
     s.verifiedRetailer = [];
-    h.state.session = null;
+    // ---- بالـ resetAll(): شيل هالسطر
+    //     h.state.session = null;
+    // وبدّله بإعادة جلسة الأدمن الافتراضية:
+    h.state.session = { user: { id: ADMIN, role: "ADMIN", tenantId: TENANT } };
     h.state.txCalls = 0;
     h.state.failAfter.length = 0;
     h.state.failAfterCommit.length = 0;

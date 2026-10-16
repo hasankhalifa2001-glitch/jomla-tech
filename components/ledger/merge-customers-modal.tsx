@@ -1,6 +1,18 @@
 "use client";
 
-import { useState, useMemo } from "react";
+/**
+ * [v4.5 — polish pass, presentation only] Header / scrolling body / footer
+ * layout so the confirm button is never lost below the fold on a phone; the
+ * two pickers and the side-by-side comparison stack on mobile (the comparison
+ * was a forced 2-column grid before); the mandatory confirmation sits in an
+ * amber card. State, the Survivor/Duplicate rules, the merge request and the
+ * BroadcastChannel eviction are unchanged.
+ *
+ * NOTE: `sm:max-w-4xl` is deliberate — components/ui/dialog.tsx bakes in a
+ * `sm:` max-width, and a bare `max-w-*` would lose to it in tailwind-merge.
+ */
+
+import { useState, useMemo, type ReactNode } from "react";
 import {
   Dialog,
   DialogContent,
@@ -21,7 +33,9 @@ import {
   Phone,
   UserCheck,
   UserX,
+  Loader2,
 } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/utils/money";
 import { broadcastCustomerMerged } from "@/lib/offline/customer-sync";
 import { toast } from "sonner";
@@ -44,6 +58,76 @@ interface MergeCustomersModalProps {
   tenantId: string;
   customers: CustomerSummaryItem[];
   onSuccess?: () => void;
+}
+
+const SELECT_CLASS =
+  "h-11 w-full rounded-xl border border-zinc-300 bg-white px-3 text-sm shadow-sm transition-shadow focus:outline-none focus:ring-2 sm:h-10";
+
+/** One icon + label + value row of a comparison card. */
+function InfoRow({
+  icon,
+  label,
+  children,
+}: {
+  icon: ReactNode;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="shrink-0 text-zinc-400">{icon}</span>
+      <span className="shrink-0">{label}</span>
+      <span className="min-w-0 truncate">{children}</span>
+    </div>
+  );
+}
+
+function CompareCard({
+  customer,
+  tone,
+  badge,
+}: {
+  customer: CustomerSummaryItem;
+  tone: "keep" | "merge";
+  badge: ReactNode;
+}) {
+  const keep = tone === "keep";
+  return (
+    <div
+      className={cn(
+        "space-y-3 rounded-xl border-2 bg-white p-3.5 shadow-sm",
+        keep ? "border-emerald-300" : "border-rose-300"
+      )}
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-zinc-100 pb-2">
+        <span
+          className={cn("min-w-0 truncate text-sm font-extrabold", keep ? "text-emerald-800" : "text-rose-800")}
+        >
+          {customer.name}
+        </span>
+        {badge}
+      </div>
+
+      <div className="space-y-2 text-xs text-zinc-600">
+        <InfoRow icon={<Phone className="size-3.5" aria-hidden />} label="الهاتف:">
+          <span dir="ltr" className="font-mono font-semibold text-zinc-900 [unicode-bidi:isolate]">
+            {customer.phone || "غير محدد"}
+          </span>
+        </InfoRow>
+        <InfoRow icon={<Building2 className="size-3.5" aria-hidden />} label="المحل:">
+          <span className="font-semibold text-zinc-900">{customer.shopName || "غير محدد"}</span>
+        </InfoRow>
+        <InfoRow icon={<CreditCard className="size-3.5" aria-hidden />} label="رصيد الدين:">
+          <span className={cn("font-extrabold tabular-nums", keep ? "text-emerald-700" : "text-rose-700")}>
+            {formatMoney(customer.cachedBalanceDebtSYP, "SYP")}
+          </span>
+        </InfoRow>
+        <InfoRow icon={<FileText className="size-3.5" aria-hidden />} label="عدد الفواتير:">
+          <span className="font-extrabold tabular-nums text-zinc-800">{customer.invoiceCount ?? 0}</span>
+        </InfoRow>
+      </div>
+    </div>
+  );
 }
 
 export function MergeCustomersModal({
@@ -135,213 +219,160 @@ export function MergeCustomersModal({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent dir="rtl" className="max-w-3xl sm:max-w-4xl text-right">
-        <DialogHeader className="text-right">
-          <div className="flex items-center gap-2">
-            <div className="p-2 rounded-lg bg-amber-100 text-amber-800">
-              <Users className="w-5 h-5" />
+      <DialogContent
+        dir="rtl"
+        className="flex max-h-[calc(100dvh-2rem)] w-[calc(100%-1.5rem)] flex-col gap-0 overflow-hidden rounded-2xl border-zinc-200 p-0 text-start sm:max-w-4xl [&>*]:min-w-0"
+      >
+        <DialogHeader className="gap-0 border-b border-zinc-100 bg-linear-to-b from-amber-50/70 to-white px-4 pb-3 pt-4 pe-14 text-start sm:px-6">
+          <div className="flex items-center gap-3">
+            <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-amber-100 text-amber-800">
+              <Users className="size-5" aria-hidden />
             </div>
-            <div>
-              <DialogTitle className="text-xl font-bold">دمج حسابات الزبائن المكررة</DialogTitle>
-              <DialogDescription className="text-sm text-zinc-500 mt-1">
+            <div className="min-w-0 flex-1">
+              <DialogTitle className="text-base font-extrabold text-zinc-900 sm:text-lg">
+                دمج حسابات الزبائن المكررة
+              </DialogTitle>
+              <DialogDescription className="mt-0.5 text-xs leading-relaxed text-zinc-500">
                 نقل كافة الفواتير والدفعات من الحساب المكرر إلى الحساب الأساسي مع إيقاف الحساب المكرر نهائياً.
               </DialogDescription>
             </div>
           </div>
         </DialogHeader>
 
-        {/* Selection Step */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 my-2">
-          {/* Surviving Customer Picker */}
-          <div className="space-y-2 p-3 rounded-lg border border-emerald-200 bg-emerald-50/50">
-            <label className="text-sm font-semibold text-emerald-950 flex items-center gap-1.5">
-              <UserCheck className="w-4 h-4 text-emerald-600" />
-              1. الحساب الأساسي المستمر (Survivor)
-            </label>
-            <select
-              aria-label="الحساب الأساسي المستمر"
-              value={survivingCustomerId}
-              onChange={(e) => {
-                setSurvivingCustomerId(e.target.value);
-                setIsConfirmed(false);
-              }}
-              className="w-full text-sm rounded-md border border-zinc-300 bg-white p-2.5 shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-            >
-              <option value="">-- اختر الحساب الأساسي --</option>
-              {eligibleCustomers.map((c) => (
-                <option
-                  key={c.id}
-                  value={c.id}
-                  disabled={c.id === mergedCustomerId}
-                >
-                  {c.name} {c.shopName ? `(${c.shopName})` : ""} {c.phone ? `- ${c.phone}` : ""}
-                </option>
-              ))}
-            </select>
-            <p className="text-xs text-emerald-800">هذا الحساب سيبقى نشطاً وتُنقل إليه كل السجلات.</p>
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
+          {/* Selection Step */}
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            {/* Surviving Customer Picker */}
+            <div className="space-y-2 rounded-xl border border-emerald-200 bg-emerald-50/50 p-3.5">
+              <label className="flex items-center gap-1.5 text-sm font-bold text-emerald-950">
+                <UserCheck className="size-4 text-emerald-600" aria-hidden />
+                1. الحساب الأساسي المستمر (Survivor)
+              </label>
+              <select
+                aria-label="الحساب الأساسي المستمر"
+                value={survivingCustomerId}
+                onChange={(e) => {
+                  setSurvivingCustomerId(e.target.value);
+                  setIsConfirmed(false);
+                }}
+                className={cn(SELECT_CLASS, "focus:ring-emerald-500")}
+              >
+                <option value="">-- اختر الحساب الأساسي --</option>
+                {eligibleCustomers.map((c) => (
+                  <option
+                    key={c.id}
+                    value={c.id}
+                    disabled={c.id === mergedCustomerId}
+                  >
+                    {c.name} {c.shopName ? `(${c.shopName})` : ""} {c.phone ? `- ${c.phone}` : ""}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-emerald-800">هذا الحساب سيبقى نشطاً وتُنقل إليه كل السجلات.</p>
+            </div>
+
+            {/* Merged Customer Picker */}
+            <div className="space-y-2 rounded-xl border border-rose-200 bg-rose-50/50 p-3.5">
+              <label className="flex items-center gap-1.5 text-sm font-bold text-rose-950">
+                <UserX className="size-4 text-rose-600" aria-hidden />
+                2. الحساب المكرر المراد دمجه (To Merge &amp; Deactivate)
+              </label>
+              <select
+                aria-label="الحساب المكرر المراد دمجه"
+                value={mergedCustomerId}
+                onChange={(e) => {
+                  setMergedCustomerId(e.target.value);
+                  setIsConfirmed(false);
+                }}
+                className={cn(SELECT_CLASS, "focus:ring-rose-500")}
+              >
+                <option value="">-- اختر الحساب المكرر --</option>
+                {eligibleCustomers.map((c) => (
+                  <option
+                    key={c.id}
+                    value={c.id}
+                    disabled={c.id === survivingCustomerId}
+                  >
+                    {c.name} {c.shopName ? `(${c.shopName})` : ""} {c.phone ? `- ${c.phone}` : ""}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-rose-800">سيتم إيقاف هذا الحساب وتحويل أي عمليات مستقبلية عنه.</p>
+            </div>
           </div>
 
-          {/* Merged Customer Picker */}
-          <div className="space-y-2 p-3 rounded-lg border border-rose-200 bg-rose-50/50">
-            <label className="text-sm font-semibold text-rose-950 flex items-center gap-1.5">
-              <UserX className="w-4 h-4 text-rose-600" />
-              2. الحساب المكرر المراد دمجه (To Merge & Deactivate)
-            </label>
-            <select
-              aria-label="الحساب المكرر المراد دمجه"
-              value={mergedCustomerId}
-              onChange={(e) => {
-                setMergedCustomerId(e.target.value);
-                setIsConfirmed(false);
-              }}
-              className="w-full text-sm rounded-md border border-zinc-300 bg-white p-2.5 shadow-sm focus:outline-none focus:ring-2 focus:ring-rose-500"
-            >
-              <option value="">-- اختر الحساب المكرر --</option>
-              {eligibleCustomers.map((c) => (
-                <option
-                  key={c.id}
-                  value={c.id}
-                  disabled={c.id === survivingCustomerId}
+          {/* Side-by-Side Comparison Screen (Mandatory UX Gate) */}
+          {survivor && duplicate && (
+            <div className="space-y-4 rounded-2xl border border-zinc-200 bg-zinc-50/80 p-4 motion-safe:animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 pb-2.5">
+                <h4 className="flex items-center gap-2 text-sm font-extrabold text-zinc-900">
+                  <AlertTriangle className="size-4 text-amber-600" aria-hidden />
+                  مقارنة تفصيلية قبل التأكيد
+                </h4>
+                <Badge variant="outline" className="border-amber-200 bg-amber-50 text-xs font-bold text-amber-800">
+                  مراجعة إجبارية قبل التنفيذ
+                </Badge>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <CompareCard
+                  customer={survivor}
+                  tone="keep"
+                  badge={
+                    <Badge className="shrink-0 bg-emerald-600 text-[10px] text-white hover:bg-emerald-600">
+                      الحساب المستمر
+                    </Badge>
+                  }
+                />
+                <CompareCard
+                  customer={duplicate}
+                  tone="merge"
+                  badge={
+                    <Badge variant="destructive" className="shrink-0 text-[10px]">
+                      سيُلغى تنشيطه
+                    </Badge>
+                  }
+                />
+              </div>
+
+              {/* Mandatory Explicit Confirmation Checkbox */}
+              <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-white p-3.5">
+                <Checkbox
+                  id="merge-confirm-checkbox"
+                  checked={isConfirmed}
+                  onCheckedChange={(checked) => setIsConfirmed(Boolean(checked))}
+                  className="mt-0.5"
+                />
+                <label
+                  htmlFor="merge-confirm-checkbox"
+                  className="cursor-pointer text-xs font-semibold leading-relaxed text-zinc-800"
                 >
-                  {c.name} {c.shopName ? `(${c.shopName})` : ""} {c.phone ? `- ${c.phone}` : ""}
-                </option>
-              ))}
-            </select>
-            <p className="text-xs text-rose-800">سيتم إيقاف هذا الحساب وتحويل أي عمليات مستقبلية عنه.</p>
-          </div>
+                  أؤكد مراجعة بيانات الزبونين أعلاه، وأوافق على نقل كافة الفواتير والدفعات نهائياً إلى حساب{" "}
+                  <span className="font-bold text-emerald-700 underline">{survivor.name}</span> وإلغاء تنشيط حساب{" "}
+                  <span className="font-bold text-rose-700 underline">{duplicate.name}</span>.
+                </label>
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div
+              role="alert"
+              className="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-semibold text-red-700"
+            >
+              <AlertTriangle className="size-4 shrink-0" aria-hidden />
+              <span>{error}</span>
+            </div>
+          )}
         </div>
 
-        {/* Side-by-Side Comparison Screen (Mandatory UX Gate) */}
-        {survivor && duplicate && (
-          <div className="border border-zinc-200 rounded-xl p-4 bg-zinc-50/80 space-y-4">
-            <div className="flex items-center justify-between border-b pb-2">
-              <h4 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-600" />
-                مقارنة تفصيلية قبل التأكيد
-              </h4>
-              <Badge variant="outline" className="text-xs">
-                مراجعة إجبارية قبل التنفيذ
-              </Badge>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              {/* Survivor Card */}
-              <div className="bg-white rounded-lg border-2 border-emerald-300 p-3 shadow-sm space-y-2">
-                <div className="flex items-center justify-between border-b pb-1.5">
-                  <span className="font-bold text-emerald-800 text-sm">{survivor.name}</span>
-                  <Badge className="bg-emerald-600 hover:bg-emerald-600 text-white text-[10px]">
-                    الحساب المستمر
-                  </Badge>
-                </div>
-
-                <div className="space-y-1.5 text-xs text-zinc-600">
-                  <div className="flex items-center gap-2">
-                    <Phone className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>الهاتف:</span>
-                    <span className="font-mono font-medium text-zinc-900">
-                      {survivor.phone || "غير محدد"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Building2 className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>المحل:</span>
-                    <span className="font-medium text-zinc-900">
-                      {survivor.shopName || "غير محدد"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <CreditCard className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>رصيد الدين:</span>
-                    <span className="font-bold text-emerald-700">
-                      {formatMoney(survivor.cachedBalanceDebtSYP, "SYP")}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <FileText className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>عدد الفواتير:</span>
-                    <span className="font-bold text-zinc-800">
-                      {survivor.invoiceCount ?? 0}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Duplicate Card */}
-              <div className="bg-white rounded-lg border-2 border-rose-300 p-3 shadow-sm space-y-2">
-                <div className="flex items-center justify-between border-b pb-1.5">
-                  <span className="font-bold text-rose-800 text-sm">{duplicate.name}</span>
-                  <Badge variant="destructive" className="text-[10px]">
-                    سيُلغى تنشيطه
-                  </Badge>
-                </div>
-
-                <div className="space-y-1.5 text-xs text-zinc-600">
-                  <div className="flex items-center gap-2">
-                    <Phone className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>الهاتف:</span>
-                    <span className="font-mono font-medium text-zinc-900">
-                      {duplicate.phone || "غير محدد"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Building2 className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>المحل:</span>
-                    <span className="font-medium text-zinc-900">
-                      {duplicate.shopName || "غير محدد"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <CreditCard className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>رصيد الدين:</span>
-                    <span className="font-bold text-rose-700">
-                      {formatMoney(duplicate.cachedBalanceDebtSYP, "SYP")}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <FileText className="w-3.5 h-3.5 text-zinc-400" />
-                    <span>عدد الفواتير:</span>
-                    <span className="font-bold text-zinc-800">
-                      {duplicate.invoiceCount ?? 0}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Mandatory Explicit Confirmation Checkbox */}
-            <div className="pt-2 border-t flex items-start gap-3 bg-white p-3 rounded-lg border border-amber-200">
-              <Checkbox
-                id="merge-confirm-checkbox"
-                checked={isConfirmed}
-                onCheckedChange={(checked) => setIsConfirmed(Boolean(checked))}
-                className="mt-0.5"
-              />
-              <label
-                htmlFor="merge-confirm-checkbox"
-                className="text-xs font-semibold text-zinc-800 leading-relaxed cursor-pointer"
-              >
-                أؤكد مراجعة بيانات الزبونين أعلاه، وأوافق على نقل كافة الفواتير والدفعات نهائياً إلى حساب{" "}
-                <span className="text-emerald-700 font-bold underline">{survivor.name}</span> وإلغاء تنشيط حساب{" "}
-                <span className="text-rose-700 font-bold underline">{duplicate.name}</span>.
-              </label>
-            </div>
-          </div>
-        )}
-
-        {error && (
-          <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-xs flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>{error}</span>
-          </div>
-        )}
-
-        <DialogFooter className="flex items-center justify-between gap-2 border-t pt-3 sm:justify-between">
+        <DialogFooter className="gap-2 border-t border-zinc-100 bg-white px-4 py-3 sm:justify-between sm:px-6">
           <Button
             type="button"
             variant="outline"
             onClick={() => handleOpenChange(false)}
             disabled={isSubmitting}
-            className="text-xs"
+            className="h-11 w-full rounded-xl text-xs font-bold transition-transform active:scale-[0.98] sm:h-10 sm:w-auto sm:px-6"
           >
             إلغاء
           </Button>
@@ -351,8 +382,9 @@ export function MergeCustomersModal({
             variant="default"
             disabled={!canSubmit}
             onClick={handleExecuteMerge}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs px-4"
+            className="h-11 w-full gap-1.5 rounded-xl bg-emerald-600 text-xs font-bold text-white shadow-sm shadow-emerald-600/25 transition-all hover:bg-emerald-700 active:scale-[0.98] sm:h-10 sm:w-auto sm:px-6"
           >
+            {isSubmitting && <Loader2 className="size-3.5 animate-spin" aria-hidden />}
             {isSubmitting ? "جارٍ تنفيذ الدمج..." : "تأكيد وتنفيذ دمج الحسابين"}
           </Button>
         </DialogFooter>

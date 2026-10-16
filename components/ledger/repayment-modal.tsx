@@ -29,10 +29,18 @@
  * (never the system cash bucket), and ONLY when the balance is > 0 — see
  * lib/ledger/repayment-ui.ts's canShowRepaymentButton(). The CASHIER case is
  * absent from the DOM, and rejected server-side regardless.
+ *
+ * [v4.5 — polish pass, presentation only] Header / scrolling body / footer
+ * layout (the actions stay reachable on a phone), a prominent balance tile, a
+ * large amount field with the "full balance" shortcut stacking under it on
+ * narrow screens, a before/after pair, and a clearer confirmation step. The
+ * `dark:` classes were dropped (the app is light-mode only). Every handler,
+ * the render-phase reset, the offline fallback and the offlineId logic are
+ * unchanged.
  */
 
 import { useEffect, useState } from "react";
-import { BanknoteArrowUp, Loader2, WifiOff } from "lucide-react";
+import { BanknoteArrowUp, CircleAlert, Loader2, WifiOff } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -259,134 +267,152 @@ export function RepaymentModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md" dir="rtl">
-        <DialogHeader>
-          <div className="flex items-center gap-2">
-            <div className="rounded-lg bg-emerald-100 p-2 dark:bg-emerald-950/40">
-              <BanknoteArrowUp className="h-5 w-5 text-emerald-700 dark:text-emerald-400" />
+      <DialogContent
+        dir="rtl"
+        className="flex max-h-[calc(100dvh-2rem)] w-[calc(100%-1.5rem)] flex-col gap-0 overflow-hidden rounded-2xl border-zinc-200 p-0 sm:max-w-md [&>*]:min-w-0"
+      >
+        <DialogHeader className="gap-0 border-b border-zinc-100 bg-linear-to-b from-emerald-50/70 to-white px-4 pb-3 pt-4 pe-14 text-start sm:px-6">
+          <div className="flex items-center gap-3">
+            <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-emerald-600 text-white shadow-sm shadow-emerald-600/25">
+              <BanknoteArrowUp className="size-5" aria-hidden />
             </div>
-            <div>
-              <DialogTitle className="text-base font-bold text-zinc-900">
-                تسديد دفعة
-              </DialogTitle>
-              <DialogDescription className="text-xs text-zinc-500">
+            <div className="min-w-0 flex-1">
+              <DialogTitle className="text-base font-extrabold text-zinc-900">تسديد دفعة</DialogTitle>
+              <DialogDescription className="mt-0.5 truncate text-xs text-zinc-500">
                 {displayCustomer.name}
               </DialogDescription>
             </div>
           </div>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="flex items-center justify-between rounded-lg border bg-zinc-50 p-3 text-sm dark:bg-zinc-900/40">
-            <span className="text-zinc-500">الرصيد الحالي</span>
-            <div className="text-left">
-              <span className="font-bold text-rose-700">
-                {formatMoney(balanceSYP, "SYP")} ل.س
-              </span>
-              <UsdApprox amountSYP={balanceSYP} rate={cachedRate} />
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-100 bg-rose-50/60 px-3.5 py-3 text-sm">
+              <span className="font-semibold text-zinc-500">الرصيد الحالي</span>
+              <div className="text-end">
+                <span className="font-extrabold tabular-nums text-rose-700">
+                  {formatMoney(balanceSYP, "SYP")} ل.س
+                </span>
+                <UsdApprox amountSYP={balanceSYP} rate={cachedRate} />
+              </div>
             </div>
+
+            {confirming && normalizedAmount && remainingSYP ? (
+              <div
+                role="status"
+                className="flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-sm font-semibold leading-relaxed text-amber-950 motion-safe:animate-in fade-in slide-in-from-bottom-1 duration-200"
+              >
+                <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden />
+                <p>{repaymentConfirmationLine(normalizedAmount, balanceSYP, remainingSYP)}</p>
+              </div>
+            ) : (
+              <div className="space-y-4 motion-safe:animate-in fade-in duration-200">
+                <div className="space-y-1.5">
+                  <Label htmlFor="repayment-amount" className="text-xs font-bold text-zinc-700">
+                    المبلغ المسدَّد (ل.س)
+                  </Label>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <Input
+                      id="repayment-amount"
+                      inputMode="decimal"
+                      autoComplete="off"
+                      dir="ltr"
+                      value={amountInput}
+                      onChange={(event) => setAmountInput(event.target.value)}
+                      placeholder="0"
+                      className="h-12 min-w-0 flex-1 rounded-xl text-start font-mono text-lg font-bold transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleFullBalance}
+                      className="h-11 whitespace-nowrap rounded-xl border-emerald-200 text-xs font-bold text-emerald-700 transition-all hover:bg-emerald-50 hover:text-emerald-800 active:scale-[0.98] sm:h-12"
+                    >
+                      تسديد كامل الرصيد
+                    </Button>
+                  </div>
+                  {normalizedAmount && (
+                    <UsdApprox amountSYP={normalizedAmount} rate={cachedRate} />
+                  )}
+                </div>
+
+                {normalizedAmount !== null && remainingSYP !== null && (
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-3 text-sm motion-safe:animate-in fade-in slide-in-from-bottom-1 duration-200">
+                    <span className="font-semibold text-emerald-800">الرصيد بعد التسديد</span>
+                    <div className="text-end">
+                      <span className="font-extrabold tabular-nums text-emerald-800">
+                        {formatMoney(remainingSYP, "SYP")} ل.س
+                      </span>
+                      <UsdApprox amountSYP={remainingSYP} rate={cachedRate} />
+                    </div>
+                  </div>
+                )}
+
+                {amountInput.trim().length > 0 && !canSubmitRepayment(balanceSYP, amountInput) && (
+                  <p className="flex items-center gap-1.5 text-xs font-semibold text-rose-600">
+                    <CircleAlert className="size-3.5 shrink-0" aria-hidden />
+                    يجب أن يكون المبلغ أكبر من صفر ولا يتجاوز الرصيد الحالي.
+                  </p>
+                )}
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="repayment-method" className="text-xs font-bold text-zinc-700">
+                    طريقة الدفع
+                  </Label>
+                  <Select
+                    value={paymentMethod}
+                    onValueChange={(value) => setPaymentMethod(value as PaymentMethod)}
+                  >
+                    <SelectTrigger id="repayment-method" className="h-11 w-full rounded-xl sm:h-10">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PAYMENT_METHODS.map((method) => (
+                        <SelectItem key={method} value={method}>
+                          {PAYMENT_METHOD_LABELS_AR[method]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="repayment-receipt" className="text-xs font-bold text-zinc-700">
+                    رقم الإيصال <span className="font-normal text-zinc-400">(اختياري)</span>
+                  </Label>
+                  <Input
+                    id="repayment-receipt"
+                    value={receiptNo}
+                    onChange={(event) => setReceiptNo(event.target.value)}
+                    placeholder="مثال: 1024"
+                    className="h-11 rounded-xl transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20 sm:h-10"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="repayment-notes" className="text-xs font-bold text-zinc-700">
+                    ملاحظات <span className="font-normal text-zinc-400">(اختياري)</span>
+                  </Label>
+                  <Textarea
+                    id="repayment-notes"
+                    value={notes}
+                    onChange={(event) => setNotes(event.target.value)}
+                    rows={2}
+                    className="rounded-xl transition-shadow focus-visible:border-emerald-500 focus-visible:ring-emerald-500/20"
+                  />
+                </div>
+              </div>
+            )}
           </div>
 
-          {confirming && normalizedAmount && remainingSYP ? (
-            <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-              {repaymentConfirmationLine(normalizedAmount, balanceSYP, remainingSYP)}
-            </p>
-          ) : (
-            <>
-              <div className="space-y-1.5">
-                <Label htmlFor="repayment-amount">المبلغ المسدَّد (ل.س)</Label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    id="repayment-amount"
-                    inputMode="decimal"
-                    autoComplete="off"
-                    value={amountInput}
-                    onChange={(event) => setAmountInput(event.target.value)}
-                    placeholder="0"
-                    className="font-mono"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={handleFullBalance}
-                    className="whitespace-nowrap text-xs"
-                  >
-                    تسديد كامل الرصيد
-                  </Button>
-                </div>
-                {normalizedAmount && (
-                  <UsdApprox amountSYP={normalizedAmount} rate={cachedRate} />
-                )}
-              </div>
-
-              {normalizedAmount !== null && remainingSYP !== null && (
-                <div className="flex items-center justify-between rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/30">
-                  <span className="text-emerald-800 dark:text-emerald-300">
-                    الرصيد بعد التسديد
-                  </span>
-                  <div className="text-left">
-                    <span className="font-bold text-emerald-800 dark:text-emerald-300">
-                      {formatMoney(remainingSYP, "SYP")} ل.س
-                    </span>
-                    <UsdApprox amountSYP={remainingSYP} rate={cachedRate} />
-                  </div>
-                </div>
-              )}
-
-              {amountInput.trim().length > 0 && !canSubmitRepayment(balanceSYP, amountInput) && (
-                <p className="text-xs text-rose-600">
-                  يجب أن يكون المبلغ أكبر من صفر ولا يتجاوز الرصيد الحالي.
-                </p>
-              )}
-
-              <div className="space-y-1.5">
-                <Label htmlFor="repayment-method">طريقة الدفع</Label>
-                <Select
-                  value={paymentMethod}
-                  onValueChange={(value) => setPaymentMethod(value as PaymentMethod)}
-                >
-                  <SelectTrigger id="repayment-method" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PAYMENT_METHODS.map((method) => (
-                      <SelectItem key={method} value={method}>
-                        {PAYMENT_METHOD_LABELS_AR[method]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="repayment-receipt">رقم الإيصال (اختياري)</Label>
-                <Input
-                  id="repayment-receipt"
-                  value={receiptNo}
-                  onChange={(event) => setReceiptNo(event.target.value)}
-                  placeholder="مثال: 1024"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="repayment-notes">ملاحظات (اختياري)</Label>
-                <Textarea
-                  id="repayment-notes"
-                  value={notes}
-                  onChange={(event) => setNotes(event.target.value)}
-                  rows={2}
-                />
-              </div>
-            </>
-          )}
-
-          <DialogFooter>
+          <DialogFooter className="gap-2 border-t border-zinc-100 bg-white px-4 py-3 sm:px-6">
             {confirming ? (
               <Button
                 type="button"
                 variant="outline"
                 onClick={() => setConfirming(false)}
                 disabled={submitting}
+                className="h-11 w-full rounded-xl text-xs font-bold transition-transform active:scale-[0.98] sm:h-10 sm:w-auto sm:px-6"
               >
                 تعديل
               </Button>
@@ -396,6 +422,7 @@ export function RepaymentModal({
                 variant="outline"
                 onClick={() => onOpenChange(false)}
                 disabled={submitting}
+                className="h-11 w-full rounded-xl text-xs font-bold transition-transform active:scale-[0.98] sm:h-10 sm:w-auto sm:px-6"
               >
                 إلغاء
               </Button>
@@ -403,9 +430,9 @@ export function RepaymentModal({
             <Button
               type="submit"
               disabled={!canSubmit}
-              className="flex items-center gap-2 bg-emerald-700 text-white hover:bg-emerald-800"
+              className="flex h-11 w-full items-center gap-2 rounded-xl bg-emerald-600 text-xs font-bold text-white shadow-sm shadow-emerald-600/25 transition-all hover:bg-emerald-700 active:scale-[0.98] sm:h-10 sm:w-auto sm:px-8"
             >
-              {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+              {submitting && <Loader2 className="size-4 animate-spin" aria-hidden />}
               <span>{confirming ? "تأكيد التسديد" : "تسجيل الدفعة"}</span>
             </Button>
           </DialogFooter>
