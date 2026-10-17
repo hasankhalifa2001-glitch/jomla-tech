@@ -580,6 +580,12 @@ const eslintConfig = defineConfig([
       "prisma/seed.ts",
       "app/(dashboard)/admin/**",
       "app/api/admin/**",
+      // [T6b Phase 1] The typed platform gateway (raw client behind a
+      // branded PlatformAdminContext) and its sole consumer. app/api/admin/**
+      // is already listed above; lib/auth/platform-admin.ts needs no entry
+      // (getTenantDb only, no raw import).
+      "lib/db/platform.ts",
+      "lib/data/platform-admin.ts",
       "app/api/sync/**",
       // [T5] The B2B order approval route is a category-5 raw-client call
       // site: it must call lockBatchesForFifoAllocations(), which is typed to

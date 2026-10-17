@@ -17,6 +17,7 @@ import {
     forbiddenRoleResponse,
 } from "@/lib/auth/role-matrix";
 import { z } from "zod";
+import { PLATFORM_TENANT_SLUG } from "@/lib/data/platform-rate";
 
 const updateRateSchema = z.object({
     rate: z
@@ -99,6 +100,21 @@ export async function POST(req: Request) {
         // identifier from the request body — the same rule that applies to
         // every write endpoint in this codebase.
         const db = getTenantDb(session.user.tenantId);
+
+        // [T6b amendment C — single edit path] The platform-internal tenant's
+        // rate is editable ONLY via PUT /api/admin/platform-rate
+        // (Super-Admin). The merchant top-bar path 403s for that slug.
+        const owner = await db.tenant.findUnique({
+            where: { id: session.user.tenantId },
+            select: { slug: true },
+        });
+        if (owner?.slug === PLATFORM_TENANT_SLUG) {
+            return NextResponse.json(
+                { error: "FORBIDDEN", message: "سعر صرف المنصة يعدل من لوحة إدارة المنصة فقط." },
+                { status: 403 }
+            );
+        }
+
         const updatedTenant = await db.tenant.update({
             where: { id: session.user.tenantId },
             data: { dailyExchangeRate: rate },
