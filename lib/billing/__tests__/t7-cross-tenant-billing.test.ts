@@ -21,6 +21,10 @@
  * tenant B" holds only because the route itself passed tenantId; a route
  * bug that omitted it would surface as wrong rows.
  *
+ * The fake `create` stores EXACTLY the tenantId the route put in `data`
+ * (it does not overwrite it), so a route that forgot or mis-set tenantId
+ * would fail the "created row belongs to the caller's tenant" assertion.
+ *
  * MOCKED: getTenantDb, auth, storage private-bucket helpers.
  * REAL: the three billing route handlers + platform-rate reader.
  */
@@ -69,11 +73,12 @@ function dbFor(tenantId: string): any {
     create: vi.fn(async (args: any) => {
       S.subSeq += 1;
       const now = new Date();
+      // NOTE: tenantId comes from args.data (what the ROUTE supplied). It is
+      // deliberately not overwritten here.
       const row = {
         id: "sub-" + S.subSeq, createdAt: now, updatedAt: now,
         receiptImageURL: null, rejectionReason: null, ...args.data,
       };
-      row.tenantId = tenantId;
       S.subs.push(row);
       return row;
     }),
@@ -184,10 +189,11 @@ describe("T7 cross-tenant billing isolation", () => {
     expect(body.recentRequests).toEqual([]);
   });
 
-  it("tenant B cannot create against tenant A", async () => {
+  it("tenant B cannot create against tenant A (route supplies the caller's tenantId)", async () => {
     setSession(TENANT_A);
     seedSub(TENANT_A);
     setSession(TENANT_B);
+    // A client-supplied tenantId must be ignored.
     const res = await createSubscription(jsonReq({ tier: "monthly", tenantId: TENANT_A } as any));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -208,5 +214,3 @@ describe("T7 cross-tenant billing isolation", () => {
     expect(body.recentRequests).toEqual([]);
   });
 });
-
-

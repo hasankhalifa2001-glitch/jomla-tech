@@ -369,25 +369,27 @@ describe("T6a receipt", () => {
     expect(S.removed).toContain(oldKey);
     expect(sub.receiptImageURL).toBe(S.uploads[0]);
   });
-  it("lost race (receipt changed concurrently): new object removed, 409", async () => {
+  it("lost race: receipt swapped between read and write → 409, new object removed", async () => {
     setSession("ADMIN", TENANT_A);
-    const sub = seedSub({ receiptImageURL: "receipts/" + TENANT_A + "/old.jpg" });
-    const db = dbFor(TENANT_A);
-    // Simulate another request swapping the receipt between our read and write.
-    const realFindFirst = db.subscription.findFirst;
-    void realFindFirst;
-    const original = sub.receiptImageURL;
-    // Make our pinned update miss by changing the stored key right after the read.
-    const row = S.subs[0];
-    const spy = vi.spyOn(Object, "assign");
-    spy.mockRestore();
-    row.receiptImageURL = original; // baseline
-    // Drive the route, then verify the pinned-update behaviour directly:
+    const oldKey = "receipts/" + TENANT_A + "/old.jpg";
+    const sub = seedSub({ receiptImageURL: oldKey });
+
+    // Another request replaces the receipt right after we upload ours,
+    // i.e. before our pinned updateMany runs.
+    const { uploadPrivateReceipt } = await import("@/lib/storage");
+    (uploadPrivateReceipt as any).mockImplementationOnce(async (p: any) => {
+      S.uploads.push(p.key);
+      sub.receiptImageURL = "receipts/" + TENANT_A + "/concurrent.jpg";
+      return p.key;
+    });
+
     const res = await uploadReceipt(multipartReq(JPEG, "r.jpg", "image/jpeg"), paramsFor(sub.id));
-    expect(res.status).toBe(200);
-    // Second upload pinned to the NEW key still succeeds sequentially;
-    // the pin itself is verified in the static scan below.
-    expect(S.uploads.length).toBe(1);
+    expect(res.status).toBe(409);
+    // The loser's object is cleaned up; the winner's receipt is untouched;
+    // the previous (now already replaced) receipt is not deleted by the loser.
+    expect(S.removed).toContain(S.uploads[0]);
+    expect(sub.receiptImageURL).toBe("receipts/" + TENANT_A + "/concurrent.jpg");
+    expect(S.removed).not.toContain(oldKey);
   });
   it("past validity without receipt OFFER_EXPIRED", async () => {
     setSession("ADMIN", TENANT_A);
@@ -550,5 +552,14 @@ describe("T6a static scans", () => {
   });
   it("status never returns the receipt key", () => {
     expect(statusSrc).not.toMatch(/receiptImageURL:\s*r\./);
+  });
+  it("shared upload route is product-images only (no receipts into the public bucket)", () => {
+    const uploadSrc = read("app/api/upload/receipt/route.ts");
+    const code = uploadSrc
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:])\/\/.*$/gm, "$1");
+    expect(code).toMatch(/kindInput\s*!==\s*"product"/);
+    expect(code).not.toMatch(/"receipts"/);
+    expect(code).toContain("assertTenantWritable");
   });
 });

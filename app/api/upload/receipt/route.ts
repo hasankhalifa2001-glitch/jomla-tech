@@ -18,42 +18,26 @@ import {
 } from "@/lib/auth/role-matrix";
 
 // ============================================================================
-// Shared upload endpoint — despite the file's path (kept from T1's original
-// folder structure entry), this handler serves TWO call sites:
-//   - T3: product/unit images from ImageCropModal (`type: "product"`)
-//   - T6: subscription payment receipts (`type: "receipt"`)
-// See lib/storage.ts's header comment for why one endpoint/client covers
-// both, and T1's folder structure, which already describes this path as a
-// general "Cloud storage upload handler for compressed receipt/product
-// images" rather than a receipt-only route.
+// Shared PUBLIC-bucket upload endpoint — PRODUCT IMAGES ONLY (T3, from
+// ImageCropModal).
 //
-// [FIX] LOCKOUT ENFORCEMENT MUST HAPPEN HERE, PER-TYPE, NOT ONLY IN
-// MIDDLEWARE. (Historical note: middleware.ts deliberately performs NO
-// API-mutation subscription-lock check — it only has the stale JWT snapshot,
-// so the real boundary is assertTenantWritable() inside each mutating route.
-// Billing checkout routes are exempt via the named list
-// SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES in lib/auth/tenant.ts.)
-// This path must stay reachable while locked, because a
-// PENDING tenant has a chicken-and-egg problem: they need to upload their
-// FIRST subscription receipt (T6) precisely while still locked out. The
-// middleware can only see the URL path, not the FormData body, so it has
-// no way to tell a receipt upload apart from a product-image upload at
-// that layer — allowing the path necessarily allows BOTH `type` values
-// through middleware. Without a second, type-aware check here, a
-// PENDING/EXPIRED tenant could keep uploading product images (T3) to cloud
-// storage indefinitely even though POST /api/inventory/products (the only
-// place those images could ever attach to a real product) is correctly
-// blocked elsewhere. The practical damage is limited to orphaned storage
-// cost (no Product/ProductUnit row can ever reference the image while
-// locked), not a data-isolation or security breach, but the endpoint
-// should not silently accept work it can never make use of. Receipts
-// (`type: "receipt"`) remain allowed regardless of subscriptionStatus —
-// that is the entire reason this path is in the middleware allowlist.
+// The path keeps its historical name (/api/upload/receipt, from T1's original
+// folder structure), but since T6a this endpoint no longer handles
+// subscription receipts. Receipts live in a PRIVATE bucket and have their own
+// routes: /api/billing/subscriptions/[id]/receipt (POST upload, GET signed
+// URL). Accepting `type=receipt` here would have let any ADMIN, including one
+// whose tenant is PENDING/EXPIRED, write into the PUBLIC bucket and get back a
+// public URL for what is a payment document. So any `type` other than
+// "product" is rejected.
 //
-// ROLE GATE: ADMIN only. Both real call sites are ADMIN-only actions —
-// creating a catalog product (T3 Scope, products/route.ts POST) and
-// submitting a subscription payment (T6) are both merchant-admin
-// decisions, never a cashier's day-to-day task.
+// LOCKOUT: product images are only useful attached to a product, and creating
+// or editing a product is blocked for a PENDING/EXPIRED tenant. This endpoint
+// therefore requires a currently writable tenant (fresh DB read via
+// assertTenantWritable), instead of letting a locked tenant accumulate
+// orphaned storage.
+//
+// ROLE GATE: ADMIN only. Creating a catalog product (T3) is a merchant-admin
+// decision, never a cashier's day-to-day task.
 // ============================================================================
 
 function extensionForContentType(contentType: string): string {
@@ -72,19 +56,24 @@ export async function POST(req: Request) {
       );
     }
 
-    // Role gate: ADMIN only for receipt/product image uploads
+    // Role gate: ADMIN only.
     assertAdmin(session.user.role);
 
     const formData = await req.formData();
     const file = formData.get("file");
     const kindInput = (formData.get("type") as string | null) || "product";
-    const kind: "products" | "receipts" = kindInput === "receipt" ? "receipts" : "products";
 
-    // When uploading product images, assert fresh tenant writability directly against the database.
-    // Receipts remain allowed when locked so the merchant can submit proof of payment to unlock.
-    if (kind === "products") {
-      await assertTenantWritable(session.user.tenantId);
+    // Receipts never go through this public-bucket endpoint (see header).
+    if (kindInput !== "product") {
+      return NextResponse.json(
+        { error: "VALIDATION_ERROR", message: "نوع الرفع غير مدعوم." },
+        { status: 400 }
+      );
     }
+
+    // Product images only: the tenant must currently be writable
+    // (fresh database read, never the JWT).
+    await assertTenantWritable(session.user.tenantId);
 
     if (!(file instanceof File)) {
       return NextResponse.json(
@@ -122,7 +111,7 @@ export async function POST(req: Request) {
 
     const key = buildStorageKey({
       tenantId: session.user.tenantId,
-      kind,
+      kind: "products",
       extension: extensionForContentType(file.type),
     });
 
