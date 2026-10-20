@@ -26,6 +26,7 @@ export interface QueueItem {
     referenceCode: string;
     status: QueueStatus;
     createdAt: string;
+    ageHours: number;
     hasReceipt: boolean;
     isStale: boolean;
 }

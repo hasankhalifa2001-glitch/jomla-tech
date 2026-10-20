@@ -1,9 +1,8 @@
 /**
  * lib/data/platform-admin.ts
  *
- * T6b Phase 1 — Super-Admin platform-rate data layer.
- * [T6b Phase 2] + subscription queue / detail / receipt key (read-only).
- * (Approve/reject/catalog arrive in later phases.)
+ * T6b — Super-Admin platform data layer: platform rate, subscription queue /
+ * detail / receipt key, subscription approve / reject, catalog reports.
  *
  * The ONLY module allowed to import lib/db/platform.ts (enforced by the
  * static scan in the T6b tests). Every function takes PlatformAdminContext
@@ -174,7 +173,7 @@ export function platformRateNeedsConfirm(currentRate: string | null, newRate: st
 }
 
 // ============================================================================
-// [T6b Phase 2] Super-Admin subscription queue / detail (read-only).
+// Super-Admin subscription queue / detail (read-only).
 // Reuses the same typed gateway (getPlatformDb) — no second gateway.
 // Every query carries an explicit where; never an unfiltered findMany.
 // ============================================================================
@@ -533,7 +532,7 @@ export async function getSubscriptionReceiptKey(
 }
 
 // ============================================================================
-// [T6b Phase 3] Super-Admin subscription approve / reject (mutating).
+// Super-Admin subscription approve / reject (mutating).
 // One $transaction per action, top-level calls only, every write carries an
 // explicit id or tenantId — the platform gateway has no tenant-scope
 // extension, so isolation is structural here, not inherited.
@@ -695,7 +694,7 @@ export async function rejectSubscription(
 }
 
 // ============================================================================
-// [T6b Phase 3] Super-Admin catalog reports.
+// Super-Admin catalog reports.
 // ProductCatalogEntry and ProductCatalogEntryReport are platform-wide (no
 // tenantId column — not in TENANT_SCOPED_MODELS), so they are read/written
 // through the same platform gateway with an explicit `where` on every call.

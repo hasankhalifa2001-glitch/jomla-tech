@@ -10,8 +10,9 @@ const TABS = [
 ] as Array<{ v: RS; l: string }>;
 interface RI {
     id: string; suggestedName: string | null; suggestedCategory: string | null;
+    suggestedImageUrl: string | null;
     status: RS; createdAt: string; reason: string;
-    entry: { id: string; name: string; category: string | null };
+    entry: { id: string; name: string; category: string | null; imageUrl: string | null };
 }
 function fmtDT(iso: string | null): string {
     if (!iso) return "—";
@@ -77,6 +78,26 @@ export function CatalogReportsClient() {
                             <div className="text-xs text-zinc-500">الحالي: {r.entry.category ?? "—"}</div>
                             <div className="mt-2 text-sm font-bold text-emerald-700">المقترح: {r.suggestedName ?? "—"}</div>
                             <div className="text-xs text-zinc-500">{r.suggestedCategory ?? "—"}</div>
+                            <div className="mt-2 flex items-center gap-3">
+                                <div className="text-xs text-zinc-600">
+                                    <div className="font-bold">الحالية</div>
+                                    {r.entry.imageUrl ? (
+                                        // eslint-disable-next-line @next/next/no-img-element
+                                        <img src={r.entry.imageUrl} alt={r.entry.name} className="mt-1 size-16 rounded-xl bg-zinc-50 object-cover" />
+                                    ) : (
+                                        <div className="mt-1 text-zinc-400">—</div>
+                                    )}
+                                </div>
+                                <div className="text-xs text-zinc-600">
+                                    <div className="font-bold">المقترحة</div>
+                                    {r.suggestedImageUrl ? (
+                                        // eslint-disable-next-line @next/next/no-img-element
+                                        <img src={r.suggestedImageUrl} alt="الصورة المقترحة" className="mt-1 size-16 rounded-xl bg-zinc-50 object-cover" />
+                                    ) : (
+                                        <div className="mt-1 text-zinc-400">—</div>
+                                    )}
+                                </div>
+                            </div>
                             <div className="mt-2 text-xs text-zinc-600">{r.reason}</div>
                             <div className="mt-1 text-xs text-zinc-500">{fmtDT(r.createdAt)}</div>
                             {r.status === "PENDING" ? (

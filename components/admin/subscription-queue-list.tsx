@@ -32,6 +32,14 @@ export function StaleBadge() {
     );
 }
 
+export function fmtAge(hours: number): string {
+    if (!Number.isFinite(hours) || hours < 0) return "—";
+    if (hours < 1) return "أقل من ساعة";
+    if (hours < 24) return `منذ ${hours} س`;
+    const days = Math.floor(hours / 24);
+    return `منذ ${days} يوم`;
+}
+
 export function QueueList(props: {
     items: QueueItem[];
     nextCursor: string | null;
@@ -50,9 +58,11 @@ export function QueueList(props: {
                     <thead>
                         <tr className="bg-zinc-50 text-xs text-zinc-500">
                             <th className="px-4 py-3 text-start">المتجر</th>
+                            <th className="px-4 py-3 text-start">الباقة</th>
                             <th className="px-4 py-3 text-start">المرجع</th>
                             <th className="px-4 py-3 text-start">المبلغ المطلوب</th>
                             <th className="px-4 py-3 text-start">الإيصال</th>
+                            <th className="px-4 py-3 text-start">العمر</th>
                             <th className="px-4 py-3 text-start">التاريخ</th>
                         </tr>
                     </thead>
@@ -64,13 +74,16 @@ export function QueueList(props: {
                                         {row.tenant.name}
                                     </Link>
                                     <div className="text-xs text-zinc-500">{row.tenant.slug}</div>
+                                    {row.tenant.phone ? <div className="text-xs text-zinc-500" dir="ltr">{row.tenant.phone}</div> : null}
                                 </td>
+                                <td className="px-4 py-3 text-xs font-bold">{row.tier}</td>
                                 <td className="px-4 py-3 font-mono text-xs" dir="ltr">
                                     {row.referenceCode}
                                     {row.isStale ? <StaleBadge /> : null}
                                 </td>
                                 <td className="px-4 py-3 text-base font-extrabold">{fmtSYP(row.amountSYP)} ل.س</td>
                                 <td className="px-4 py-3">{row.hasReceipt ? "مرفق" : "—"}</td>
+                                <td className="px-4 py-3 text-xs text-zinc-500">{fmtAge(row.ageHours)}</td>
                                 <td className="px-4 py-3 text-xs text-zinc-500">{fmtDate(row.createdAt)}</td>
                             </tr>
                         ))}
@@ -87,9 +100,10 @@ export function QueueList(props: {
                         <div className="mt-1 font-mono text-xs text-zinc-500" dir="ltr">
                             {row.referenceCode}
                         </div>
+                        <div className="mt-1 text-xs text-zinc-500">الباقة: {row.tier}</div>
                         <div className="mt-2 text-lg font-extrabold">{fmtSYP(row.amountSYP)} ل.س</div>
                         <div className="mt-1 text-xs text-zinc-500">
-                            {row.hasReceipt ? "الإيصال مرفق" : "بلا إيصال"} • {fmtDate(row.createdAt)}
+                            {row.hasReceipt ? "الإيصال مرفق" : "بلا إيصال"} • {fmtAge(row.ageHours)} • {fmtDate(row.createdAt)}
                         </div>
                     </Link>
                 ))}
