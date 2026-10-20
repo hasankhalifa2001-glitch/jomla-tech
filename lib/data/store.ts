@@ -72,6 +72,7 @@ import { orderReference } from "@/lib/utils/order-reference";
 import { normalizeArabic, normalizeCategory } from "@/lib/utils/arabic-search";
 import { breakdownForDisplay, type DisplayUnit } from "@/lib/inventory/units";
 import { compareMoney, serializeMoney } from "@/lib/utils/money";
+import { getEffectiveTenantStatus } from "@/lib/subscription/effective-status";
 
 // ============================================================================
 // Types
@@ -151,14 +152,15 @@ export function storeBestsellersTag(tenantId: string): string {
  * no tenantId until this resolves.
  *
  * Returns:
- *  - { kind: "tenant", tenant }      — known AND not EXPIRED/PENDING (open)
- *  - { kind: "unavailable" }         — known but EXPIRED/PENDING (D7: closed)
+ *  - { kind: "tenant", tenant }      — known AND effectively open (D7)
+ *  - { kind: "unavailable" }         — known but locked (D7: closed)
  *  - { kind: "not_found" }           — no such slug → the page renders 404
  *
- * The subscription check is the SAME "not EXPIRED/PENDING" rule
- * assertTenantWritable enforces (available ⟺ status === ACTIVE), read fresh
- * here every time. Never the JWT (there is none) and never a cached value, so
- * it can never serve a just-closed store.
+ * [T6c] The subscription check is the SAME effective rule assertTenantWritable
+ * enforces (open ⟺ effective ACTIVE or GRACE), read fresh here every time —
+ * stored PENDING and past-grace EXPIRED close the store. Never the JWT (there
+ * is none) and never a cached value, so it can never serve a just-closed
+ * store. Gate always runs BEFORE any Data-Cache read.
  */
 export async function resolveStorefrontTenant(
     slug: string
@@ -178,12 +180,17 @@ export async function resolveStorefrontTenant(
             phone: true,
             dailyExchangeRate: true,
             subscriptionStatus: true,
+            expiresAt: true,
         },
     });
 
     if (!row) return { kind: "not_found" };
 
-    if (row.subscriptionStatus !== "ACTIVE") {
+    const effective = getEffectiveTenantStatus(
+        { subscriptionStatus: row.subscriptionStatus, expiresAt: row.expiresAt },
+        new Date()
+    );
+    if (!effective.writable) {
         return { kind: "unavailable" };
     }
 

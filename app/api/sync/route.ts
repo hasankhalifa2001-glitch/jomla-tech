@@ -29,11 +29,7 @@ import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
 // [T4e] The ONE repayment core — this route's Payment pass and
 // POST /api/ledger/repayments both call recordRepaymentIdempotent.
 import { recordRepaymentIdempotent } from "@/lib/ledger/repayment";
-import {
-  assertTenantWritable,
-  SubscriptionLockedError,
-  subscriptionLockedResponse,
-} from "@/lib/auth/tenant";
+import { getFreshEffectiveStatus } from "@/lib/auth/tenant";
 
 
 export const dynamic = "force-dynamic";
@@ -627,13 +623,40 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  try {
-    await assertTenantWritable(session.user.tenantId);
-  } catch (error) {
-    if (error instanceof SubscriptionLockedError) {
-      return subscriptionLockedResponse(error);
-    }
-    throw error;
+  // [T6c — D10] Sync rule. Fresh effective status, read ONCE per request —
+  // this route deliberately does NOT call assertTenantWritable() (which
+  // would 403 the whole batch for a locked tenant and LOSE pre-lock offline
+  // sales queued on the device):
+  //   - writable (ACTIVE/GRACE) → process exactly as before;
+  //   - locked (stored PENDING, or past-grace EXPIRED) → per-item decision:
+  //     an item whose client createdAt ≤ lockAt is processed normally; a
+  //     later item is FAILED with the Arabic subscription reason. A PENDING
+  //     (never activated) tenant rejects everything. Voids follow the same
+  //     per-item rule (their own createdAt). Ordering, idempotency and all
+  //     existing validations are unchanged.
+  //   KNOWN LIMITATION (documented per spec): the client clock is untrusted,
+  //   so this rule is a pragmatic safeguard that preserves pre-lock offline
+  //   sales — NOT a security boundary.
+  const effective = await getFreshEffectiveStatus(session.user.tenantId);
+  const syncLocked = !effective || !effective.writable;
+  const syncLockAtMs = effective?.lockAt ? effective.lockAt.getTime() : null;
+  const syncPending = !effective || effective.status === "PENDING";
+
+  /** Arabic reason for a post-lock item (spec §4, verbatim). */
+  const SUBSCRIPTION_SYNC_REJECTED_MESSAGE = "انتهى الاشتراك قبل تسجيل هذه العملية";
+
+  /**
+   * True when this item may still be processed despite a locked tenant:
+   * its client createdAt is at or before the lock moment. Unparseable
+   * dates never reach here (per-item date validation runs first).
+   */
+  function isSyncItemPreLock(createdAt: string): boolean {
+    if (!syncLocked) return true;
+    if (syncPending) return false;
+    if (syncLockAtMs == null) return true;
+    const ms = new Date(createdAt).getTime();
+    if (Number.isNaN(ms)) return false;
+    return ms <= syncLockAtMs;
   }
 
   const tenantId = session.user.tenantId;
@@ -737,6 +760,17 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
+    // [T6c — D10] Locked tenant: only pre-lock items are processed; later
+    // items fail with the subscription reason (PENDING fails everything).
+    if (!isSyncItemPreLock(c.createdAt)) {
+      customerResults.push({
+        offlineId: c.offlineId,
+        status: "FAILED",
+        error: SUBSCRIPTION_SYNC_REJECTED_MESSAGE,
+      });
+      continue;
+    }
+
     try {
       const { id } = await withTxRetries(() =>
         prisma.$transaction(async (tx) => {
@@ -826,6 +860,17 @@ export async function POST(req: NextRequest) {
         offlineId: inv.offlineId,
         status: "FAILED",
         error: INVALID_CREATED_AT_MESSAGE,
+      });
+      return;
+    }
+
+    // [T6c — D10] Same per-item lock rule for sales AND voids (the void's own
+    // createdAt decides, not the original sale's).
+    if (!isSyncItemPreLock(inv.createdAt)) {
+      invoiceResults.push({
+        offlineId: inv.offlineId,
+        status: "FAILED",
+        error: SUBSCRIPTION_SYNC_REJECTED_MESSAGE,
       });
       return;
     }
@@ -1530,6 +1575,16 @@ export async function POST(req: NextRequest) {
         offlineId: p.offlineId,
         status: "FAILED",
         error: INVALID_CREATED_AT_MESSAGE,
+      });
+      continue;
+    }
+
+    // [T6c — D10] Same per-item lock rule for repayments.
+    if (!isSyncItemPreLock(p.createdAt)) {
+      paymentResults.push({
+        offlineId: p.offlineId,
+        status: "FAILED",
+        error: SUBSCRIPTION_SYNC_REJECTED_MESSAGE,
       });
       continue;
     }

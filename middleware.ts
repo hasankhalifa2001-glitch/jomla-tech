@@ -13,6 +13,32 @@ const DASHBOARD_PATH_PREFIXES = [
     "/dashboard", "/pos", "/inventory", "/ledger", "/orders", "/settings", "/account-locked",
 ];
 
+// [T6c] Edge-safe effective-status computation. Mirrors
+// lib/subscription/effective-status.ts with pure date math only — middleware
+// cannot import Prisma or that helper's config chain without blowing the
+// Vercel Edge 1 MB bundle limit. GRACE_DAYS_MS must equal
+// SUBSCRIPTION_GRACE_DAYS (lib/config/subscription.ts) × DAY_MS; the static
+// scan test (t6c suite) fails if they drift.
+const T6C_GRACE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
+
+type SessionSubscriptionSnapshot = {
+    subscriptionStatus?: unknown;
+    subscriptionExpiresAt?: unknown;
+};
+
+function getMiddlewareEffectiveWritable(user: SessionSubscriptionSnapshot | undefined, nowMs: number): boolean {
+    const stored = user?.subscriptionStatus;
+    if (stored === "PENDING") return false;
+    if (stored !== "ACTIVE") return false;
+    const raw = user?.subscriptionExpiresAt;
+    // Stored ACTIVE with no expiry = platform-internal tenant: always open.
+    if (raw == null || raw === "") return true;
+    const expiresMs = new Date(raw as string).getTime();
+    if (Number.isNaN(expiresMs)) return false;
+    // Writable ⇔ ACTIVE or GRACE (now ≤ expiresAt + grace).
+    return nowMs <= expiresMs + T6C_GRACE_DAYS_MS;
+}
+
 function isPathUnder(pathname: string, prefixes: string[]) {
     return prefixes.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 }
@@ -151,8 +177,13 @@ export default auth((req) => {
             pathname.startsWith("/dashboard/settings/billing/");
 
         const isAccountLockedRoute = pathname.startsWith("/account-locked");
-        const isLocked =
-            user?.subscriptionStatus === "EXPIRED" || user?.subscriptionStatus === "PENDING";
+        // [T6c] Effective lock = NOT writable (covers stored PENDING/EXPIRED
+        // AND stored-ACTIVE-past-grace). GRACE counts as writable → no
+        // redirect. Session snapshot may be short-TTL/stale (see note below).
+        const isLocked = !getMiddlewareEffectiveWritable(
+            user as SessionSubscriptionSnapshot | undefined,
+            Date.now()
+        );
 
         // CASHIER settings restriction: CASHIER is never permitted to access settings.
         // If the tenant is locked, cashier goes to /account-locked; if active, to /dashboard/pos.
@@ -174,8 +205,9 @@ export default auth((req) => {
             return NextResponse.redirect(new URL("/pos", req.url));
         }
 
-        // Page-navigation layer subscription lockout:
-        // Locked tenants (EXPIRED or PENDING) are routed by role:
+        // Page-navigation layer subscription lockout (effective, T6c):
+        // Locked tenants (effective EXPIRED or PENDING — stored or past-grace)
+        // are routed by role:
         // - ADMIN -> /settings/billing (where they can act on the subscription)
         // - CASHIER -> /account-locked (read-only explanation)
         //
@@ -191,7 +223,7 @@ export default auth((req) => {
                 return NextResponse.redirect(new URL("/account-locked", req.url));
             }
             const billingUrl = new URL("/settings/billing", req.url);
-            billingUrl.searchParams.set("reason", user!.subscriptionStatus!.toLowerCase());
+            billingUrl.searchParams.set("reason", String(user?.subscriptionStatus ?? "expired").toLowerCase());
             return NextResponse.redirect(billingUrl);
         }
 
@@ -199,7 +231,7 @@ export default auth((req) => {
         // is bounced to /settings/billing where they can act on subscription.
         if (isAccountLockedRoute && user?.role === "ADMIN" && isLocked) {
             const billingUrl = new URL("/settings/billing", req.url);
-            billingUrl.searchParams.set("reason", user!.subscriptionStatus!.toLowerCase());
+            billingUrl.searchParams.set("reason", String(user?.subscriptionStatus ?? "expired").toLowerCase());
             return NextResponse.redirect(billingUrl);
         }
 

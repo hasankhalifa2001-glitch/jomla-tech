@@ -27,6 +27,12 @@ import type { JWT } from "@auth/core/jwt";
 // This function contains NO database access and NO imports beyond NextAuth's
 // own types, so it is safe to import from auth.config.ts without pulling
 // Prisma/bcrypt/Upstash into the Edge middleware bundle.
+//
+// [T6c] Carries `subscriptionExpiresAt` (ISO string | null) alongside the
+// stored status so middleware can compute the EFFECTIVE status (ACTIVE /
+// GRACE / EXPIRED / PENDING) with pure date math on the Edge — no Prisma.
+// Missing value fails closed downstream (treated as expired) exactly like a
+// missing status.
 export function applySessionFromToken(session: Session, token: JWT): Session {
     if (token && session.user) {
         session.user.id = token.id as string;
@@ -41,6 +47,12 @@ export function applySessionFromToken(session: Session, token: JWT): Session {
         // write access.
         session.user.subscriptionStatus =
             (token.subscriptionStatus as "ACTIVE" | "EXPIRED" | "PENDING") || "EXPIRED";
+        // [T6c] Expiry snapshot for the effective-status computation. A raw
+        // ISO string (never a Date) so it survives JWT serialization and the
+        // Edge runtime untouched.
+        const rawExpiry = token.subscriptionExpiresAt as string | null | undefined;
+        session.user.subscriptionExpiresAt =
+            typeof rawExpiry === "string" && rawExpiry.length > 0 ? rawExpiry : null;
         // Default false so a missing/stale token never grants
         // platform-admin access.
         session.user.isPlatformAdmin = (token.isPlatformAdmin as boolean) ?? false;

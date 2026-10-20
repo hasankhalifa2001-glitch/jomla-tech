@@ -18,6 +18,9 @@ declare module "next-auth" {
         tenantName?: string;
         dailyExchangeRate?: number | null;
         subscriptionStatus?: "ACTIVE" | "EXPIRED" | "PENDING";
+        // [T6c] ISO-string expiry snapshot for the Edge-safe effective-status
+        // redirect computation (see session-callback.ts).
+        subscriptionExpiresAt?: string | null;
         // Platform-level privilege (T6 Super-Admin dashboard), distinct
         // from tenant-scoped `role` — a platform admin isn't a member of
         // any tenant's staff, just additionally privileged.
@@ -41,6 +44,13 @@ declare module "next-auth" {
             // edit until its own session is refreshed.
             dailyExchangeRate: number | null;
             subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+            // [T6c] ISO-string expiry snapshot (null = no expiry). Session-only
+            // convenience for middleware/banner redirects — NEVER a security
+            // boundary; mutating routes re-read fresh via assertTenantWritable.
+            // Optional for backward compatibility with sessions/fixtures
+            // written before this field existed (treated as null = unknown,
+            // which fails closed downstream).
+            subscriptionExpiresAt?: string | null;
             isPlatformAdmin: boolean;
         } & DefaultSession["user"];
     }
@@ -55,6 +65,7 @@ declare module "@auth/core/jwt" {
         tenantName?: string;
         dailyExchangeRate?: number | null;
         subscriptionStatus?: "ACTIVE" | "EXPIRED" | "PENDING";
+        subscriptionExpiresAt?: string | null;
         isPlatformAdmin?: boolean;
     }
 }
@@ -170,6 +181,11 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                         ? Number(user.tenant.dailyExchangeRate)
                         : null,
                     subscriptionStatus: user.tenant.subscriptionStatus,
+                    // [T6c] Snapshot for the Edge redirect layer only; the
+                    // write boundary re-reads fresh from the DB per request.
+                    subscriptionExpiresAt: user.tenant.expiresAt
+                        ? user.tenant.expiresAt.toISOString()
+                        : null,
                     isPlatformAdmin: user.isPlatformAdmin,
                 };
             },
@@ -191,6 +207,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
                 token.tenantName = user.tenantName;
                 token.dailyExchangeRate = user.dailyExchangeRate;
                 token.subscriptionStatus = user.subscriptionStatus;
+                token.subscriptionExpiresAt = user.subscriptionExpiresAt ?? null;
                 token.isPlatformAdmin = user.isPlatformAdmin;
             }
 
@@ -206,10 +223,13 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             if (trigger === "update" && token.tenantId) {
                 const tenant = await prisma.tenant.findUnique({
                     where: { id: token.tenantId as string },
-                    select: { subscriptionStatus: true, dailyExchangeRate: true },
+                    select: { subscriptionStatus: true, expiresAt: true, dailyExchangeRate: true },
                 });
                 if (tenant) {
                     token.subscriptionStatus = tenant.subscriptionStatus;
+                    token.subscriptionExpiresAt = tenant.expiresAt
+                        ? tenant.expiresAt.toISOString()
+                        : null;
                     token.dailyExchangeRate = tenant.dailyExchangeRate
                         ? Number(tenant.dailyExchangeRate)
                         : null;

@@ -19,6 +19,7 @@ import {
     SUBSCRIPTION_OFFER_VALIDITY_HOURS,
 } from "@/lib/config/subscription";
 import { PLATFORM_TENANT_SLUG } from "@/lib/data/platform-rate";
+import { getPublicUrlPrefix } from "@/lib/storage";
 import {
     compareMoney,
     MoneyError,
@@ -559,6 +560,19 @@ export class SubscriptionAlreadyReviewedError extends SubscriptionDomainError {
     }
 }
 
+/**
+ * Thrown when another approval changed the tenant's expiry between our read
+ * and our write. The whole transaction (including the claim) rolls back, so
+ * the request is still PENDING_APPROVAL and is safe to retry. Map to
+ * 409 CONCURRENT_UPDATE.
+ */
+export class ConcurrentTenantUpdateError extends SubscriptionDomainError {
+    constructor() {
+        super("تم تحديث اشتراك المتجر بالتزامن مع عملية أخرى. أعد المحاولة.");
+        this.name = "ConcurrentTenantUpdateError";
+    }
+}
+
 export interface ApproveSubscriptionInput {
     reviewedByUserId: string;
     now: Date;
@@ -573,15 +587,18 @@ export interface ApproveSubscriptionResult {
 /**
  * Approve a PENDING_APPROVAL subscription request.
  *
- * Order inside the transaction (top-level calls only), per T6b spec:
+ * Order inside the transaction (top-level calls only):
  *   a. Claim updateMany (PENDING_APPROVAL + receipt present) -> ACTIVE.
- *   b. count !== 1 -> findUnique to distinguish 404 / RECEIPT_REQUIRED /
- *      ALREADY_REVIEWED (zero side effects, tx rolls back).
- *   c. Read tenant fresh; compute newExpiresAt from the row's FROZEN
- *      durationDays (never the live config) per D6.
- *   d. subscription.update expiresAt = newExpiresAt.
- *   e. tenant.update subscriptionStatus ACTIVE, expiresAt = newExpiresAt.
- *   f. Expire the tenant's other ACTIVE subscription rows (folded coverage).
+ *      count !== 1 -> classify (404 / RECEIPT_REQUIRED / ALREADY_REVIEWED),
+ *      zero side effects.
+ *   b. Read the claimed row for tenantId + the FROZEN durationDays.
+ *   c. Read the tenant's expiry fresh; compute D6 from the row's frozen
+ *      duration (never the live config).
+ *   d. subscription.update expiresAt.
+ *   e. GUARDED tenant update: pinned to the expiry read in (c). A concurrent
+ *      approval for the same tenant makes this match 0 rows, and the whole
+ *      transaction rolls back instead of silently losing a paid period.
+ *   f. Expire the tenant's other ACTIVE rows (their coverage is folded in).
  * Any failure rolls back everything, including the claim.
  */
 export async function approveSubscription(
@@ -593,60 +610,58 @@ export async function approveSubscription(
     const { reviewedByUserId, now } = input;
 
     const { tenantId, newExpiresAt } = await db.$transaction(async (tx) => {
-        // a. Claim.
+        // a. Claim (by id only).
         const claim = await tx.subscription.updateMany({
-            where: {
-                id,
-                status: "PENDING_APPROVAL",
-                receiptImageURL: { not: null },
-            },
-            data: {
-                status: "ACTIVE",
-                reviewedByUserId,
-                reviewedAt: now,
-            },
+            where: { id, status: "PENDING_APPROVAL", receiptImageURL: { not: null } },
+            data: { status: "ACTIVE", reviewedByUserId, reviewedAt: now },
         });
-
-        // count !== 1 -> classify without any side effects.
         if (claim.count !== 1) {
-            const row = await tx.subscription.findUnique({ where: { id } });
-            if (!row) throw new SubscriptionNotFoundError();
-            if (row.receiptImageURL == null) throw new SubscriptionReceiptRequiredError();
+            const existing = await tx.subscription.findUnique({
+                where: { id },
+                select: { receiptImageURL: true },
+            });
+            if (!existing) throw new SubscriptionNotFoundError();
+            if (existing.receiptImageURL == null) throw new SubscriptionReceiptRequiredError();
             throw new SubscriptionAlreadyReviewedError();
         }
 
-        // The claim set status to ACTIVE but left tenantId / durationDays intact.
-        const row = await tx.subscription.findUnique({ where: { id } });
-        if (!row) throw new SubscriptionNotFoundError();
-        const durationDays = row.durationDays;
-
-        // b. Read tenant fresh; compute newExpiresAt per D6 using the
-        // row's FROZEN durationDays (never the live config).
-        const tenant = await tx.tenant.findUnique({ where: { id: row.tenantId } });
-        if (!tenant) throw new SubscriptionNotFoundError();
-
-        // D6: max(now, future tenant expiry) + frozen durationDays.
-        const newExpiresAt = previewNewExpiry({ now, tenantExpiresAt: tenant.expiresAt, durationDays });
-
-        // c. subscription.update -> expiresAt = newExpiresAt.
-        await tx.subscription.update({
+        // b. The claimed row: tenantId + frozen durationDays only.
+        const row = await tx.subscription.findUnique({
             where: { id },
-            data: { expiresAt: newExpiresAt },
+            select: { tenantId: true, durationDays: true },
         });
+        if (!row) throw new SubscriptionNotFoundError();
 
-        // d. tenant.update -> subscriptionStatus ACTIVE, expiresAt = newExpiresAt.
-        await tx.tenant.update({
+        // c. Tenant expiry, fresh.
+        const tenant = await tx.tenant.findUnique({
             where: { id: row.tenantId },
-            data: { subscriptionStatus: "ACTIVE", expiresAt: newExpiresAt },
+            select: { expiresAt: true },
+        });
+        if (!tenant) throw new SubscriptionNotFoundError();
+        const readExpiresAt: Date | null = tenant.expiresAt ?? null;
+        const computedExpiresAt = previewNewExpiry({
+            now,
+            tenantExpiresAt: readExpiresAt,
+            durationDays: row.durationDays,
         });
 
-        // e. Fold the tenant's other ACTIVE coverage into the single expiry.
+        // d. Subscription expiry.
+        await tx.subscription.update({ where: { id }, data: { expiresAt: computedExpiresAt } });
+
+        // e. Guarded tenant update. `expiresAt: null` is matched as IS NULL.
+        const tenantUpdate = await tx.tenant.updateMany({
+            where: { id: row.tenantId, expiresAt: readExpiresAt },
+            data: { subscriptionStatus: "ACTIVE", expiresAt: computedExpiresAt },
+        });
+        if (tenantUpdate.count !== 1) throw new ConcurrentTenantUpdateError();
+
+        // f. Fold the tenant's other ACTIVE coverage into the single expiry.
         await tx.subscription.updateMany({
             where: { tenantId: row.tenantId, status: "ACTIVE", id: { not: id } },
             data: { status: "EXPIRED" },
         });
 
-        return { tenantId: row.tenantId, newExpiresAt };
+        return { tenantId: row.tenantId, newExpiresAt: computedExpiresAt };
     });
 
     return {
@@ -686,8 +701,11 @@ export async function rejectSubscription(
             },
         });
         if (claim.count !== 1) {
-            const row = await tx.subscription.findUnique({ where: { id } });
-            if (!row) throw new SubscriptionNotFoundError();
+            const existing = await tx.subscription.findUnique({
+                where: { id },
+                select: { id: true },
+            });
+            if (!existing) throw new SubscriptionNotFoundError();
             throw new SubscriptionAlreadyReviewedError();
         }
     });
@@ -776,18 +794,16 @@ export async function listCatalogReports(
     const where: Record<string, unknown> = { status };
     if (ands.length > 0) where.AND = ands;
 
-    const [rows] = await Promise.all([
-        db.productCatalogEntryReport.findMany({
-            where,
-            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-            take: limit + 1,
-            select: {
-                id: true, catalogEntryId: true, reportedByTenantId: true, reason: true,
-                suggestedName: true, suggestedCategory: true, suggestedImageUrl: true,
-                status: true, createdAt: true, resolvedAt: true,
-            },
-        }),
-    ]);
+    const rows = await db.productCatalogEntryReport.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: limit + 1,
+        select: {
+            id: true, catalogEntryId: true, reportedByTenantId: true, reason: true,
+            suggestedName: true, suggestedCategory: true, suggestedImageUrl: true,
+            status: true, createdAt: true, resolvedAt: true,
+        },
+    });
 
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
@@ -833,44 +849,85 @@ export interface ResolveCatalogReportInput {
     now: Date;
 }
 
+export interface ResolveCatalogReportResult {
+    applied: { name: boolean; category: boolean; imageUrl: boolean };
+    /** A suggested image existed but was NOT applied (outside our public bucket). */
+    imageSkipped: boolean;
+}
+
+const CATALOG_TEXT_MAX = 200;
+
 /**
- * Resolve a PENDING catalog report. Conditional updateMany WHERE status =
- * 'PENDING'; count 0 -> read the row to distinguish 404 from 409. When
- * apply is true, apply only the non-null suggested fields to the catalog
- * entry via a top-level update (the entry is never touched otherwise).
+ * Resolve a PENDING catalog report. The claim (conditional updateMany WHERE
+ * status = 'PENDING') and the optional entry update happen in ONE
+ * transaction. When apply is true, only validated, non-empty suggested
+ * fields are written. suggestedImageUrl is tenant-supplied, so it is applied
+ * ONLY when it starts with our own public-bucket URL prefix; otherwise it is
+ * skipped and reported via `imageSkipped`.
  */
 export async function resolveCatalogReport(
     ctx: PlatformAdminContext,
     id: string,
     input: ResolveCatalogReportInput
-): Promise<void> {
+): Promise<ResolveCatalogReportResult> {
     const db: PlatformDb = getPlatformDb(ctx);
     const now = input.now;
+    const publicPrefix = input.apply ? getPublicUrlPrefix() : null;
 
-    await db.$transaction(async (tx) => {
-        const updated = await tx.productCatalogEntryReport.updateMany({
+    return db.$transaction(async (tx) => {
+        const claim = await tx.productCatalogEntryReport.updateMany({
             where: { id, status: "PENDING" },
             data: { status: "RESOLVED", resolvedAt: now },
         });
-        if (updated.count !== 1) {
-            const row = await tx.productCatalogEntryReport.findUnique({ where: { id } });
-            if (!row) throw new CatalogReportNotFoundError();
+        if (claim.count !== 1) {
+            const existing = await tx.productCatalogEntryReport.findUnique({
+                where: { id },
+                select: { id: true },
+            });
+            if (!existing) throw new CatalogReportNotFoundError();
             throw new CatalogReportAlreadyProcessedError();
         }
-        if (!input.apply) return;
 
-        const row = await tx.productCatalogEntryReport.findUnique({ where: { id } });
+        const result: ResolveCatalogReportResult = {
+            applied: { name: false, category: false, imageUrl: false },
+            imageSkipped: false,
+        };
+        if (!input.apply) return result;
+
+        const row = await tx.productCatalogEntryReport.findUnique({
+            where: { id },
+            select: {
+                catalogEntryId: true,
+                suggestedName: true,
+                suggestedCategory: true,
+                suggestedImageUrl: true,
+            },
+        });
         if (!row) throw new CatalogReportNotFoundError();
-        const data: Record<string, unknown> = {};
-        if (row.suggestedName != null) data.name = row.suggestedName;
-        if (row.suggestedCategory != null) data.category = row.suggestedCategory;
-        if (row.suggestedImageUrl != null) data.imageUrl = row.suggestedImageUrl;
-        if (Object.keys(data).length > 0) {
-            await tx.productCatalogEntry.update({
-                where: { id: row.catalogEntryId },
-                data,
-            });
+
+        const data: { name?: string; category?: string; imageUrl?: string } = {};
+        const name = row.suggestedName?.trim();
+        if (name && name.length <= CATALOG_TEXT_MAX) {
+            data.name = name;
+            result.applied.name = true;
         }
+        const category = row.suggestedCategory?.trim();
+        if (category && category.length <= CATALOG_TEXT_MAX) {
+            data.category = category;
+            result.applied.category = true;
+        }
+        if (row.suggestedImageUrl) {
+            if (publicPrefix && row.suggestedImageUrl.startsWith(publicPrefix)) {
+                data.imageUrl = row.suggestedImageUrl;
+                result.applied.imageUrl = true;
+            } else {
+                result.imageSkipped = true;
+            }
+        }
+        if (Object.keys(data).length > 0) {
+            await tx.productCatalogEntry.update({ where: { id: row.catalogEntryId }, data });
+        }
+        return result;
     });
 }
 
@@ -897,8 +954,11 @@ export async function dismissCatalogReport(
             data: { status: "DISMISSED", resolvedAt: now },
         });
         if (updated.count !== 1) {
-            const row = await tx.productCatalogEntryReport.findUnique({ where: { id } });
-            if (!row) throw new CatalogReportNotFoundError();
+            const existing = await tx.productCatalogEntryReport.findUnique({
+                where: { id },
+                select: { id: true },
+            });
+            if (!existing) throw new CatalogReportNotFoundError();
             throw new CatalogReportAlreadyProcessedError();
         }
     });

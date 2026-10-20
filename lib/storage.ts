@@ -385,3 +385,23 @@ export async function removePrivateReceipt(key: string): Promise<boolean> {
         return false;
     }
 }
+
+/**
+ * Public-bucket URL prefix. Used to accept only URLs that point into OUR own
+ * public bucket, e.g. when a Super-Admin applies a tenant-supplied
+ * suggestedImageUrl to the shared catalog. Returns null when storage is not
+ * configured (callers must then treat every URL as untrusted).
+ */
+export function getPublicUrlPrefix(): string | null {
+    try {
+        assertStorageEnv();
+        const client = getSupabaseClient();
+        const bucket = process.env.SUPABASE_BUCKET_NAME as string;
+        // getPublicUrl appends the key; strip a one-character probe to get the prefix.
+        const { data } = client.storage.from(bucket).getPublicUrl("x");
+        const url = data.publicUrl;
+        return url.endsWith("x") ? url.slice(0, -1) : null;
+    } catch {
+        return null;
+    }
+}

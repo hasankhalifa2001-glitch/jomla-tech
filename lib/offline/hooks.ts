@@ -220,6 +220,12 @@ export interface SessionFallbackClaims {
    * value says.
    */
   subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+  /**
+   * [T6c] ISO-string expiry snapshot; informational only, same as above.
+   * Optional for backward compatibility with rows/sessions written before
+   * this field existed (treated as null = unknown).
+   */
+  subscriptionExpiresAt?: string | null;
 }
 
 export interface UseSessionWithOfflineFallbackResult {
@@ -275,6 +281,7 @@ function extractValidatedUser(rawUser: unknown): {
   isPlatformAdmin: boolean;
   name?: string;
   subscriptionStatus: "ACTIVE" | "EXPIRED" | "PENDING";
+  subscriptionExpiresAt: string | null;
 } | null {
   const user = rawUser as {
     id?: string;
@@ -285,6 +292,7 @@ function extractValidatedUser(rawUser: unknown): {
     isPlatformAdmin?: boolean;
     name?: string | null;
     subscriptionStatus?: "ACTIVE" | "EXPIRED" | "PENDING";
+    subscriptionExpiresAt?: string | null;
   } | null | undefined;
 
   if (!user) return null;
@@ -299,6 +307,7 @@ function extractValidatedUser(rawUser: unknown): {
     return null;
   }
 
+  const rawExpiry = user.subscriptionExpiresAt;
   return {
     id: user.id,
     tenantId: user.tenantId,
@@ -308,6 +317,8 @@ function extractValidatedUser(rawUser: unknown): {
     isPlatformAdmin: !!user.isPlatformAdmin,
     name: user.name ?? undefined,
     subscriptionStatus: user.subscriptionStatus,
+    subscriptionExpiresAt:
+      typeof rawExpiry === "string" && rawExpiry.length > 0 ? rawExpiry : null,
   };
 }
 
@@ -563,6 +574,7 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
           name: validUser.name,
           source: "live",
           subscriptionStatus: validUser.subscriptionStatus,
+          subscriptionExpiresAt: validUser.subscriptionExpiresAt,
         },
         update,
       };
@@ -596,6 +608,7 @@ export function useSessionWithOfflineFallback(): UseSessionWithOfflineFallbackRe
         name: cachedClaims.name,
         source: "cached",
         subscriptionStatus: cachedClaims.subscriptionStatus,
+        subscriptionExpiresAt: null,
       },
       update,
     };

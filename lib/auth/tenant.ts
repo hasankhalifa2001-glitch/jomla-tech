@@ -1,6 +1,7 @@
 import { getTenantDb } from "@/lib/db";
 import type { TenantSubscriptionStatus } from "@prisma/client";
 import { NextResponse } from "next/server";
+import { getEffectiveTenantStatus } from "@/lib/subscription/effective-status";
 
 export class SubscriptionLockedError extends Error {
   readonly status: TenantSubscriptionStatus | null;
@@ -20,6 +21,9 @@ export class SubscriptionLockedError extends Error {
  * Returns the fresh subscriptionStatus for a tenant directly from the database.
  * Never trusted from the JWT session payload, since subscriptionStatus can change
  * mid-session (e.g. Super-Admin approval in T6).
+ *
+ * [T6c] Kept for the read-only status-poll endpoint only. Write enforcement
+ * goes through assertTenantWritable() → getEffectiveTenantStatus().
  */
 export async function getFreshTenantStatus(
   tenantId: string
@@ -33,22 +37,54 @@ export async function getFreshTenantStatus(
 }
 
 /**
- * Asserts that a tenant's subscription is currently ACTIVE by performing a fresh,
- * authoritative database read within the same request lifecycle.
+ * [T6c] The actual security boundary: fresh, authoritative tenant row read
+ * within the same request lifecycle, decided SOLELY by
+ * getEffectiveTenantStatus() (lib/subscription/effective-status.ts).
+ * Writable ⇔ effective ACTIVE or GRACE; PENDING and effective EXPIRED throw.
  *
- * This is the actual security boundary: it rejects direct mutating API calls against
- * EXPIRED or PENDING tenants independent of JWT/session token staleness.
+ * Rejects direct mutating API calls independent of JWT/session staleness and
+ * of any page redirect. Locking depends on NO cron job: a tenant is locked
+ * exactly when expiresAt + grace passes, evaluated live on every request.
  *
- * Throws SubscriptionLockedError if the tenant is EXPIRED, PENDING, or not found.
+ * Throws SubscriptionLockedError if the tenant is locked or not found.
+ * Never caches across calls.
  */
 export async function assertTenantWritable(
   tenantId: string
 ): Promise<TenantSubscriptionStatus> {
-  const status = await getFreshTenantStatus(tenantId);
-  if (status !== "ACTIVE") {
-    throw new SubscriptionLockedError(status);
+  const db = getTenantDb(tenantId);
+  const tenant = await db.tenant.findUnique({
+    where: { id: tenantId },
+    select: { subscriptionStatus: true, expiresAt: true },
+  });
+  if (!tenant) {
+    throw new SubscriptionLockedError(null);
   }
-  return status;
+  const effective = getEffectiveTenantStatus(
+    { subscriptionStatus: tenant.subscriptionStatus, expiresAt: tenant.expiresAt },
+    new Date()
+  );
+  if (!effective.writable) {
+    throw new SubscriptionLockedError(tenant.subscriptionStatus);
+  }
+  return tenant.subscriptionStatus;
+}
+
+/**
+ * [T6c] Fresh effective status for callers that need the computed value
+ * (sync's per-item D10 rule) rather than just the throw/no-throw gate.
+ */
+export async function getFreshEffectiveStatus(tenantId: string) {
+  const db = getTenantDb(tenantId);
+  const tenant = await db.tenant.findUnique({
+    where: { id: tenantId },
+    select: { subscriptionStatus: true, expiresAt: true },
+  });
+  if (!tenant) return null;
+  return getEffectiveTenantStatus(
+    { subscriptionStatus: tenant.subscriptionStatus, expiresAt: tenant.expiresAt },
+    new Date()
+  );
 }
 
 /**
@@ -85,29 +121,43 @@ export async function getFreshExchangeRate(
 }
 
 /**
- * T6a — named, narrow lockout-exemption list for the subscription checkout
- * API surface. These paths are deliberately allowed for PENDING/EXPIRED
- * tenants because that surface's whole purpose is to let a locked merchant
- * create a subscription request and upload a receipt to unlock.
+ * [T6c] THE lockout exemption list — one named constant. Routes/pages that
+ * must stay reachable when the tenant is locked, so a lapsed merchant can
+ * always (a) pay/renew and (b) retrieve their own data:
+ *   - billing routes (T6a checkout surface, API + pages)
+ *   - /account-locked (the lockout explanation screen itself)
+ *   - auth routes (/login, /register, NextAuth internals)
+ *   - the data-export surface (T7 item 6: /api/export/* + /settings/export)
  *
- * This is NOT a weakening of assertTenantWritable(): every route on this
- * list simply does NOT call assertTenantWritable(). Every other mutating
- * route continues to call it unconditionally. The list exists so the
- * exemption is explicit, auditable, and confined to exactly these prefixes
- * rather than scattered or implicit.
+ * A merchant whose subscription lapsed can always retrieve their own data
+ * and pay. Anything NOT on this list keeps calling assertTenantWritable().
  */
 export const SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES = [
   "/api/billing/subscriptions",
   "/api/billing/status",
+  "/api/tenant/status",
+  "/api/export",
+] as const;
+
+/** Page (non-API) prefixes covered by the same exemption policy. */
+export const SUBSCRIPTION_LOCKOUT_EXEMPT_PAGE_PREFIXES = [
+  "/settings/billing",
+  "/dashboard/settings/billing",
+  "/account-locked",
+  "/settings/export",
+  "/dashboard/settings/export",
+  "/login",
+  "/register",
 ] as const;
 
 /**
- * True when `pathname` is one of the T6a subscription-checkout API routes
- * that are exempt from the EXPIRED/PENDING write block. Such routes still
- * require an authenticated ADMIN session and a fresh isActive user check.
+ * True when `pathname` is exempt from the locked-tenant write/redirect block
+ * (API or page). Such routes still require an authenticated session and a
+ * fresh isActive user check — exemption is from the SUBSCRIPTION lock only.
  */
 export function isLockoutExemptPath(pathname: string): boolean {
-  return SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES.some(
+  const all = [...SUBSCRIPTION_LOCKOUT_EXEMPT_API_PREFIXES, ...SUBSCRIPTION_LOCKOUT_EXEMPT_PAGE_PREFIXES];
+  return all.some(
     (prefix) => pathname === prefix || pathname.startsWith(prefix + "/")
   );
 }
