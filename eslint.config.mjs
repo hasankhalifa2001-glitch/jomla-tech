@@ -580,6 +580,7 @@ const eslintConfig = defineConfig([
       "prisma/seed.ts",
       "app/(dashboard)/admin/**",
       "app/api/admin/**",
+      "app/admin/**",
       // [T6b Phase 1] The typed platform gateway (raw client behind a
       // branded PlatformAdminContext) and its sole consumer. app/api/admin/**
       // is already listed above; lib/auth/platform-admin.ts needs no entry
