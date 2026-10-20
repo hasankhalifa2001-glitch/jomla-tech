@@ -52,6 +52,9 @@ export const STORE_ERROR = {
   // retry, distinct from a generic INTERNAL_ERROR. The transaction is fully
   // rolled back and the order stays PENDING_REVIEW.
   TX_RETRY: "TX_RETRY",
+  // [T6b — additive] Subscription approval: the request has no receipt image,
+  // so adoption cannot proceed until the merchant uploads one.
+  RECEIPT_REQUIRED: "RECEIPT_REQUIRED",
 } as const;
 
 export type StoreErrorCode = (typeof STORE_ERROR)[keyof typeof STORE_ERROR];

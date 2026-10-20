@@ -531,3 +531,376 @@ export async function getSubscriptionReceiptKey(
     if (!row) throw new SubscriptionNotFoundError();
     return { tenantId: row.tenantId, receiptKey: row.receiptImageURL ?? null };
 }
+
+// ============================================================================
+// [T6b Phase 3] Super-Admin subscription approve / reject (mutating).
+// One $transaction per action, top-level calls only, every write carries an
+// explicit id or tenantId — the platform gateway has no tenant-scope
+// extension, so isolation is structural here, not inherited.
+// ============================================================================
+
+export class SubscriptionDomainError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "SubscriptionDomainError";
+    }
+}
+
+export class SubscriptionReceiptRequiredError extends SubscriptionDomainError {
+    constructor() {
+        super("الإيصال مطلوب لاعتماد الطلب.");
+        this.name = "SubscriptionReceiptRequiredError";
+    }
+}
+
+export class SubscriptionAlreadyReviewedError extends SubscriptionDomainError {
+    constructor() {
+        super("تمت مراجعة هذا الطلب مسبقاً.");
+        this.name = "SubscriptionAlreadyReviewedError";
+    }
+}
+
+export interface ApproveSubscriptionInput {
+    reviewedByUserId: string;
+    now: Date;
+}
+
+export interface ApproveSubscriptionResult {
+    id: string;
+    tenantId: string;
+    newExpiresAt: string;
+}
+
+/**
+ * Approve a PENDING_APPROVAL subscription request.
+ *
+ * Order inside the transaction (top-level calls only), per T6b spec:
+ *   a. Claim updateMany (PENDING_APPROVAL + receipt present) -> ACTIVE.
+ *   b. count !== 1 -> findUnique to distinguish 404 / RECEIPT_REQUIRED /
+ *      ALREADY_REVIEWED (zero side effects, tx rolls back).
+ *   c. Read tenant fresh; compute newExpiresAt from the row's FROZEN
+ *      durationDays (never the live config) per D6.
+ *   d. subscription.update expiresAt = newExpiresAt.
+ *   e. tenant.update subscriptionStatus ACTIVE, expiresAt = newExpiresAt.
+ *   f. Expire the tenant's other ACTIVE subscription rows (folded coverage).
+ * Any failure rolls back everything, including the claim.
+ */
+export async function approveSubscription(
+    ctx: PlatformAdminContext,
+    id: string,
+    input: ApproveSubscriptionInput
+): Promise<ApproveSubscriptionResult> {
+    const db: PlatformDb = getPlatformDb(ctx);
+    const { reviewedByUserId, now } = input;
+
+    const { tenantId, newExpiresAt } = await db.$transaction(async (tx) => {
+        // a. Claim.
+        const claim = await tx.subscription.updateMany({
+            where: {
+                id,
+                status: "PENDING_APPROVAL",
+                receiptImageURL: { not: null },
+            },
+            data: {
+                status: "ACTIVE",
+                reviewedByUserId,
+                reviewedAt: now,
+            },
+        });
+
+        // count !== 1 -> classify without any side effects.
+        if (claim.count !== 1) {
+            const row = await tx.subscription.findUnique({ where: { id } });
+            if (!row) throw new SubscriptionNotFoundError();
+            if (row.receiptImageURL == null) throw new SubscriptionReceiptRequiredError();
+            throw new SubscriptionAlreadyReviewedError();
+        }
+
+        // The claim set status to ACTIVE but left tenantId / durationDays intact.
+        const row = await tx.subscription.findUnique({ where: { id } });
+        if (!row) throw new SubscriptionNotFoundError();
+        const durationDays = row.durationDays;
+
+        // b. Read tenant fresh; compute newExpiresAt per D6 using the
+        // row's FROZEN durationDays (never the live config).
+        const tenant = await tx.tenant.findUnique({ where: { id: row.tenantId } });
+        if (!tenant) throw new SubscriptionNotFoundError();
+
+        // D6: max(now, future tenant expiry) + frozen durationDays.
+        const newExpiresAt = previewNewExpiry({ now, tenantExpiresAt: tenant.expiresAt, durationDays });
+
+        // c. subscription.update -> expiresAt = newExpiresAt.
+        await tx.subscription.update({
+            where: { id },
+            data: { expiresAt: newExpiresAt },
+        });
+
+        // d. tenant.update -> subscriptionStatus ACTIVE, expiresAt = newExpiresAt.
+        await tx.tenant.update({
+            where: { id: row.tenantId },
+            data: { subscriptionStatus: "ACTIVE", expiresAt: newExpiresAt },
+        });
+
+        // e. Fold the tenant's other ACTIVE coverage into the single expiry.
+        await tx.subscription.updateMany({
+            where: { tenantId: row.tenantId, status: "ACTIVE", id: { not: id } },
+            data: { status: "EXPIRED" },
+        });
+
+        return { tenantId: row.tenantId, newExpiresAt };
+    });
+
+    return {
+        id,
+        tenantId,
+        newExpiresAt: newExpiresAt.toISOString(),
+    };
+}
+
+export interface RejectSubscriptionInput {
+    reason: string;
+    reviewedByUserId: string;
+    now: Date;
+}
+
+/**
+ * Reject a PENDING_APPROVAL subscription request. Writes ONLY
+ * status / rejectionReason / reviewedByUserId / reviewedAt; the Tenant is
+ * untouched. Works with or without a receipt.
+ */
+export async function rejectSubscription(
+    ctx: PlatformAdminContext,
+    id: string,
+    input: RejectSubscriptionInput
+): Promise<void> {
+    const db: PlatformDb = getPlatformDb(ctx);
+    const { reason, reviewedByUserId, now } = input;
+
+    await db.$transaction(async (tx) => {
+        const claim = await tx.subscription.updateMany({
+            where: { id, status: "PENDING_APPROVAL" },
+            data: {
+                status: "REJECTED",
+                rejectionReason: reason,
+                reviewedByUserId,
+                reviewedAt: now,
+            },
+        });
+        if (claim.count !== 1) {
+            const row = await tx.subscription.findUnique({ where: { id } });
+            if (!row) throw new SubscriptionNotFoundError();
+            throw new SubscriptionAlreadyReviewedError();
+        }
+    });
+}
+
+// ============================================================================
+// [T6b Phase 3] Super-Admin catalog reports.
+// ProductCatalogEntry and ProductCatalogEntryReport are platform-wide (no
+// tenantId column — not in TENANT_SCOPED_MODELS), so they are read/written
+// through the same platform gateway with an explicit `where` on every call.
+// ============================================================================
+
+export class CatalogReportNotFoundError extends SubscriptionDomainError {
+    constructor() {
+        super("البلاغ غير موجود.");
+        this.name = "CatalogReportNotFoundError";
+    }
+}
+
+export class CatalogReportAlreadyProcessedError extends SubscriptionDomainError {
+    constructor() {
+        super("تمت معالجة هذا البلاغ مسبقاً.");
+        this.name = "CatalogReportAlreadyProcessedError";
+    }
+}
+
+export type CatalogReportStatus = "PENDING" | "RESOLVED" | "DISMISSED";
+
+export interface CatalogReportEntry {
+    id: string;
+    name: string;
+    category: string | null;
+    imageUrl: string | null;
+    addedByTenantId: string;
+}
+
+export interface CatalogReportRow {
+    id: string;
+    catalogEntryId: string;
+    reportedByTenantId: string;
+    reason: string;
+    suggestedName: string | null;
+    suggestedCategory: string | null;
+    suggestedImageUrl: string | null;
+    status: CatalogReportStatus;
+    createdAt: string;
+    resolvedAt: string | null;
+    entry: CatalogReportEntry;
+}
+
+export interface CatalogReportPage {
+    items: CatalogReportRow[];
+    nextCursor: string | null;
+}
+
+export interface ListCatalogReportsInput {
+    status?: unknown;
+    cursor?: unknown;
+    limit?: unknown;
+}
+
+const REPORT_STATUSES: readonly CatalogReportStatus[] = ["PENDING", "RESOLVED", "DISMISSED"];
+
+function parseReportStatus(raw: unknown): CatalogReportStatus {
+    if (typeof raw === "string" && (REPORT_STATUSES as readonly string[]).includes(raw)) {
+        return raw as CatalogReportStatus;
+    }
+    return "PENDING";
+}
+
+export async function listCatalogReports(
+    ctx: PlatformAdminContext,
+    input: ListCatalogReportsInput
+): Promise<CatalogReportPage> {
+    const status = parseReportStatus(input.status);
+    const limit = parseQueueLimit(input.limit);
+    const rawCursor = typeof input.cursor === "string" && input.cursor.length > 0 ? input.cursor : null;
+    const cursor = rawCursor ? decodeSubscriptionCursor(rawCursor) : null;
+    const db: PlatformDb = getPlatformDb(ctx);
+
+    const ands: Array<Record<string, unknown>> = [];
+    if (cursor) {
+        const curDate = new Date(cursor.createdAtMs);
+        ands.push({ OR: [{ createdAt: { lt: curDate } }, { createdAt: { equals: curDate }, id: { lt: cursor.id } }] });
+    }
+    const where: Record<string, unknown> = { status };
+    if (ands.length > 0) where.AND = ands;
+
+    const [rows] = await Promise.all([
+        db.productCatalogEntryReport.findMany({
+            where,
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+            take: limit + 1,
+            select: {
+                id: true, catalogEntryId: true, reportedByTenantId: true, reason: true,
+                suggestedName: true, suggestedCategory: true, suggestedImageUrl: true,
+                status: true, createdAt: true, resolvedAt: true,
+            },
+        }),
+    ]);
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const entryIds = [...new Set(page.map((r) => r.catalogEntryId))];
+    const entryMap = new Map<string, CatalogReportEntry>();
+    if (entryIds.length > 0) {
+        const entries = await db.productCatalogEntry.findMany({
+            where: { id: { in: entryIds } },
+            select: { id: true, name: true, category: true, imageUrl: true, addedByTenantId: true },
+        });
+        for (const e of entries) entryMap.set(e.id, e);
+    }
+
+    const items: CatalogReportRow[] = page.map((r) => {
+        const created = r.createdAt instanceof Date ? r.createdAt : new Date(r.createdAt as unknown as string);
+        return {
+            id: r.id,
+            catalogEntryId: r.catalogEntryId,
+            reportedByTenantId: r.reportedByTenantId,
+            reason: r.reason,
+            suggestedName: r.suggestedName,
+            suggestedCategory: r.suggestedCategory,
+            suggestedImageUrl: r.suggestedImageUrl,
+            status: r.status as CatalogReportStatus,
+            createdAt: toIso(created),
+            resolvedAt: r.resolvedAt ? toIso(r.resolvedAt as Date) : null,
+            entry: entryMap.get(r.catalogEntryId) ?? {
+                id: r.catalogEntryId,
+                name: "—",
+                category: null,
+                imageUrl: null,
+                addedByTenantId: "",
+            },
+        };
+    });
+    const last = page[page.length - 1];
+    const nextCursor = hasMore && last ? encodeSubscriptionCursor(toIso(last.createdAt as Date), last.id) : null;
+    return { items, nextCursor };
+}
+
+export interface ResolveCatalogReportInput {
+    apply: boolean;
+    now: Date;
+}
+
+/**
+ * Resolve a PENDING catalog report. Conditional updateMany WHERE status =
+ * 'PENDING'; count 0 -> read the row to distinguish 404 from 409. When
+ * apply is true, apply only the non-null suggested fields to the catalog
+ * entry via a top-level update (the entry is never touched otherwise).
+ */
+export async function resolveCatalogReport(
+    ctx: PlatformAdminContext,
+    id: string,
+    input: ResolveCatalogReportInput
+): Promise<void> {
+    const db: PlatformDb = getPlatformDb(ctx);
+    const now = input.now;
+
+    await db.$transaction(async (tx) => {
+        const updated = await tx.productCatalogEntryReport.updateMany({
+            where: { id, status: "PENDING" },
+            data: { status: "RESOLVED", resolvedAt: now },
+        });
+        if (updated.count !== 1) {
+            const row = await tx.productCatalogEntryReport.findUnique({ where: { id } });
+            if (!row) throw new CatalogReportNotFoundError();
+            throw new CatalogReportAlreadyProcessedError();
+        }
+        if (!input.apply) return;
+
+        const row = await tx.productCatalogEntryReport.findUnique({ where: { id } });
+        if (!row) throw new CatalogReportNotFoundError();
+        const data: Record<string, unknown> = {};
+        if (row.suggestedName != null) data.name = row.suggestedName;
+        if (row.suggestedCategory != null) data.category = row.suggestedCategory;
+        if (row.suggestedImageUrl != null) data.imageUrl = row.suggestedImageUrl;
+        if (Object.keys(data).length > 0) {
+            await tx.productCatalogEntry.update({
+                where: { id: row.catalogEntryId },
+                data,
+            });
+        }
+    });
+}
+
+export interface DismissCatalogReportInput {
+    now: Date;
+}
+
+/**
+ * Dismiss a PENDING catalog report. Conditional updateMany WHERE status =
+ * 'PENDING'; count 0 -> read the row to distinguish 404 from 409. The
+ * catalog entry is never touched.
+ */
+export async function dismissCatalogReport(
+    ctx: PlatformAdminContext,
+    id: string,
+    input: DismissCatalogReportInput
+): Promise<void> {
+    const db: PlatformDb = getPlatformDb(ctx);
+    const now = input.now;
+
+    await db.$transaction(async (tx) => {
+        const updated = await tx.productCatalogEntryReport.updateMany({
+            where: { id, status: "PENDING" },
+            data: { status: "DISMISSED", resolvedAt: now },
+        });
+        if (updated.count !== 1) {
+            const row = await tx.productCatalogEntryReport.findUnique({ where: { id } });
+            if (!row) throw new CatalogReportNotFoundError();
+            throw new CatalogReportAlreadyProcessedError();
+        }
+    });
+}
