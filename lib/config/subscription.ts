@@ -119,3 +119,6 @@ export function getTierConfig(tier: string) {
     ? SUBSCRIPTION_TIERS[tier]
     : undefined;
 }
+
+
+export const SUBSCRIPTION_OFFER_EXPIRED_REASON = "انتهت صلاحية العرض دون إرفاق إيصال.";

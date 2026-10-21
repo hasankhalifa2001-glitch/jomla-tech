@@ -587,6 +587,9 @@ const eslintConfig = defineConfig([
       // (getTenantDb only, no raw import).
       "lib/db/platform.ts",
       "lib/data/platform-admin.ts",
+      // [T6c §5] Cross-tenant daily reconciliation cron (no session/tenantId;
+      // every query needs the raw client inside a single prisma.$transaction).
+      "lib/data/subscription-reconcile.ts",
       "app/api/sync/**",
       // [T5] The B2B order approval route is a category-5 raw-client call
       // site: it must call lockBatchesForFifoAllocations(), which is typed to

@@ -37,6 +37,7 @@ const { prismaMock } = vi.hoisted(() => {
     subscription: {
       updateMany: vi.fn(),
     },
+    $transaction: vi.fn(async (fn: any) => fn(prismaMock)),
   };
   return { prismaMock };
 });
@@ -48,6 +49,7 @@ vi.mock("@/lib/db", () => ({
 vi.mock("@/lib/config/subscription", () => ({
   SUBSCRIPTION_GRACE_DAYS: 5,
   SUBSCRIPTION_OFFER_VALIDITY_HOURS: 24,
+  SUBSCRIPTION_OFFER_EXPIRED_REASON: "انتهت صلاحية العرض دون إرفاق إيصال.",
 }));
 
 import { GET as cronGet } from "@/app/api/cron/reconcile-subscriptions/route";
