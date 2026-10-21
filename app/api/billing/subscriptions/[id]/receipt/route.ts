@@ -139,9 +139,21 @@ export async function POST(
   }
 
   if (receiptRatelimit) {
-    const { success, reset } = await receiptRatelimit.limit(
-      subscriptionRateLimitKey(tenantId)
-    );
+    let success = false;
+    let reset = 0;
+    try {
+      ({ success, reset } = await receiptRatelimit.limit(subscriptionRateLimitKey(tenantId)));
+    } catch (error) {
+      // An Upstash outage must not become an unformatted 500.
+      console.error("[billing/receipt] rate limiter unavailable:", error);
+      return NextResponse.json(
+        {
+          error: "RATE_LIMIT_UNAVAILABLE",
+          message: "خدمة تحديد المعدل غير متاحة حالياً، رجاءً جرب لاحقاً.",
+        },
+        { status: 503 }
+      );
+    }
     if (!success) {
       const retryAfter = Math.max(1, Math.ceil((reset - Date.now()) / 1000));
       return NextResponse.json(

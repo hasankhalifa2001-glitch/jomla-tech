@@ -292,6 +292,10 @@ export function BillingCheckout(props: {
         });
         if (fileRef.current) fileRef.current.value = "";
         await refresh();
+        if (res.status === 409) {
+          toast.error("تم تحديث الطلب، أعد المحاولة");
+          await refresh();
+        }
       } else {
         toast.error(data?.message || "حدث خطأ أثناء رفع الإيصال.");
         await refresh();

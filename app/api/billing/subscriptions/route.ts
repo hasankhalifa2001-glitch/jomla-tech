@@ -138,9 +138,20 @@ export async function POST(req: Request) {
   // Per-tenant rate limit. Skipped only outside production; in production a
   // missing limiter fails closed instead of silently disabling the control.
   if (subscribeRatelimit) {
-    const { success, reset } = await subscribeRatelimit.limit(
-      subscriptionRateLimitKey(tenantId)
-    );
+    let success = false;
+    let reset = 0;
+    try {
+      ({ success, reset } = await subscribeRatelimit.limit(subscriptionRateLimitKey(tenantId)));
+    } catch (error) {
+      console.error("[billing/subscriptions] rate limiter unavailable:", error);
+      return NextResponse.json(
+        {
+          error: "RATE_LIMIT_UNAVAILABLE",
+          message: "خدمة تحديد المعدل غير متاحة حالياً، رجاءً جرب لاحقاً.",
+        },
+        { status: 503 }
+      );
+    }
     if (!success) {
       const retryAfter = Math.max(1, Math.ceil((reset - Date.now()) / 1000));
       return NextResponse.json(
