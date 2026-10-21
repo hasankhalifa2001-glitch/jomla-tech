@@ -43,6 +43,21 @@ const DEFS = vi.hoisted(() => {
     if (!t) throw new Error("nf");
     Object.assign(t, a.data); return t;
   });
+  /** CAS tenant.updateMany: matches only when where.expiresAt equals the stored value. */
+  tenD.updateMany = vi.fn(async (a: any) => {
+    const w = a?.where ?? {};
+    const t = S.tenants.find((x: any) => x.id === w.id);
+    if (!t) return { count: 0 };
+    const wanted = w.expiresAt;
+    const stored = t.expiresAt;
+    let match: boolean;
+    if (wanted === undefined) match = true;
+    else if (wanted === null) match = stored === null;
+    else match = stored != null && new Date(stored).getTime() === new Date(wanted).getTime();
+    if (!match) return { count: 0 };
+    Object.assign(t, a.data);
+    return { count: 1 };
+  });
   const usrD: any = {};
   usrD.findFirst = vi.fn(async (a: any) => S.users[S.session?.user?.tenantId]?.[a?.where?.id] ?? null);
   const repD: any = {};
@@ -90,6 +105,7 @@ import { resolveCatalogReport, dismissCatalogReport } from "@/lib/data/platform-
 import { CatalogReportNotFoundError } from "@/lib/data/platform-admin";
 import { CatalogReportAlreadyProcessedError } from "@/lib/data/platform-admin";
 import { setPlatformRate, InvalidPlatformRateError } from "@/lib/data/platform-admin";
+import { STORE_ERROR } from "@/lib/config/storefront";
 const PLAT = "tenant-platform";
 const AID = "admin-platform";
 const DAY = 86400e3;
@@ -170,6 +186,15 @@ describe("approve", () => {
     expect(race.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     await expect(approveSubscription(ctx, "nope", { reviewedByUserId: AID, now: new Date() })).rejects.toBeInstanceOf(SubscriptionNotFoundError);
     for (const bad of [{}, { reason: "ab" }]) expect((await rejectH(pReq(bad), pFor("s-new"))).status).toBe(400);
+  });
+  it("tenant CAS mismatch -> 409 TX_RETRY retry message", async () => {
+    DEFS.tenD.updateMany.mockResolvedValueOnce({ count: 0 });
+    const res = await approveH(pReq(), pFor("s-new"));
+    expect(res.status).toBe(409);
+    const j = await res.json();
+    expect(j.code).toBe(STORE_ERROR.TX_RETRY);
+    expect(typeof j.message).toBe("string");
+    expect(j.message.length).toBeGreaterThan(0);
   });
 });
 describe("reject+rate+catalog", () => {

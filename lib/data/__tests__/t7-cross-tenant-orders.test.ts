@@ -27,6 +27,15 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
+import {
+  GET as adminListHandler,
+} from "@/app/api/admin/subscriptions/route";
+import {
+  GET as adminDetailHandler,
+} from "@/app/api/admin/subscriptions/[id]/route";
+import {
+  GET as adminReceiptHandler,
+} from "@/app/api/admin/subscriptions/[id]/receipt/route";
 
 const TENANT_A = "tenant-A";
 const TENANT_B = "tenant-B";
@@ -125,6 +134,14 @@ const { mockSession, mockDb, mockWritable } = vi.hoisted(() => {
     const mockDb: any = {
         b2BOrderRequest, b2BOrderRequestItem, customer, verifiedRetailer,
         productUnit, productBatch, product: { findMany: vi.fn(async () => []) },
+        user: {
+            findFirst: vi.fn(async (args: any) => {
+                const id = args?.where?.id;
+                if (id === "admin-platform") return { id: "admin-platform", tenantId: "tenant-platform", isActive: true, isPlatformAdmin: true };
+                if (id === "admin-B") return { id: "admin-B", tenantId: TENANT_B, isActive: true, isPlatformAdmin: false };
+                return null;
+            }),
+        },
     };
     mockDb.$transaction = vi.fn(async (cb: any) => cb(mockDb));
     const mockWritable = vi.fn(async (_tenantId: string) => "ACTIVE");
@@ -148,6 +165,74 @@ vi.mock("@/lib/auth/tenant", async (importOriginal) => {
     const actual = await importOriginal<any>();
     return { ...actual, assertTenantWritable: mockWritable };
 });
+const PLATFORM_TENANT = "tenant-platform";
+const ADMIN_PLATFORM = "admin-platform";
+const ADMIN_B = "admin-B";
+// Platform-wide subscription + tenant data, readable ONLY through the platform gateway.
+const PLAT_SUBS = [
+    { id: "sub-a", tenantId: TENANT_A, tier: "monthly", durationDays: 30, amountSYP: "300000", amountUSD: "10", referenceCode: "REF-A", exchangeRateUsed: "30000", status: "PENDING_APPROVAL", receiptImageURL: "k-a", createdAt: new Date("2026-10-20T10:00:00.000Z"), updatedAt: new Date("2026-10-20T10:00:00.000Z") },
+    { id: "sub-b", tenantId: TENANT_B, tier: "yearly", durationDays: 365, amountSYP: "3000000", amountUSD: "100", referenceCode: "REF-B", exchangeRateUsed: "30000", status: "PENDING_APPROVAL", receiptImageURL: "k-b", createdAt: new Date("2026-10-20T11:00:00.000Z"), updatedAt: new Date("2026-10-20T11:00:00.000Z") },
+];
+const PLAT_TENANTS = [
+    { id: TENANT_A, name: "متجر أ", slug: "tenant-a", phone: "0944123456", subscriptionStatus: "PENDING", expiresAt: null },
+    { id: TENANT_B, name: "متجر ب", slug: "tenant-b", phone: "0944333333", subscriptionStatus: "PENDING", expiresAt: null },
+    { id: PLATFORM_TENANT, name: "المنصة الداخلية", slug: "platform-internal", phone: null, subscriptionStatus: "ACTIVE", expiresAt: null, dailyExchangeRate: "30000" },
+];
+vi.mock("@/lib/db/platform", () => ({
+    getPlatformDb: vi.fn(() => ({
+        subscription: {
+            findMany: vi.fn(async (args: any) => {
+                const w = args?.where ?? {};
+                let rows = [...PLAT_SUBS];
+                if (w.status) rows = rows.filter((r) => r.status === w.status);
+                if (w.tenantId) {
+                    if (w.tenantId.in) rows = rows.filter((r) => (w.tenantId.in as string[]).includes(r.tenantId));
+                    else rows = rows.filter((r) => r.tenantId === w.tenantId);
+                }
+                if (w.OR) {
+                    rows = rows.filter((r) => w.OR.some((b: any) => {
+                        if (b.referenceCode?.contains) return String(r.referenceCode).toUpperCase().includes(String(b.referenceCode.contains).toUpperCase());
+                        if (b.tenantId?.in) return (b.tenantId.in as string[]).includes(r.tenantId);
+                        return false;
+                    }));
+                }
+                const ord = args?.orderBy;
+                if (Array.isArray(ord)) {
+                    rows = [...rows].sort((x, y) => {
+                        for (const key of ord) {
+                            const f = Object.keys(key)[0];
+                            const dir = (key as any)[f] === "desc" ? -1 : 1;
+                            if (f === "createdAt") { const d = y.createdAt.getTime() - x.createdAt.getTime(); if (d !== 0) return d * dir; }
+                            else if (f === "id") { const d = x.id < y.id ? -1 : x.id > y.id ? 1 : 0; if (d !== 0) return d * dir; }
+                        }
+                        return 0;
+                    });
+                }
+                const take = args?.take;
+                if (take) rows = rows.slice(0, take);
+                return rows;
+            }),
+            count: vi.fn(async (args: any) => {
+                const w = args?.where ?? {};
+                return PLAT_SUBS.filter((r) => w.status ? r.status === w.status : true).length;
+            }),
+            findUnique: vi.fn(async (args: any) => PLAT_SUBS.find((r) => r.id === args?.where?.id) ?? null),
+        },
+        tenant: {
+            findMany: vi.fn(async (args: any) => {
+                const w = args?.where ?? {};
+                if (w.id?.in) return PLAT_TENANTS.filter((t) => (w.id.in as string[]).includes(t.id));
+                return [...PLAT_TENANTS];
+            }),
+            findUnique: vi.fn(async (args: any) => {
+                const w = args?.where ?? {};
+                if (w.id) return PLAT_TENANTS.find((t) => t.id === w.id) ?? null;
+                if (w.slug) return PLAT_TENANTS.find((t) => t.slug === w.slug) ?? null;
+                return null;
+            }),
+        },
+    })),
+}));
 
 import { GET as listHandler } from "@/app/api/orders/route";
 import { GET as detailHandler } from "@/app/api/orders/[id]/route";
@@ -159,8 +244,16 @@ import { POST as approveHandler } from "@/app/api/orders/[id]/approve/route";
 function setSession(role: "ADMIN" | "CASHIER") {
     mockSession.current = { user: { id: ADMIN_A, role, tenantId: TENANT_A } };
 }
+function setPlatformAdminSession() {
+    mockSession.current = { user: { id: ADMIN_PLATFORM, role: "ADMIN", tenantId: PLATFORM_TENANT } };
+}
+function setNonPlatformAdminSession() {
+    mockSession.current = { user: { id: ADMIN_B, role: "ADMIN", tenantId: TENANT_B } };
+}
 const listReq = (q = "") => new NextRequest(q ? `http://localhost/api/orders?${q}` : "http://localhost/api/orders");
 const detailCtx = (id: string) => ({ params: Promise.resolve({ id }) });
+const adminListReq = (q = "") => new NextRequest(q ? `http://localhost/api/admin/subscriptions?${q}` : "http://localhost/api/admin/subscriptions");
+const adminDetailCtx = (id: string) => ({ params: Promise.resolve({ id }) });
 const rejectReq = (id: string, body: unknown) =>
     new Request(`http://localhost/api/orders/${id}/reject`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -332,4 +425,44 @@ it("retailer signal exposes only {hasPriorApproval, verificationCount}", async (
     const j: any = await res.json();
     expect(Object.keys(j.order.signal).sort()).toEqual(["hasPriorApproval", "verificationCount"]);
     expect(JSON.stringify(j)).not.toContain("متجر آخر");
+});
+
+describe("T7 cross-tenant isolation — T6b admin subscription APIs", () => {
+    it("platform admin list reads subscriptions across ALL tenants (not just own)", async () => {
+        setPlatformAdminSession();
+        const res = await adminListHandler(adminListReq());
+        expect(res.status).toBe(200);
+        const j: any = await res.json();
+        const ids = j.items.map((r: any) => r.id);
+        expect(ids).toContain("sub-a");
+        expect(ids).toContain("sub-b");
+        // Each row carries its own tenant id (not the platform tenant).
+        const subA = j.items.find((r: any) => r.id === "sub-a");
+        const subB = j.items.find((r: any) => r.id === "sub-b");
+        expect(subA.tenant.id).toBe(TENANT_A);
+        expect(subB.tenant.id).toBe(TENANT_B);
+    });
+    it("platform admin detail reads a foreign tenant's subscription", async () => {
+        setPlatformAdminSession();
+        const res = await adminDetailHandler(new Request("http://localhost/x"), adminDetailCtx("sub-b"));
+        expect(res.status).toBe(200);
+        const j: any = await res.json();
+        expect(j.subscription.id).toBe("sub-b");
+        expect(j.subscription.tenant.id).toBe(TENANT_B);
+    });
+    it("non-platform ADMIN of tenant B gets 403 on /api/admin/subscriptions and never sees tenant A data", async () => {
+        setNonPlatformAdminSession();
+        const res = await adminListHandler(adminListReq());
+        expect(res.status).toBe(403);
+    });
+    it("non-platform ADMIN of tenant B gets 403 on /api/admin/subscriptions/[id]", async () => {
+        setNonPlatformAdminSession();
+        const res = await adminDetailHandler(new Request("http://localhost/x"), adminDetailCtx("sub-a"));
+        expect(res.status).toBe(403);
+    });
+    it("non-platform ADMIN of tenant B gets 403 on /api/admin/subscriptions/[id]/receipt", async () => {
+        setNonPlatformAdminSession();
+        const res = await adminReceiptHandler(new Request("http://localhost/x"), adminDetailCtx("sub-a"));
+        expect(res.status).toBe(403);
+    });
 });

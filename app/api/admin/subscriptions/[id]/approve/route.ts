@@ -19,6 +19,7 @@ import {
     SubscriptionAlreadyReviewedError,
     SubscriptionNotFoundError,
     SubscriptionReceiptRequiredError,
+    ConcurrentTenantUpdateError,
 } from "@/lib/data/platform-admin";
 import { STORE_ERROR } from "@/lib/config/storefront";
 
@@ -67,6 +68,15 @@ export async function POST(
         if (error instanceof SubscriptionAlreadyReviewedError) {
             return NextResponse.json(
                 { code: STORE_ERROR.ALREADY_REVIEWED, message: error.message },
+                { status: 409 }
+            );
+        }
+        if (error instanceof ConcurrentTenantUpdateError) {
+            return NextResponse.json(
+                {
+                    code: STORE_ERROR.TX_RETRY,
+                    message: "تم تحديث اشتراك المتجر بالتزامن مع عملية أخرى. أعد المحاولة.",
+                },
                 { status: 409 }
             );
         }
