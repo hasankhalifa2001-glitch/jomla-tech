@@ -12,13 +12,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ARABIC_REASON = "انتهى الاشتراك قبل تسجيل هذه العملية";
 
-// Fixed "now": 2026-10-20. Tenant expired 2026-10-10 → lockAt 2026-10-15.
-const EXPIRES_AT = new Date("2026-10-10T12:00:00.000Z");
-const LOCK_AT = new Date("2026-10-15T12:00:00.000Z");
-const PRE_LOCK = "2026-10-12T10:00:00.000Z";
-const POST_LOCK = "2026-10-18T10:00:00.000Z";
-
-const { mockSessionState, tenantRow, calls } = vi.hoisted(() => {
+const { mockSessionState, tenantRow, calls, EXPIRES_AT, LOCK_AT, PRE_LOCK, POST_LOCK } = vi.hoisted(() => {
+  // Fixed "now": 2026-10-20. Tenant expired 2026-10-10 → lockAt 2026-10-15.
+  const EXPIRES_AT = new Date("2026-10-10T12:00:00.000Z");
+  const LOCK_AT = new Date("2026-10-15T12:00:00.000Z");
+  const PRE_LOCK = "2026-10-12T10:00:00.000Z";
+  const POST_LOCK = "2026-10-18T10:00:00.000Z";
   const calls: { customers: any[]; invoices: any[]; payments: any[] } = {
     customers: [],
     invoices: [],
@@ -33,6 +32,10 @@ const { mockSessionState, tenantRow, calls } = vi.hoisted(() => {
     },
     tenantRow,
     calls,
+    EXPIRES_AT,
+    LOCK_AT,
+    PRE_LOCK,
+    POST_LOCK,
   };
 });
 

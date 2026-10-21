@@ -213,4 +213,28 @@ describe("T7 cross-tenant billing isolation", () => {
     expect(body.openRequest).toBeNull();
     expect(body.recentRequests).toEqual([]);
   });
+
+  describe("T6c — lockout exemption with cross-tenant isolation", () => {
+    it("locked tenant A can still reach billing status (exemption) but never tenant B rows", async () => {
+      // Tenant A is locked (EXPIRED, past grace).
+      S.tenants[TENANT_A] = {
+        subscriptionStatus: "EXPIRED",
+        dailyExchangeRate: "11500",
+        expiresAt: new Date("2026-01-01T00:00:00.000Z"),
+      };
+      setSession(TENANT_A);
+
+      // Billing status must still work for a locked tenant (exemption).
+      const statusA = await (await getBillingStatus()).json();
+      expect(statusA.openRequest).toBeNull();
+
+      // Tenant A must NOT see tenant B's subscription requests.
+      setSession(TENANT_B);
+      seedSub(TENANT_B);
+      setSession(TENANT_A);
+      const statusA2 = await (await getBillingStatus()).json();
+      expect(statusA2.recentRequests).toEqual([]);
+      expect(statusA2.openRequest).toBeNull();
+    });
+  });
 });
