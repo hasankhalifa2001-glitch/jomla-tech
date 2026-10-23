@@ -239,7 +239,7 @@ export function SubscriptionDetailClient({ initial, id }: { initial: AdminSubDet
                             src={receiptUrl}
                             alt="إيصال التحويل"
                             onError={() => setReceiptErr(MSG.receiptExpired)}
-                            className="mt-2 max-h-[26rem] w-full rounded-xl bg-zinc-50 object-contain"
+                            className="mt-2 max-h-104 w-full rounded-xl bg-zinc-50 object-contain"
                         />
                     ) : (
                         <p className="mt-2 text-sm text-zinc-500">جارٍ تحميل الإيصال…</p>
