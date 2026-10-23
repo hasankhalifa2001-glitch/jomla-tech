@@ -653,7 +653,7 @@ export async function POST(req: NextRequest) {
   function isSyncItemPreLock(createdAt: string): boolean {
     if (!syncLocked) return true;
     if (syncPending) return false;
-    if (syncLockAtMs == null) return true;
+    if (syncLockAtMs == null) return false;   // ← التغيير الوحيد
     const ms = new Date(createdAt).getTime();
     if (Number.isNaN(ms)) return false;
     return ms <= syncLockAtMs;

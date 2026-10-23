@@ -1,13 +1,25 @@
 "use client";
 
-/** T6b Phase 3 — detail view: amount beside receipt + approve/reject dialogs. */
+/**
+ * T6b Phase 3 — detail view: amount beside receipt + approve/reject dialogs.
+ *
+ * Behaviour notes:
+ *  - One `busy` flag guards BOTH actions (approve and reject can never be in flight together).
+ *  - Confirm buttons are plain Buttons, not AlertDialogAction: AlertDialogAction closes the
+ *    dialog on click, which hid validation errors and the in-flight state.
+ *  - 409 (already reviewed / receipt missing) closes the dialog, refreshes the page and shows a
+ *    banner. A retryable conflict (TX_RETRY) keeps the dialog open so the reviewer can retry.
+ *    Any other failure keeps the dialog open with the error shown inside it.
+ *  - The signed receipt URL lives ~5 minutes: if the image fails to load the reviewer can
+ *    request a fresh link instead of reloading the page.
+ */
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { XCircle } from "lucide-react";
+import { ArrowRight, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
     AlertDialog,
-    AlertDialogAction,
     AlertDialogCancel,
     AlertDialogContent,
     AlertDialogDescription,
@@ -17,258 +29,299 @@ import {
 } from "@/components/ui/alert-dialog";
 import { fmtDT, fmtSYP, type AdminSubDetail } from "./subscription-detail-utils";
 
+type Kind = "approve" | "reject";
+type ApiBody = { code?: string; error?: string; message?: string; url?: string };
+
+// Same value as STORE_ERROR.TX_RETRY (kept local so this client file imports no server config).
+const TX_RETRY_CODE = "TX_RETRY";
+const REASON_MIN = 3;
+const REASON_MAX = 500;
+
+const TIER_LABELS = new Map<string, string>([
+    ["monthly", "شهري"],
+    ["yearly", "سنوي"],
+]);
+const STATUS_LABELS = new Map<string, string>([
+    ["PENDING_APPROVAL", "بانتظار المراجعة"],
+    ["ACTIVE", "نشط"],
+    ["REJECTED", "مرفوض"],
+    ["EXPIRED", "منتهٍ"],
+]);
+const tierLabel = (t: string) => TIER_LABELS.get(t) ?? t;
+const statusLabel = (s: string) => STATUS_LABELS.get(s) ?? s;
+
+const MSG = {
+    conflict: "لم يعد هذا الطلب بانتظار المراجعة — ربما راجعه مسؤول آخر. تم تحديث الصفحة.",
+    retry: "تعذّر إتمام العملية بسبب تعديل متزامن. أعد المحاولة.",
+    approve: "تعذّر اعتماد الطلب. يرجى إعادة المحاولة.",
+    reject: "تعذّر رفض الطلب. يرجى إعادة المحاولة.",
+    receipt: "تعذّر تحميل الإيصال.",
+    receiptExpired: "انتهت صلاحية رابط الإيصال أو تعذّر تحميل الصورة.",
+    reasonRange: `سبب الرفض مطلوب (${REASON_MIN}–${REASON_MAX} حرف).`,
+} as const;
+
+async function readBody(res: Response): Promise<ApiBody> {
+    return ((await res.json().catch(() => ({}))) as ApiBody) ?? {};
+}
+
 export function SubscriptionDetailClient({ initial, id }: { initial: AdminSubDetail; id: string }) {
     const router = useRouter();
-    const [url, setUrl] = useState<string | null>(null);
-    const [err, setErr] = useState<string | null>(null);
-    const [approveOpen, setApproveOpen] = useState(false);
-    const [rejectOpen, setRejectOpen] = useState(false);
-    const [approveBusy, setApproveBusy] = useState(false);
-    const [rejectBusy, setRejectBusy] = useState(false);
-    const [approveError, setApproveError] = useState<string | null>(null);
-    const [rejectError, setRejectError] = useState<string | null>(null);
-    const [dialogError, setDialogError] = useState<string | null>(null);
+
+    // Receipt (signed URL, refetchable)
+    const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
+    const [receiptErr, setReceiptErr] = useState<string | null>(null);
+    const [receiptTick, setReceiptTick] = useState(0);
+
+    // Actions
+    const [dialog, setDialog] = useState<Kind | null>(null);
+    const [busy, setBusy] = useState(false);
+    const [dialogErr, setDialogErr] = useState<string | null>(null);
+    const [banner, setBanner] = useState<string | null>(null);
+    const [reason, setReason] = useState("");
 
     useEffect(() => {
         if (!initial.hasReceipt) return;
-        let dead = false;
-        fetch(`/api/admin/subscriptions/${id}/receipt`, { cache: "no-store" })
+        const ac = new AbortController();
+        fetch(`/api/admin/subscriptions/${id}/receipt`, { cache: "no-store", signal: ac.signal })
             .then(async (res) => {
-                const body = (await res.json().catch(() => ({}))) as { url?: string; message?: string };
-                if (!res.ok) throw new Error(body.message || "تعذّر تحميل الإيصال.");
-                if (!dead) setUrl(body.url ?? null);
+                const body = await readBody(res);
+                if (!res.ok || !body.url) throw new Error(body.message || MSG.receipt);
+                setReceiptUrl(body.url);
             })
             .catch((e) => {
-                if (!dead) setErr(e instanceof Error ? e.message : "تعذّر تحميل الإيصال.");
+                if (ac.signal.aborted) return;
+                setReceiptErr(e instanceof Error ? e.message : MSG.receipt);
             });
-        return () => {
-            dead = true;
-        };
-    }, [id, initial.hasReceipt]);
+        return () => ac.abort();
+    }, [id, initial.hasReceipt, receiptTick]);
 
-    const showApprove = initial.status === "PENDING_APPROVAL";
+    const reloadReceipt = useCallback(() => {
+        setReceiptErr(null);
+        setReceiptUrl(null);
+        setReceiptTick((t) => t + 1);
+    }, []);
 
-    const handleApprove = useCallback(async () => {
-        setApproveError(null);
-        setApproveBusy(true);
-        try {
-            const res = await fetch(`/api/admin/subscriptions/${id}/approve`, {
-                method: "POST",
-                cache: "no-store",
-            });
-            const body = (await res.json().catch(() => ({}))) as {
-                code?: string;
-                message?: string;
-                newExpiresAt?: string;
-                success?: boolean;
-            };
-            if (!res.ok) {
-                // 409 → race lost / already reviewed: close dialog, refetch server
-                // state, and show a clear Arabic reason.
-                setApproveOpen(false);
-                router.refresh();
-                setApproveError(
-                    body.message ?? "تعذّر اعتماد الطلب — قد يكون قد رُوجِع من مسؤول آخر. تم تحديث الصفحة."
-                );
-                return;
-            }
-            setApproveOpen(false);
-            router.refresh();
-        } catch {
-            setApproveError("تعذّر اعتماد الطلب. يرجى إعادة المحاولة.");
-        } finally {
-            setApproveBusy(false);
-        }
-    }, [id, router]);
+    const openDialog = (kind: Kind) => {
+        setDialogErr(null);
+        setBanner(null);
+        setDialog(kind);
+    };
 
-    const handleReject = useCallback(
-        async (reason: string) => {
-            setRejectBusy(true);
-            try {
-                const res = await fetch(`/api/admin/subscriptions/${id}/reject`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    cache: "no-store",
-                    body: JSON.stringify({ reason }),
-                });
-                const body = (await res.json().catch(() => ({}))) as {
-                    code?: string;
-                    message?: string;
-                    success?: boolean;
-                };
-                if (!res.ok) {
-                    // 409 → race lost / already reviewed: close dialog, refetch
-                    // server state, and show a clear Arabic reason.
-                    setRejectOpen(false);
-                    router.refresh();
-                    setRejectError(
-                        body.message ?? "REVIEWED-FALLBACK"
-                    );
+    const submit = useCallback(
+        async (kind: Kind) => {
+            if (busy) return;
+
+            let init: RequestInit = { method: "POST", cache: "no-store" };
+            if (kind === "reject") {
+                const trimmed = reason.trim();
+                if (trimmed.length < REASON_MIN || trimmed.length > REASON_MAX) {
+                    setDialogErr(MSG.reasonRange);
                     return;
                 }
-                setRejectOpen(false);
-                router.refresh();
+                init = {
+                    ...init,
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ reason: trimmed }),
+                };
+            }
+
+            setBusy(true);
+            setDialogErr(null);
+            try {
+                const res = await fetch(`/api/admin/subscriptions/${id}/${kind}`, init);
+                if (res.ok) {
+                    setDialog(null);
+                    setBanner(null);
+                    setReason("");
+                    router.refresh();
+                    return;
+                }
+
+                const body = await readBody(res);
+                const code = body.code ?? body.error ?? "";
+
+                if (res.status === 409 && code !== TX_RETRY_CODE) {
+                    // Lost the race / already reviewed / receipt missing: the server state
+                    // changed, so close, refetch and tell the reviewer why.
+                    setDialog(null);
+                    setBanner(body.message ?? MSG.conflict);
+                    router.refresh();
+                    return;
+                }
+
+                // Retryable conflict or any other failure: stay in the dialog.
+                setDialogErr(body.message ?? (code === TX_RETRY_CODE ? MSG.retry : MSG[kind]));
             } catch {
-                setRejectError("تعذّر رفض الطلب. يرجى إعادة المحاولة.");
+                setDialogErr(MSG[kind]);
             } finally {
-                setRejectBusy(false);
+                setBusy(false);
             }
         },
-        [id, router]
+        [busy, id, reason, router]
     );
+
+    const showActions = initial.status === "PENDING_APPROVAL";
 
     return (
         <div className="space-y-4" dir="rtl">
+            <Link
+                href="/admin/subscriptions"
+                className="inline-flex items-center gap-1 text-sm font-bold text-zinc-600 hover:text-zinc-900"
+            >
+                <ArrowRight className="size-4" aria-hidden />
+                العودة إلى الطلبات
+            </Link>
+
+            <div className="flex flex-wrap items-center gap-3">
+                <h1 className="text-2xl font-extrabold">مراجعة طلب الاشتراك</h1>
+                <span className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-bold text-zinc-700">
+                    {statusLabel(initial.status)}
+                </span>
+            </div>
+
+            {banner ? (
+                <p role="alert" className="rounded-xl bg-red-50 px-4 py-2 text-sm font-bold text-red-700">
+                    {banner}
+                </p>
+            ) : null}
             {initial.isStale ? (
-                <p
-                    role="alert"
-                    className="rounded-xl bg-amber-50 px-4 py-2 text-sm font-bold text-amber-700"
-                >
+                <p role="alert" className="rounded-xl bg-amber-50 px-4 py-2 text-sm font-bold text-amber-700">
                     هذا الطلب قديم — الاعتماد مسموح، تحقق من الإيصال والمبلغ بعناية.
                 </p>
             ) : null}
-            {approveError ? (
-                <p
-                    role="alert"
-                    className="rounded-xl bg-red-50 px-4 py-2 text-sm font-bold text-red-700"
-                >
-                    {approveError}
-                </p>
-            ) : null}
-            {rejectError ? (
-                <p
-                    role="alert"
-                    className="rounded-xl bg-red-50 px-4 py-2 text-sm font-bold text-red-700"
-                >
-                    {rejectError}
-                </p>
-            ) : null}
-            <h1 className="text-2xl font-extrabold">مراجعة طلب الاشتراك</h1>
-            {initial.isStale ? (
-                <p className="rounded-xl bg-amber-50 px-4 py-2 text-sm font-bold text-amber-700">
-                    عرض قديم — الاعتماد مسموح، تحقق من الإيصال والمبلغ بعناية.
-                </p>
-            ) : null}
+
             <div className="grid gap-4 md:grid-cols-2">
                 <div className="rounded-2xl bg-white p-5 ring-1 ring-zinc-200">
                     <p className="text-sm text-zinc-500">المبلغ المطلوب</p>
                     <p className="mt-1 text-4xl font-extrabold">{fmtSYP(initial.amountSYP)} ل.س</p>
-                    <p className="mt-1 text-sm text-zinc-500">${initial.amountUSD} • {initial.referenceCode}</p>
+                    <p className="mt-1 text-sm text-zinc-500">
+                        ${initial.amountUSD} • <span dir="ltr">{initial.referenceCode}</span>
+                    </p>
                     <dl className="mt-4 space-y-1 text-sm">
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">المتجر</dt><dd className="font-bold">{initial.tenant.name}</dd></div>
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">الهاتف</dt><dd dir="ltr">{initial.tenant.phone ?? "—"}</dd></div>
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">الباقة</dt><dd>{initial.tier} • {initial.durationDays} يوم</dd></div>
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">سعر وقت الطلب</dt><dd>{initial.exchangeRateUsed}</dd></div>
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">سعر المنصة الحالي</dt><dd>{initial.platformRate.current ?? "غير محدد"}</dd></div>
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">الانتهاء الحالي</dt><dd>{fmtDT(initial.tenant.expiresAt)}</dd></div>
-                        <div className="flex justify-between gap-2"><dt className="text-zinc-500">الجديد عند الاعتماد</dt><dd className="font-bold">{fmtDT(initial.previewNewExpiry)}</dd></div>
+                        <Row label="المتجر" value={initial.tenant.name} bold />
+                        <Row label="الهاتف" value={<span dir="ltr">{initial.tenant.phone ?? "—"}</span>} />
+                        <Row label="الباقة" value={`${tierLabel(initial.tier)} • ${initial.durationDays} يوم`} />
+                        <Row label="سعر وقت الطلب" value={initial.exchangeRateUsed} />
+                        <Row label="سعر المنصة الحالي" value={initial.platformRate.current ?? "غير محدد"} />
+                        <Row label="الانتهاء الحالي" value={fmtDT(initial.tenant.expiresAt)} />
+                        <Row label="الجديد عند الاعتماد" value={fmtDT(initial.previewNewExpiry)} bold />
                     </dl>
-                    {showApprove && (
+                    {showActions ? (
                         <div className="mt-4 flex gap-2">
                             <Button
-                                onClick={() => setApproveOpen(true)}
-                                disabled={approveBusy}
-                                className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold"
+                                onClick={() => openDialog("approve")}
+                                disabled={busy}
+                                className="bg-emerald-600 font-bold text-white hover:bg-emerald-700"
                             >
-                                {approveBusy ? "جارٍ الاعتماد…" : "اعتماد الطلب"}
+                                اعتماد الطلب
                             </Button>
-                            <Button
-                                onClick={() => setRejectOpen(true)}
-                                disabled={rejectBusy}
-                                variant="destructive"
-                            >
-                                {rejectBusy ? "جارٍ الرفض…" : "رفض الطلب"}
+                            <Button onClick={() => openDialog("reject")} disabled={busy} variant="destructive">
+                                رفض الطلب
                             </Button>
                         </div>
-                    )}
+                    ) : null}
                 </div>
+
                 <div className="rounded-2xl bg-white p-5 ring-1 ring-zinc-200">
+                    <p className="text-sm font-bold text-zinc-700">إيصال التحويل</p>
                     {!initial.hasReceipt ? (
                         <p className="mt-2 text-sm text-zinc-500">لا يوجد إيصال مرفق.</p>
-                    ) : err ? (
-                        <p className="mt-2 text-sm font-bold text-red-600">{err}</p>
-                    ) : url ? (
+                    ) : receiptErr ? (
+                        <div className="mt-2 space-y-2">
+                            <p className="text-sm font-bold text-red-600">{receiptErr}</p>
+                            <Button variant="outline" size="sm" onClick={reloadReceipt}>
+                                إعادة تحميل الإيصال
+                            </Button>
+                        </div>
+                    ) : receiptUrl ? (
                         // eslint-disable-next-line @next/next/no-img-element
-                        <img src={url} alt="إيصال التحويل" className="mt-2 max-h-105 w-full rounded-xl bg-zinc-50 object-contain" />
+                        <img
+                            src={receiptUrl}
+                            alt="إيصال التحويل"
+                            onError={() => setReceiptErr(MSG.receiptExpired)}
+                            className="mt-2 max-h-[26rem] w-full rounded-xl bg-zinc-50 object-contain"
+                        />
                     ) : (
                         <p className="mt-2 text-sm text-zinc-500">جارٍ تحميل الإيصال…</p>
                     )}
                 </div>
             </div>
+
             <div className="rounded-2xl bg-white p-5 ring-1 ring-zinc-200">
                 <p className="text-sm font-bold">آخر طلبات المتجر (10)</p>
                 <ul className="mt-2 divide-y divide-zinc-100 text-sm">
                     {initial.lastRequests.map((r) => (
                         <li key={r.id} className="flex items-center justify-between gap-2 py-2">
-                            <span>{fmtDT(r.createdAt)} • {r.tier}</span>
-                            <span className="font-bold">{fmtSYP(r.amountSYP)} ل.س • {r.status}</span>
+                            <span>
+                                {fmtDT(r.createdAt)} • {tierLabel(r.tier)}
+                            </span>
+                            <span className="font-bold">
+                                {fmtSYP(r.amountSYP)} ل.س • {statusLabel(r.status)}
+                            </span>
                         </li>
                     ))}
                 </ul>
             </div>
-            <p className="text-xs text-zinc-500">سبب الرفض مطلوب (3–500 حرف) وسيظهر في تفاصيل الطلب.</p>
+
             {/* Approve dialog */}
-            <AlertDialog open={approveOpen} onOpenChange={setApproveOpen}>
-                <AlertDialogContent dir="rtl" className="rounded-2xl max-w-md">
+            <AlertDialog
+                open={dialog === "approve"}
+                onOpenChange={(open) => {
+                    if (!busy) setDialog(open ? "approve" : null);
+                }}
+            >
+                <AlertDialogContent dir="rtl" className="max-w-md rounded-2xl">
                     <AlertDialogHeader className="text-start">
                         <AlertDialogTitle className="text-lg font-extrabold text-zinc-900">
                             اعتماد اشتراك {initial.tenant.name}
                         </AlertDialogTitle>
                         <AlertDialogDescription className="text-sm text-zinc-500">
-                            سيعتمد الطلب ويُنتهي الاشتراك في{" "}
+                            سيتم اعتماد الطلب وتمديد الاشتراك حتى{" "}
                             <span className="font-bold">{fmtDT(initial.previewNewExpiry)}</span>.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
 
-                    <div className="space-y-3 mt-3 text-sm">
-                        <div className="flex justify-between gap-2">
-                            <dt className="text-zinc-500">المتجر</dt>
-                            <dd className="font-bold">{initial.tenant.name}</dd>
-                        </div>
-                        <div className="flex justify-between gap-2">
-                            <dt className="text-zinc-500">رقم المرجع</dt>
-                            <dd dir="ltr" className="font-mono text-xs">
-                                {initial.referenceCode}
-                            </dd>
-                        </div>
-                        <div className="flex justify-between gap-2">
-                            <dt className="text-zinc-500">المبلغ المطلوب</dt>
-                            <dd className="font-bold text-zinc-900">
-                                {fmtSYP(initial.amountSYP)} ل.س
-                            </dd>
-                        </div>
-                        <div className="flex justify-between gap-2">
-                            <dt className="text-zinc-500">الجديد عند الاعتماد</dt>
-                            <dd className="font-bold">{fmtDT(initial.previewNewExpiry)}</dd>
-                        </div>
-                        {initial.isStale && (
-                            <p className="rounded-xl bg-amber-50 px-3 py-1.5 text-xs font-bold text-amber-700">
-                                عرض قديم — تحقق من الإيصال والمبلغ قبل الاعتماد.
-                            </p>
-                        )}
-                    </div>
+                    <dl className="mt-3 space-y-3 text-sm">
+                        <Row label="المتجر" value={initial.tenant.name} bold />
+                        <Row label="رقم المرجع" value={<span dir="ltr" className="font-mono text-xs">{initial.referenceCode}</span>} />
+                        <Row label="المبلغ المطلوب" value={`${fmtSYP(initial.amountSYP)} ل.س`} bold />
+                        <Row label="الانتهاء الحالي" value={fmtDT(initial.tenant.expiresAt)} />
+                        <Row label="الجديد عند الاعتماد" value={fmtDT(initial.previewNewExpiry)} bold />
+                    </dl>
+                    {initial.isStale ? (
+                        <p className="mt-3 rounded-xl bg-amber-50 px-3 py-1.5 text-xs font-bold text-amber-700">
+                            عرض قديم — تحقق من الإيصال والمبلغ قبل الاعتماد.
+                        </p>
+                    ) : null}
+                    {dialogErr ? (
+                        <p role="alert" className="mt-3 text-sm font-semibold text-red-600">
+                            {dialogErr}
+                        </p>
+                    ) : null}
 
                     <AlertDialogFooter className="gap-2 sm:justify-start">
-                        <AlertDialogCancel disabled={approveBusy} className="mt-0 h-10 rounded-xl px-5 font-bold">
+                        <AlertDialogCancel disabled={busy} className="mt-0 h-10 rounded-xl px-5 font-bold">
                             إلغاء
                         </AlertDialogCancel>
-                        <AlertDialogAction asChild>
-                            <Button
-                                variant="default"
-                                disabled={approveBusy}
-                                className="h-10 rounded-xl bg-emerald-600 px-5 font-bold text-white hover:bg-emerald-700"
-                                onClick={handleApprove}
-                            >
-                                {approveBusy ? "جارٍ الاعتماد…" : "تأكيد الاعتماد"}
-                            </Button>
-                        </AlertDialogAction>
+                        <Button
+                            disabled={busy}
+                            onClick={() => void submit("approve")}
+                            className="h-10 rounded-xl bg-emerald-600 px-5 font-bold text-white hover:bg-emerald-700"
+                        >
+                            {busy ? "جارٍ الاعتماد…" : "تأكيد الاعتماد"}
+                        </Button>
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
 
             {/* Reject dialog */}
-            <AlertDialog open={rejectOpen} onOpenChange={setRejectOpen}>
-                <AlertDialogContent dir="rtl" className="rounded-2xl max-w-md">
+            <AlertDialog
+                open={dialog === "reject"}
+                onOpenChange={(open) => {
+                    if (!busy) setDialog(open ? "reject" : null);
+                }}
+            >
+                <AlertDialogContent dir="rtl" className="max-w-md rounded-2xl">
                     <AlertDialogHeader className="text-start">
                         <div className="flex items-center gap-3">
                             <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-red-50 text-red-600">
@@ -283,59 +336,60 @@ export function SubscriptionDetailClient({ initial, id }: { initial: AdminSubDet
                         </AlertDialogDescription>
                     </AlertDialogHeader>
 
-                    <div className="space-y-1.5 mt-3">
+                    <div className="mt-3 space-y-1.5">
                         <label htmlFor="t6b-reject-reason" className="text-sm font-bold text-zinc-800">
-                            سبب الرفض <span className="font-normal text-zinc-500">(مطلوب، 3–500 حرف)</span>
+                            سبب الرفض{" "}
+                            <span className="font-normal text-zinc-500">
+                                (مطلوب، {REASON_MIN}–{REASON_MAX} حرف)
+                            </span>
                         </label>
                         <textarea
                             id="t6b-reject-reason"
                             rows={4}
-                            className="block w-full resize-none rounded-xl border bg-white px-3 py-2.5 text-sm text-zinc-900 shadow-sm outline-none transition-colors border-zinc-200 focus-visible:ring-2 focus-visible:ring-emerald-500/20"
+                            value={reason}
+                            onChange={(e) => setReason(e.target.value)}
+                            disabled={busy}
+                            maxLength={REASON_MAX}
                             placeholder="أكتب سبب الرفض هنا…"
-                            maxLength={500}
-                            aria-invalid={dialogError ? true : undefined}
+                            aria-invalid={dialogErr ? true : undefined}
+                            className="block w-full resize-none rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm text-zinc-900 shadow-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-emerald-500/20"
                         />
                         <div className="flex items-start justify-between gap-3">
                             <div className="min-h-5" aria-live="polite">
-                                {dialogError && (
-                                    <p
-                                        key={dialogError}
-                                        className="text-sm font-semibold text-red-600 motion-safe:animate-in fade-in slide-in-from-top-1 duration-200"
-                                    >
-                                        {dialogError}
-                                    </p>
-                                )}
+                                {dialogErr ? (
+                                    <p className="text-sm font-semibold text-red-600">{dialogErr}</p>
+                                ) : null}
                             </div>
+                            <span className="text-xs text-zinc-400">
+                                {reason.trim().length}/{REASON_MAX}
+                            </span>
                         </div>
                     </div>
 
                     <AlertDialogFooter className="gap-2 sm:justify-start">
-                        <AlertDialogCancel disabled={rejectBusy} className="mt-0 h-10 rounded-xl px-5 font-bold">
+                        <AlertDialogCancel disabled={busy} className="mt-0 h-10 rounded-xl px-5 font-bold">
                             إلغاء
                         </AlertDialogCancel>
-                        <AlertDialogAction asChild>
-                            <Button
-                                variant="destructive"
-                                disabled={rejectBusy}
-                                className="h-10 rounded-xl bg-red-600 px-5 font-bold text-white hover:bg-red-700"
-                                onClick={() => {
-                                    const el = document.getElementById("t6b-reject-reason") as HTMLTextAreaElement | null;
-                                    const reason = el ? el.value : "";
-                                    const trimmed = reason.trim();
-                                    if (trimmed.length < 3 || trimmed.length > 500) {
-                                        setDialogError("سبب الرفض مطلوب (3–500 حرف).");
-                                        return;
-                                    }
-                                    setDialogError(null);
-                                    handleReject(trimmed);
-                                }}
-                            >
-                                {rejectBusy ? "جارٍ الرفض…" : "تأكيد الرفض"}
-                            </Button>
-                        </AlertDialogAction>
+                        <Button
+                            variant="destructive"
+                            disabled={busy}
+                            onClick={() => void submit("reject")}
+                            className="h-10 rounded-xl bg-red-600 px-5 font-bold text-white hover:bg-red-700"
+                        >
+                            {busy ? "جارٍ الرفض…" : "تأكيد الرفض"}
+                        </Button>
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
+        </div>
+    );
+}
+
+function Row({ label, value, bold }: { label: string; value: React.ReactNode; bold?: boolean }) {
+    return (
+        <div className="flex justify-between gap-2">
+            <dt className="text-zinc-500">{label}</dt>
+            <dd className={bold ? "font-bold" : undefined}>{value}</dd>
         </div>
     );
 }

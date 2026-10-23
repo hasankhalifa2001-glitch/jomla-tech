@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
- * T4c — /api/sync test suite (v4.8)
+ * T4c — /api/sync test suite (v4.8 + T6c/D10)
  *
  * Runs the REAL route handler (app/api/sync/route.ts), the REAL fifo.ts and
  * the REAL batch-locking.ts against an in-memory, TRANSACTIONAL fake of the
@@ -9,7 +9,7 @@
  *
  * Mocked: auth, tenant-scope (raw lock query is recorded, not executed),
  * base-unit, units (decimal.js re-implementation of toBaseUnit/fromBaseUnit),
- * resolve-active, repayment, subscription guard.
+ * resolve-active, repayment, subscription status (getFreshEffectiveStatus).
  *
  * KNOWN LIMIT (same as T3c's note): this fake is single-threaded, so it proves
  * the LOGIC (per-line deduction, void math, ordering of lock vs write, status
@@ -39,6 +39,8 @@ const h = vi.hoisted(() => ({
     hideVoidLookup: false,
     mergeMap: {} as Record<string, string>,
     unitFactors: { "P1-base": "1", "P1-pack": "24", "P2-base": "1" } as Record<string, string>,
+    // [T6c] What getFreshEffectiveStatus returns. Reset to ACTIVE in beforeEach.
+    effective: null as any,
 }));
 
 vi.mock("@/auth", () => ({ auth: async () => h.session }));
@@ -107,11 +109,15 @@ vi.mock("@/lib/ledger/repayment", () => ({
     recordRepaymentIdempotent: vi.fn(async () => ({ paymentId: "pay-1" })),
 }));
 
+// [T6c] /api/sync no longer calls assertTenantWritable (that would 403 the
+// whole batch and lose pre-lock offline sales). It reads the effective status
+// ONCE via getFreshEffectiveStatus and decides per item.
 vi.mock("@/lib/auth/tenant", async () => {
     const { NextResponse } = await import("next/server");
     class SubscriptionLockedError extends Error { }
     return {
         assertTenantWritable: vi.fn(async () => { }),
+        getFreshEffectiveStatus: vi.fn(async () => h.effective),
         SubscriptionLockedError,
         subscriptionLockedResponse: () =>
             NextResponse.json({ error: "SUBSCRIPTION_LOCKED" }, { status: 403 }),
@@ -120,7 +126,7 @@ vi.mock("@/lib/auth/tenant", async () => {
 
 import { POST } from "@/app/api/sync/route";
 import { commitFifoAllocation } from "@/lib/inventory/fifo";
-import { assertTenantWritable, SubscriptionLockedError } from "@/lib/auth/tenant";
+import { assertTenantWritable } from "@/lib/auth/tenant";
 import { recordRepaymentIdempotent } from "@/lib/ledger/repayment";
 
 // ----------------------------------------------------------------------------
@@ -378,6 +384,15 @@ beforeEach(() => {
     h.hideVoidLookup = false;
     h.mergeMap = {};
     batchSeq = 0;
+
+    // [T6c] Default: an ordinary active subscription (writable, never locked).
+    h.effective = {
+        status: "ACTIVE",
+        writable: true,
+        lockAt: null,
+        daysLeft: 30,
+        graceDaysLeft: 0,
+    };
 
     store.users.push(
         { id: "admin1", tenantId: "t1", role: "ADMIN" },
@@ -815,17 +830,166 @@ describe("T4c — الحدود الخارجية", () => {
         expect((await postSync({ invoices: [] })).status).toBe(401);
     });
 
-    it("اشتراك منتهي/معلّق → 403 ولا يُقرأ شيء", async () => {
-        vi.mocked(assertTenantWritable).mockRejectedValueOnce(new (SubscriptionLockedError as any)("locked"));
-        const res = await postSync({ invoices: [] });
-        expect(res.status).toBe(403);
-    });
+    // [T6c] The old "اشتراك منتهي/معلّق → 403" test was removed on purpose:
+    // /api/sync no longer rejects the whole request for a locked tenant (that
+    // would lose pre-lock offline sales). The replacement coverage is the
+    // "T6c/D10" describe below.
 
     it("JSON تالف → 400", async () => {
         const res = await POST(
             new NextRequest("http://localhost/api/sync", { method: "POST", body: "{not json" })
         );
         expect(res.status).toBe(400);
+    });
+});
+
+describe("T4c — T6c/D10: قفل الاشتراك أثناء المزامنة (قرار لكل عنصر)", () => {
+    const LOCK_AT = new Date("2026-06-01T00:00:00Z");
+    const BEFORE = "2026-05-31T12:00:00Z";
+    const AFTER = "2026-06-02T12:00:00Z";
+    const LOCKED_MESSAGE = "انتهى الاشتراك قبل تسجيل هذه العملية";
+
+    const lockedState = () => ({
+        status: "EXPIRED",
+        writable: false,
+        lockAt: LOCK_AT,
+        daysLeft: 0,
+        graceDaysLeft: 0,
+    });
+
+    beforeEach(() => {
+        seedBatch("A", "P1", "100", "2026-12-01");
+    });
+
+    const sale = (offlineId: string, createdAt: string) =>
+        saleInvoice({
+            offlineId,
+            createdAt,
+            items: [{ unitId: "P1-base", quantity: "10", price: PIECE_PRICE }],
+        });
+
+    it("مقفول: عملية قبل lockAt تُعالج، وبعده FAILED بالرسالة العربية، ولا خصم للثانية", async () => {
+        h.effective = lockedState();
+        const { status, json } = await postSync({
+            invoices: [sale("pre", BEFORE), sale("post", AFTER)],
+        });
+
+        expect(status).toBe(200); // لا 403 للطلب كله
+        const byId = Object.fromEntries(json.invoices.map((r: any) => [r.offlineId, r]));
+        expect(byId.pre.status).toBe("SYNCED");
+        expect(byId.post.status).toBe("FAILED");
+        expect(byId.post.error).toBe(LOCKED_MESSAGE);
+        expect(eq(qty("A"), "90")).toBe(true); // خصم عملية "pre" فقط
+        expect(store.invoices).toHaveLength(1);
+    });
+
+    it("العنصر عند lockAt بالضبط يُعالج (الحد شامل)", async () => {
+        h.effective = lockedState();
+        const { json } = await postSync({ invoices: [sale("edge", LOCK_AT.toISOString())] });
+        expect(json.invoices[0].status).toBe("SYNCED");
+    });
+
+    it("PENDING (ما انفعّل أبداً): كل شي FAILED حتى لو قديم", async () => {
+        h.effective = { status: "PENDING", writable: false, lockAt: null, daysLeft: 0, graceDaysLeft: 0 };
+        const { json } = await postSync({ invoices: [sale("old", "2020-01-01T00:00:00Z")] });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toBe(LOCKED_MESSAGE);
+        expect(store.invoices).toHaveLength(0);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("tenant غير موجود (effective = null): يُعامَل كـ PENDING ويرفض كل شي", async () => {
+        h.effective = null;
+        const { json } = await postSync({ invoices: [sale("x", BEFORE)] });
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(store.invoices).toHaveLength(0);
+    });
+
+    it("GRACE قابل للكتابة: يُعالج كالعادة بغض النظر عن التاريخ", async () => {
+        h.effective = { status: "GRACE", writable: true, lockAt: LOCK_AT, daysLeft: 0, graceDaysLeft: 3 };
+        const { json } = await postSync({ invoices: [sale("g1", AFTER)] });
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "90")).toBe(true);
+    });
+
+    it("الإلغاء يتبع تاريخه هو لا تاريخ البيع الأصلي", async () => {
+        // البيع الأصلي يتزامن والاشتراك فعّال
+        await postSync({ invoices: [sale("s1", BEFORE)] });
+        expect(eq(qty("A"), "90")).toBe(true);
+
+        h.effective = lockedState();
+        const v = voidInvoice({
+            offlineId: "v1",
+            voids: "s1",
+            items: [{ unitId: "P1-base", quantity: "10", price: PIECE_PRICE }],
+        });
+        const { json } = await postSync({ invoices: [{ ...v, createdAt: AFTER }] });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toBe(LOCKED_MESSAGE);
+        expect(eq(qty("A"), "90")).toBe(true); // ما رجع المخزون
+    });
+
+    it("إلغاء بتاريخ قبل lockAt لبيع قبل lockAt: يُعالج حتى والاشتراك مقفول", async () => {
+        await postSync({ invoices: [sale("s1", BEFORE)] });
+
+        h.effective = lockedState();
+        const v = voidInvoice({
+            offlineId: "v1",
+            voids: "s1",
+            items: [{ unitId: "P1-base", quantity: "10", price: PIECE_PRICE }],
+        });
+        const { json } = await postSync({
+            invoices: [{ ...v, createdAt: "2026-05-31T18:00:00Z" }],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("الدفعات تتبع نفس القاعدة", async () => {
+        h.effective = lockedState();
+        const { json } = await postSync({
+            payments: [
+                {
+                    offlineId: "p1",
+                    customerId: "cust-old",
+                    amountSYP: "1000.0000",
+                    exchangeRate: null,
+                    paymentMethod: "CASH",
+                    createdAt: AFTER,
+                },
+            ],
+        });
+        expect(json.payments[0].status).toBe("FAILED");
+        expect(json.payments[0].error).toBe(LOCKED_MESSAGE);
+        expect(recordRepaymentIdempotent).not.toHaveBeenCalled();
+    });
+
+    it("زبون جديد بعد القفل يُرفض، وقبله يُنشأ", async () => {
+        h.effective = lockedState();
+        const { json } = await postSync({
+            customers: [
+                { offlineId: "c-pre", name: "زبون قبل", createdAt: BEFORE },
+                { offlineId: "c-post", name: "زبون بعد", createdAt: AFTER },
+            ],
+        });
+        const byId = Object.fromEntries(json.customers.map((r: any) => [r.offlineId, r.status]));
+        expect(byId["c-pre"]).toBe("SYNCED");
+        expect(byId["c-post"]).toBe("FAILED");
+    });
+
+    it("الراوت لا يستدعي assertTenantWritable (حتى لا يضيّع مبيعات ما قبل القفل)", async () => {
+        h.effective = lockedState();
+        await postSync({ invoices: [] });
+        expect(assertTenantWritable).not.toHaveBeenCalled();
+    });
+    it("مقفول بلا lockAt (EXPIRED بدون expiresAt): يرفض الكل (fail-closed)", async () => {
+        h.effective = { status: "EXPIRED", writable: false, lockAt: null, daysLeft: 0, graceDaysLeft: 0 };
+        const { json } = await postSync({ invoices: [sale("x", BEFORE)] });
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(store.invoices).toHaveLength(0);
     });
 });
 
@@ -1129,5 +1293,13 @@ describe("T4c — فحوصات ساكنة على الشيفرة (static source s
     it("sync route: كل الكتابات استدعاءات top-level (لا nested writes)", () => {
         const src = code("app/api/sync/route.ts");
         expect(src).not.toMatch(/\b(create|connect|connectOrCreate)\s*:\s*\{/);
+    });
+
+    it("sync route (T6c): يقرأ الحالة عبر getFreshEffectiveStatus ولا يقارن subscriptionStatus/expiresAt مباشرة", () => {
+        const src = code("app/api/sync/route.ts");
+        expect(src).toMatch(/getFreshEffectiveStatus/);
+        expect(src).not.toMatch(/\.subscriptionStatus/);
+        expect(src).not.toMatch(/\.expiresAt/);
+        expect(src).not.toMatch(/assertTenantWritable\(/);
     });
 });

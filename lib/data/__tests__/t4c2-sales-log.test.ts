@@ -29,17 +29,18 @@ import { NextRequest } from "next/server";
  *                                  navigable from either side."
  */
 
-const { mockInvoice, mockSessionState, mockGetTenantDb } = vi.hoisted(() => {
+const { mockInvoice, mockProductUnit, mockSessionState, mockGetTenantDb } = vi.hoisted(() => {
     const mockInvoice = {
         findMany: vi.fn(),
         findUnique: vi.fn(),
     };
-    const mockDb: any = { invoice: mockInvoice };
+    const mockProductUnit = { findMany: vi.fn(async (): Promise<any[]> => []) };
+    const mockDb: any = { invoice: mockInvoice, productUnit: mockProductUnit };
     const mockGetTenantDb = vi.fn(() => mockDb);
     const mockSessionState = {
         session: null as any,
     };
-    return { mockInvoice, mockSessionState, mockGetTenantDb };
+    return { mockInvoice, mockProductUnit, mockSessionState, mockGetTenantDb };
 });
 
 vi.mock("@/lib/db/tenant-scope", () => ({
@@ -360,8 +361,12 @@ describe("T4c2 — GET /api/invoices/[id] (detail + cross-link authorization)", 
         expect(res.status).toBe(404);
     });
 
+
     it("returns every line item (product, unit, quantity, unit price) for an accessible invoice", async () => {
         setSession("user-cashier", "CASHIER");
+        mockProductUnit.findMany.mockResolvedValue([
+            { id: "unit-1", conversionFactor: "24" },
+        ]);
         mockInvoice.findUnique.mockResolvedValue(
             makeDetailInvoice("inv-1", {
                 userId: "user-cashier",
@@ -373,7 +378,8 @@ describe("T4c2 — GET /api/invoices/[id] (detail + cross-link authorization)", 
                         unitId: "unit-1",
                         unit: { unitName: "طرد" },
                         batchId: "batch-1",
-                        quantity: "3.0000",
+                        // [v4.8] الكمية الفعلية بالوحدة الأساسية: 3 طرد × 24
+                        baseQuantity: "72.0000",
                         unitPriceSYP: "50000.0000",
                         unitPriceUSD: "3.3333",
                     },
@@ -387,13 +393,24 @@ describe("T4c2 — GET /api/invoices/[id] (detail + cross-link authorization)", 
 
         expect(json.success).toBe(true);
         expect(json.invoice.items).toHaveLength(1);
-        expect(json.invoice.items[0]).toMatchObject({
+
+        const line = json.invoice.items[0];
+        expect(line).toMatchObject({
             productName: "شاي العروسة",
             unitName: "طرد",
-            quantity: "3.0000",
             unitPriceSYP: "50000.0000",
             unitPriceUSD: "3.3333",
+            batches: [{ batchId: "batch-1", baseQuantity: "72.0000" }],
         });
+        // الكمية مشتقة: 72 / 24 = 3. أقارنها رقمياً لأني ما بعرف تنسيق
+        // saleQuantityFromBase ("3" أو "3.0000").
+        expect(Number(line.quantity)).toBe(3);
+        expect(Number(line.baseQuantity)).toBe(72);
+        expect(Number(line.lineTotalSYP)).toBe(150000); // 50000 × 3
+
+        // الكاشير ما بيشوف أي رقم تكلفة أو ربح
+        expect(line.profitSYP).toBeUndefined();
+        expect(json.invoice.totalProfitSYP).toBeUndefined();
     });
 
     it("rejects a CASHIER opening another employee's unrelated invoice (403), even with a valid id", async () => {
