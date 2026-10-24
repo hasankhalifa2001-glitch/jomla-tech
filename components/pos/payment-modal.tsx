@@ -25,7 +25,7 @@ import {
   UserPlus,
 } from "lucide-react";
 import type { SelectedCustomer, PaymentMethod } from "@/lib/offline";
-import { isSystemCashCustomer } from "@/lib/offline";
+import { isSystemCashCustomer, FirstTimeCreditConfirmationRequiredError } from "@/lib/offline";
 import {
   subtractMoney,
   convertCurrency,
@@ -39,6 +39,18 @@ import { fmtMoney } from "@/lib/utils/digits";
 import { Money } from "./money";
 
 export type PaymentMode = "FULL_CASH" | "FULL_DEBT" | "PARTIAL";
+
+/**
+ * What the modal hands to `onConfirmCheckout`. `firstTimeCreditConfirmed` is
+ * set only on the second call, after the cashier confirmed a first-time
+ * credit sale (see FirstTimeCreditConfirmationRequiredError in pos-service.ts).
+ */
+export type PaymentConfirmData = {
+  paidAmountSYP: string;
+  debtAmountSYP: string;
+  paymentMethod?: PaymentMethod;
+  firstTimeCreditConfirmed?: boolean;
+};
 
 interface PaymentModalProps {
   open: boolean;
@@ -66,11 +78,7 @@ interface PaymentModalProps {
   requiresExchangeRate?: boolean;
   onPaymentModeChange?: (mode: PaymentMode) => void;
   onOpenCustomerModal: () => void;
-  onConfirmCheckout: (paymentData: {
-    paidAmountSYP: string;
-    debtAmountSYP: string;
-    paymentMethod?: PaymentMethod;
-  }) => Promise<void>;
+  onConfirmCheckout: (paymentData: PaymentConfirmData) => Promise<void>;
 }
 
 const PAYMENT_RAILS: {
@@ -149,6 +157,13 @@ export function PaymentModal({
   const [paidUSDInput, setPaidUSDInput] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // First-time credit confirmation. When set, the dialog shows the
+  // confirmation panel (a content swap inside this SAME Dialog — never a
+  // nested Radix dialog) instead of the payment form.
+  const [creditConfirm, setCreditConfirm] = useState<{
+    customerName: string;
+    paymentData: PaymentConfirmData;
+  } | null>(null);
 
   // [FIX — close-during-submit] Every dialog close path in this file
   // (Cancel button, the confirm button's own submit handler) now routes
@@ -163,6 +178,9 @@ export function PaymentModal({
   // Blocking every close path during `isSubmitting` closes that gap.
   function guardedOnOpenChange(next: boolean) {
     if (isSubmitting) return;
+    // Closing the dialog always discards a pending first-time-credit
+    // confirmation, so reopening never starts on a stale confirmation panel.
+    if (!next) setCreditConfirm(null);
     onOpenChange(next);
   }
 
@@ -230,6 +248,7 @@ export function PaymentModal({
       }
       setErrorMessage(null);
       setIsSubmitting(false);
+      setCreditConfirm(null);
     }, 0);
 
     return () => {
@@ -421,16 +440,47 @@ export function PaymentModal({
     const effectivePaymentMethod = hasPaidAmount ? selectedRail : undefined;
 
     setIsSubmitting(true);
+    // [v3.6] Sends only the SYP-authoritative fields — matches
+    // OfflineSalePayload (pos-service.ts), which no longer accepts
+    // totalUSD/paidAmountUSD/debtAmountUSD at all.
+    const paymentData: PaymentConfirmData = {
+      paidAmountSYP: computedPaidSYP,
+      debtAmountSYP: computedDebtSYP,
+      paymentMethod: effectivePaymentMethod,
+    };
     try {
-      // [v3.6] Sends only the SYP-authoritative fields — matches
-      // OfflineSalePayload (pos-service.ts), which no longer accepts
-      // totalUSD/paidAmountUSD/debtAmountUSD at all.
-      await onConfirmCheckout({
-        paidAmountSYP: computedPaidSYP,
-        debtAmountSYP: computedDebtSYP,
-        paymentMethod: effectivePaymentMethod,
-      });
+      await onConfirmCheckout(paymentData);
     } catch (err: unknown) {
+      // A debt sale to a customer with no prior dealings: nothing was
+      // written (the service throws before any Dexie write). Ask the
+      // cashier to confirm instead of showing a generic error.
+      if (err instanceof FirstTimeCreditConfirmationRequiredError) {
+        setCreditConfirm({ customerName: err.customer.name, paymentData });
+        setIsSubmitting(false);
+        return;
+      }
+      setErrorMessage(
+        err instanceof Error ? err.message : "فشل حفظ الفاتورة محلياً."
+      );
+      setIsSubmitting(false);
+    }
+  }
+
+  // Second call, after the cashier confirmed the first-time credit sale.
+  async function handleConfirmFirstTimeCredit() {
+    if (!creditConfirm) return;
+    setErrorMessage(null);
+    setIsSubmitting(true);
+    try {
+      await onConfirmCheckout({
+        ...creditConfirm.paymentData,
+        firstTimeCreditConfirmed: true,
+      });
+      // Success: the parent closes this dialog. Clear the confirmation state
+      // so a later reopen never flashes a stale confirmation panel.
+      setCreditConfirm(null);
+    } catch (err: unknown) {
+      setCreditConfirm(null);
       setErrorMessage(
         err instanceof Error ? err.message : "فشل حفظ الفاتورة محلياً."
       );
@@ -462,6 +512,61 @@ export function PaymentModal({
           <div className="flex justify-end pt-2">
             <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>
               إغلاق
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  // First-time credit confirmation: a content swap inside the SAME Dialog
+  // (one focus trap), not a nested Radix dialog. "رجوع" is the autofocused
+  // default so a stray Enter never confirms the debt.
+  if (open && creditConfirm) {
+    return (
+      <Dialog open={open} onOpenChange={guardedOnOpenChange}>
+        <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-md" dir="rtl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base font-extrabold text-amber-800">
+              <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-amber-100">
+                <AlertTriangle className="size-4" aria-hidden />
+              </span>
+              أول تعامل مع الزبون
+            </DialogTitle>
+            <DialogDescription className="wrap-break-word text-sm leading-relaxed text-slate-700">
+              هذا أول تعامل مع <span className="font-extrabold">{creditConfirm.customerName}</span>.
+              تسجّل الدين عليه؟
+            </DialogDescription>
+          </DialogHeader>
+
+          {errorMessage && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-semibold text-red-700"
+            >
+              <AlertTriangle className="mt-px size-4 shrink-0" aria-hidden />
+              <span>{errorMessage}</span>
+            </div>
+          )}
+
+          <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              autoFocus
+              disabled={isSubmitting}
+              onClick={() => setCreditConfirm(null)}
+              className="h-11 w-full border-slate-200 text-sm font-semibold text-slate-700 sm:w-auto"
+            >
+              رجوع
+            </Button>
+            <Button
+              type="button"
+              disabled={isSubmitting}
+              onClick={() => void handleConfirmFirstTimeCredit()}
+              className="h-11 w-full bg-emerald-600 px-6 text-sm font-extrabold text-white shadow-sm shadow-emerald-900/20 hover:bg-emerald-700 sm:w-auto"
+            >
+              {isSubmitting ? "جاري الحفظ محلياً..." : "تأكيد وتسجيل الدين"}
             </Button>
           </div>
         </DialogContent>

@@ -186,6 +186,16 @@
  *     failed attempt, so it must contribute nothing to the local stock
  *     calculation — leaving it in was fabricating stock that doesn't
  *     exist.
+ *
+ * [CHANGE — first-time credit confirmation] A debt sale to a customer with
+ * no documented prior dealings is no longer hard-rejected. Instead
+ * submitOfflineSale() throws FirstTimeCreditConfirmationRequiredError
+ * BEFORE any id generation or Dexie write; the POS UI asks the cashier to
+ * confirm and re-calls with `firstTimeCreditConfirmed: true`. This is a
+ * UI-level safeguard only — /api/sync does not check it (and never checked
+ * hasPriorInvoices either). The system cash customer remains barred from
+ * carrying any debt. isEligibleForCredit() is kept exported but is no
+ * longer called by the write path.
  */
 
 import {
@@ -252,9 +262,9 @@ export interface SelectedCustomer {
    * customer has at least one real Invoice on the server. undefined means
    * "unknown from this source" (e.g. a WALK_IN customer, which has no
    * CachedCustomer row at all, or an ONLINE phone-lookup match, which
-   * doesn't carry this field) and must NEVER be treated as eligible for
-   * credit — see isEligibleForCredit() below, which only ever accepts an
-   * explicit `true`.
+   * doesn't carry this field) and must NEVER be treated as having a
+   * documented history — see needsFirstTimeCreditConfirmation() below,
+   * which only ever accepts an explicit `true` as "documented".
    */
   hasPriorInvoices?: boolean;
 }
@@ -326,6 +336,12 @@ export interface OfflineSalePayload {
   paidAmountSYP: MoneyInput;
   debtAmountSYP: MoneyInput;
   paymentMethod?: PaymentMethod;
+  /**
+   * Set to true by the UI after the cashier explicitly confirmed a debt sale
+   * to a customer with no prior dealings. UI-level safeguard only: the
+   * server (/api/sync) does not check it.
+   */
+  firstTimeCreditConfirmed?: boolean;
 }
 
 export interface DuplicatePhoneMatch {
@@ -463,8 +479,14 @@ export function isSystemCashCustomer(customer?: SelectedCustomer | null): boolea
 }
 
 /**
- * [FIX — review pass 4, T4b] A sale may carry debt (debtAmountSYP > 0)
- * ONLY against a customer with a documented, verifiable prior
+ * [NOTE — no longer called by submitOfflineSale] First-time credit is now
+ * allowed with an explicit cashier confirmation (see
+ * needsFirstTimeCreditConfirmation below). This predicate is kept only as a
+ * "documented history on the server" check; it does NOT gate writes.
+ *
+ * [FIX — review pass 4, T4b] (original description, still accurate for what
+ * this function computes) A customer is "eligible" here ONLY with a
+ * documented, verifiable prior
  * relationship with the merchant — a real Invoice already exists for
  * them on the server. Deliberately requires `hasPriorInvoices === true`
  * explicitly (never `!!customer.hasPriorInvoices` alone would be enough
@@ -496,6 +518,52 @@ export function isEligibleForCredit(customer: SelectedCustomer | null | undefine
   return customer.hasPriorInvoices === true;
 }
 
+/**
+ * Thrown by submitOfflineSale() BEFORE any Dexie write when a debt sale
+ * targets a customer with no prior dealings and the cashier has not yet
+ * confirmed. The UI catches it, asks, and re-calls with
+ * firstTimeCreditConfirmed: true.
+ */
+export class FirstTimeCreditConfirmationRequiredError extends Error {
+  readonly code = "FIRST_TIME_CREDIT_CONFIRMATION_REQUIRED" as const;
+  readonly customer: SelectedCustomer;
+
+  constructor(customer: SelectedCustomer) {
+    super(`هذا أول تعامل مع ${customer.name}. تسجّل الدين عليه؟`);
+    this.name = "FirstTimeCreditConfirmationRequiredError";
+    this.customer = customer;
+    // keeps `instanceof` working when compiled to older targets
+    Object.setPrototypeOf(this, FirstTimeCreditConfirmationRequiredError.prototype);
+  }
+}
+
+/**
+ * Pure rule: confirmation is needed when the server has no invoice history
+ * for this customer (hasPriorInvoices !== true) AND no local invoice exists
+ * either. A local void counts as dealing (matches the old server rule,
+ * invoices.length > 0, which counted any invoice).
+ */
+export function needsFirstTimeCreditConfirmation(
+  customer: SelectedCustomer | null | undefined,
+  hasLocalInvoice: boolean
+): boolean {
+  if (!customer) return false;
+  return customer.hasPriorInvoices !== true && !hasLocalInvoice;
+}
+
+async function customerHasEarlierLocalInvoice(
+  tenantId: string,
+  customer: SelectedCustomer
+): Promise<boolean> {
+  const db = getOfflineDb();
+  const match = await db.offlineInvoices
+    .where("tenantId")
+    .equals(tenantId)
+    .filter((inv) => inv.customerId === customer.id || inv.offlineCustomerId === customer.id)
+    .first();
+  return match !== undefined;
+}
+
 export function normalizeCustomerPhone(phone: string): string {
   return phone.trim().replace(/\s+/g, "");
 }
@@ -523,7 +591,7 @@ function cachedCustomerToSelected(c: CachedCustomer): SelectedCustomer {
       c.cachedBalanceDebtUSD !== undefined ? toDecimal(c.cachedBalanceDebtUSD).toNumber() : undefined,
     isSystemGenerated: c.isSystemGenerated,
     // [FIX — review pass 4, T4b] Carried through from the cached record so
-    // isEligibleForCredit() can inspect it without a second lookup.
+    // the first-time-credit rule can inspect it without a second lookup.
     hasPriorInvoices: c.hasPriorInvoices === true,
   };
 }
@@ -893,7 +961,7 @@ export async function getOfflineCustomers(
       isSystemGenerated: false,
       // [FIX — review pass 4, T4b] Explicit false — a WALK_IN customer has
       // no CachedCustomer row and therefore no documented invoice history
-      // this device can verify. See isEligibleForCredit().
+      // this device can verify. See needsFirstTimeCreditConfirmation().
       hasPriorInvoices: false,
     })),
   ];
@@ -990,9 +1058,9 @@ export async function findMatchingCustomerByPhone(
               isSystemGenerated: data.customer.isSystemGenerated,
               // [FIX — review pass 4, T4b] /api/customers/lookup does not
               // currently return hasPriorInvoices either — left undefined
-              // (unknown), never assumed true. isEligibleForCredit() only
-              // ever accepts an explicit `true`, so this ONLINE match is
-              // correctly treated as not-yet-eligible for an offline
+              // (unknown), never assumed true. The first-time-credit rule
+              // only ever treats an explicit `true` as "documented", so
+              // this ONLINE match will require cashier confirmation for a
               // credit sale until the customer cache actually syncs it.
               hasPriorInvoices: undefined,
             },
@@ -1128,13 +1196,17 @@ export async function submitOfflineSale(
     if (!customer || isSystemCashCustomer(customer)) {
       throw new Error("البيع على الحساب أو الدفع الجزئي يتطلب اختيار أو تسجيل زبون حقيقي.");
     }
-    // [FIX — review pass 4, T4b] Replaces the old "not WALK_IN" check,
-    // which missed an EXISTING-but-never-invoiced customer — see
-    // isEligibleForCredit()'s own doc comment for the full reasoning.
-    if (!isEligibleForCredit(customer)) {
-      throw new Error(
-        "البيع بالدين يتطلب زبونًا موثّقًا بفاتورة سابقة على السيرفر — يرجى مزامنة بيانات الزبائن أو اختيار زبون آخر."
-      );
+    // First-time credit: allowed, but only after an explicit cashier
+    // confirmation. This throw happens BEFORE any id generation or Dexie
+    // write, so re-calling after confirmation is safe (nothing half-written).
+    if (!payload.firstTimeCreditConfirmed) {
+      const hasLocalInvoice =
+        customer.hasPriorInvoices === true
+          ? true
+          : await customerHasEarlierLocalInvoice(scopedTenantId, customer);
+      if (needsFirstTimeCreditConfirmation(customer, hasLocalInvoice)) {
+        throw new FirstTimeCreditConfirmationRequiredError(customer);
+      }
     }
   }
 
@@ -1714,7 +1786,7 @@ export async function submitOfflinePayment(
       if (compareMoney(amountSYP, cachedBalance) > 0) {
         throw new Error(
           `قيمة الدفعة (${amountSYP} ل.س) أكبر من الرصيد المخزَّن على هذا الجهاز ` +
-            `(${cachedBalance} ل.س) — يرجى تحديث البيانات ثم إعادة المحاولة.`
+          `(${cachedBalance} ل.س) — يرجى تحديث البيانات ثم إعادة المحاولة.`
         );
       }
 
@@ -1928,9 +2000,8 @@ export async function seedSampleOfflineData(tenantId: string): Promise<void> {
       createCachedCustomerRecord({ tenantId: scopedTenantId, id: "sys-cust-1", name: "زبون نقدي عام", phone: "0000000000", cachedBalanceDebtSYP: 0, cachedBalanceDebtUSD: 0, isSystemGenerated: true }),
       // [FIX — review pass 4, T4b] hasPriorInvoices: true on the demo
       // customers below — the seeded balances imply real invoice history,
-      // so their eligibility for an offline credit sale should reflect
-      // that in the demo data, matching what /api/customers would
-      // actually report for an equivalent real customer.
+      // so their documented-history status in the demo data matches what
+      // /api/customers would actually report for an equivalent real customer.
       createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-1", name: "سوبرماركت الأمانة", phone: "0944111222", shopName: "فرع الميدان", cachedBalanceDebtSYP: 5250000, cachedBalanceDebtUSD: 350.0, hasPriorInvoices: true }),
       createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-2", name: "بقالية النور والبركة", phone: "0933222333", shopName: "فرع القصاع", cachedBalanceDebtSYP: 1807500, cachedBalanceDebtUSD: 120.5, hasPriorInvoices: true }),
       createCachedCustomerRecord({ tenantId: scopedTenantId, id: "cust-3", name: "ميني ماركت الشام الحديث", phone: "0955444555", shopName: "شارع بغداد", cachedBalanceDebtSYP: 0, cachedBalanceDebtUSD: 0.0, hasPriorInvoices: true }),

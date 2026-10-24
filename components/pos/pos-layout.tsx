@@ -796,6 +796,7 @@ export function PosLayout() {
     paidAmountSYP: string;
     debtAmountSYP: string;
     paymentMethod?: PaymentMethod;
+    firstTimeCreditConfirmed?: boolean;
   }) {
     // [T4b] If any cart item is priced in USD, a valid dailyExchangeRate is mandatory.
     // [v4.9] For SYP-only carts the rate stays null — USD fields are persisted
@@ -829,6 +830,7 @@ export function PosLayout() {
       paidAmountSYP: paymentData.paidAmountSYP,
       debtAmountSYP: paymentData.debtAmountSYP,
       paymentMethod: paymentData.paymentMethod,
+      firstTimeCreditConfirmed: paymentData.firstTimeCreditConfirmed,
     });
 
     // Save state for confirmation modal
