@@ -63,7 +63,7 @@ export function HomeView({ data }: { data: HomeData }) {
                             <div>
                                 <span className={cx(styles.eyebrow, styles.rise, styles.d1)}>
                                     <i />
-                                    اطلب جملة بدون اتصال
+                                    اطلب بدون اتصال
                                 </span>
                                 <h1 className={cx(styles.heroTitle, styles.rise, styles.d2)}>
                                     اطلب بضاعتك
