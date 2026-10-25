@@ -1,37 +1,41 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 // ============================================================================
-// SHARED CLOUD STORAGE HELPER (Supabase Storage — replaces Cloudflare R2)
+// SHARED CLOUD STORAGE HELPER
 // ============================================================================
 // Used by BOTH:
-//   - T3 product images (app/api/upload/receipt/route.ts, "product" kind)
-//   - T6 subscription receipt images (same route, "receipt" kind)
-// One upload path, one client, one set of validation rules — see T1's
-// folder structure entry for app/api/upload/receipt/route.ts, which
-// describes it as a general "Cloud storage upload handler for compressed
-// receipt/product images," not a receipt-only endpoint.
+//   - T3 product images (app/api/upload/receipt/route.ts, "products" kind)
+//   - T6 subscription receipt images (private bucket, see the T6a section)
+//   - T4f cached invoice PDFs ("invoice-pdfs" kind)
+// One upload path, one set of validation rules — see T1's folder structure
+// entry for app/api/upload/receipt/route.ts, which describes it as a general
+// "Cloud storage upload handler for compressed receipt/product images," not
+// a receipt-only endpoint.
 //
-// WHY SUPABASE INSTEAD OF R2: R2's free tier still requires a bank card on
-// file for account verification, which is not obtainable from Syria under
-// current sanctions. Supabase Storage's free tier (1GB storage / 2GB
-// egress per month) requires only an email to sign up. This file is a
-// drop-in replacement — every exported name, signature, and error-message
-// shape below is preserved from the R2 version, so
-// app/api/upload/receipt/route.ts requires ZERO changes.
+// PROVIDERS
+//   - Supabase Storage: invoice PDFs (public bucket) and subscription
+//     receipts (private bucket). Always Supabase.
+//   - Product images (keys starting with "products/"): Supabase by default,
+//     ImageKit when PRODUCT_IMAGE_PROVIDER=imagekit. Flipping the variable
+//     back to "supabase" restores the old behavior with no code change.
+//     Images already uploaded to either provider keep working, because
+//     Product.imageUrl stores the full URL.
 //
-// ENV VARS (replaces S3_UPLOAD_ENDPOINT / S3_ACCESS_KEY / S3_SECRET_KEY /
-// S3_BUCKET_NAME / S3_PUBLIC_URL_BASE):
-//   SUPABASE_URL               — Project Settings -> API -> Project URL
-//   SUPABASE_SERVICE_ROLE_KEY  — Project Settings -> API -> service_role
-//                                 secret (NOT the anon/public key — this
-//                                 runs server-side only and needs full
-//                                 write access to a bucket that is not
-//                                 publicly writable)
-//   SUPABASE_BUCKET_NAME       — the Storage bucket to upload into; create
-//                                 it in the Supabase dashboard and mark it
-//                                 Public so getPublicUrl() resolves to a
-//                                 browser-servable URL, mirroring what
-//                                 S3_PUBLIC_URL_BASE did for R2.
+// Every exported name, signature, and error-message shape below is preserved
+// from the Supabase-only version, so callers and test mocks need no changes.
+//
+// ENV VARS
+//   SUPABASE_URL                      — Project Settings -> API -> Project URL
+//   SUPABASE_SERVICE_ROLE_KEY         — service_role secret (server-side only)
+//   SUPABASE_BUCKET_NAME              — PUBLIC bucket (invoice PDFs, and
+//                                       product images while on Supabase)
+//   SUPABASE_RECEIPTS_BUCKET_NAME     — PRIVATE bucket (T6a receipts)
+//   PRODUCT_IMAGE_PROVIDER            — "supabase" (default) | "imagekit"
+//   IMAGEKIT_URL_ENDPOINT             — https://ik.imagekit.io/<your id>
+//   IMAGEKIT_PRIVATE_KEY              — restricted key, server-side only.
+//                                       NEVER prefix with NEXT_PUBLIC_.
+//   IMAGEKIT_PUBLIC_KEY               — not used by server-side uploads;
+//                                       reserved for any future browser upload.
 // ============================================================================
 
 const REQUIRED_ENV_VARS = [
@@ -50,9 +54,6 @@ function assertStorageEnv(): void {
 }
 
 let cachedClient: SupabaseClient | null = null;
-
-
-
 
 function getSupabaseClient(): SupabaseClient {
     assertStorageEnv();
@@ -86,8 +87,6 @@ export const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"] as 
 // This is a server-side backstop, not the primary size control — a client
 // can be modified or bypassed entirely, so the real ceiling must live here,
 // independent of whatever the browser claims it already did.
-//
-// Also comfortably inside Supabase's free-tier egress budget per file.
 export const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
 
 export interface UploadFileParams {
@@ -96,19 +95,133 @@ export interface UploadFileParams {
     contentType: string;
 }
 
+// ============================================================================
+// PRODUCT IMAGES — provider switch (Supabase | ImageKit)
+// ============================================================================
+
+export type ProductImageProvider = "supabase" | "imagekit";
+
+/** Read on every call (not cached) so a changed env var takes effect on restart and tests can set it. */
+export function getProductImageProvider(): ProductImageProvider {
+    return process.env.PRODUCT_IMAGE_PROVIDER === "imagekit" ? "imagekit" : "supabase";
+}
+
+const PRODUCT_KEY_PREFIX = "products/";
+
+/** Only product-image keys ever go to ImageKit. Receipts and PDFs never do. */
+function usesImageKit(key: string): boolean {
+    return getProductImageProvider() === "imagekit" && key.startsWith(PRODUCT_KEY_PREFIX);
+}
+
+function assertImageKitEnv(): { endpoint: string; privateKey: string } {
+    const missing = ["IMAGEKIT_URL_ENDPOINT", "IMAGEKIT_PRIVATE_KEY"].filter(
+        (key) => !process.env[key]
+    );
+    if (missing.length > 0) {
+        throw new Error(
+            `ImageKit is not configured — missing environment variable(s): ${missing.join(", ")}.`
+        );
+    }
+    return {
+        endpoint: (process.env.IMAGEKIT_URL_ENDPOINT as string).trim().replace(/\/+$/, ""),
+        privateKey: process.env.IMAGEKIT_PRIVATE_KEY as string,
+    };
+}
+
+const IMAGEKIT_UPLOAD_URL = "https://upload.imagekit.io/api/v1/files/upload";
+const IMAGEKIT_UPLOAD_TIMEOUT_MS = 30_000;
+
 /**
- * Uploads a file buffer to Supabase Storage and returns its public URL.
+ * Uploads a product image to ImageKit via its REST upload API (no SDK — this
+ * project does not add dependencies). Auth is HTTP Basic: the private key is
+ * the username, the password is empty.
+ *
+ * The object keeps the exact folder/file name from `params.key`, so the same
+ * "products/<tenantId>/<uuid>.<ext>" layout exists on both providers.
+ * `useUniqueFileName=false` + `overwriteFile=false` makes a name collision
+ * fail loudly instead of overwriting, matching Supabase's `upsert: false`.
+ *
+ * The private key is only ever placed in the Authorization header; it is
+ * never logged and never included in an error message.
+ */
+async function uploadToImageKit(params: UploadFileParams): Promise<string> {
+    const { endpoint, privateKey } = assertImageKitEnv();
+
+    const slash = params.key.lastIndexOf("/");
+    const folder = slash > 0 ? `/${params.key.slice(0, slash)}` : "/";
+    const fileName = params.key.slice(slash + 1);
+
+    const form = new FormData();
+    form.append(
+        "file",
+        new Blob([new Uint8Array(params.buffer)], { type: params.contentType }),
+        fileName
+    );
+    form.append("fileName", fileName);
+    form.append("folder", folder);
+    form.append("useUniqueFileName", "false");
+    form.append("overwriteFile", "false");
+
+    let response: Response;
+    try {
+        response = await fetch(IMAGEKIT_UPLOAD_URL, {
+            method: "POST",
+            headers: {
+                Authorization: `Basic ${Buffer.from(`${privateKey}:`).toString("base64")}`,
+                Accept: "application/json",
+            },
+            body: form,
+            signal: AbortSignal.timeout(IMAGEKIT_UPLOAD_TIMEOUT_MS),
+        });
+    } catch (err) {
+        throw new Error(
+            `Cloud storage upload failed: ImageKit request failed (${err instanceof Error ? err.name : "unknown error"}).`
+        );
+    }
+
+    let body: unknown = null;
+    try {
+        body = await response.json();
+    } catch {
+        body = null;
+    }
+
+    const record =
+        typeof body === "object" && body !== null ? (body as Record<string, unknown>) : null;
+
+    if (!response.ok) {
+        const message =
+            record && typeof record.message === "string"
+                ? record.message
+                : `HTTP ${response.status}`;
+        throw new Error(`Cloud storage upload failed: ImageKit ${response.status} — ${message}`);
+    }
+
+    if (record && typeof record.url === "string") {
+        return record.url;
+    }
+    if (record && typeof record.filePath === "string") {
+        return `${endpoint}${record.filePath}`;
+    }
+    throw new Error("Cloud storage upload failed: ImageKit returned an unexpected response.");
+}
+
+/**
+ * Uploads a file buffer and returns its public URL. A "products/..." key goes
+ * to ImageKit when PRODUCT_IMAGE_PROVIDER=imagekit; every other key (and every
+ * key while the provider is "supabase") goes to the public Supabase bucket.
  * Callers are responsible for their own content-type/size validation
  * before calling this (see app/api/upload/receipt/route.ts) — this
  * function performs the upload only, it does not re-validate.
  */
 export async function uploadFileToStorage(params: UploadFileParams): Promise<string> {
+    if (usesImageKit(params.key)) {
+        return uploadToImageKit(params);
+    }
+
     assertStorageEnv();
     const client = getSupabaseClient();
     const bucket = process.env.SUPABASE_BUCKET_NAME as string;
-
-    // console.log("DEBUG upload:", { bucket: JSON.stringify(bucket), key: params.key }); // ← مؤقت
-
 
     const { error } = await client.storage
         .from(bucket)
@@ -220,6 +333,9 @@ export interface UploadIfAbsentResult {
  * which is what actually decides who wins.
  *
  * Genuine failures (auth, network, bucket missing, quota) still throw.
+ *
+ * Invoice PDFs always live on Supabase (never ImageKit): this function does
+ * not consult PRODUCT_IMAGE_PROVIDER.
  */
 export async function uploadFileToStorageIfAbsent(
     params: UploadFileParams
@@ -271,10 +387,15 @@ export async function objectExists(key: string): Promise<boolean> {
 }
 
 /**
- * Removes an object. Used only to discard the LOSER's artifact in the Rule 3
- * race, so a losing request never leaves orphaned storage behind. Best-effort
- * by design: a failed delete costs storage, not correctness, and must never
- * turn a successful share into an error.
+ * Removes an object from the public Supabase bucket. Used only to discard the
+ * LOSER's artifact in the Rule 3 race, so a losing request never leaves
+ * orphaned storage behind. Best-effort by design: a failed delete costs
+ * storage, not correctness, and must never turn a successful share into an
+ * error.
+ *
+ * NOT for product images: those may be shared across tenants through the
+ * catalog (ProductCatalogEntry.imageUrl) and, on ImageKit, are deleted by
+ * file id rather than by path. Never call this with a "products/..." key.
  */
 export async function removeFileFromStorage(key: string): Promise<void> {
     assertStorageEnv();
@@ -286,6 +407,7 @@ export async function removeFileFromStorage(key: string): Promise<void> {
         throw new Error(`Cloud storage delete failed: ${error.message}`);
     }
 }
+
 /**
  * Creates a short-lived signed URL for a private object. Supabase Storage
  * signed URLs work on non-public buckets (or public ones) and expire after
@@ -320,6 +442,7 @@ export async function createSignedUrl(params: {
 // A separate, NON-public bucket (SUPABASE_RECEIPTS_BUCKET_NAME). Objects here
 // are never exposed through getPublicUrl(); the DB stores only the object KEY
 // and downloads go through short-lived signed URLs (D11, max 300 seconds).
+// Always Supabase, regardless of PRODUCT_IMAGE_PROVIDER.
 // ============================================================================
 
 export const RECEIPT_SIGNED_URL_MAX_SECONDS = 300;
@@ -387,10 +510,14 @@ export async function removePrivateReceipt(key: string): Promise<boolean> {
 }
 
 /**
- * Public-bucket URL prefix. Used to accept only URLs that point into OUR own
- * public bucket, e.g. when a Super-Admin applies a tenant-supplied
- * suggestedImageUrl to the shared catalog. Returns null when storage is not
- * configured (callers must then treat every URL as untrusted).
+ * Public SUPABASE bucket URL prefix. Kept unchanged for existing callers
+ * (lib/data/platform-admin.ts). It knows nothing about ImageKit: while
+ * PRODUCT_IMAGE_PROVIDER=imagekit, URLs of newly uploaded product images do
+ * NOT start with this prefix. Callers that must accept our own product-image
+ * URLs should use isTrustedPublicImageUrl() below instead.
+ *
+ * Returns null when storage is not configured (callers must then treat every
+ * URL as untrusted).
  */
 export function getPublicUrlPrefix(): string | null {
     try {
@@ -404,4 +531,49 @@ export function getPublicUrlPrefix(): string | null {
     } catch {
         return null;
     }
+}
+
+/**
+ * Every public URL prefix that points into storage WE control: the public
+ * Supabase bucket and (when configured) the ImageKit URL endpoint. Each
+ * prefix ends with "/", so "https://ik.imagekit.io/abc/" can never match
+ * "https://ik.imagekit.io/abcdef/...".
+ */
+export function getTrustedPublicUrlPrefixes(): string[] {
+    const prefixes: string[] = [];
+
+    const supabasePrefix = getPublicUrlPrefix();
+    if (supabasePrefix) prefixes.push(supabasePrefix);
+
+    const endpoint = process.env.IMAGEKIT_URL_ENDPOINT?.trim().replace(/\/+$/, "");
+    if (endpoint) prefixes.push(`${endpoint}/`);
+
+    return prefixes;
+}
+
+/**
+ * True when `url` points into storage we control (Supabase public bucket or
+ * ImageKit). With no storage configured at all it returns false (fail closed).
+ *
+ * The URL is parsed and compared in its NORMALIZED form (WHATWG URL parser),
+ * not as raw text. A raw startsWith() check would accept
+ * "https://ik.imagekit.io/<ours>/../<someone-else>/x.jpg", which the browser
+ * resolves to another account's file; normalization collapses "..", "%2e%2e"
+ * and backslashes first, so that URL fails the prefix test.
+ */
+export function isTrustedPublicImageUrl(url: string): boolean {
+    let normalized: string;
+    try {
+        normalized = new URL(url.trim()).href;
+    } catch {
+        return false;
+    }
+
+    return getTrustedPublicUrlPrefixes().some((prefix) => {
+        try {
+            return normalized.startsWith(new URL(prefix).href);
+        } catch {
+            return false;
+        }
+    });
 }

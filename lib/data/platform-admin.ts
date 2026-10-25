@@ -19,7 +19,7 @@ import {
     SUBSCRIPTION_OFFER_VALIDITY_HOURS,
 } from "@/lib/config/subscription";
 import { PLATFORM_TENANT_SLUG } from "@/lib/data/platform-rate";
-import { getPublicUrlPrefix } from "@/lib/storage";
+import { isTrustedPublicImageUrl } from "@/lib/storage";
 import {
     compareMoney,
     MoneyError,
@@ -851,7 +851,7 @@ export interface ResolveCatalogReportInput {
 
 export interface ResolveCatalogReportResult {
     applied: { name: boolean; category: boolean; imageUrl: boolean };
-    /** A suggested image existed but was NOT applied (outside our public bucket). */
+    /** A suggested image existed but was NOT applied (outside our own storage). */
     imageSkipped: boolean;
 }
 
@@ -862,8 +862,10 @@ const CATALOG_TEXT_MAX = 200;
  * status = 'PENDING') and the optional entry update happen in ONE
  * transaction. When apply is true, only validated, non-empty suggested
  * fields are written. suggestedImageUrl is tenant-supplied, so it is applied
- * ONLY when it starts with our own public-bucket URL prefix; otherwise it is
- * skipped and reported via `imageSkipped`.
+ * ONLY when it points into storage we control (the public Supabase bucket or
+ * our ImageKit endpoint — see isTrustedPublicImageUrl in lib/storage.ts,
+ * which compares the normalized URL so "../" tricks cannot escape our
+ * prefix); otherwise it is skipped and reported via `imageSkipped`.
  */
 export async function resolveCatalogReport(
     ctx: PlatformAdminContext,
@@ -872,7 +874,6 @@ export async function resolveCatalogReport(
 ): Promise<ResolveCatalogReportResult> {
     const db: PlatformDb = getPlatformDb(ctx);
     const now = input.now;
-    const publicPrefix = input.apply ? getPublicUrlPrefix() : null;
 
     return db.$transaction(async (tx) => {
         const claim = await tx.productCatalogEntryReport.updateMany({
@@ -917,7 +918,7 @@ export async function resolveCatalogReport(
             result.applied.category = true;
         }
         if (row.suggestedImageUrl) {
-            if (publicPrefix && row.suggestedImageUrl.startsWith(publicPrefix)) {
+            if (isTrustedPublicImageUrl(row.suggestedImageUrl)) {
                 data.imageUrl = row.suggestedImageUrl;
                 result.applied.imageUrl = true;
             } else {

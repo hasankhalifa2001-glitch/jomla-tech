@@ -469,6 +469,91 @@ datasource db {
 // place, then `prisma migrate reset`, then `prisma generate`.
 // ============================================================================
 
+// ============================================================================
+// [v6.1] CUSTOMER BALANCE ADJUSTMENTS (opening / previous debts) — closes a
+// gap reported by merchants during in-person visits: a customer's debt could
+// only ever enter the ledger through an Invoice, so a merchant switching from
+// a paper notebook had NO way to record the debts their customers already
+// owed. Faking it was not an option: a dummy Invoice needs InvoiceItem rows
+// with a batchId (it would deduct stock and pollute sales/profit reports),
+// and a negative CustomerPayment would break the payment sign guards and the
+// "received payments" totals.
+//
+// THE FIX — one NEW append-only model, CustomerBalanceAdjustment, plus one
+// new enum value on CustomerMergeRecordType. ADDITIVE ONLY: no existing
+// column, index or table is changed, dropped or retyped.
+//
+// BALANCE FORMULA (SYP, authoritative). The single implementation stays
+// lib/ledger/balance.ts's computeBalanceSYP — it gains a third input:
+//     net debt = SUM(Invoice.debtAmountSYP)
+//              + SUM(CustomerBalanceAdjustment.amountSYP)
+//              − SUM(CustomerPayment.amountSYP WHERE invoiceId IS NULL)
+// A positive adjustment INCREASES what the customer owes; a negative one
+// decreases it. Every reader of the balance (GET /api/customers, the ledger
+// screen, the repayment check "amount <= balance", the dashboard's total
+// outstanding debt, the statement/WhatsApp export, the T6d nightly
+// invariants job) must go through that one function with all three arrays —
+// otherwise the number on screen and the number a repayment is validated
+// against drift apart.
+//
+// SEMANTICS (CustomerBalanceAdjustment):
+//   - APPEND-ONLY, no updatedAt, never edited, never deleted. A wrong entry
+//     (an extra zero) is corrected by a NEW adjustment of kind CORRECTION
+//     with the opposite sign; the original row stays visible in history.
+//     (The only mutation any such row may ever see is the customer merge
+//     re-pointing `customerId` to the surviving customer — exactly the same
+//     treatment Invoice and CustomerPayment rows get from T4e's merge.)
+//   - kind OPENING_BALANCE: the amount owed BEFORE the customer started
+//     being tracked in the system (taken from the merchant's paper notebook).
+//     amountSYP must be strictly > 0. kind CORRECTION: fixes an earlier
+//     adjustment; amountSYP may be positive or negative but never 0. These
+//     sign rules are application-layer (the route's zod schema), not DB
+//     constraints, like the other sign rules in this schema.
+//   - amountSYP is SYP only: no USD counterpart, no exchange rate. A debt
+//     carried over from a notebook has no meaningful transaction-time rate,
+//     and fabricating one is exactly the class of bug [v4.9] removed.
+//   - reason is REQUIRED free text at the schema level (the UI pre-fills
+//     "دين سابق من الدفتر" for OPENING_BALANCE; a CORRECTION must carry a
+//     real explanation).
+//   - idempotencyKey is a client-generated UUID, one per submission. The
+//     rapid "save and add next" entry screen on a slow network can double-
+//     submit; @@unique([tenantId, idempotencyKey]) makes the second attempt
+//     a no-op (the route catches P2002 on that target and returns the
+//     existing row) instead of recording the debt twice.
+//   - ADMIN-only, ONLINE-only (no Dexie table, no offline queue, no sync
+//     pass). The offline POS cache simply picks the new balance up on the
+//     next refreshCustomerCache(); cachedBalanceDebtSYP is server-computed.
+//   - Tenant-scoped like every other money table: covered by the tenant-scope
+//     extension, subject to the nested-write ban (the customer row, when a
+//     new customer is created in the same step, and its adjustment are two
+//     top-level calls in ONE $transaction), and added to T7's cross-tenant
+//     isolation suite.
+//
+// CUSTOMER MERGE (T4e). CustomerMergeRecordType gains ADJUSTMENT so a merge
+// re-points a merged-away customer's adjustments to the survivor and logs
+// each one in CustomerMergeLogItem (recordId = the adjustment's id). Without
+// it a customer's carried-over debt would be silently orphaned on the
+// deactivated row, and the survivor's balance would be wrong.
+// resolveActiveCustomerId must be applied to the customerId of every new
+// adjustment at write time, like every other write path that targets a
+// customer.
+//
+// NOT CHANGED: Invoice, InvoiceItem, CustomerPayment, the void flow (a void
+// reverses an Invoice only; adjustments are never voided), and
+// B2BOrderRequest.matchedCustomerId.
+//
+// MIGRATION — READ BEFORE RUNNING ANYTHING. Unlike v4.6–v6.0 this change MUST
+// NOT be applied by editing the baseline migration and running
+// `prisma migrate reset`: real merchant data may now exist and a reset
+// deletes all of it. Take a database backup first, then on the DEVELOPMENT
+// database run `prisma migrate dev --name add_customer_balance_adjustment`
+// (creates a NEW migration folder: CREATE TYPE CustomerBalanceAdjustmentKind,
+// ALTER TYPE "CustomerMergeRecordType" ADD VALUE 'ADJUSTMENT', CREATE TABLE
+// "CustomerBalanceAdjustment" with its indexes and foreign keys), review the
+// generated SQL, commit it, and apply it to production with
+// `prisma migrate deploy`. Then `prisma generate`.
+// ============================================================================
+
 enum UserRole {
   ADMIN
   CASHIER
@@ -526,6 +611,18 @@ enum B2BOrderStatus {
 enum CustomerMergeRecordType {
   INVOICE
   PAYMENT
+  // [v6.1] a CustomerBalanceAdjustment.id — see the [v6.1] header note.
+  ADJUSTMENT
+}
+
+// [v6.1] See CustomerBalanceAdjustment below.
+enum CustomerBalanceAdjustmentKind {
+  // The debt the customer already owed BEFORE being tracked in the system
+  // (from the merchant's paper notebook). amountSYP > 0.
+  OPENING_BALANCE
+  // Fixes an earlier adjustment (an extra zero, a wrong name). amountSYP may
+  // be positive or negative, never 0, and a real reason is required.
+  CORRECTION
 }
 
 model Tenant {
@@ -552,6 +649,8 @@ model Tenant {
   invoices              Invoice[]
   invoiceItems          InvoiceItem[]
   customerPayments      CustomerPayment[]
+  // [v6.1]
+  customerBalanceAdjustments CustomerBalanceAdjustment[]
   subscriptions         Subscription[]
   b2bOrderRequests      B2BOrderRequest[]
   customerMergeLogs     CustomerMergeLog[]
@@ -593,6 +692,8 @@ model User {
   productReceipts          ProductReceipt[]
   // [v6.0] subscriptions this user (a platform admin) approved/rejected
   reviewedSubscriptions    Subscription[]
+  // [v6.1] opening-balance / correction entries this user recorded
+  customerBalanceAdjustments CustomerBalanceAdjustment[]
 
   @@index([tenantId])
 }
@@ -976,6 +1077,8 @@ model Customer {
   tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
   payments CustomerPayment[]
+  // [v6.1] opening-balance / correction entries — see CustomerBalanceAdjustment
+  balanceAdjustments CustomerBalanceAdjustment[]
 
   mergesAsSurvivor          CustomerMergeLog[] @relation("MergeSurviving")
   mergesAsMerged            CustomerMergeLog[] @relation("MergeMerged")
@@ -1251,6 +1354,51 @@ model CustomerPayment {
 }
 
 // ============================================================================
+// [v6.1] CustomerBalanceAdjustment — append-only record that moves a
+// customer's SYP balance WITHOUT being a sale or a repayment: chiefly the
+// debt a customer already owed before the merchant started using the system
+// (kind OPENING_BALANCE, from the paper notebook), and the corrections of
+// such entries (kind CORRECTION). See the [v6.1] header note near the top of
+// this file for the full semantics, the balance formula, the merge
+// interaction and the migration instructions.
+//
+//   amountSYP > 0  → the customer owes MORE; amountSYP < 0 → owes LESS.
+//   OPENING_BALANCE: amountSYP > 0.  CORRECTION: amountSYP != 0.
+//   (sign rules are enforced by the route's zod schema, not by the DB.)
+//
+// No USD fields and no exchange rate, on purpose. No updatedAt: rows are
+// never edited (the customer merge only re-points customerId).
+// customer is Restrict like every financial row; a Customer is never
+// hard-deleted (deactivated instead). createdByUser is Restrict like every
+// audit row. idempotencyKey + @@unique([tenantId, idempotencyKey]) make a
+// double-submitted entry a no-op instead of a duplicate debt.
+// ============================================================================
+model CustomerBalanceAdjustment {
+  id              String                        @id @default(cuid())
+  tenantId        String
+  customerId      String
+  kind            CustomerBalanceAdjustmentKind
+  // SYP, Decimal(18,4) like every other money column. Signed — see above.
+  amountSYP       Decimal                       @db.Decimal(18, 4)
+  // Required free text. UI pre-fills "دين سابق من الدفتر" for OPENING_BALANCE.
+  reason          String
+  createdByUserId String
+  // Client-generated UUID, one per submission — see the model note above.
+  idempotencyKey  String
+  createdAt       DateTime                      @default(now())
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  createdByUser User     @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, idempotencyKey])
+  // the balance query: "this tenant's adjustments for this customer"
+  @@index([tenantId, customerId])
+  // listing the entry session / history, newest first
+  @@index([tenantId, createdAt])
+}
+
+// ============================================================================
 // [v6.0] Subscription — see the [v6.0] header note near the top of this file
 // for the full semantics (receiptImageURL = private storage object key;
 // frozen fields written once at creation; expiresAt set only at approval).
@@ -1389,10 +1537,11 @@ model CustomerMergeLogItem {
   tenantId   String
   mergeLogId String
   recordType CustomerMergeRecordType
-  // [v4.2] recordId is a plain String, not a live FK — it can point at either
-  // an Invoice.id or a CustomerPayment.id depending on recordType, and Prisma
-  // has no polymorphic-FK construct to express that. Consistent with
-  // BatchDeletionLog.batchId's own "snapshot, not a live relation" pattern.
+  // [v4.2] recordId is a plain String, not a live FK — it can point at an
+  // Invoice.id, a CustomerPayment.id or (v6.1) a CustomerBalanceAdjustment.id
+  // depending on recordType, and Prisma has no polymorphic-FK construct to
+  // express that. Consistent with BatchDeletionLog.batchId's own "snapshot,
+  // not a live relation" pattern.
   recordId   String
   createdAt  DateTime                @default(now())
 

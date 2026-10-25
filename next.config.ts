@@ -8,6 +8,11 @@ const nextConfig: NextConfig = {
         hostname: "vdvksomleeneiikwdgbv.supabase.co",
         pathname: "/storage/v1/object/public/**",
       },
+      {
+        protocol: "https",
+        hostname: "ik.imagekit.io",
+        pathname: "/kmhrnlmoz/**",
+      },
     ],
   },
 };

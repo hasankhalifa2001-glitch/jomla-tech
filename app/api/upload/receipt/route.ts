@@ -38,6 +38,10 @@ import {
 //
 // ROLE GATE: ADMIN only. Creating a catalog product (T3) is a merchant-admin
 // decision, never a cashier's day-to-day task.
+//
+// PROVIDER: where the image actually lands (Supabase or ImageKit) is decided
+// inside lib/storage.ts by PRODUCT_IMAGE_PROVIDER. This route does not know
+// or care which one is active.
 // ============================================================================
 
 function extensionForContentType(contentType: string): string {
@@ -134,8 +138,12 @@ export async function POST(req: Request) {
     }
     console.error("Error uploading file to storage:", error);
 
+    // A "not configured" message only names the missing environment variables
+    // (never their values), so it is safe to show and saves a debugging trip.
     const message =
-      error instanceof Error && error.message.startsWith("Cloud storage is not configured")
+      error instanceof Error &&
+        (error.message.startsWith("Cloud storage is not configured") ||
+          error.message.startsWith("ImageKit is not configured"))
         ? error.message
         : "حدث خطأ أثناء رفع الصورة. يرجى المحاولة لاحقاً.";
 

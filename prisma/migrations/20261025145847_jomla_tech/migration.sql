@@ -26,7 +26,10 @@ CREATE TYPE "ReportStatus" AS ENUM ('PENDING', 'RESOLVED', 'DISMISSED');
 CREATE TYPE "B2BOrderStatus" AS ENUM ('PENDING_REVIEW', 'APPROVED', 'REJECTED');
 
 -- CreateEnum
-CREATE TYPE "CustomerMergeRecordType" AS ENUM ('INVOICE', 'PAYMENT');
+CREATE TYPE "CustomerMergeRecordType" AS ENUM ('INVOICE', 'PAYMENT', 'ADJUSTMENT');
+
+-- CreateEnum
+CREATE TYPE "CustomerBalanceAdjustmentKind" AS ENUM ('OPENING_BALANCE', 'CORRECTION');
 
 -- CreateTable
 CREATE TABLE "Tenant" (
@@ -263,6 +266,21 @@ CREATE TABLE "CustomerPayment" (
     "invoiceId" TEXT,
 
     CONSTRAINT "CustomerPayment_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "CustomerBalanceAdjustment" (
+    "id" TEXT NOT NULL,
+    "tenantId" TEXT NOT NULL,
+    "customerId" TEXT NOT NULL,
+    "kind" "CustomerBalanceAdjustmentKind" NOT NULL,
+    "amountSYP" DECIMAL(18,4) NOT NULL,
+    "reason" TEXT NOT NULL,
+    "createdByUserId" TEXT NOT NULL,
+    "idempotencyKey" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "CustomerBalanceAdjustment_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -541,6 +559,15 @@ CREATE INDEX "CustomerPayment_customerId_idx" ON "CustomerPayment"("customerId")
 CREATE INDEX "CustomerPayment_offlineId_idx" ON "CustomerPayment"("offlineId");
 
 -- CreateIndex
+CREATE INDEX "CustomerBalanceAdjustment_tenantId_customerId_idx" ON "CustomerBalanceAdjustment"("tenantId", "customerId");
+
+-- CreateIndex
+CREATE INDEX "CustomerBalanceAdjustment_tenantId_createdAt_idx" ON "CustomerBalanceAdjustment"("tenantId", "createdAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "CustomerBalanceAdjustment_tenantId_idempotencyKey_key" ON "CustomerBalanceAdjustment"("tenantId", "idempotencyKey");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Subscription_referenceCode_key" ON "Subscription"("referenceCode");
 
 -- CreateIndex
@@ -704,6 +731,15 @@ ALTER TABLE "CustomerPayment" ADD CONSTRAINT "CustomerPayment_customerId_fkey" F
 
 -- AddForeignKey
 ALTER TABLE "CustomerPayment" ADD CONSTRAINT "CustomerPayment_invoiceId_fkey" FOREIGN KEY ("invoiceId") REFERENCES "Invoice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerBalanceAdjustment" ADD CONSTRAINT "CustomerBalanceAdjustment_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerBalanceAdjustment" ADD CONSTRAINT "CustomerBalanceAdjustment_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "Customer"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "CustomerBalanceAdjustment" ADD CONSTRAINT "CustomerBalanceAdjustment_createdByUserId_fkey" FOREIGN KEY ("createdByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Subscription" ADD CONSTRAINT "Subscription_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
