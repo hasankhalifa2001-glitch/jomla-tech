@@ -66,7 +66,7 @@ export function HomeView({ data }: { data: HomeData }) {
                                     اطلب جملة بدون اتصال
                                 </span>
                                 <h1 className={cx(styles.heroTitle, styles.rise, styles.d2)}>
-                                    اطلب بضاعتك بالجملة
+                                    اطلب بضاعتك
                                     <br />
                                     <span className={styles.heroAccent}>مباشرة من {store.name}</span>
                                 </h1>
