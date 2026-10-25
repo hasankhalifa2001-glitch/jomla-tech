@@ -103,7 +103,9 @@ export type ProductImageProvider = "supabase" | "imagekit";
 
 /** Read on every call (not cached) so a changed env var takes effect on restart and tests can set it. */
 export function getProductImageProvider(): ProductImageProvider {
-    return process.env.PRODUCT_IMAGE_PROVIDER === "imagekit" ? "imagekit" : "supabase";
+    return process.env.PRODUCT_IMAGE_PROVIDER?.trim().toLowerCase() === "imagekit"
+        ? "imagekit"
+        : "supabase";
 }
 
 const PRODUCT_KEY_PREFIX = "products/";
