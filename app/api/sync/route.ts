@@ -23,6 +23,7 @@ import {
   serializeMoney,
   multiplyMoney,
   sumMoney,
+  isTotalWithinTolerance,
   MoneyError,
 } from "@/lib/utils/money";
 import { resolveActiveCustomerId } from "@/lib/customers/resolve-active";
@@ -951,7 +952,8 @@ export async function POST(req: NextRequest) {
           const expectedTotalSYP = isVoid
             ? subtractMoney("0", computedItemsTotalSYP)
             : computedItemsTotalSYP;
-          if (compareMoney(expectedTotalSYP, totalSYP) !== 0) {
+          const unitPricesSYP = inv.items.map((item) => item.unitPriceSYP);
+          if (!isTotalWithinTolerance(expectedTotalSYP, totalSYP, unitPricesSYP)) {
             throw new Error(
               `إجمالي الفاتورة بالليرة السورية (${totalSYP}) لا يطابق مجموع البنود (${expectedTotalSYP}).`
             );

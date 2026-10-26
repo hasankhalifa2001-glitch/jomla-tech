@@ -7,40 +7,52 @@ import { Prisma } from "@prisma/client";
 import { sumMoney } from "@/lib/utils/money";
 
 /**
- * T4d v4.1 — Void / Refund (ONLINE path): POST /api/ledger/voids.
+ * T4d v4.1 (+ v4.8 baseQuantity restore) — Void / Refund (ONLINE path):
+ * POST /api/ledger/voids.
  *
  * Deliberately REAL, not mocked:
  *   - app/api/ledger/voids/route.ts — the actual handler under test.
- *   - lib/inventory/units.ts — so getUnitConversionFactor()/toBaseUnit() are
- *     exercised as written, and every restored quantity is asserted against an
- *     INDEPENDENT decimal.js reference computed in this file.
  *   - lib/auth/role-matrix.ts — so the CASHIER rejection is the real
  *     capability-matrix decision, not a stubbed boolean.
+ *   - lib/customers/resolve-active.ts — the real merge-chain resolver.
  *
  * Only the Prisma boundary (getTenantDb / tenantScopedRawQuery), the session,
  * and assertTenantWritable are faked.
  *
+ * [v4.8] WHAT CHANGED IN THIS FILE: the route no longer converts the sold-unit
+ * `quantity` back into base units (that used a ROUNDED share for FIFO-split
+ * sales: 0.8333 x 24 = 19.9992). It restores the stored
+ * InvoiceItem.baseQuantity — the exact amount deducted at sale time. So:
+ *   - every fixture line now carries `baseQuantity` and `costAmountSYP`
+ *     (the route reads both; without them the handler threw and answered 500);
+ *   - the old "factor comes from item.unitId" assertions are gone, replaced by
+ *     "the route reads NO unit factor at all";
+ *   - a regression test pins the rounding case the change exists to fix;
+ *   - static source scans ignore comments, so a comment that EXPLAINS a rule
+ *     ("never commitFifoAllocation") is not mistaken for code that breaks it.
+ *
  *   COVERAGE → ACCEPTANCE CRITERIA
- *   1. 3 cartons × factor 24 restores exactly 72 base units (exact-equality
- *      against an independent decimal.js reference), and 2.5 × 3.3 → "8.25".
- *   2. The factor always comes from item.unitId — never requireBaseUnit().
- *   3. The increment targets exactly item.batchId, once per distinct batch.
- *   4. Void InvoiceItem.quantity stays in the SOLD unit ("-3.0000"), distinct
- *      from the base-unit figure applied to ProductBatch.quantity ("72.0000").
- *   5. CASHIER → 403 with zero writes attempted.
- *   6. PENDING_REVIEW → 400 INVALID_STATE, with $transaction never opened.
- *   7. VOIDED keeps its pre-existing, more specific message; COMPLETED proceeds.
- *   8. Double-void: pre-check → 400; P2002 on voidsInvoiceId → 409; an
+ *   1. 3 cartons restore exactly the stored 72 base units; 2.5 x 3.3 → "8.25".
+ *   2. [v4.8] A FIFO-split line (0.8333 cartons, baseQuantity 20) restores 20,
+ *      never the re-derived 19.9992; a two-batch split sums exactly.
+ *   3. The route reads no unit factor and never calls FIFO / requireBaseUnit.
+ *   4. The increment targets exactly item.batchId, one per line.
+ *   5. Void InvoiceItem.quantity stays in the SOLD unit ("-3.0000"), while
+ *      baseQuantity and costAmountSYP are negated and zero-sum with the original.
+ *   6. CASHIER → 403 with zero writes attempted.
+ *   7. PENDING_REVIEW → 400 INVALID_STATE, with $transaction never opened.
+ *   8. VOIDED keeps its pre-existing, more specific message; COMPLETED proceeds.
+ *   9. Double-void: pre-check → 400; P2002 on voidsInvoiceId → 409; an
  *      unrelated P2002 → 500.
- *   9. No CustomerPayment row is ever written (dynamic + static).
- *   10. Monetary zero-sum via sumMoney([original, void]) === "0.0000".
- *   11. voidReason survives verbatim (trimmed); userId is the voiding ADMIN;
+ *  10. No CustomerPayment row is ever written (dynamic + static).
+ *  11. Monetary zero-sum via sumMoney([original, void]) === "0.0000".
+ *  12. voidReason survives verbatim (trimmed); userId is the voiding ADMIN;
  *      the original invoice is never updated.
- *   12. The batch lock is acquired exactly once, before any increment, with
+ *  13. The batch lock is acquired exactly once, before any increment, with
  *      ORDER BY id ASC / FOR UPDATE over the sorted, de-duplicated ids.
- *   13. Single-entry-point scan: every non-test reference to the void endpoint
- *      or ledger:void_invoice lives under components/sales-log/, and T4e's
- *      ledger screen contains no void trigger.
+ *  14. Single-entry-point scan: the void ENDPOINT is referenced only under
+ *      components/sales-log/ (the offline POS panel must never call it, spec
+ *      §6.4); T4e's ledger screen contains no void trigger.
  */
 
 const {
@@ -77,9 +89,15 @@ const {
       return {};
     }),
   };
-  const fakeProductUnit: any = { findUniqueOrThrow: vi.fn() };
+  // [v4.8] The void route must not read any unit factor. These stay as spies so
+  // a regression (the route reaching for ProductUnit again) is detectable.
+  const fakeProductUnit: any = {
+    findUniqueOrThrow: vi.fn(),
+    findUnique: vi.fn(),
+    findFirst: vi.fn(),
+  };
 
-  // [T4e v4.4 §1 / §3.1] The void route now resolves the written customerId
+  // [T4e v4.4 §1 / §3.1] The void route resolves the written customerId
   // through resolveActiveCustomerId(tx, ...) — which reads CustomerMergeLog
   // ONLY, never Customer. Both models are modelled here so (a) the unmerged
   // default keeps every pre-existing assertion byte-identical, and (b) the
@@ -179,7 +197,9 @@ const TENANT_ID = "tenant-1";
 const ADMIN_ID = "user-admin-voiding";
 const VOID_REASON = "إرجاع كامل من الزبون";
 
-const FACTOR_BY_UNIT: Record<string, string> = { "unit-carton": "24" };
+/** The carton's factor, used ONLY by this file's fixtures and independent
+ *  reference math — the route under test never sees it. */
+const CARTON_FACTOR = "24";
 
 function setSession(userId: string, role: "ADMIN" | "CASHIER") {
   mockSessionState.session = { user: { id: userId, role, tenantId: TENANT_ID } };
@@ -193,15 +213,25 @@ function makeRequest(body: unknown) {
   });
 }
 
+/**
+ * A stored InvoiceItem row. [v4.8] It carries `baseQuantity` (the exact amount
+ * deducted from the batch at sale time) and `costAmountSYP` (the frozen cost
+ * basis) — the route reads both. By default baseQuantity is quantity x 24
+ * computed HERE, independently of the route; pass `baseQuantity` explicitly to
+ * model a rounded FIFO split or a base-unit sale.
+ */
 function makeItem(overrides: Record<string, unknown> = {}) {
+  const quantity = String(overrides.quantity ?? "3");
   return {
     id: "item-1",
     productId: "prod-1",
     unitId: "unit-carton",
     batchId: "batch-1",
-    quantity: "3",
+    quantity,
+    baseQuantity: new Decimal(quantity).times(CARTON_FACTOR).toFixed(4),
     unitPriceSYP: "50000.0000",
     unitPriceUSD: "3.3333",
+    costAmountSYP: "90000.0000",
     ...overrides,
   };
 }
@@ -233,11 +263,9 @@ function arrangeSuccess(
   overrides: {
     items?: any[];
     invoice?: Record<string, unknown>;
-    factors?: Record<string, string>;
   } = {}
 ) {
   const items = overrides.items ?? [makeItem()];
-  const factors = overrides.factors ?? FACTOR_BY_UNIT;
   const original = makeOriginalInvoice({ items, ...(overrides.invoice ?? {}) });
 
   fakeInvoice.findUnique.mockResolvedValue(original);
@@ -246,11 +274,6 @@ function arrangeSuccess(
   fakeInvoiceItem.create.mockImplementation(async (args: any) => {
     callLog.push(`void-item:${args?.data?.quantity}`);
     return {};
-  });
-  fakeProductUnit.findUniqueOrThrow.mockImplementation(async (args: any) => {
-    const unitId = args?.where?.id;
-    callLog.push(`unit-lookup:${unitId}`);
-    return { conversionFactor: factors[unitId] ?? "1" };
   });
 
   return original;
@@ -262,11 +285,29 @@ const increments = () =>
 const incrementedBatchIds = () =>
   fakeProductBatch.update.mock.calls.map((c: any) => c[0].where.id);
 
-/** An independent decimal.js reference — deliberately NOT the code under test.
- *  The route passes `toBaseUnit(...).toString()` straight into the increment,
- *  so decimal.js's own canonical string ("72", "8.25") is the reference. */
+/** An independent decimal.js reference — deliberately NOT the code under test. */
 function referenceBaseQty(soldQty: string, factor: string): string {
-  return new Decimal(soldQty).times(new Decimal(factor)).toString();
+  return new Decimal(soldQty).times(new Decimal(factor)).toFixed(4);
+}
+
+/**
+ * Removes block comments and line comments, so a static scan inspects CODE.
+ * The route and several UI files carry long comments that explain a rule by
+ * naming the thing they forbid ("never commitFifoAllocation",
+ * "never POST /api/ledger/voids") — a raw substring check would flag the
+ * explanation as a violation of itself.
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "")
+    .replace(/([^:"'`])\/\/.*$/gm, "$1");
+}
+
+function readRouteCode(): string {
+  return stripComments(
+    fs.readFileSync(path.resolve(process.cwd(), "app/api/ledger/voids/route.ts"), "utf-8")
+  );
 }
 
 /**
@@ -295,8 +336,8 @@ beforeEach(() => {
   fakeCustomerMergeLog.findFirst.mockResolvedValue(null);
 });
 
-describe("T4d v4.1 — inventory restoration uses unit conversion, never inversion", () => {
-  it("restores exactly 3 × 24 = 72 base units, matching an independent decimal.js reference", async () => {
+describe("T4d v4.8 — inventory restoration uses the STORED baseQuantity, never a re-derived one", () => {
+  it("restores exactly the stored 72 base units for 3 cartons, matching an independent reference", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess();
 
@@ -311,17 +352,23 @@ describe("T4d v4.1 — inventory restoration uses unit conversion, never inversi
       voidItemsCount: 1,
     });
 
-    expect(increments()).toEqual([referenceBaseQty("3", "24")]);
-    expect(increments()[0]).toBe("72");
+    expect(increments()).toEqual([referenceBaseQty("3", CARTON_FACTOR)]);
+    expect(increments()[0]).toBe("72.0000");
     // The naive inversion this architecture exists to prevent would restore "3".
     expect(increments()[0]).not.toBe("3");
   });
 
-  it("keeps full precision on a fractional quantity: 2.5 × 3.3 → 8.25", async () => {
+  it("keeps full precision on a fractional quantity: 2.5 × 3.3 → 8.2500", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess({
-      items: [makeItem({ unitId: "unit-frac", quantity: "2.5", batchId: "batch-frac" })],
-      factors: { "unit-frac": "3.3" },
+      items: [
+        makeItem({
+          unitId: "unit-frac",
+          quantity: "2.5",
+          batchId: "batch-frac",
+          baseQuantity: referenceBaseQty("2.5", "3.3"),
+        }),
+      ],
     });
 
     const res = await voidInvoice(
@@ -329,30 +376,63 @@ describe("T4d v4.1 — inventory restoration uses unit conversion, never inversi
     );
     expect(res.status).toBe(200);
 
-    expect(increments()).toEqual([referenceBaseQty("2.5", "3.3")]);
-    expect(increments()[0]).toBe("8.25");
-    // Zero rounding loss: the same figure at the schema's Decimal(18,4) precision.
-    expect(new Decimal(increments()[0]).toFixed(4)).toBe("8.2500");
+    expect(increments()).toEqual(["8.2500"]);
+    expect(new Decimal(increments()[0]).toString()).toBe("8.25");
   });
 
-  it("resolves the factor via item.unitId — never the product's base unit", async () => {
+  it("[v4.8 regression] a FIFO-split line restores its stored baseQuantity (20), never the re-derived 19.9992", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    // One carton sold across two batches: this line is the 0.8333-carton share
+    // whose exact deduction was 20 base units. quantity x factor would restore
+    // 19.9992 and silently corrupt the batch.
+    arrangeSuccess({
+      items: [makeItem({ quantity: "0.8333", baseQuantity: "20.0000" })],
+    });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: "inv-original", voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    const rederived = new Decimal("0.8333").times(CARTON_FACTOR).toFixed(4);
+    expect(rederived).toBe("19.9992");
+    expect(increments()).toEqual(["20.0000"]);
+    expect(increments()[0]).not.toBe(rederived);
+  });
+
+  it("a two-batch FIFO split restores each batch exactly and the parts sum to the carton", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    arrangeSuccess({
+      items: [
+        makeItem({ id: "i-1", batchId: "batch-a", quantity: "0.8333", baseQuantity: "20.0000" }),
+        makeItem({ id: "i-2", batchId: "batch-b", quantity: "0.1667", baseQuantity: "4.0000" }),
+      ],
+    });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: "inv-original", voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    expect(incrementedBatchIds()).toEqual(["batch-a", "batch-b"]);
+    expect(increments()).toEqual(["20.0000", "4.0000"]);
+    // One whole carton = 24 base units, restored with zero drift.
+    expect(sumMoney(increments())).toBe("24.0000");
+  });
+
+  it("reads no unit factor at all — the void route never touches ProductUnit", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess();
 
     await voidInvoice(makeRequest({ invoiceId: "inv-original", voidReason: VOID_REASON }));
 
-    // A base unit would have carried factor 1; this proves the SOLD unit was fetched.
-    expect(fakeProductUnit.findUniqueOrThrow).toHaveBeenCalledTimes(1);
-    expect(fakeProductUnit.findUniqueOrThrow.mock.calls[0][0].where).toMatchObject({
-      id: "unit-carton",
-      tenantId: TENANT_ID,
-    });
-    expect(callLog.filter((e) => e.startsWith("unit-lookup:"))).toEqual([
-      "unit-lookup:unit-carton",
-    ]);
+    expect(fakeProductUnit.findUniqueOrThrow).not.toHaveBeenCalled();
+    expect(fakeProductUnit.findUnique).not.toHaveBeenCalled();
+    expect(fakeProductUnit.findFirst).not.toHaveBeenCalled();
+    expect(callLog.filter((e) => e.startsWith("unit-lookup:"))).toEqual([]);
   });
 
-  it("increments exactly item.batchId, once per distinct batch, on a FIFO-split invoice", async () => {
+  it("increments exactly each line's batchId, in line order, on a multi-line invoice", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess({
       items: [
@@ -368,25 +448,28 @@ describe("T4d v4.1 — inventory restoration uses unit conversion, never inversi
     expect(fakeInvoiceItem.create).toHaveBeenCalledTimes(2);
 
     expect([...incrementedBatchIds()].sort()).toEqual(["batch-a", "batch-b"]);
-    expect(increments()).toEqual(["24", "48"]);
+    expect(increments()).toEqual(["24.0000", "48.0000"]);
     expect(increments()).toEqual([
-      referenceBaseQty("1", "24"),
-      referenceBaseQty("2", "24"),
+      referenceBaseQty("1", CARTON_FACTOR),
+      referenceBaseQty("2", CARTON_FACTOR),
     ]);
   });
 
-  it("never invokes a FIFO re-allocation — restoration is a direct increment", async () => {
+  it("never invokes FIFO allocation, base-unit lookup or unit conversion — restoration is a direct increment", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess();
 
     await voidInvoice(makeRequest({ invoiceId: "inv-original", voidReason: VOID_REASON }));
 
-    const routeSource = fs.readFileSync(
-      path.resolve(process.cwd(), "app/api/ledger/voids/route.ts"),
-      "utf-8"
-    );
-    expect(routeSource).not.toContain("commitFifoAllocation");
-    expect(routeSource).not.toContain("requireBaseUnit");
+    // Comments are stripped first: the route's own comments name these
+    // functions to explain that it does NOT use them.
+    const code = readRouteCode();
+    expect(code).not.toMatch(/commitFifoAllocation/);
+    expect(code).not.toMatch(/previewFifoAllocation/);
+    expect(code).not.toMatch(/requireBaseUnit/);
+    expect(code).not.toMatch(/getUnitConversionFactor/);
+    expect(code).not.toMatch(/toBaseUnit/);
+    expect(code).not.toMatch(/\.conversionFactor/);
 
     // Every write in the transaction is an increment, never a decrement/set.
     for (const call of fakeProductBatch.update.mock.calls as any[]) {
@@ -395,7 +478,7 @@ describe("T4d v4.1 — inventory restoration uses unit conversion, never inversi
     }
   });
 
-  it("keeps the void InvoiceItem.quantity in the SOLD unit, distinct from the base-unit restore", async () => {
+  it("keeps the void InvoiceItem.quantity in the SOLD unit and negates baseQuantity separately", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess();
 
@@ -403,26 +486,53 @@ describe("T4d v4.1 — inventory restoration uses unit conversion, never inversi
 
     const itemData = fakeInvoiceItem.create.mock.calls[0][0].data;
     expect(itemData.quantity).toBe("-3.0000"); // sold unit: −3 cartons
+    expect(itemData.baseQuantity).toBe("-72.0000"); // exact base-unit amount, negated
     expect(itemData.unitId).toBe("unit-carton"); // same sold unit, never a base unit
     expect(itemData.batchId).toBe("batch-1");
-    expect(itemData.quantity).not.toBe(increments()[0]);
-    expect(increments()[0]).toBe("72");
+    expect(itemData.quantity).not.toBe(itemData.baseQuantity);
+    expect(increments()[0]).toBe("72.0000");
     // Price deliberately never negated — that would double-negate the line total.
     expect(itemData.unitPriceSYP).toBe("50000.0000");
     expect(itemData.unitPriceUSD).toBe("3.3333");
   });
 
-  it("collapses to one value only when the sold unit IS the base unit (factor 1)", async () => {
+  it("negates the frozen cost basis and base quantity exactly — original + void is zero per line", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({
+      items: [makeItem({ costAmountSYP: "90000.0000" })],
+    });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    const itemData = fakeInvoiceItem.create.mock.calls[0][0].data;
+    expect(itemData.costAmountSYP).toBe("-90000.0000");
+    expect(sumMoney([original.items[0].costAmountSYP, itemData.costAmountSYP])).toBe("0.0000");
+    expect(sumMoney([original.items[0].baseQuantity, itemData.baseQuantity])).toBe("0.0000");
+    expect(sumMoney([original.items[0].quantity, itemData.quantity])).toBe("0.0000");
+  });
+
+  it("restores 1:1 when the sold unit IS the base unit", async () => {
     setSession(ADMIN_ID, "ADMIN");
     arrangeSuccess({
-      items: [makeItem({ unitId: "unit-piece", quantity: "7", batchId: "batch-p" })],
-      factors: { "unit-piece": "1" },
+      items: [
+        makeItem({
+          unitId: "unit-piece",
+          quantity: "7",
+          batchId: "batch-p",
+          baseQuantity: "7.0000",
+        }),
+      ],
     });
 
     await voidInvoice(makeRequest({ invoiceId: "inv-original", voidReason: VOID_REASON }));
 
-    expect(fakeInvoiceItem.create.mock.calls[0][0].data.quantity).toBe("-7.0000");
-    expect(increments()[0]).toBe("7");
+    const itemData = fakeInvoiceItem.create.mock.calls[0][0].data;
+    expect(itemData.quantity).toBe("-7.0000");
+    expect(itemData.baseQuantity).toBe("-7.0000");
+    expect(increments()[0]).toBe("7.0000");
   });
 });
 
@@ -485,12 +595,9 @@ describe("T4d v4.1 — the void row's shape (money, reason, actor, append-only)"
 
     expect(callLog.every((e) => !e.toLowerCase().includes("payment"))).toBe(true);
 
-    const routeSource = fs.readFileSync(
-      path.resolve(process.cwd(), "app/api/ledger/voids/route.ts"),
-      "utf-8"
-    );
-    expect(routeSource).not.toContain("customerPayment");
-    expect(routeSource).not.toContain("CustomerPayment");
+    const code = readRouteCode();
+    expect(code).not.toContain("customerPayment");
+    expect(code).not.toContain("CustomerPayment");
   });
 });
 
@@ -772,27 +879,50 @@ describe("T4d v4.1 — single entry point for the online void action (static sca
     return collected;
   }
 
-  it("keeps every UI reference to the void flow under components/sales-log/", () => {
-    const uiFiles = [
+  const SALES_LOG_DIR = path.join("components", "sales-log");
+  const OFFLINE_PANEL = path.join("components", "pos", "offline-void-panel.tsx");
+
+  function uiFiles(): string[] {
+    return [
       ...collectFiles("components", /\.(ts|tsx)$/),
       ...collectFiles("app", /\.tsx$/),
     ].filter((file) => !file.includes("__tests__"));
+  }
 
-    expect(uiFiles.length).toBeGreaterThan(0);
+  it("keeps every UI reference to the void ENDPOINT under components/sales-log/ (comments ignored)", () => {
+    const files = uiFiles();
+    expect(files.length).toBeGreaterThan(0);
 
-    const offenders = uiFiles.filter((file) => {
-      const source = fs.readFileSync(file, "utf-8");
-      const mentionsVoidFlow =
-        source.includes("/api/ledger/voids") || source.includes("ledger:void_invoice");
-      if (!mentionsVoidFlow) return false;
-      return !file.includes(path.join("components", "sales-log"));
+    const offenders = files.filter((file) => {
+      const code = stripComments(fs.readFileSync(file, "utf-8"));
+      if (!code.includes("/api/ledger/voids")) return false;
+      return !file.includes(SALES_LOG_DIR);
     });
 
-    // No POS screen, no ledger screen, no other dashboard page reaches the
-    // online void action. (Non-UI files — the route itself, the role matrix,
-    // the T4c2 cross-reference comments in app/api/invoices/** — are outside
-    // this scan by design: the guarantee is about UI reachability.)
+    // No POS screen (the offline void panel included — it writes to local
+    // Dexie through submitOfflineVoid(), spec §6.4), no ledger screen, no other
+    // dashboard page reaches the online void endpoint. Non-UI files — the route
+    // itself, the role matrix, cross-reference comments — are outside this scan
+    // by design: the guarantee is about UI reachability.
     expect(offenders).toEqual([]);
+  });
+
+  it("limits the ledger:void_invoice capability string in UI code to the two sanctioned void surfaces", () => {
+    const offenders = uiFiles().filter((file) => {
+      const code = stripComments(fs.readFileSync(file, "utf-8"));
+      if (!code.includes("ledger:void_invoice")) return false;
+      return !file.includes(SALES_LOG_DIR) && !file.endsWith(OFFLINE_PANEL);
+    });
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("keeps the offline void panel off the online endpoint (spec §6.4)", () => {
+    const panelPath = path.resolve(process.cwd(), OFFLINE_PANEL);
+    expect(fs.existsSync(panelPath)).toBe(true);
+
+    const code = stripComments(fs.readFileSync(panelPath, "utf-8"));
+    expect(code).not.toContain("/api/ledger/voids");
   });
 
   it("leaves T4e's ledger screen without any void trigger", () => {
@@ -992,3 +1122,128 @@ describe("T4e v4.4 §1 — the void row lands on the customer's CURRENT survivor
   });
 });
 
+// ============================================================================
+// PASTE AT THE END of lib/data/__tests__/t4d-void-refund.test.ts
+//
+// No new imports needed: this block reuses the file's own helpers
+// (setSession, arrangeSuccess, makeItem, voidInvoice, makeRequest, createData,
+// increments, incrementedBatchIds, readRouteCode, fakeInvoiceItem, sumMoney,
+// VOID_REASON, ADMIN_ID).
+//
+// By-amount (بيع بالمبلغ): 0.3333 kg @ 15,000 = 4,999.5, but the customer paid
+// 5,000 and the stored invoice says 5,000. The online void builds the reversal
+// from the STORED original, so it must reverse 5,000 exactly (never 4,999.5)
+// and restore exactly the stored baseQuantity.
+// ============================================================================
+describe("T4d — إلغاء بيع بالمبلغ أونلاين (0.3333 كغ @ 15000 بإجمالي 5000)", () => {
+  const BY_AMOUNT_INVOICE = {
+    totalSYP: "5000.0000",
+    totalUSD: null,
+    exchangeRateUsed: null,
+    paidAmountSYP: "5000.0000",
+    paidAmountUSD: null,
+    debtAmountSYP: "0.0000",
+    debtAmountUSD: null,
+    isPaid: true,
+  };
+
+  const kgItem = (overrides: Record<string, unknown> = {}) =>
+    makeItem({
+      unitId: "unit-kg",
+      batchId: "batch-kg",
+      quantity: "0.3333",
+      baseQuantity: "0.3333", // what was actually deducted — the default (x24) would be wrong here
+      unitPriceSYP: "15000.0000",
+      unitPriceUSD: null,
+      costAmountSYP: "3.3330",
+      ...overrides,
+    });
+
+  it("يعكس إجمالي/مدفوع/دين الأصل المخزّن بالضبط (-5000 لا -4999.5) والصافي صفر", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({ items: [kgItem()], invoice: BY_AMOUNT_INVOICE });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    const data = createData();
+    expect(data.totalSYP).toBe("-5000.0000");
+    expect(data.paidAmountSYP).toBe("-5000.0000");
+    expect(data.debtAmountSYP).toBe("0.0000");
+    // The route never derives the total from quantity x price:
+    expect(data.totalSYP).not.toBe("-4999.5000");
+
+    // No rate on the original -> no rate and no USD on the void either.
+    expect(data.exchangeRateUsed).toBeNull();
+    expect(data.totalUSD).toBeNull();
+
+    expect(sumMoney([original.totalSYP, data.totalSYP])).toBe("0.0000");
+    expect(sumMoney([original.paidAmountSYP, data.paidAmountSYP])).toBe("0.0000");
+    expect(sumMoney([original.debtAmountSYP, data.debtAmountSYP])).toBe("0.0000");
+  });
+
+  it("سطر الإلغاء: الكمية و baseQuantity والتكلفة سالب الأصل، والسعر كما هو، والصافي صفر لكل حقل", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({ items: [kgItem()], invoice: BY_AMOUNT_INVOICE });
+
+    await voidInvoice(makeRequest({ invoiceId: original.id, voidReason: VOID_REASON }));
+
+    const itemData = fakeInvoiceItem.create.mock.calls[0][0].data;
+    expect(itemData.quantity).toBe("-0.3333");
+    expect(itemData.baseQuantity).toBe("-0.3333");
+    expect(itemData.costAmountSYP).toBe("-3.3330");
+    expect(itemData.unitPriceSYP).toBe("15000.0000"); // never negated
+    expect(itemData.unitPriceUSD).toBeNull();
+
+    const o = original.items[0];
+    expect(sumMoney([o.quantity, itemData.quantity])).toBe("0.0000");
+    expect(sumMoney([o.baseQuantity, itemData.baseQuantity])).toBe("0.0000");
+    expect(sumMoney([o.costAmountSYP, itemData.costAmountSYP])).toBe("0.0000");
+  });
+
+  it("المخزون يرجع بـ baseQuantity المخزّنة بالضبط (0.3333) لنفس الدفعة", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({ items: [kgItem()], invoice: BY_AMOUNT_INVOICE });
+
+    await voidInvoice(makeRequest({ invoiceId: original.id, voidReason: VOID_REASON }));
+
+    expect(incrementedBatchIds()).toEqual(["batch-kg"]);
+    expect(increments()).toEqual(["0.3333"]);
+  });
+
+  it("بيع بالمبلغ موزّع على دفعتين: كل دفعة ترجع بالضبط ومجموعها 0.3333، والإجمالي المعكوس 5000", async () => {
+    setSession(ADMIN_ID, "ADMIN");
+    const original = arrangeSuccess({
+      items: [
+        kgItem({ id: "i-a", batchId: "batch-a", quantity: "0.2000", baseQuantity: "0.2000", costAmountSYP: "2.0000" }),
+        kgItem({ id: "i-b", batchId: "batch-b", quantity: "0.1333", baseQuantity: "0.1333", costAmountSYP: "1.3330" }),
+      ],
+      invoice: BY_AMOUNT_INVOICE,
+    });
+
+    const res = await voidInvoice(
+      makeRequest({ invoiceId: original.id, voidReason: VOID_REASON })
+    );
+    expect(res.status).toBe(200);
+
+    expect(incrementedBatchIds()).toEqual(["batch-a", "batch-b"]);
+    expect(increments()).toEqual(["0.2000", "0.1333"]);
+    expect(sumMoney(increments())).toBe("0.3333");
+
+    // The invoice total comes from the stored invoice (5000), not from summing
+    // the two lines (0.2 x 15000 + 0.1333 x 15000 = 4999.95).
+    expect(createData().totalSYP).toBe("-5000.0000");
+
+    const voidCosts = fakeInvoiceItem.create.mock.calls.map((c: any) => c[0].data.costAmountSYP);
+    expect(sumMoney([...original.items.map((i: any) => i.costAmountSYP), ...voidCosts])).toBe("0.0000");
+  });
+
+  it("[static] المسار لا يعيد حساب الإجمالي من السطور ولا يستعمل التسامح أبداً — يبقى مشتقاً من الأصل المخزّن", () => {
+    const code = readRouteCode();
+    expect(code).not.toMatch(/isTotalWithinTolerance|invoiceTotalTolerance|quantityFromAmount|QUANTITY_HALF_STEP/);
+    expect(code).not.toMatch(/multiplyMoney/);
+    expect(code).not.toMatch(/0\.00005/);
+  });
+});

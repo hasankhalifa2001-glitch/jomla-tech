@@ -229,6 +229,7 @@ import { saveOfflineInvoiceWithBalance, saveOfflinePaymentWithBalance } from "./
 import { refreshProductCache } from "./cache-refresh";
 import {
   compareMoney,
+  isTotalWithinTolerance,
   toDecimal,
   multiplyMoney,
   subtractMoney,
@@ -295,6 +296,14 @@ export interface CartLineItem {
   // proceed without a cached rate (SYP-only carts can; USD-priced items
   // need a rate to resolve their unitPriceSYP in the first place).
   pricingCurrency: "USD" | "SYP";
+  /**
+ * [By-amount] Set ONLY on a base-unit line the cashier sold "by amount".
+ * The typed amount is the authoritative line total; quantity is derived
+ * (quantityFromAmount) and may differ from this by < half a quantity step
+ * x unit price. Cart state only: never persisted per item (the invoice
+ * stores totalSYP). Must be cleared when quantity, unit or price changes.
+ */
+  lineTotalOverrideSYP?: string;
 }
 
 export interface CartTotalsResult {
@@ -639,7 +648,22 @@ export function calculateCartTotals(
     // correctness bug. Every monetary computation below stays strictly
     // per-line via unitPriceSYP × quantity, which is unaffected.
     itemCount += item.quantity;
-    const lineTotalSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
+    let lineTotalSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
+    if (item.lineTotalOverrideSYP !== undefined) {
+      // D1: by-amount only on the base unit (factor exactly 1).
+      if (compareMoney(item.conversionFactor, 1) !== 0) {
+        throw new Error("البيع بالمبلغ متاح فقط للوحدة الأساسية.");
+      }
+      if (compareMoney(item.lineTotalOverrideSYP, 0) <= 0) {
+        throw new Error("مبلغ السطر يجب أن يكون أكبر من الصفر.");
+      }
+      // A bad override can never smuggle a wrong total: it must stay within
+      // half a quantity step of quantity x price for THIS line.
+      if (!isTotalWithinTolerance(lineTotalSYP, item.lineTotalOverrideSYP, [item.unitPriceSYP])) {
+        throw new Error("مبلغ السطر لا يطابق الكمية والسعر — أعد إدخال المبلغ.");
+      }
+      lineTotalSYP = serializeMoney(item.lineTotalOverrideSYP);
+    }
     lineTotalsSYP.push(lineTotalSYP);
 
     let lineTotalUSD: string | null = null;
@@ -1182,6 +1206,8 @@ export async function submitOfflineSale(
   // would previously have accepted it as long as the three SYP fields
   // agreed among themselves.
   const computedTotals = calculateCartTotals(payload.items, payload.exchangeRateUsed);
+  // The overrides are already folded into computedTotals, so this comparison
+  // is EXACT again: a cart without by-amount lines gets zero slack.
   if (compareMoney(computedTotals.totalSYP, payload.totalSYP) !== 0) {
     throw new Error(
       "إجمالي الفاتورة المرسل لا يطابق مجموع أسعار عناصر السلة الفعلية — يرجى إعادة حساب السلة قبل المتابعة."

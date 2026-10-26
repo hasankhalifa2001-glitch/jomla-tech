@@ -1303,3 +1303,173 @@ describe("T4c — فحوصات ساكنة على الشيفرة (static source s
         expect(src).not.toMatch(/assertTenantWritable\(/);
     });
 });
+
+
+// ----------------------------------------------------------------------------
+// By-amount sales (بيع بالمبلغ): 0.3333 kg @ 15,000 = 4,999.5, but the customer
+// paid 5,000. The invoice total is the typed amount; the shared tolerance
+// (half a quantity step x price, summed per line) accepts it, nothing more.
+// ----------------------------------------------------------------------------
+describe("T4c — البيع بالمبلغ (تسامح التقريب)", () => {
+    const KG_PRICE = "15000";
+
+    function byAmountSale(offlineId: string, total = "5000.0000", lines = 1) {
+        const inv = saleInvoice({
+            offlineId,
+            items: Array.from({ length: lines }, () => ({
+                unitId: "P1-base",
+                quantity: "0.3333",
+                price: KG_PRICE,
+            })),
+        });
+        inv.totalSYP = total;
+        inv.paidAmountSYP = total;
+        inv.debtAmountSYP = "0.0000";
+        return inv;
+    }
+
+    function byAmountVoid(offlineId: string, voids: string, total = "5000.0000") {
+        const v = voidInvoice({
+            offlineId,
+            voids,
+            items: [{ unitId: "P1-base", quantity: "0.3333", price: KG_PRICE }],
+        });
+        v.totalSYP = `-${total}`;
+        v.paidAmountSYP = `-${total}`;
+        v.debtAmountSYP = "0.0000";
+        return v;
+    }
+
+    it("0.3333 كغ @ 15000 بإجمالي 5000 → SYNCED، المخزّن 5000 والخصم والتكلفة دقيقان", async () => {
+        seedBatch("A", "P1", "10", "2026-12-01", "10");
+
+        const { json } = await postSync({ invoices: [byAmountSale("s1")] });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(eq(inv.totalSYP, "5000")).toBe(true);
+        expect(eq(inv.debtAmountSYP, "0")).toBe(true);
+
+        const items = itemsOf(inv.id);
+        expect(items).toHaveLength(1);
+        expect(eq(items[0].baseQuantity, "0.3333")).toBe(true);
+        expect(eq(items[0].costAmountSYP, "3.333")).toBe(true); // 0.3333 x 10
+        expect(eq(qty("A"), "9.6667")).toBe(true);
+    });
+
+    it("إجمالي مزوّر (4000 أو 5001) لنفس الكمية → FAILED والمخزون ما يتغير", async () => {
+        seedBatch("A", "P1", "10", "2026-12-01");
+
+        const low = await postSync({ invoices: [byAmountSale("s1", "4000.0000")] });
+        const high = await postSync({ invoices: [byAmountSale("s2", "5001.0000")] });
+
+        expect(low.json.invoices[0].status).toBe("FAILED");
+        expect(high.json.invoices[0].status).toBe("FAILED");
+        expect(store.invoices).toHaveLength(0);
+        expect(eq(qty("A"), "10")).toBe(true);
+    });
+
+    it("حدّ التسامح شامل: فرق 0.75 مقبول وفرق أكبر منه بخطوة 4 خانات مرفوض", async () => {
+        seedBatch("A", "P1", "10", "2026-12-01");
+        // expected = 4999.5, tolerance = 0.75
+        const atEdge = await postSync({ invoices: [byAmountSale("edge", "5000.2500")] });
+        const beyond = await postSync({ invoices: [byAmountSale("over", "5000.2501")] });
+
+        expect(atEdge.json.invoices[0].status).toBe("SYNCED");
+        expect(beyond.json.invoices[0].status).toBe("FAILED");
+    });
+
+    it("سطران: التسامح هو المجموع (1.5) لا تسامح الفاتورة الواحدة", async () => {
+        seedBatch("A", "P1", "10", "2026-12-01");
+        // expected = 9999.0 ; tolerance = 2 x 0.75 = 1.5
+        const ok = await postSync({ invoices: [byAmountSale("two-ok", "10000.0000", 2)] }); // diff 1.0
+        const bad = await postSync({ invoices: [byAmountSale("two-bad", "10001.0000", 2)] }); // diff 2.0
+
+        expect(ok.json.invoices[0].status).toBe("SYNCED");
+        expect(bad.json.invoices[0].status).toBe("FAILED");
+    });
+
+    it("بيع بالمبلغ موزّع على دفعتين: مجموع baseQuantity = 0.3333 بالضبط والإجمالي 5000", async () => {
+        seedBatch("A", "P1", "0.2", "2026-12-01");
+        seedBatch("B", "P1", "10", "2027-06-01");
+
+        const { json } = await postSync({ invoices: [byAmountSale("s1")] });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const items = itemsOf(json.invoices[0].realId);
+        expect(items).toHaveLength(2);
+        const sum = items.reduce((s, i) => s.plus(i.baseQuantity), new Decimal(0));
+        expect(sum.eq("0.3333")).toBe(true);
+        expect(eq(qty("A"), "0")).toBe(true);
+        expect(eq(qty("B"), "9.8667")).toBe(true);
+        expect(eq(store.invoices[0].totalSYP, "5000")).toBe(true);
+    });
+
+    it("إلغاء بيع بالمبلغ عبر الـ sync: SYNCED، الأصل + الإلغاء = 0 للإجمالي/المدفوع/الدين/التكلفة، والمخزون يرجع كما كان", async () => {
+        seedBatch("A", "P1", "10", "2026-12-01", "10");
+        await postSync({ invoices: [byAmountSale("s1")] });
+        expect(eq(qty("A"), "9.6667")).toBe(true);
+
+        const { json } = await postSync({ invoices: [byAmountVoid("v1", "s1")] });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const original = store.invoices.find((i) => i.offlineId === "s1");
+        const voided = store.invoices.find((i) => i.offlineId === "v1");
+        for (const f of ["totalSYP", "paidAmountSYP", "debtAmountSYP"] as const) {
+            expect(new Decimal(original[f]).plus(voided[f]).isZero()).toBe(true);
+        }
+        const costSum = [...itemsOf(original.id), ...itemsOf(voided.id)].reduce(
+            (s, i) => s.plus(i.costAmountSYP),
+            new Decimal(0)
+        );
+        const baseSum = [...itemsOf(original.id), ...itemsOf(voided.id)].reduce(
+            (s, i) => s.plus(i.baseQuantity),
+            new Decimal(0)
+        );
+        expect(costSum.isZero()).toBe(true);
+        expect(baseSum.isZero()).toBe(true);
+        expect(eq(qty("A"), "10")).toBe(true); // لا 10.0001 ولا 9.9999
+    });
+
+    it("إلغاء بإجمالي مزوّر لبيع بالمبلغ (غير سالب الأصل) → FAILED والمخزون ما يرجع", async () => {
+        seedBatch("A", "P1", "10", "2026-12-01");
+        await postSync({ invoices: [byAmountSale("s1")] });
+
+        const { json } = await postSync({ invoices: [byAmountVoid("v1", "s1", "4999.5000")] });
+
+        expect(json.invoices[0].status).toBe("FAILED"); // الفحص الدقيق مقابل الأصل المخزّن
+        expect(eq(qty("A"), "9.6667")).toBe(true);
+    });
+});
+
+describe("T4c — فحوصات ساكنة للتسامح (تعريف واحد)", () => {
+    const strip = (rel: string) =>
+        readFileSync(path.resolve(process.cwd(), rel), "utf8")
+            .replace(/\/\*[\s\S]*?\*\//g, "")
+            .replace(/^\s*\/\/.*$/gm, "");
+
+    it("الثابت 0.00005 معرّف مرة وحدة بـ money.ts ولا يظهر بأي ملف تاني", () => {
+        expect((strip("lib/utils/money.ts").match(/0\.00005/g) ?? []).length).toBe(1);
+        for (const rel of [
+            "app/api/sync/route.ts",
+            "app/api/ledger/voids/route.ts",
+            "lib/offline/db.ts",
+            "lib/offline/pos-service.ts",
+        ]) {
+            expect(strip(rel), rel).not.toMatch(/0\.00005/);
+        }
+    });
+
+    it("لا مقارنة دقيقة بين مجموع البنود والإجمالي بمسار الـ sync", () => {
+        const src = strip("app/api/sync/route.ts");
+        expect(src).not.toMatch(/compareMoney\(\s*expectedTotalSYP\s*,\s*totalSYP\s*\)/);
+        expect(src).toMatch(/isTotalWithinTolerance\(\s*expectedTotalSYP/);
+    });
+
+    it("فحوصات الإلغاء المقابلة للأصل المخزّن تبقى دقيقة (لا تسامح)", () => {
+        const src = strip("app/api/sync/route.ts");
+        expect(src).toMatch(/compareMoney\(totalSYP, expectedVoidTotalSYP\) !== 0/);
+        expect(src).toMatch(/compareMoney\(paidSYP, expectedVoidPaidSYP\) !== 0/);
+        expect(src).toMatch(/compareMoney\(debtSYP, expectedVoidDebtSYP\) !== 0/);
+    });
+});

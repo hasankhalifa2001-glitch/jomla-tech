@@ -69,6 +69,32 @@ export class MoneyError extends Error {
 }
 
 /**
+ * [D2] Half of the smallest quantity step (0.0001) used by
+ * InvoiceItem.quantity / ProductBatch.quantity / baseQuantity - all
+ * Decimal(18,4). A by-amount line's derived quantity can differ from its
+ * typed amount by up to half a step times the unit price (e.g.
+ * 0.3333 kg x 15,000 = 4,999.5 vs 5,000). The invoice-level tolerance is
+ * the SUM of this per line (see invoiceTotalTolerance / D3).
+ *
+ * This is the ONLY definition of this constant in the codebase. Nothing
+ * else may declare a second 0.00005 literal or re-implement the tolerance
+ * comparison below (a static source scan enforces this - added in Phase 2).
+ */
+export const QUANTITY_HALF_STEP = "0.00005";
+
+/**
+ * [D2/D5] Thrown by quantityFromAmount() when the amount cannot be
+ * converted to a valid sellable quantity: price <= 0, amount <= 0, or the
+ * derived quantity rounds below the 0.0001 minimum.
+ */
+export class QuantityFromAmountError extends MoneyError {
+  constructor(message: string) {
+    super(message);
+    this.name = "QuantityFromAmountError";
+  }
+}
+
+/**
  * [FIX] Uses decimal.js's own `Decimal.isDecimal()` static check instead
  * of `instanceof Money`. `Money` is a `.clone()`'d constructor, entirely
  * separate from the base `Decimal` export and from any OTHER module's own
@@ -201,6 +227,41 @@ export function divideMoney(a: MoneyInput, b: MoneyInput): string {
     throw new MoneyError("Division by zero: cannot divide a monetary value by 0.");
   }
   return toDecimal(a).dividedBy(divisor).toFixed(4);
+}
+
+/**
+ * [D2/D3] Derive the sell quantity from a customer-requested amount.
+ * quantity = amount / unitPriceSYP, rounded ONCE (HALF_UP) to 4 dp - the
+ * precision of InvoiceItem.quantity / ProductBatch.quantity / baseQuantity.
+ * Throws QuantityFromAmountError for price <= 0, amount <= 0, or a derived
+ * quantity below the 0.0001 minimum (D5). Uses divideMoney() so the division
+ * itself stays within this module's decimal.js rounding config.
+ */
+export function quantityFromAmount(
+  amountSYP: MoneyInput,
+  unitPriceSYP: MoneyInput
+): string {
+  const amount = toDecimal(amountSYP);
+  const price = toDecimal(unitPriceSYP);
+
+  if (price.isZero() || price.isNegative()) {
+    throw new QuantityFromAmountError("سعر الوحدة يجب أن يكون أكبر من صفر.");
+  }
+  if (amount.isZero() || amount.isNegative()) {
+    throw new QuantityFromAmountError("المبلغ يجب أن يكون أكبر من صفر.");
+  }
+
+  // divideMoney rounds HALF_UP to 4 dp - matches Decimal(18,4) quantity precision.
+  const quantity = toDecimal(divideMoney(amountSYP, unitPriceSYP));
+
+  // D5: minimum derived quantity is 0.0001.
+  if (quantity.lessThan(toDecimal("0.0001"))) {
+    throw new QuantityFromAmountError(
+      "المبلغ أدنى من الكمية الدنيا القابلة للبيع (0.0001)."
+    );
+  }
+
+  return quantity.toFixed(4);
 }
 
 /**
@@ -347,9 +408,52 @@ export function formatMoney(
 /** Sums an array of monetary values and returns the result as a Decimal string.
  * Exists so T4b's "summation across line items" always goes through the
  * shared decimal.js wrapper instead of a hand-rolled .reduce((a,b)=>a+b) that
- * would silently reintroduce native float arithmetic on money. */
+ * would silently reintroduce native float arithmetic on money.
+ *
+ * An empty array returns "0.0000" (same 4-dp format as every other function
+ * in this module) so callers can compare/serialize the result uniformly. */
 export function sumMoney(values: MoneyInput[]): string {
-  return values.reduce<string>((acc, v) => addMoney(acc, v), "0");
+  return values.reduce<string>((acc, v) => addMoney(acc, v), "0.0000");
+}
+
+/**
+ * [D2/D3] Invoice-level tolerance = SUM over lines of (|unitPriceSYP| x 0.00005).
+ * Uniform across every line because the server cannot know which lines were
+ * entered by amount. The result is a SYP tolerance amount.
+ *
+ * The sum is computed at full decimal precision (no intermediate 4-dp
+ * rounding) and rounded ONCE, UPWARD (ROUND_CEIL), to 4 dp. The tolerance may
+ * only ever be rounded up, never down: a legitimate by-amount line that sits
+ * exactly on the half-step boundary (possible with a fractional, e.g.
+ * USD-converted, unit price) must never be rejected merely because the
+ * tolerance itself was rounded below its true value.
+ */
+export function invoiceTotalTolerance(unitPricesSYP: string[]): string {
+  const total = unitPricesSYP.reduce(
+    (acc, price) =>
+      acc.plus(toDecimal(price).abs().times(toDecimal(QUANTITY_HALF_STEP))),
+    new Money(0)
+  );
+  return total.toDecimalPlaces(4, Decimal.ROUND_CEIL).toFixed(4);
+}
+
+/**
+ * [D2/D3] Inclusive tolerance check: |expectedTotal - actualTotal| <=
+ * SUM(|unitPriceSYP| x 0.00005) over the invoice's lines.
+ * Returns true when the difference is within tolerance (inclusive).
+ * D1 (base-unit only) is enforced in the POS service, not on the server,
+ * by design - the server cannot know which lines were entered by amount.
+ */
+export function isTotalWithinTolerance(
+  expectedTotalSYP: MoneyInput,
+  actualTotalSYP: MoneyInput,
+  unitPricesSYP: string[]
+): boolean {
+  const tolerance = toDecimal(invoiceTotalTolerance(unitPricesSYP));
+  const diff = toDecimal(expectedTotalSYP)
+    .minus(toDecimal(actualTotalSYP))
+    .abs();
+  return diff.lessThanOrEqualTo(tolerance);
 }
 
 /**

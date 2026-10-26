@@ -54,6 +54,7 @@ import {
   type SelectedCustomer,
 } from "@/lib/offline/pos-service";
 import { syncPendingRecords } from "@/lib/offline/sync-worker";
+import { sumMoney } from "@/lib/utils/money";
 
 const TEST_TENANT_ID = "tenant-offline-void-t4d";
 const OTHER_TENANT_ID = "tenant-other-t4d";
@@ -668,14 +669,31 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
   });
 
   it("the offline void service writes no CustomerPayment record and no raw Decimal negation", () => {
-    // Slice on the RAW source first (the slice end-marker is a doc comment,
-    // which stripComments would remove), then strip comments from the slice.
-    const raw = fs.readFileSync(path.join(rootDir, "lib/offline/pos-service.ts"), "utf-8");
+    // Normalize line endings first: a Windows checkout can use CRLF, and
+    // every marker below assumes "\n".
+    const raw = fs
+      .readFileSync(path.join(rootDir, "lib/offline/pos-service.ts"), "utf-8")
+      .replace(/\r\n/g, "\n");
     const start = raw.indexOf("export async function submitOfflineVoid");
     expect(start).toBeGreaterThan(-1);
 
-    const nextExport = raw.indexOf("\n\n/**", start);
-    const body = stripComments(raw.slice(start, nextExport > -1 ? nextExport : undefined));
+    // The function ends where the NEXT top-level declaration begins: a line
+    // starting at column 0 with a doc comment or `export`. (The previous
+    // marker, "\n\n/**", only matched a doc-commented declaration, so when the
+    // next one had none — OfflineRepaymentParams / submitOfflinePayment — the
+    // slice ran on into submitOfflinePayment, which legitimately writes
+    // offlinePayments.)
+    const afterStart = raw.slice(start + 1);
+    const nextTopLevel = afterStart.search(/\n(?:\/\*\*|export\s)/);
+    const end = nextTopLevel === -1 ? raw.length : start + 1 + nextTopLevel;
+    const sliced = raw.slice(start, end);
+
+    // Sanity: the slice really is just this one function.
+    expect(sliced).not.toContain("export async function submitOfflinePayment");
+    expect(sliced).not.toContain("OfflineRepaymentParams");
+    expect(sliced).toContain("return voidRecord;");
+
+    const body = stripComments(sliced);
 
     expect(body).not.toContain("offlinePayments");
     expect(body).not.toContain("createOfflinePaymentRecord");
@@ -696,5 +714,145 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
     expect(ledgerPage).not.toContain("voidsInvoiceId");
     expect(ledgerPage).not.toContain("/api/ledger/voids");
     expect(ledgerPage).not.toContain("submitOfflineVoid");
+  });
+});
+
+
+// ============================================================================
+// PASTE AT THE END of lib/offline/__tests__/t4d-offline-void.test.ts
+//
+// ONE new import is needed at the top of that file:
+//     import { sumMoney } from "@/lib/utils/money";
+//
+// Everything else reuses the file's own helpers (seedCustomer, getOfflineDb,
+// submitOfflineSale, submitOfflineVoid, TEST_TENANT_ID, CartLineItem).
+//
+// By-amount (بيع بالمبلغ) queued OFFLINE: 0.3333 kg @ 15,000 = 4,999.5, the
+// customer paid 5,000. The local void is built from the stored local invoice,
+// so it must carry exactly -5,000 (never -4,999.5) and net to zero.
+// ============================================================================
+describe("T4d — إلغاء محلي لبيع بالمبلغ (بدون اتصال)", () => {
+  function byAmountCartItem(): CartLineItem {
+    const product = {
+      id: "prod-rice",
+      tenantId: TEST_TENANT_ID,
+      name: "رز مصري (بالكيلو)",
+      units: [
+        {
+          id: "unit-kg",
+          unitName: "كغ",
+          conversionFactor: "1",
+          priceWholesale: "15000.0000",
+          pricingCurrency: "SYP" as const,
+          isActive: true,
+        },
+      ],
+      batches: [],
+    };
+
+    return {
+      id: "line-kg",
+      product,
+      unitId: "unit-kg",
+      unitName: "كغ",
+      conversionFactor: "1",
+      quantity: 0.3333,
+      unitPriceSYP: "15000.0000",
+      unitPriceUSD: null,
+      pricingCurrency: "SYP",
+      lineTotalOverrideSYP: "5000.0000",
+    };
+  }
+
+  async function seedByAmountSale() {
+    const customer = await seedCustomer("cust-byamount", "0.0000");
+    return submitOfflineSale(TEST_TENANT_ID, {
+      customer,
+      items: [byAmountCartItem()],
+      totalSYP: "5000.0000",
+      exchangeRateUsed: null,
+      paidAmountSYP: "5000.0000",
+      debtAmountSYP: "0.0000",
+      paymentMethod: "CASH",
+    });
+  }
+
+  it("البيع يُحفظ محلياً بإجمالي 5000 وكمية 0.3333، والـ override لا يُحفظ على السطر", async () => {
+    const sale = await seedByAmountSale();
+
+    expect(sale.totalSYP).toBe("5000.0000");
+    expect(sale.paidAmountSYP).toBe("5000.0000");
+    expect(sale.debtAmountSYP).toBe("0.0000");
+    expect(sale.items[0].quantity).toBe("0.3333");
+    expect(sale.items[0]).not.toHaveProperty("lineTotalOverrideSYP");
+  });
+
+  it("الإلغاء المحلي: الإجماليات سالب المخزّن بالضبط (-5000 لا -4999.5) والصافي صفر", async () => {
+    const sale = await seedByAmountSale();
+
+    const voidRecord = await submitOfflineVoid(TEST_TENANT_ID, {
+      offlineInvoiceId: sale.offlineId,
+      voidReason: "إرجاع كامل من الزبون",
+      actorRole: "ADMIN",
+    });
+
+    expect(voidRecord.status).toBe("PENDING");
+    expect(voidRecord.totalSYP).toBe("-5000.0000");
+    expect(voidRecord.totalSYP).not.toBe("-4999.5000");
+    expect(voidRecord.paidAmountSYP).toBe("-5000.0000");
+    expect(voidRecord.debtAmountSYP).toBe("0.0000");
+
+    // Sold-unit quantity negated; price NOT negated; no base-unit math here.
+    expect(voidRecord.items[0].unitId).toBe("unit-kg");
+    expect(voidRecord.items[0].quantity).toBe("-0.3333");
+    expect(voidRecord.items[0].unitPriceSYP).toBe("15000.0000");
+
+    expect(sumMoney([sale.totalSYP, voidRecord.totalSYP])).toBe("0.0000");
+    expect(sumMoney([sale.paidAmountSYP, voidRecord.paidAmountSYP])).toBe("0.0000");
+    expect(sumMoney([sale.debtAmountSYP, voidRecord.debtAmountSYP])).toBe("0.0000");
+    expect(sumMoney([sale.items[0].quantity, voidRecord.items[0].quantity])).toBe("0.0000");
+  });
+
+  it("الأصل لا يتغيّر، ولا تُكتب أي دفعة، والرصيد المخزّن يبقى صفراً (دين صفر)", async () => {
+    const sale = await seedByAmountSale();
+    await submitOfflineVoid(TEST_TENANT_ID, {
+      offlineInvoiceId: sale.offlineId,
+      voidReason: "إرجاع كامل من الزبون",
+      actorRole: "ADMIN",
+    });
+
+    const db = getOfflineDb();
+    const original = await db.offlineInvoices.where("offlineId").equals(sale.offlineId).first();
+    expect(original?.totalSYP).toBe("5000.0000");
+    expect(original?.items[0].quantity).toBe("0.3333");
+    expect(original?.voidsOfflineInvoiceId).toBeUndefined();
+
+    expect(await db.offlinePayments.count()).toBe(0);
+    expect((await db.cachedCustomers.get("cust-byamount"))?.cachedBalanceDebtSYP).toBe("0.0000");
+  });
+
+  it("القيود تبقى: إلغاء مكرر لبيع بالمبلغ مرفوض، وكاشير مرفوض", async () => {
+    const sale = await seedByAmountSale();
+
+    await expect(
+      submitOfflineVoid(TEST_TENANT_ID, {
+        offlineInvoiceId: sale.offlineId,
+        voidReason: "x",
+        actorRole: "CASHIER",
+      })
+    ).rejects.toThrow(/ADMIN/);
+
+    await submitOfflineVoid(TEST_TENANT_ID, {
+      offlineInvoiceId: sale.offlineId,
+      voidReason: "إرجاع كامل من الزبون",
+      actorRole: "ADMIN",
+    });
+    await expect(
+      submitOfflineVoid(TEST_TENANT_ID, {
+        offlineInvoiceId: sale.offlineId,
+        voidReason: "محاولة ثانية",
+        actorRole: "ADMIN",
+      })
+    ).rejects.toThrow(/ملغاة محلياً بالفعل/);
   });
 });

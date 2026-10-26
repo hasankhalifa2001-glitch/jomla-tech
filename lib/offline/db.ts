@@ -6,6 +6,7 @@ import {
   compareMoney,
   subtractMoney,
   multiplyMoney,
+  isTotalWithinTolerance,
   sumMoney,
   deriveUsd,
   type MoneyInput,
@@ -671,13 +672,14 @@ export function createOfflineInvoiceRecord(data: {
 
   const totalSYP = serializeMoney(data.totalSYP);
 
+  const unitPricesSYP = serializedItems.map((item) => item.unitPriceSYP);
   const computedTotal = sumMoney(
     serializedItems.map((item) => multiplyMoney(item.quantity, item.unitPriceSYP))
   );
-  if (compareMoney(computedTotal, totalSYP) !== 0) {
+  if (!isTotalWithinTolerance(computedTotal, totalSYP, unitPricesSYP)) {
     throw new Error(
       `totalSYP (${totalSYP}) must equal the sum of item.quantity × item.unitPriceSYP ` +
-      `(${computedTotal}).`
+      `(${computedTotal}) within the by-amount rounding tolerance (half a quantity step per line).`
     );
   }
 
@@ -843,13 +845,14 @@ export function createOfflineVoidRecord(data: {
     );
   }
 
+  const unitPricesSYP = serializedItems.map((item) => item.unitPriceSYP);
   const computedTotal = sumMoney(
     serializedItems.map((item) => multiplyMoney(item.quantity, item.unitPriceSYP))
   );
-  if (compareMoney(computedTotal, totalSYP) !== 0) {
+  if (!isTotalWithinTolerance(computedTotal, totalSYP, unitPricesSYP)) {
     throw new Error(
       `totalSYP (${totalSYP}) must equal the sum of item.quantity × item.unitPriceSYP ` +
-      `(${computedTotal}).`
+      `(${computedTotal}) within the by-amount rounding tolerance (half a quantity step per line).`
     );
   }
 
