@@ -196,6 +196,27 @@
  * hasPriorInvoices either). The system cash customer remains barred from
  * carrying any debt. isEligibleForCredit() is kept exported but is no
  * longer called by the write path.
+ *
+ * [By-amount / بيع بالمبلغ — D1..D10] On a BASE-UNIT line the cashier may type
+ * an AMOUNT instead of a quantity: quantity = amount / unitPriceSYP rounded
+ * once to 4 dp (quantityFromAmount, lib/utils/money.ts) and
+ * CartLineItem.lineTotalOverrideSYP carries the typed amount, which IS the
+ * line total. It is cart state only — never persisted per item: the offline
+ * invoice stores totalSYP, and the sync server accepts quantity x price within
+ * the ONE tolerance defined in money.ts (half a quantity step per line).
+ *   - D8: every mutation of a line that can affect an amount line goes through
+ *     the pure funnel in this file (applyLineAmountOverride, clearLineOverride,
+ *     setLineQuantity, changeLineUnit, addUnitToLine, reconcileLineOverride).
+ *     The funnel never produces a state that calculateCartTotals() rejects.
+ *   - D9: when a line's unit price changes, the AMOUNT stays authoritative —
+ *     reconcileLineOverride() re-derives the quantity from it, and only clears
+ *     the override (visibly, via its outcome) when re-derivation is impossible.
+ *   - D1: by-amount is base-unit only (isBaseUnitLine). submitOfflineSale()
+ *     re-verifies it against cachedProducts, so the cart line's own
+ *     conversionFactor is never the only evidence.
+ *   - submitOfflineSale() compares the override-inclusive cart total EXACTLY
+ *     against payload.totalSYP; the tolerance only ever applies per line,
+ *     inside calculateCartTotals() and the db.ts factories.
  */
 
 import {
@@ -236,7 +257,9 @@ import {
   sumMoney,
   convertCurrency,
   serializeMoney,
+  addMoney,
   MoneyError,
+  quantityFromAmount,
   type MoneyInput,
 } from "../utils/money";
 
@@ -277,11 +300,8 @@ export interface CartLineItem {
   unitName: string;
   /**
    * [FIX — review pass 9] Decimal-serialized string, never a native JS
-   * number — was previously typed `number`, the only Decimal-precision
-   * field on this interface (and one of very few anywhere in the
-   * codebase) that wasn't. Mirrors CachedProductUnit.conversionFactor's
-   * own string type (db.ts) — this value should be read straight from
-   * that field, never coerced through Number(...) on the way in.
+   * number. Mirrors CachedProductUnit.conversionFactor's own string type
+   * (db.ts) — read straight from that field, never coerced through Number().
    */
   conversionFactor: string;
   quantity: number;
@@ -291,18 +311,19 @@ export interface CartLineItem {
   // when this line was added to the cart.
   unitPriceUSD: string | null;
   // [T4b] The merchant's own pricing denomination for this specific unit —
-  // does NOT mean USD is authoritative on the cart; SYP always is.
-  // Used by cartNeedsExchangeRate() to determine whether checkout can
-  // proceed without a cached rate (SYP-only carts can; USD-priced items
-  // need a rate to resolve their unitPriceSYP in the first place).
+  // SYP is always authoritative on the cart. Used by cartNeedsExchangeRate().
   pricingCurrency: "USD" | "SYP";
   /**
- * [By-amount] Set ONLY on a base-unit line the cashier sold "by amount".
- * The typed amount is the authoritative line total; quantity is derived
- * (quantityFromAmount) and may differ from this by < half a quantity step
- * x unit price. Cart state only: never persisted per item (the invoice
- * stores totalSYP). Must be cleared when quantity, unit or price changes.
- */
+   * [By-amount] Set ONLY on a base-unit line the cashier sold "by amount".
+   * The typed amount is the authoritative line total; quantity is derived
+   * (quantityFromAmount) and may differ from this by < half a quantity step
+   * x unit price. Cart state only: never persisted per item (the invoice
+   * stores totalSYP). Must be cleared when quantity, unit or price changes —
+   * which is exactly what the funnel functions below do (D8).
+   * NOTE: calculateCartTotals() THROWS on an override that no longer holds,
+   * so the UI must call reconcileLineOverride() after any price/unit change
+   * and BEFORE rendering totals.
+   */
   lineTotalOverrideSYP?: string;
 }
 
@@ -630,11 +651,24 @@ function resolveTenantId(tenantId?: string): string {
   return tenantId.trim();
 }
 
+/**
+ * [D1] Single source of truth for "is this line the base unit?" Wraps the
+ * factor-equals-1 check using compareMoney. Every place that needs to enforce
+ * by-amount = base-unit-only must use this helper and no other comparison.
+ * Accepts any `{ conversionFactor: string }` so it works on cart lines and on
+ * cached product units alike.
+ */
+export function isBaseUnitLine(item: { conversionFactor: string }): boolean {
+  return compareMoney(item.conversionFactor, "1") === 0;
+}
+
 export function calculateCartTotals(
   items: CartLineItem[],
   exchangeRate: MoneyInput | null
 ): CartTotalsResult {
-  let itemCount = 0;
+  // Accumulated through money.ts, never with native `+` — a display counter
+  // must not drift either (0.1 + 0.2 style artifacts on fractional quantities).
+  let itemCountSum = "0.0000";
   const lineItems: CartTotalsResult["lineItems"] = [];
   const lineTotalsSYP: string[] = [];
 
@@ -647,11 +681,11 @@ export function calculateCartTotals(
     // (e.g. 3 كرتونة + 2 قطعة = 5) is a cosmetic ambiguity at most, not a
     // correctness bug. Every monetary computation below stays strictly
     // per-line via unitPriceSYP × quantity, which is unaffected.
-    itemCount += item.quantity;
+    itemCountSum = addMoney(itemCountSum, item.quantity);
     let lineTotalSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
     if (item.lineTotalOverrideSYP !== undefined) {
       // D1: by-amount only on the base unit (factor exactly 1).
-      if (compareMoney(item.conversionFactor, 1) !== 0) {
+      if (!isBaseUnitLine(item)) {
         throw new Error("البيع بالمبلغ متاح فقط للوحدة الأساسية.");
       }
       if (compareMoney(item.lineTotalOverrideSYP, 0) <= 0) {
@@ -684,9 +718,232 @@ export function calculateCartTotals(
   return {
     totalSYP,
     totalUSD,
-    itemCount,
+    itemCount: Number(itemCountSum),
     lineItems,
   };
+}
+
+// ============================================================================
+// [D8] CART FUNNEL — the ONLY code allowed to write `quantity` or
+// `lineTotalOverrideSYP` on a cart line that can carry an amount override.
+// Every function is pure (returns a new array, never mutates), exported, and
+// leaves every line in a state calculateCartTotals() accepts. Components call
+// these and never edit those two fields themselves.
+// ============================================================================
+
+/** Returns a copy of the line with the `lineTotalOverrideSYP` key REMOVED
+ * (not left as `undefined`), so no stale override key can survive on a line. */
+function withoutOverride(line: CartLineItem): CartLineItem {
+  const copy: CartLineItem = { ...line };
+  delete copy.lineTotalOverrideSYP;
+  return copy;
+}
+
+function requireLine(items: CartLineItem[], cartId: string): CartLineItem {
+  const line = items.find((i) => i.id === cartId);
+  if (!line) throw new Error("سطر السلة غير موجود.");
+  return line;
+}
+
+/**
+ * [D8] Applies an amount override to a base-unit line.
+ * quantity = amount / unitPriceSYP (4 dp, half-up, once), lineTotalOverrideSYP
+ * = the amount (normalized to 4 dp first, so the amount the quantity is
+ * derived from is exactly the amount that is stored).
+ * Throws QuantityFromAmountError for price <= 0, amount <= 0, or a derived
+ * quantity < 0.0001 (D5); throws a plain Error if the unit is not the base
+ * unit (D1); throws MoneyError on a non-numeric amount.
+ */
+export function applyLineAmountOverride(
+  items: CartLineItem[],
+  cartId: string,
+  amountSYP: string
+): CartLineItem[] {
+  const item = requireLine(items, cartId);
+
+  if (!isBaseUnitLine(item)) {
+    throw new Error("البيع بالمبلغ متاح فقط للوحدة الأساسية.");
+  }
+
+  const amount = serializeMoney(amountSYP);
+  const quantity = quantityFromAmount(amount, item.unitPriceSYP);
+
+  return items.map((i) =>
+    i.id === cartId ? { ...i, quantity: Number(quantity), lineTotalOverrideSYP: amount } : i
+  );
+}
+
+/**
+ * [D8/D10] Clears the amount override on a line (exits "بالمبلغ" mode).
+ * Quantity is kept as-is; the line reverts to quantity × price. The
+ * `lineTotalOverrideSYP` key is removed entirely.
+ */
+export function clearLineOverride(items: CartLineItem[], cartId: string): CartLineItem[] {
+  return items.map((i) => (i.id === cartId ? withoutOverride(i) : i));
+}
+
+/**
+ * [D9] Reconciles an existing amount override against the line's CURRENT
+ * unit price. Pure safety net — never throws. Returns the (possibly new)
+ * items plus an outcome the UI must turn into a visible notice:
+ *   - "unchanged": the line has no override, or the override still holds at
+ *     the current price (|quantity x price - amount| within the tolerance).
+ *   - "rederived": the price moved so the override no longer matched
+ *     quantity x price; the AMOUNT stays authoritative and the quantity is
+ *     re-derived from it at the new price. The line stays in amount mode.
+ *   - "cleared": the override cannot be kept — the line is not a base unit,
+ *     or re-derivation failed (D5 minimum quantity, price <= 0, a bad
+ *     number). The override is removed and the cashier must be told, never
+ *     silently.
+ * Call it from every place that refreshes a line's unit price and when a
+ * persisted cart is rehydrated.
+ */
+export type OverrideOutcome = "unchanged" | "rederived" | "cleared";
+
+export interface ReconcileOverrideResult {
+  items: CartLineItem[];
+  outcome: OverrideOutcome;
+}
+
+export function reconcileLineOverride(
+  items: CartLineItem[],
+  cartId: string
+): ReconcileOverrideResult {
+  const item = items.find((i) => i.id === cartId);
+  if (!item || item.lineTotalOverrideSYP === undefined) {
+    return { items, outcome: "unchanged" };
+  }
+
+  try {
+    // A non-base line can never carry a valid override.
+    if (!isBaseUnitLine(item)) {
+      return { items: clearLineOverride(items, cartId), outcome: "cleared" };
+    }
+
+    const lineTotalSYP = multiplyMoney(item.unitPriceSYP, serializeMoney(item.quantity));
+    if (isTotalWithinTolerance(lineTotalSYP, item.lineTotalOverrideSYP, [item.unitPriceSYP])) {
+      return { items, outcome: "unchanged" };
+    }
+
+    // Override no longer holds at the current price — keep the amount
+    // authoritative and re-derive the quantity from it.
+    return {
+      items: applyLineAmountOverride(items, cartId, item.lineTotalOverrideSYP),
+      outcome: "rederived",
+    };
+  } catch (err) {
+    // MoneyError is the superclass of QuantityFromAmountError and what
+    // toDecimal throws on a bad number: re-derivation is impossible → clear.
+    if (err instanceof MoneyError) {
+      return { items: clearLineOverride(items, cartId), outcome: "cleared" };
+    }
+    throw err;
+  }
+}
+
+/**
+ * [D8] Adds one unit to a cart line (scan/repeat on the same product).
+ * All arithmetic goes through money.ts (never native `+`), so fractional
+ * quantities such as 0.3333 stay exact. On an amount line the override grows
+ * by unitPriceSYP, so quantity x price - amount is unchanged and the line
+ * stays in amount mode (the invoice total stays a clean amount).
+ */
+export function addUnitToLine(items: CartLineItem[], cartId: string): CartLineItem[] {
+  const item = requireLine(items, cartId);
+
+  const newQuantity = Number(addMoney(item.quantity, "1"));
+
+  if (item.lineTotalOverrideSYP === undefined) {
+    return items.map((i) => (i.id === cartId ? { ...i, quantity: newQuantity } : i));
+  }
+
+  const newOverride = addMoney(item.lineTotalOverrideSYP, item.unitPriceSYP);
+
+  return items.map((i) =>
+    i.id === cartId
+      ? { ...i, quantity: newQuantity, lineTotalOverrideSYP: newOverride }
+      : i
+  );
+}
+
+/**
+ * [D8/D10] Sets a line's quantity from a decimal string. Normalizes to 4 dp
+ * through serializeMoney FIRST and rejects <= 0 on the normalized value (so
+ * "0.00004" becomes "0.0000" and is rejected). CLEARS any amount override:
+ * typing or stepping a quantity exits "بالمبلغ" mode — only typing an amount
+ * (applyLineAmountOverride) enters it. Every write to CartLineItem.quantity
+ * goes through here, via a 4-dp decimal string converted once with Number().
+ */
+export function setLineQuantity(
+  items: CartLineItem[],
+  cartId: string,
+  quantity: string
+): CartLineItem[] {
+  requireLine(items, cartId);
+
+  const normalized = serializeMoney(quantity);
+  if (compareMoney(normalized, 0) <= 0) {
+    throw new Error("الكمية يجب أن تكون أكبر من الصفر.");
+  }
+
+  return items.map((i) =>
+    i.id === cartId ? { ...withoutOverride(i), quantity: Number(normalized) } : i
+  );
+}
+
+/**
+ * [D8] Changes a line's unit in place. The caller passes the already-resolved
+ * unit fields (this funnel cannot resolve prices). CLEARS any amount override:
+ * by-amount is base-unit only, so switching units exits "بالمبلغ" mode. It does
+ * NOT touch the quantity; re-deriving after a PRICE refresh is
+ * reconcileLineOverride's D9 job.
+ */
+export function changeLineUnit(
+  items: CartLineItem[],
+  cartId: string,
+  fields: {
+    unitId: string;
+    unitName: string;
+    conversionFactor: string;
+    unitPriceSYP: string;
+    unitPriceUSD: string | null;
+    pricingCurrency: "USD" | "SYP";
+  }
+): CartLineItem[] {
+  requireLine(items, cartId);
+
+  return items.map((i) => (i.id === cartId ? { ...withoutOverride(i), ...fields } : i));
+}
+
+/**
+ * [D6] Pure stock-warning helper — never blocks anything.
+ * For a product, sums the BASE quantity of all of its cart lines
+ * (multiplyMoney(quantity, conversionFactor) — exactly the pattern
+ * getOfflineProducts uses) and compares it with totalCachedStock (which
+ * already nets pending local sales but not the cart being built). Returns
+ * whether the cart's base total exceeds known stock, plus both figures as
+ * decimal strings. No native `quantity * factor` arithmetic and no native
+ * number comparison.
+ */
+export interface StockCheckResult {
+  exceeds: boolean;
+  baseTotal: string;
+  stock: string;
+}
+
+export function cartExceedsKnownStock(
+  items: CartLineItem[],
+  productId: string,
+  totalCachedStock: number | string
+): StockCheckResult {
+  const stock = serializeMoney(totalCachedStock);
+  const baseTotal = items
+    .filter((i) => i.product.id === productId)
+    .reduce<string>(
+      (acc, i) => addMoney(acc, multiplyMoney(serializeMoney(i.quantity), i.conversionFactor)),
+      "0.0000"
+    );
+  return { exceeds: compareMoney(baseTotal, stock) > 0, baseTotal, stock };
 }
 
 /**
@@ -1192,6 +1449,38 @@ export async function submitOfflineSale(
     throw new Error(
       "لا يمكن إتمام البيع بدون تحديد سعر الصرف اليومي — مطلوب لعناصر مسعّرة بالدولار في السلة."
     );
+  }
+
+  // [D1 defense in depth] For every line that carries an amount override,
+  // re-resolve its unit from the CACHED catalog and require the base unit
+  // (factor exactly 1). The cart line's own conversionFactor must not be the
+  // only evidence: a stale or tampered line could claim factor 1 while the
+  // cached unit says otherwise. A product or unit that cannot be found in the
+  // cache is rejected too. Only runs for carts that actually carry an override,
+  // and reads just the products involved (never the whole catalog).
+  const overrideLines = payload.items.filter((item) => item.lineTotalOverrideSYP !== undefined);
+  if (overrideLines.length > 0) {
+    const cacheDb = getOfflineDb();
+    const productIds = [...new Set(overrideLines.map((item) => item.product.id))];
+    const cachedRows = await cacheDb.cachedProducts.bulkGet(productIds);
+    const cachedById = new Map<string, CachedProduct>();
+    for (const row of cachedRows) {
+      if (row && row.tenantId === scopedTenantId) cachedById.set(row.id, row);
+    }
+
+    for (const item of overrideLines) {
+      const cachedProduct = cachedById.get(item.product.id);
+      const cachedUnit = cachedProduct?.units?.find((u) => u.id === item.unitId);
+      if (!cachedProduct || !cachedUnit) {
+        throw new Error(
+          `تعذّر التحقق من وحدة الصنف "${item.product.name}" في بيانات هذا الجهاز — ` +
+          "حدّث البيانات ثم أعد المحاولة."
+        );
+      }
+      if (!isBaseUnitLine(cachedUnit)) {
+        throw new Error("البيع بالمبلغ متاح فقط للوحدة الأساسية.");
+      }
+    }
   }
 
   // [FIX — ADDED, review pass] Recompute the expected total directly from

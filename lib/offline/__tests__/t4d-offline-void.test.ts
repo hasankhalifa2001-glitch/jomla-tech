@@ -8,10 +8,14 @@
  *   2. submitOfflineVoid() SUCCEEDS on PENDING and on FAILED targets,
  *      producing negated sold-unit item quantities, negated money, and a
  *      correctly decremented cached customer balance.
- *   3. [CURRENTLY DISABLED — see the commented-out block below] The written
- *      record's voidReason matches verbatim and survives unchanged into the
- *      eventual /api/sync payload shape (verified by running the REAL
- *      syncPendingRecords() against a mocked fetch and inspecting the body).
+ *   3. The written record's voidReason matches verbatim and survives unchanged
+ *      into the /api/sync payload (verified by running the REAL
+ *      syncPendingRecords() against a mocked fetch and inspecting the bodies).
+ *      The worker sends the original sale and its void in SEPARATE, ordered
+ *      chunks (sale first), so the test locates each invoice in whichever call
+ *      carries it instead of assuming one combined payload. A by-amount
+ *      (بيع بالمبلغ) variant proves the derived quantity travels as an exact
+ *      decimal string and that totalSYP is the stored 5000, not 4999.5.
  *   4. canVoidOfflineInvoice() / shouldShowOfflineVoidPanel() truth tables —
  *      pure functions, no DOM required.
  *   5. listPendingOfflineInvoices() splits originals from local voids, resolves
@@ -44,6 +48,7 @@ import {
   createCachedCustomerRecord,
   createOfflineInvoiceRecord,
 } from "@/lib/offline";
+import { createCachedProductRecord } from "@/lib/offline/db";
 import {
   submitOfflineVoid,
   submitOfflineSale,
@@ -416,65 +421,132 @@ describe("T4d v4.1 — submitOfflineVoid success path", () => {
   });
 });
 
-// [DISABLED — kept verbatim from the previous revision.]
-// This is the only test proving voidReason and the negative sold-unit
-// quantities actually reach /api/sync. While it stays commented out, coverage
-// item 3 in the file header is NOT verified. Re-enable it (and the
-// syncPendingRecords import above becomes used) once the failure that led to
-// disabling it is understood.
-//
-// describe("T4d v4.1 — the offline void reason survives into the sync payload", () => {
-//   it("sends voidsOfflineInvoiceId, the verbatim reason, and negative sold-unit quantities to /api/sync", async () => {
-//     const sale = await seedPendingSale();
-//     const REASON = "إرجاع كامل من الزبون بسبب تلف البضاعة";
-//     const voidRecord = await submitOfflineVoid(TEST_TENANT_ID, {
-//       offlineInvoiceId: sale.offlineId,
-//       voidReason: REASON,
-//       actorRole: "ADMIN",
-//     });
+// ----------------------------------------------------------------------------
+// Sync-payload helpers. The REAL syncPendingRecords() runs against a mocked
+// fetch; these helpers only parse what it sent. The sale and its void travel in
+// separate, ordered chunks, so every lookup is "which call carried this
+// invoice?" rather than "look at the first payload".
+// ----------------------------------------------------------------------------
+interface SentInvoice {
+  offlineId: string;
+  voidsOfflineInvoiceId?: string;
+  voidReason?: string;
+  totalSYP?: string;
+  items: Array<{ unitId: string; quantity: string }>;
+}
 
-//     const fetchMock = vi.fn(async () => ({
-//       ok: true,
-//       status: 200,
-//       json: async () => ({ customers: [], invoices: [], payments: [] }),
-//     }));
-//     vi.stubGlobal("fetch", fetchMock);
+interface SyncBody {
+  invoices?: SentInvoice[];
+}
 
-//     // The REAL worker, not a re-implementation of its payload mapping.
-//     const summary = await syncPendingRecords(TEST_TENANT_ID);
-//     expect(summary.success).toBe(true);
+function parseSyncBody(init?: RequestInit): SyncBody {
+  try {
+    return JSON.parse(String(init?.body ?? "{}")) as SyncBody;
+  } catch {
+    return {};
+  }
+}
 
-//     const syncCall = fetchMock.mock.calls.find(([url]) => String(url).includes("/api/sync"));
-//     expect(syncCall).toBeDefined();
+/** Mocks /api/sync: every invoice it receives is acknowledged as SYNCED. */
+function installSyncFetchMock() {
+  const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+    const invoices = (parseSyncBody(init).invoices ?? []).map((inv) => ({
+      offlineId: inv.offlineId,
+      status: "SYNCED",
+      realId: "srv-" + inv.offlineId,
+    }));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ customers: [], invoices, payments: [] }),
+    };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
 
-//     const body = JSON.parse((syncCall![1] as RequestInit).body as string);
+/** Finds the fetch call (index + the invoice row it carried) for an offlineId. */
+function findSentInvoice(
+  fetchMock: ReturnType<typeof installSyncFetchMock>,
+  offlineId: string
+): { callIndex: number; invoice: SentInvoice } | undefined {
+  for (let callIndex = 0; callIndex < fetchMock.mock.calls.length; callIndex++) {
+    const [, init] = fetchMock.mock.calls[callIndex] as [unknown, RequestInit | undefined];
+    const invoice = (parseSyncBody(init).invoices ?? []).find((inv) => inv.offlineId === offlineId);
+    if (invoice) return { callIndex, invoice };
+  }
+  return undefined;
+}
 
-//     // The void travels as its own invoice row, pointing at the original.
-//     const sentVoid = body.invoices.find(
-//       (inv: { offlineId: string }) => inv.offlineId === voidRecord.offlineId
-//     );
-//     expect(sentVoid).toBeDefined();
-//     expect(sentVoid.voidsOfflineInvoiceId).toBe(sale.offlineId);
-//     expect(sentVoid.voidReason).toBe(REASON);
+describe("T4d v4.1 — the offline void reason survives into the sync payload", () => {
+  it("sends voidsOfflineInvoiceId, the verbatim reason, and negative sold-unit quantities to /api/sync", async () => {
+    const sale = await seedPendingSale();
+    const REASON = "إرجاع كامل من الزبون بسبب تلف البضاعة";
+    const voidRecord = await submitOfflineVoid(TEST_TENANT_ID, {
+      offlineInvoiceId: sale.offlineId,
+      voidReason: REASON,
+      actorRole: "ADMIN",
+    });
 
-//     // Sold-unit sign convention the server's schema refines on: every
-//     // quantity on a void row must be strictly negative.
-//     expect(Number(sentVoid.items[0].quantity)).toBe(-3);
-//     expect(sentVoid.items[0].unitId).toBe("unit-carton");
+    const fetchMock = installSyncFetchMock();
 
-//     // The ORIGINAL sale rides in the same payload with its positive quantity —
-//     // and because the app route sorts by createdAt, this holds regardless of
-//     // array order (the void is listed after its own original here).
-//     const sentOriginal = body.invoices.find(
-//       (inv: { offlineId: string }) => inv.offlineId === sale.offlineId
-//     );
-//     expect(sentOriginal).toBeDefined();
-//     expect(Number(sentOriginal.items[0].quantity)).toBe(3);
+    // The REAL worker, not a re-implementation of its payload mapping.
+    const summary = await syncPendingRecords(TEST_TENANT_ID);
+    expect(summary.success).toBe(true);
 
-//     // The void is the LAST invoice in the array (createdAt ASC ordering).
-//     expect(body.invoices[body.invoices.length - 1].offlineId).toBe(voidRecord.offlineId);
-//   });
-// });
+    // The original sale rides in its own chunk, with its positive quantity.
+    const sentSale = findSentInvoice(fetchMock, sale.offlineId);
+    expect(sentSale).toBeDefined();
+    expect(Number(sentSale!.invoice.items[0].quantity)).toBe(3);
+
+    // The void rides in its own, later chunk, as its own invoice row pointing
+    // at the original.
+    const sentVoid = findSentInvoice(fetchMock, voidRecord.offlineId);
+    expect(sentVoid).toBeDefined();
+    expect(sentVoid!.invoice.voidsOfflineInvoiceId).toBe(sale.offlineId);
+    expect(sentVoid!.invoice.voidReason).toBe(REASON);
+
+    // Sold-unit sign convention the server's schema refines on: every
+    // quantity on a void row must be strictly negative.
+    expect(Number(sentVoid!.invoice.items[0].quantity)).toBe(-3);
+    expect(sentVoid!.invoice.items[0].unitId).toBe("unit-carton");
+
+    // The void chunk is sent after the sale chunk (createdAt ASC ordering).
+    expect(sentVoid!.callIndex).toBeGreaterThan(sentSale!.callIndex);
+  });
+
+  it("by-amount: the derived quantity and the stored 5000 total reach /api/sync as exact decimal strings", async () => {
+    // 0.3333 kg @ 15,000 = 4,999.5 by arithmetic; the customer paid 5,000 and
+    // the STORED invoice total is 5,000. Neither the sale nor its void may be
+    // sent with the recomputed 4,999.5.
+    const sale = await seedByAmountSale();
+    const voidRecord = await submitOfflineVoid(TEST_TENANT_ID, {
+      offlineInvoiceId: sale.offlineId,
+      voidReason: "إرجاع كامل من الزبون",
+      actorRole: "ADMIN",
+    });
+
+    const fetchMock = installSyncFetchMock();
+    const summary = await syncPendingRecords(TEST_TENANT_ID);
+    expect(summary.success).toBe(true);
+
+    const sentSale = findSentInvoice(fetchMock, sale.offlineId);
+    expect(sentSale).toBeDefined();
+    expect(sentSale!.invoice.items[0].quantity).toBe("0.3333");
+    expect(sentSale!.invoice.items[0].unitId).toBe("unit-kg");
+    expect(sentSale!.invoice.totalSYP).toBe("5000.0000");
+    expect(sentSale!.invoice.totalSYP).not.toBe("4999.5000");
+
+    const sentVoid = findSentInvoice(fetchMock, voidRecord.offlineId);
+    expect(sentVoid).toBeDefined();
+    expect(sentVoid!.invoice.voidsOfflineInvoiceId).toBe(sale.offlineId);
+    expect(sentVoid!.invoice.items[0].quantity).toBe("-0.3333");
+    expect(sentVoid!.invoice.totalSYP).toBe("-5000.0000");
+    expect(sentVoid!.invoice.totalSYP).not.toBe("-4999.5000");
+
+    expect(sentVoid!.callIndex).toBeGreaterThan(sentSale!.callIndex);
+  });
+});
 
 describe("T4d v4.1 — pure decision helpers (no DOM required)", () => {
   describe("canVoidOfflineInvoice", () => {
@@ -719,64 +791,68 @@ describe("T4d v4.1 — strict separation between the two void surfaces (static s
 
 
 // ============================================================================
-// PASTE AT THE END of lib/offline/__tests__/t4d-offline-void.test.ts
-//
-// ONE new import is needed at the top of that file:
-//     import { sumMoney } from "@/lib/utils/money";
-//
-// Everything else reuses the file's own helpers (seedCustomer, getOfflineDb,
-// submitOfflineSale, submitOfflineVoid, TEST_TENANT_ID, CartLineItem).
-//
 // By-amount (بيع بالمبلغ) queued OFFLINE: 0.3333 kg @ 15,000 = 4,999.5, the
 // customer paid 5,000. The local void is built from the stored local invoice,
 // so it must carry exactly -5,000 (never -4,999.5) and net to zero.
+//
+// submitOfflineSale re-verifies D1 (base unit only) against the CACHED catalog
+// for every line that carries an override, so the kilogram product must exist
+// in cachedProducts — exactly as it does on a real device.
 // ============================================================================
+function makeRiceProduct() {
+  return createCachedProductRecord({
+    tenantId: TEST_TENANT_ID,
+    id: "prod-rice",
+    name: "رز مصري (بالكيلو)",
+    units: [
+      {
+        id: "unit-kg",
+        unitName: "كغ",
+        conversionFactor: "1",
+        priceWholesale: "15000.0000",
+        pricingCurrency: "SYP",
+        isActive: true,
+      },
+    ],
+    batches: [{ id: "batch-rice-1", unitId: "unit-kg", batchNumber: "R-1", quantity: "10.0000" }],
+  });
+}
+
+async function seedRiceProduct() {
+  const db = getOfflineDb();
+  await db.cachedProducts.add(makeRiceProduct());
+}
+
+function byAmountCartItem(): CartLineItem {
+  return {
+    id: "line-kg",
+    product: makeRiceProduct(),
+    unitId: "unit-kg",
+    unitName: "كغ",
+    conversionFactor: "1",
+    quantity: 0.3333,
+    unitPriceSYP: "15000.0000",
+    unitPriceUSD: null,
+    pricingCurrency: "SYP",
+    lineTotalOverrideSYP: "5000.0000",
+  };
+}
+
+async function seedByAmountSale() {
+  await seedRiceProduct();
+  const customer = await seedCustomer("cust-byamount", "0.0000");
+  return submitOfflineSale(TEST_TENANT_ID, {
+    customer,
+    items: [byAmountCartItem()],
+    totalSYP: "5000.0000",
+    exchangeRateUsed: null,
+    paidAmountSYP: "5000.0000",
+    debtAmountSYP: "0.0000",
+    paymentMethod: "CASH",
+  });
+}
+
 describe("T4d — إلغاء محلي لبيع بالمبلغ (بدون اتصال)", () => {
-  function byAmountCartItem(): CartLineItem {
-    const product = {
-      id: "prod-rice",
-      tenantId: TEST_TENANT_ID,
-      name: "رز مصري (بالكيلو)",
-      units: [
-        {
-          id: "unit-kg",
-          unitName: "كغ",
-          conversionFactor: "1",
-          priceWholesale: "15000.0000",
-          pricingCurrency: "SYP" as const,
-          isActive: true,
-        },
-      ],
-      batches: [],
-    };
-
-    return {
-      id: "line-kg",
-      product,
-      unitId: "unit-kg",
-      unitName: "كغ",
-      conversionFactor: "1",
-      quantity: 0.3333,
-      unitPriceSYP: "15000.0000",
-      unitPriceUSD: null,
-      pricingCurrency: "SYP",
-      lineTotalOverrideSYP: "5000.0000",
-    };
-  }
-
-  async function seedByAmountSale() {
-    const customer = await seedCustomer("cust-byamount", "0.0000");
-    return submitOfflineSale(TEST_TENANT_ID, {
-      customer,
-      items: [byAmountCartItem()],
-      totalSYP: "5000.0000",
-      exchangeRateUsed: null,
-      paidAmountSYP: "5000.0000",
-      debtAmountSYP: "0.0000",
-      paymentMethod: "CASH",
-    });
-  }
-
   it("البيع يُحفظ محلياً بإجمالي 5000 وكمية 0.3333، والـ override لا يُحفظ على السطر", async () => {
     const sale = await seedByAmountSale();
 

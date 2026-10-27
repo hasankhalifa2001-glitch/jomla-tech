@@ -12,6 +12,7 @@
  * copy of the same switch — it can import from here to keep a single one.
  */
 
+import Decimal from "decimal.js";
 import { formatMoney } from "@/lib/utils/money";
 
 export const USE_LATIN_DIGITS: boolean = true;
@@ -43,4 +44,19 @@ export const fmtInt = (n: number) => intFormatter.format(n);
 export function fmtQty(value: number | string): string {
     const n = Number(value);
     return Number.isFinite(n) ? qtyFormatter.format(n) : String(value);
+}
+
+/**
+ * [D9] Format a decimal-serialized quantity string (4 dp) for display:
+ * always compute at 4 dp, then trim trailing zeros (e.g. "0.3333" → "0.3333",
+ * "0.5000" → "0.5", "1.0000" → "1"). Never round-trips through Number(),
+ * so 4-dp values like "0.3333" survive exactly.
+ */
+export function formatQtyDecimal(value: string): string {
+    const fixed = new Decimal(0).plus(value).toFixed(4);
+    const trimmed = fixed.includes(".")
+        ? fixed.replace(/0+$/, "").replace(/\.$/, "")
+        : fixed;
+    if (trimmed === "" || trimmed === "-0" || trimmed === "-") return "0";
+    return trimmed;
 }
