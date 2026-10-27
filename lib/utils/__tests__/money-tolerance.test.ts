@@ -141,6 +141,16 @@ describe("invoiceTotalTolerance (D2/D3)", () => {
   it("uses |price| (sign of the price never reduces the tolerance)", () => {
     expect(invoiceTotalTolerance(["-15000"])).toBe("0.7500");
   });
+
+  it("odd price 15001: tolerance rounds UP to 0.7501 (CEIL)", () => {
+    // 15001 x 0.00005 = 0.75005 -> CEIL to 4 dp = 0.7501
+    expect(invoiceTotalTolerance(["15001"])).toBe("0.7501");
+  });
+
+  it("odd price 7: tolerance rounds UP to 0.0004 (CEIL)", () => {
+    // 7 x 0.00005 = 0.00035 -> CEIL to 4 dp = 0.0004
+    expect(invoiceTotalTolerance(["7"])).toBe("0.0004");
+  });
 });
 
 describe("isTotalWithinTolerance (D2/D3)", () => {
