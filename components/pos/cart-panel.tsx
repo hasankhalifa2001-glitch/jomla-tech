@@ -3,14 +3,12 @@
 /**
  * components/pos/cart-panel.tsx
  *
- * Same props and same behaviour as before — only the presentation changed:
- * light-only slate + emerald (matching the dashboard), Latin digits through
- * <Money>, the "clear cart" action moved up to the header (away from the
- * checkout button), and the total + checkout merged into one hero card that
- * turns emerald when the sale is ready to go.
+ * Presentation only. Every cart mutation is delegated to the callbacks that
+ * PosLayout routes through the pos-service funnel (D8): this file never writes
+ * `quantity` or `lineTotalOverrideSYP` itself.
  */
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ChevronLeft,
@@ -37,13 +35,21 @@ import {
   resolveUnitPriceSYP,
   isSystemCashCustomer,
   cartNeedsExchangeRate,
+  isBaseUnitLine,
   type CartLineItem,
   type SelectedCustomer,
 } from "@/lib/offline";
 import { compareMoney } from "@/lib/utils/money";
+import {
+  parseAmountInput,
+  formatQuantityText,
+} from "@/lib/pos/by-amount-ui";
 import { cn } from "@/lib/utils";
 import { fmtInt, fmtMoney } from "@/lib/utils/digits";
 import { Money } from "./money";
+
+type LineInputMode = "qty" | "amount";
+type CartTotals = ReturnType<typeof calculateCartTotals>;
 
 interface CartPanelProps {
   items: CartLineItem[];
@@ -56,8 +62,36 @@ interface CartPanelProps {
   onClearCart: () => void;
   onOpenCustomerModal: () => void;
   onOpenPaymentModal: () => void;
+  // [D8/D10] By-amount presentation state, keyed by cart line id
+  lineModes: Record<string, LineInputMode>;
+  lineAmounts: Record<string, string>;
+  /** A line whose amount field holds something the funnel refused (Arabic message). */
+  amountErrors?: Record<string, string>;
+  /** [D6] cart line id -> true when the product's cart quantity exceeds known stock. */
+  stockWarnings?: Record<string, boolean>;
+  /** [D9] Optional visible notice per line (e.g. after reconcileLineOverride re-derived/cleared). */
+  lineNotices?: Record<string, string>;
+  onToggleLineMode: (cartId: string) => void;
+  onLineAmountChange: (cartId: string, amount: string) => void;
+  onLineQuickQuantity: (cartId: string, qty: number | string) => void;
   isMobileDrawer?: boolean;
+  /** Blocks checkout: unreadable cart total, or an amount field the cart refused. */
+  cartInconsistent?: boolean;
 }
+
+/** [D7] Quick weight buttons — applied by the parent through setLineQuantity. */
+const QUICK_BUTTONS: ReadonlyArray<{ label: string; value: string; title: string }> = [
+  { label: "¼", value: "0.25", title: "ربع كيلو" },
+  { label: "½", value: "0.5", title: "نصف كيلو" },
+  { label: "1", value: "1", title: "كيلو" },
+];
+
+const EMPTY_TOTALS: CartTotals = {
+  totalSYP: "0.0000",
+  totalUSD: null,
+  itemCount: 0,
+  lineItems: [],
+};
 
 // [v3.6] Same currency-primacy as the catalog: the unit switcher shows the SYP
 // price the cart/invoice actually bills. Returns null (instead of throwing)
@@ -74,6 +108,47 @@ function resolvePriceOrNull(
   }
 }
 
+/**
+ * Quantity field that accepts fractions (0.25, 0.3333). It keeps its own draft
+ * text while focused so typing "0." or "1.5" is never fought by the cart value,
+ * and commits only valid positive numbers (the parent routes them through
+ * setLineQuantity, which normalizes to 4 dp and clears any amount override).
+ */
+function QuantityField({
+  value,
+  onCommit,
+}: {
+  value: number;
+  onCommit: (quantity: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      lang="en"
+      dir="ltr"
+      aria-label="الكمية"
+      value={draft ?? formatQuantityText(value)}
+      onFocus={(e) => {
+        setDraft(formatQuantityText(value));
+        e.target.select();
+      }}
+      onChange={(e) => {
+        const text = e.target.value;
+        setDraft(text);
+        const parsed = parseAmountInput(text);
+        if (parsed === null) return;
+        const qty = Number(parsed);
+        if (Number.isFinite(qty) && qty > 0) onCommit(qty);
+      }}
+      onBlur={() => setDraft(null)}
+      className="h-10 w-16 border-0 bg-transparent text-center text-sm font-extrabold tabular-nums text-slate-900 focus:outline-none sm:h-9"
+    />
+  );
+}
+
 export function CartPanel({
   items,
   customer,
@@ -85,10 +160,30 @@ export function CartPanel({
   onClearCart,
   onOpenCustomerModal,
   onOpenPaymentModal,
+  lineModes,
+  lineAmounts,
+  amountErrors = {},
+  stockWarnings = {},
+  lineNotices = {},
+  onToggleLineMode,
+  onLineAmountChange,
+  onLineQuickQuantity,
   isMobileDrawer = false,
+  cartInconsistent = false,
 }: CartPanelProps) {
-  // [v3.4] All totals go through decimal.js wrappers.
-  const totals = useMemo(() => calculateCartTotals(items, exchangeRate), [items, exchangeRate]);
+  // [Never throw during render] calculateCartTotals() rejects a line whose
+  // override no longer holds. If that ever happens the panel must not crash:
+  // totals fall back to zeros and checkout is blocked.
+  const { totals, totalsFailed } = useMemo(() => {
+    try {
+      return { totals: calculateCartTotals(items, exchangeRate), totalsFailed: false };
+    } catch {
+      return { totals: EMPTY_TOTALS, totalsFailed: true };
+    }
+  }, [items, exchangeRate]);
+
+  const hasAmountErrors = Object.keys(amountErrors).length > 0;
+  const blocked = cartInconsistent || totalsFailed || hasAmountErrors;
 
   const isRateMissing = exchangeRate === null || compareMoney(exchangeRate, 0) <= 0;
   const isCartEmpty = items.length === 0;
@@ -97,10 +192,10 @@ export function CartPanel({
   // USD-priced unit; a SYP-only cart never needs a rate.
   const rateRequired = useMemo(() => cartNeedsExchangeRate(items), [items]);
   const isRateBlocking = rateRequired && isRateMissing;
-  const isCheckoutDisabled = isCartEmpty || isRateBlocking;
+  const isCheckoutDisabled = isCartEmpty || isRateBlocking || blocked;
   const ready = !isCheckoutDisabled;
 
-  // [v3.6] `syp` is authoritative (never null); `usd` is derived and may be null.
+  // `syp` is authoritative (never null); `usd` is derived and may be null.
   const lineTotalsMap = useMemo(() => {
     const map = new Map<string, { syp: string; usd: string | null }>();
     for (const lt of totals.lineItems) {
@@ -109,8 +204,7 @@ export function CartPanel({
     return map;
   }, [totals.lineItems]);
 
-  // When a line is ADDED, bring the new line into view (it is appended at the
-  // bottom of a scrolling list).
+  // When a line is ADDED, bring the new line into view.
   const listRef = useRef<HTMLDivElement | null>(null);
   const prevCount = useRef(items.length);
   useEffect(() => {
@@ -234,6 +328,11 @@ export function CartPanel({
         ) : (
           items.map((item) => {
             const lineTotal = lineTotalsMap.get(item.id) || { syp: "0.0000", usd: null };
+            const baseUnit = isBaseUnitLine(item);
+            const isAmountMode = baseUnit && lineModes[item.id] === "amount";
+            const amountError = amountErrors[item.id];
+            const notice = lineNotices[item.id];
+            const hasOverride = item.lineTotalOverrideSYP !== undefined;
 
             return (
               <div
@@ -257,7 +356,6 @@ export function CartPanel({
                     variant="ghost"
                     size="icon"
                     onClick={() => onRemoveItem(item.id)}
-                    // 40px on mobile, 32px from `sm:` up.
                     className="-me-1 -mt-1 size-10 shrink-0 text-slate-400 hover:bg-red-50 hover:text-red-600 sm:size-8"
                     title="حذف من السلة"
                     aria-label="حذف من السلة"
@@ -294,6 +392,7 @@ export function CartPanel({
                     </Select>
                   </div>
 
+                  {/* quantity stepper — every edit goes through setLineQuantity in the parent */}
                   <div className="flex shrink-0 items-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
                     <button
                       type="button"
@@ -304,25 +403,9 @@ export function CartPanel({
                     >
                       <Minus className="size-4" />
                     </button>
-                    <input
-                      type="number"
-                      min="1"
-                      inputMode="numeric"
-                      lang="en"
-                      dir="ltr"
-                      aria-label="الكمية"
+                    <QuantityField
                       value={item.quantity}
-                      // Select the whole number on focus so typing REPLACES it
-                      // (the field ignores an empty value, so it can't be
-                      // cleared by backspacing).
-                      onFocus={(e) => e.target.select()}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
-                        if (!isNaN(val) && val >= 1) {
-                          onSetQuantity(item.id, val);
-                        }
-                      }}
-                      className="h-10 w-11 border-0 bg-transparent text-center text-sm font-extrabold tabular-nums text-slate-900 [appearance:textfield] focus:outline-none sm:h-9 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                      onCommit={(qty) => onSetQuantity(item.id, qty)}
                     />
                     <button
                       type="button"
@@ -336,6 +419,112 @@ export function CartPanel({
                   </div>
                 </div>
 
+                {/* base-unit lines only: quick weights (D7) + low-key mode switch (D10) */}
+                {baseUnit && (
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-1">
+                      {QUICK_BUTTONS.map((b) => (
+                        <button
+                          key={b.value}
+                          type="button"
+                          onClick={() => onLineQuickQuantity(item.id, b.value)}
+                          className="h-8 min-w-8 rounded-md border border-slate-200 bg-white px-2 text-xs font-semibold text-slate-600 transition-colors hover:bg-emerald-50"
+                          title={b.title}
+                          aria-label={b.title}
+                        >
+                          {b.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div
+                      role="group"
+                      aria-label="وضع الإدخال"
+                      className="flex items-center overflow-hidden rounded-md border border-slate-200 bg-slate-50 text-[11px] font-semibold"
+                    >
+                      <button
+                        type="button"
+                        aria-pressed={!isAmountMode}
+                        onClick={() => {
+                          if (isAmountMode) onToggleLineMode(item.id);
+                        }}
+                        className={cn(
+                          "h-8 px-2.5 transition-colors",
+                          !isAmountMode ? "bg-white text-slate-800" : "text-slate-500 hover:bg-white"
+                        )}
+                      >
+                        بالكمية
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={isAmountMode}
+                        onClick={() => {
+                          if (!isAmountMode) onToggleLineMode(item.id);
+                        }}
+                        className={cn(
+                          "h-8 px-2.5 transition-colors",
+                          isAmountMode ? "bg-emerald-50 text-emerald-700" : "text-slate-500 hover:bg-white"
+                        )}
+                      >
+                        بالمبلغ
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* [D8/D10] Amount input when in "بالمبلغ" mode */}
+                {isAmountMode && (
+                  <div className="mt-2">
+                    <div
+                      className={cn(
+                        "flex items-center gap-2 rounded-lg border px-2.5 py-1.5",
+                        amountError ? "border-red-300 bg-red-50" : "border-emerald-200 bg-emerald-50"
+                      )}
+                    >
+                      <span className="text-[11px] font-semibold text-emerald-700">المبلغ</span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        lang="en"
+                        dir="ltr"
+                        aria-label="المبلغ بالليرة"
+                        aria-invalid={amountError ? true : undefined}
+                        value={lineAmounts[item.id] ?? ""}
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => onLineAmountChange(item.id, e.target.value)}
+                        className="h-10 min-w-0 flex-1 border-0 bg-transparent text-center text-sm font-extrabold tabular-nums text-emerald-900 focus:outline-none"
+                        placeholder="0"
+                      />
+                      <span className="text-[11px] font-semibold text-emerald-700">ل.س</span>
+                    </div>
+
+                    {amountError && (
+                      <p role="alert" className="mt-1 text-[11px] font-semibold text-red-700">
+                        {amountError}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* [D2] Derived quantity, large: "5,000 ل.س ← 0.3333 كغ" */}
+                {isAmountMode && hasOverride && !amountError && (
+                  <p className="mt-1.5 text-center text-base font-extrabold tabular-nums text-emerald-700">
+                    {fmtMoney(item.lineTotalOverrideSYP as string, "SYP")} ل.س ←{" "}
+                    <span dir="ltr">{formatQuantityText(item.quantity)}</span> {item.unitName}
+                  </p>
+                )}
+
+                {/* [D9] Visible notice after a price change re-derived / cleared the amount */}
+                {notice && (
+                  <div
+                    role="status"
+                    className="mt-1.5 flex items-start gap-1 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1"
+                  >
+                    <Info className="mt-px size-3.5 shrink-0 text-amber-600" aria-hidden />
+                    <span className="text-[11px] font-semibold text-amber-800">{notice}</span>
+                  </div>
+                )}
+
                 {/* line total — SYP primary, USD secondary (may be null) */}
                 <div className="mt-2.5 flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5">
                   <span className="text-[11px] font-semibold text-slate-500">الإجمالي</span>
@@ -348,18 +537,23 @@ export function CartPanel({
                     <Money value={lineTotal.syp} className="text-sm font-extrabold text-emerald-700" />
                   </span>
                 </div>
+
+                {/* [D6] Non-blocking stock warning (computed by the parent) */}
+                {stockWarnings[item.id] && (
+                  <div className="mt-1.5 flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1">
+                    <AlertTriangle className="size-3.5 shrink-0 text-amber-600" aria-hidden />
+                    <span className="text-[11px] font-semibold text-amber-800">
+                      الكمية أكبر من المخزون المسجّل
+                    </span>
+                  </div>
+                )}
               </div>
             );
           })
         )}
       </div>
 
-      {/* ------------------------------------------------ rate notices
-                [T4b] Two distinct states:
-                - isRateBlocking (a USD-priced line AND no rate): RED, the sale
-                  really is stopped.
-                - rate missing but the cart is SYP-only (or empty): AMBER,
-                  informational — SYP sales work normally. */}
+      {/* ------------------------------------------------ rate notices */}
       {isRateBlocking && (
         <div className="mx-3 mt-3 shrink-0 space-y-1 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-800">
           <div className="flex items-center gap-1.5 font-extrabold">
@@ -384,6 +578,27 @@ export function CartPanel({
         </div>
       )}
 
+      {blocked && (
+        <div
+          role="alert"
+          className="mx-3 mt-3 shrink-0 space-y-1 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-800"
+        >
+          <div className="flex items-center gap-1.5 font-extrabold">
+            <AlertTriangle className="size-4 shrink-0 text-red-600" aria-hidden />
+            <span>
+              {hasAmountErrors && !totalsFailed && !cartInconsistent
+                ? "يوجد مبلغ غير صالح في السلة"
+                : "السلة غير متسقة — أعد إدخال المبالغ"}
+            </span>
+          </div>
+          <p className="text-[11px] leading-relaxed text-red-700">
+            {hasAmountErrors && !totalsFailed && !cartInconsistent
+              ? "صحّح المبلغ المحدّد بالأحمر أو أفرغ الحقل قبل المتابعة."
+              : "تعذّر إعادة حساب إجمالي السلة — يرجى تصحيح المبالغ قبل المتابعة."}
+          </p>
+        </div>
+      )}
+
       {/* ------------------------------------- total + checkout (hero) */}
       <div className="shrink-0 bg-white p-3">
         <div
@@ -402,8 +617,6 @@ export function CartPanel({
             <span className={cn("text-xs font-bold", ready ? "text-emerald-50" : "text-slate-600")}>
               المجموع الإجمالي
             </span>
-            {/* Re-mounts when the total changes: a quick "pop" that says
-                            the figure updated, without ever tweening the digits. */}
             <span
               key={totals.totalSYP}
               className="animate-in duration-200 fade-in-0 zoom-in-95 motion-reduce:animate-none"
@@ -449,7 +662,9 @@ export function CartPanel({
                   ? "يلزم سعر صرف لصنف مسعّر بالدولار"
                   : isCartEmpty
                     ? "أضف أصنافاً للسلة أولاً"
-                    : "إتمام البيع والدفع"}
+                    : blocked
+                      ? "صحّح المبالغ أولاً"
+                      : "إتمام البيع والدفع"}
               </span>
               {ready && (
                 <span className="flex items-center gap-1.5">

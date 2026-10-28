@@ -13,6 +13,13 @@ import {
   resolveCartLinePrices,
   cartNeedsExchangeRate,
   useSyncWorker,
+  applyLineAmountOverride,
+  clearLineOverride,
+  addUnitToLine,
+  setLineQuantity,
+  changeLineUnit,
+  isBaseUnitLine,
+  cartExceedsKnownStock,
   // [camera + hardware barcode scanning] Re-exported via lib/offline/index.ts's
   // `export * from "./barcode-lookup"` — imported from the barrel like
   // everything else in this block.
@@ -63,7 +70,12 @@ import {
   Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { compareMoney } from "@/lib/utils/money";
+import { compareMoney, addMoney, MoneyError, QuantityFromAmountError } from "@/lib/utils/money";
+import {
+  parseAmountInput,
+  formatQuantityText,
+  formatAmountInputWhileTyping,
+} from "@/lib/pos/by-amount-ui";
 import { cn } from "@/lib/utils";
 import { fmtInt, fmtMoney } from "@/lib/utils/digits";
 
@@ -81,6 +93,54 @@ interface ScanBanner {
 }
 
 type AddToCartResult = { ok: true; cartId: string } | { ok: false; message: string };
+
+/** Outcome of one guarded cart write (see commitCart inside PosLayout). */
+type CommitResult = { ok: true } | { ok: false; message: string };
+
+type LineInputMode = "qty" | "amount";
+
+type CartTotals = ReturnType<typeof calculateCartTotals>;
+
+/** What the cart total reads while the cart is inconsistent — never shown as a real total. */
+const EMPTY_CART_TOTALS: CartTotals = {
+  totalSYP: "0.0000",
+  totalUSD: null,
+  itemCount: 0,
+  lineItems: [],
+};
+
+const CART_INCONSISTENT_MESSAGE = "السلة غير متسقة — أعد إدخال المبالغ.";
+
+/** A copy of the record without `key` (the same object when the key is absent, so React skips the update). */
+function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in record)) return record;
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
+/** The override (a 4-dp string like "20000.0000") as the amount field should read: "20,000". */
+function overrideToFieldText(override: string): string {
+  return formatAmountInputWhileTyping(formatQuantityText(override));
+}
+
+/**
+ * The text a cashier may see for a failed cart write. The by-amount errors
+ * (QuantityFromAmountError) and the funnel's own errors are already Arabic.
+ * Any OTHER MoneyError carries English technical text meant for developers —
+ * it is replaced by the fallback instead of being shown on screen.
+ */
+function messageFromError(error: unknown, fallback: string): string {
+  if (error instanceof QuantityFromAmountError) return error.message;
+  if (error instanceof MoneyError) return fallback;
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+/** A cart quantity for display: whole numbers like before, fractions at their exact stored precision. */
+function fmtQty(quantity: number): string {
+  return Number.isInteger(quantity) ? fmtInt(quantity) : formatQuantityText(quantity);
+}
 
 // ---------------------------------------------------------------------------
 // [UX] Audible + haptic confirmation for each scan. The cashier is looking at
@@ -174,7 +234,7 @@ function ScanSessionPanel({
               dir="ltr"
               className="shrink-0 rounded-full bg-emerald-600 px-2.5 py-0.5 text-xs font-extrabold tabular-nums text-white"
             >
-              × {fmtInt(bannerQty)}
+              × {fmtQty(bannerQty)}
             </span>
           )}
         </div>
@@ -206,8 +266,9 @@ function ScanSessionPanel({
                 >
                   <Minus className="size-4" />
                 </Button>
+                {/* A by-amount line holds a fraction (0.3333): never round it to a whole number here. */}
                 <span dir="ltr" className="min-w-8 text-center text-sm font-extrabold tabular-nums">
-                  {fmtInt(item.quantity)}
+                  {fmtQty(item.quantity)}
                 </span>
                 <Button
                   type="button"
@@ -286,7 +347,29 @@ export function PosLayout() {
 
   // Cart & Customer states
   const [cartItems, setCartItems] = useState<CartLineItem[]>([]);
+  // [By-amount UI state] All three are PRESENTATION state keyed by the cart line
+  // id. The data itself (quantity + lineTotalOverrideSYP) lives on the cart line
+  // and is only ever written through the pos-service funnel, via commitCart().
+  //   lineModes   — which input a base-unit line currently shows ("qty" default).
+  //   lineAmounts — the text typed in that line's amount field.
+  //   amountErrors— a line whose amount field holds something the funnel refused;
+  //                 while any exists, checkout is blocked (see cartBlocked).
+  const [lineModes, setLineModes] = useState<Record<string, LineInputMode>>({});
+  const [lineAmounts, setLineAmounts] = useState<Record<string, string>>({});
+  const [amountErrors, setAmountErrors] = useState<Record<string, string>>({});
   const [selectedCustomer, setSelectedCustomer] = useState<SelectedCustomer | null>(null);
+
+  // [D8] The latest cart, readable synchronously from any handler.
+  //
+  // WHY a ref next to the state: a cart write is computed OUTSIDE React's
+  // setState updater. The funnel functions can throw (a line that no longer
+  // exists, a quantity <= 0, an amount below the minimum quantity), and a throw
+  // inside an updater is raised while React renders — it crashes the screen
+  // instead of reaching a try/catch around the setState call. Computing from
+  // the ref lets every handler catch the error, keep the previous cart, and tell
+  // the cashier. Every cart write goes through commitCart()/writeCart(), which
+  // keep the ref and the state identical.
+  const cartRef = useRef<CartLineItem[]>([]);
 
   // Modals & Mobile Drawer states
   const [isMobileCartOpen, setIsMobileCartOpen] = useState(false);
@@ -425,10 +508,30 @@ export function PosLayout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDbOpen, tenantId]);
 
-  // Cart Totals calculation strictly through decimal.js
-  const cartTotals = useMemo(() => {
-    return calculateCartTotals(cartItems, dailyExchangeRate);
+  // Cart totals, strictly through decimal.js (calculateCartTotals).
+  //
+  // [Never throw during render] calculateCartTotals() REJECTS a line whose
+  // amount override no longer holds. The funnel never produces such a line, but
+  // if one ever appears (a future code path, a bug) this must not crash the POS:
+  // the totals fall back to zeros and `cartInconsistent` turns on, which blocks
+  // checkout and shows the banner. Derived in ONE memo — no effect, no second
+  // calculation, no extra render.
+  const { cartTotals, cartInconsistent } = useMemo(() => {
+    try {
+      return {
+        cartTotals: calculateCartTotals(cartItems, dailyExchangeRate),
+        cartInconsistent: false,
+      };
+    } catch {
+      return { cartTotals: EMPTY_CART_TOTALS, cartInconsistent: true };
+    }
   }, [cartItems, dailyExchangeRate]);
+
+  // Checkout is blocked while the cart cannot be totalled OR while an amount
+  // field holds a value the funnel refused (the field and the cart would
+  // disagree about what the customer pays).
+  const hasAmountErrors = Object.keys(amountErrors).length > 0;
+  const cartBlocked = cartInconsistent || hasAmountErrors;
 
   // cart line id → quantity, so each unit button in the catalog can show how
   // many of it are already in the cart. (Line ids are `${product.id}-${unit.id}`.)
@@ -437,6 +540,29 @@ export function PosLayout() {
     for (const item of cartItems) map[item.id] = item.quantity;
     return map;
   }, [cartItems]);
+  // [D6] cart line id -> true when this product's cart quantity (all of its
+  // lines, base units) exceeds the known stock. A WARNING only: it never
+  // touches checkout. Stock comes from the live catalog; if the product is not
+  // in the current (search-filtered) list, the snapshot taken when it was added
+  // is used; with neither, no warning is shown.
+  const stockWarnings = useMemo(() => {
+    const result: Record<string, boolean> = {};
+    const checked = new Map<string, boolean>();
+    for (const item of cartItems) {
+      const productId = item.product.id;
+      let exceeds = checked.get(productId);
+      if (exceeds === undefined) {
+        const live = products.find((p) => p.id === productId);
+        const snapshot = (item.product as Partial<PosProductItem>).totalCachedStock;
+        const stock = live?.totalCachedStock ?? snapshot;
+        exceeds =
+          typeof stock === "number" && cartExceedsKnownStock(cartItems, productId, stock).exceeds;
+        checked.set(productId, exceeds);
+      }
+      if (exceeds) result[item.id] = true;
+    }
+    return result;
+  }, [cartItems, products]);
 
   // [T4b] True only when at least one cart line is USD-priced — the only
   // case where checkout legitimately requires a cached exchange rate.
@@ -499,28 +625,93 @@ export function PosLayout() {
         setIsCustomerModalOpen(true);
       } else if (e.key === "F9") {
         e.preventDefault();
-        if (cartItems.length > 0) {
-          // [T4b] Only block checkout for a missing rate when the cart
-          // actually contains USD-priced items. A SYP-only cart checks
-          // out with no rate at all.
-          const needsRate = cartNeedsExchangeRate(cartItems);
-          if (needsRate && (!dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0)) {
-            toast.error(
-              "لا يمكن إتمام البيع: يوجد في السلة صنف مسعّر بالدولار ولا يوجد سعر صرف يومي محفوظ."
-            );
-          } else {
-            setIsPaymentModalOpen(true);
-          }
+        if (cartItems.length === 0) return;
+
+        // An inconsistent cart (or an amount field the funnel refused) must
+        // never reach the payment step.
+        if (cartBlocked) {
+          toast.error(CART_INCONSISTENT_MESSAGE);
+          return;
+        }
+
+        // [T4b] Only block checkout for a missing rate when the cart
+        // actually contains USD-priced items. A SYP-only cart checks
+        // out with no rate at all.
+        const needsRate = cartNeedsExchangeRate(cartItems);
+        if (needsRate && (!dailyExchangeRate || compareMoney(dailyExchangeRate, 0) <= 0)) {
+          toast.error(
+            "لا يمكن إتمام البيع: يوجد في السلة صنف مسعّر بالدولار ولا يوجد سعر صرف يومي محفوظ."
+          );
+        } else {
+          setIsPaymentModalOpen(true);
         }
       }
     }
 
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, [cartItems, cartItems.length, dailyExchangeRate, isCustomerModalOpen, isPaymentModalOpen, isSuccessModalOpen]);
+  }, [cartItems, cartBlocked, dailyExchangeRate, isCustomerModalOpen, isPaymentModalOpen, isSuccessModalOpen]);
 
   // 3. Cart Management Operations
   //
+  // ---------------------------------------------------------------------------
+  // [D8] THE CART WRITE FUNNEL (component side)
+  //
+  // Every change to the cart in this component goes through writeCart() or
+  // commitCart(). commitCart() runs a pure pos-service funnel function
+  // (setLineQuantity, addUnitToLine, applyLineAmountOverride, clearLineOverride,
+  // changeLineUnit) against the latest cart, catches whatever it throws, and
+  // reports it — it never throws into React and never leaves the cart half
+  // changed. This component never sets `quantity` or the amount override on a
+  // line itself.
+  // ---------------------------------------------------------------------------
+  function writeCart(next: CartLineItem[]) {
+    cartRef.current = next;
+    setCartItems(next);
+  }
+
+  function commitCart(
+    compute: (prev: CartLineItem[]) => CartLineItem[],
+    fallbackMessage = "تعذّر تعديل السلة."
+  ): CommitResult {
+    try {
+      writeCart(compute(cartRef.current));
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: messageFromError(error, fallbackMessage) };
+    }
+  }
+
+  /** Forgets everything the UI remembers about one line's by-amount input. */
+  function resetAmountState(cartId: string) {
+    setLineModes((prev) => omitKey(prev, cartId));
+    setLineAmounts((prev) => omitKey(prev, cartId));
+    setAmountErrors((prev) => omitKey(prev, cartId));
+  }
+
+  function resetAllAmountState() {
+    setLineModes({});
+    setLineAmounts({});
+    setAmountErrors({});
+  }
+
+  /** After the funnel changed an amount line's override (scan-repeat), show the new amount in its field. */
+  function syncAmountText(cartId: string) {
+    const override = cartRef.current.find((item) => item.id === cartId)?.lineTotalOverrideSYP;
+    if (override === undefined) return;
+    const text = overrideToFieldText(override);
+    setLineAmounts((prev) => ({ ...prev, [cartId]: text }));
+  }
+
+  /** Opens the payment step, unless the cart cannot be totalled or an amount field is invalid. */
+  function openPaymentModal() {
+    if (cartBlocked) {
+      toast.error(CART_INCONSISTENT_MESSAGE);
+      return;
+    }
+    setIsPaymentModalOpen(true);
+  }
+
   // [v3.6] FIX — this handler previously only captured `unitPriceUSD` from
   // resolveCartLinePrices() and never stored `unitPriceSYP` on the cart
   // line at all, even though CartLineItem (pos-service.ts) has required
@@ -563,32 +754,35 @@ export function PosLayout() {
       );
     }
 
-    setCartItems((prev) => {
-      const existingIndex = prev.findIndex((item) => item.id === cartItemId);
-      if (existingIndex > -1) {
-        const copy = [...prev];
-        copy[existingIndex] = {
-          ...copy[existingIndex],
-          quantity: copy[existingIndex].quantity + 1,
-        };
-        return copy;
-      }
+    const alreadyInCart = cartRef.current.some((item) => item.id === cartItemId);
 
-      const newItem: CartLineItem = {
-        id: cartItemId,
-        product,
-        unitId: unit.id,
-        unitName: unit.unitName,
-        conversionFactor: unit.conversionFactor,
-        quantity: 1,
-        unitPriceSYP,
-        unitPriceUSD,
-        // [T4b] Preserved from resolveCartLinePrices so cartNeedsExchangeRate
-        // can inspect items without re-reading the unit from the catalog.
-        pricingCurrency,
-      };
-      return [...prev, newItem];
-    });
+    const newItem: CartLineItem = {
+      id: cartItemId,
+      product,
+      unitId: unit.id,
+      unitName: unit.unitName,
+      conversionFactor: unit.conversionFactor,
+      quantity: 1,
+      unitPriceSYP,
+      unitPriceUSD,
+      // [T4b] Preserved from resolveCartLinePrices so cartNeedsExchangeRate
+      // can inspect items without re-reading the unit from the catalog.
+      pricingCurrency,
+    };
+
+    // [D8] A repeat add goes through addUnitToLine: a normal line gets exact
+    // 4-dp arithmetic; an amount line grows its override by the unit price so
+    // the line stays consistent (and stays in amount mode).
+    const result = commitCart((prev) =>
+      alreadyInCart ? addUnitToLine(prev, cartItemId) : [...prev, newItem]
+    );
+    if (!result.ok) {
+      return fail(result.message);
+    }
+
+    if (alreadyInCart) {
+      syncAmountText(cartItemId);
+    }
 
     if (!opts.silent) {
       toast.success(`تمت إضافة ${product.name} (${unit.unitName}) إلى السلة`, {
@@ -694,75 +888,190 @@ export function PosLayout() {
     [tenantId, searchQuery, dailyExchangeRate]
   );
 
+  // The stepper (−1 / +1) and the scan-session "−" button.
+  // A result of zero or less removes the line (a line cannot hold a quantity of
+  // zero); anything else goes through setLineQuantity, which normalizes to 4 dp
+  // and drops any amount override — stepping a quantity leaves "بالمبلغ" mode.
   function handleUpdateQuantity(cartId: string, delta: number) {
-    setCartItems((prev) =>
-      prev
-        .map((item) => {
-          if (item.id === cartId) {
-            const newQty = item.quantity + delta;
-            return newQty > 0 ? { ...item, quantity: newQty } : null;
-          }
-          return item;
-        })
-        .filter((item): item is CartLineItem => item !== null)
-    );
+    const item = cartRef.current.find((line) => line.id === cartId);
+    if (!item) return;
+
+    const nextQty = addMoney(item.quantity, delta);
+    if (compareMoney(nextQty, 0) <= 0) {
+      handleRemoveItem(cartId);
+      return;
+    }
+
+    const result = commitCart((prev) => setLineQuantity(prev, cartId, nextQty));
+    if (!result.ok) {
+      toast.error(result.message, { id: `line-qty-${cartId}` });
+      return;
+    }
+    resetAmountState(cartId);
   }
 
+  // The quantity input. A value that is not a positive number is ignored (the
+  // line keeps its quantity — nothing is removed by a typo); remove a line with
+  // its ✕ button.
   function handleSetQuantity(cartId: string, quantity: number) {
-    setCartItems((prev) =>
-      prev.map((item) => (item.id === cartId ? { ...item, quantity } : item))
-    );
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      toast.error("الكمية يجب أن تكون أكبر من الصفر.", { id: `line-qty-${cartId}` });
+      return;
+    }
+
+    const result = commitCart((prev) => setLineQuantity(prev, cartId, String(quantity)));
+    if (!result.ok) {
+      toast.error(result.message, { id: `line-qty-${cartId}` });
+      return;
+    }
+    resetAmountState(cartId);
   }
 
   // [v3.6] FIX — rebuilds ALL price fields returned by
   // resolveCartLinePrices() on a unit change (previously only
   // `unitPriceUSD` was written, silently dropping `unitPriceSYP`).
   function handleChangeUnit(cartId: string, newUnitId: string) {
-    setCartItems((prev) =>
-      prev.map((item) => {
-        if (item.id === cartId) {
-          const selectedUnit = item.product.units?.find((u) => u.id === newUnitId && u.isActive !== false);
-          if (selectedUnit) {
-            try {
-              const prices = resolveCartLinePrices(
-                selectedUnit,
-                item.product,
-                dailyExchangeRate
-              );
-              return {
-                ...item,
-                id: `${item.product.id}-${selectedUnit.id}`,
-                unitId: selectedUnit.id,
-                unitName: selectedUnit.unitName,
-                conversionFactor: selectedUnit.conversionFactor,
-                unitPriceSYP: prices.unitPriceSYP,
-                unitPriceUSD: prices.unitPriceUSD,
-                // [T4b] Keep pricingCurrency up to date when the cashier
-                // switches a line item to a different unit mid-sale.
-                pricingCurrency: prices.pricingCurrency,
-              };
-            } catch (err) {
-              toast.error(
-                err instanceof Error
-                  ? err.message
-                  : "لا يمكن تبديل الوحدة بدون سعر جملة أو سعر صرف صالح."
-              );
-              return item;
-            }
-          }
-        }
-        return item;
+    const item = cartRef.current.find((line) => line.id === cartId);
+    if (!item) return;
+
+    const selectedUnit = item.product.units?.find((u) => u.id === newUnitId && u.isActive !== false);
+    if (!selectedUnit) return;
+
+    let prices: ReturnType<typeof resolveCartLinePrices>;
+    try {
+      prices = resolveCartLinePrices(selectedUnit, item.product, dailyExchangeRate);
+    } catch (err) {
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : "لا يمكن تبديل الوحدة بدون سعر جملة أو سعر صرف صالح."
+      );
+      return;
+    }
+
+    // [D8/D10] changeLineUnit drops any override (by-amount is base-unit only)
+    // and keeps the quantity as it was.
+    const result = commitCart((prev) =>
+      changeLineUnit(prev, cartId, {
+        unitId: selectedUnit.id,
+        unitName: selectedUnit.unitName,
+        conversionFactor: selectedUnit.conversionFactor,
+        unitPriceSYP: prices.unitPriceSYP,
+        unitPriceUSD: prices.unitPriceUSD,
+        pricingCurrency: prices.pricingCurrency,
       })
     );
+    if (!result.ok) {
+      toast.error(result.message);
+      return;
+    }
+    resetAmountState(cartId);
   }
 
   function handleRemoveItem(cartId: string) {
-    setCartItems((prev) => prev.filter((item) => item.id !== cartId));
+    commitCart((prev) => prev.filter((item) => item.id !== cartId));
+    resetAmountState(cartId);
   }
 
   function handleClearCart() {
-    setCartItems([]);
+    writeCart([]);
+    resetAllAmountState();
     toast.info("تم إفراغ السلة");
+  }
+
+  // [D10] Switches a line's input mode ("بالكمية" / "بالمبلغ"), base-unit lines only.
+  //   qty -> amount : changes NOTHING about the cart. Only typing an amount
+  //                   applies the funnel.
+  //   amount -> qty : the quantity stays exactly as it is and the amount
+  //                   override is dropped, so the line reverts to quantity x
+  //                   price (the funnel's clearLineOverride).
+  function handleToggleLineMode(cartId: string) {
+    const item = cartRef.current.find((line) => line.id === cartId);
+    if (!item) return;
+
+    if (lineModes[cartId] === "amount") {
+      const result = commitCart((prev) => clearLineOverride(prev, cartId));
+      if (!result.ok) {
+        toast.error(result.message);
+        return;
+      }
+      resetAmountState(cartId);
+      return;
+    }
+
+    // Defense in depth: the cart panel only offers the toggle on a base unit,
+    // and pos-service refuses an override on any other unit anyway.
+    if (!isBaseUnitLine(item)) {
+      toast.error("البيع بالمبلغ متاح فقط للوحدة الأساسية.", { id: `line-amount-${cartId}` });
+      return;
+    }
+    setLineModes((prev) => ({ ...prev, [cartId]: "amount" }));
+  }
+
+  /** Marks a line's amount field as holding something the funnel refused, and tells the cashier why. */
+  function flagAmountError(cartId: string, message: string) {
+    setAmountErrors((prev) => ({ ...prev, [cartId]: message }));
+    toast.error(message, { id: `line-amount-${cartId}` });
+  }
+
+  // [D10/D8] The cashier typed in the amount field of an amount-mode line.
+  //
+  // The field always shows exactly what was typed, so a number can be entered
+  // digit by digit even when its first digits alone would be refused (a
+  // 1,000,000-per-kg product cannot sell "5", only "5000").
+  //   - empty          -> the override is dropped (the line reverts to
+  //                       quantity x price); the field stays empty.
+  //   - not a number   -> the cart is left untouched, the line is flagged.
+  //   - refused by the funnel (D5 minimum quantity, price <= 0, ...) -> the cart
+  //                       is left untouched, the line is flagged.
+  //   - accepted       -> the funnel sets the derived quantity and the amount.
+  // While any line is flagged, checkout is blocked (cartBlocked), so a typed
+  // value that the cart did not accept can never be charged by accident.
+  function handleLineAmountChange(cartId: string, rawText: string) {
+    const item = cartRef.current.find((line) => line.id === cartId);
+    if (!item || !isBaseUnitLine(item)) return;
+
+    // A valid number is shown grouped as typed ("5,000"); anything else stays
+    // exactly as typed, so the error below points at what the cashier sees.
+    const shownText = parseAmountInput(rawText) !== null ? formatAmountInputWhileTyping(rawText) : rawText;
+    setLineAmounts((prev) => ({ ...prev, [cartId]: shownText }));
+
+    if (rawText.trim() === "") {
+      const cleared = commitCart((prev) => clearLineOverride(prev, cartId));
+      if (cleared.ok) {
+        setAmountErrors((prev) => omitKey(prev, cartId));
+      } else {
+        flagAmountError(cartId, cleared.message);
+      }
+      return;
+    }
+
+    const amount = parseAmountInput(rawText);
+    if (amount === null) {
+      flagAmountError(cartId, "المبلغ غير صالح — أدخل أرقاماً فقط.");
+      return;
+    }
+
+    const result = commitCart((prev) => applyLineAmountOverride(prev, cartId, amount), "المبلغ غير صالح.");
+    if (!result.ok) {
+      flagAmountError(cartId, result.message);
+      return;
+    }
+
+    setAmountErrors((prev) => omitKey(prev, cartId));
+    setLineModes((prev) => (prev[cartId] === "amount" ? prev : { ...prev, [cartId]: "amount" }));
+  }
+
+  // [D7/D8] Quick quantity button (¼, ½, 1) on a base-unit line: sets the
+  // quantity through setLineQuantity (4-dp, drops any override) and returns the
+  // line to quantity mode.
+  function handleLineQuickQuantity(cartId: string, qty: number | string) {
+    const result = commitCart((prev) => setLineQuantity(prev, cartId, String(qty)));
+    if (!result.ok) {
+      toast.error(result.message, { id: `line-qty-${cartId}` });
+      return;
+    }
+    resetAmountState(cartId);
   }
 
   // [UX] Camera scan session helpers.
@@ -810,6 +1119,14 @@ export function PosLayout() {
       throw new Error("سعر الصرف غير محدد في الذاكرة المحلية (مطلوب للأصناف المسعرة بالدولار).");
     }
 
+    // One snapshot of the cart for the whole checkout: the total, the saved
+    // invoice and the confirmation screen are all built from the SAME lines.
+    const itemsAtCheckout = cartRef.current;
+
+    if (hasAmountErrors) {
+      throw new Error("يوجد مبلغ غير صالح في السلة — صحّحه أو أفرغ الحقل ثم حاول مرة أخرى.");
+    }
+
     let customer = selectedCustomer;
     if (!customer || isSystemCashCustomer(customer)) {
       customer = isSystemCashCustomer(customer) && customer?.id
@@ -817,12 +1134,17 @@ export function PosLayout() {
         : await getSystemCashCustomer(tenantId);
     }
 
-    const { totalSYP } = calculateCartTotals(cartItems, effectiveRate);
+    let totalSYP: string;
+    try {
+      totalSYP = calculateCartTotals(itemsAtCheckout, effectiveRate).totalSYP;
+    } catch {
+      throw new Error("السلة غير متسقة — أعد إدخال المبالغ ثم حاول مرة أخرى.");
+    }
 
     // Save offline invoice strictly into Dexie
     const savedInvoice = await submitOfflineSale(tenantId, {
       customer,
-      items: cartItems,
+      items: itemsAtCheckout,
       totalSYP,
       // [v4.9] effectiveRate is null for SYP-only carts with no cached rate —
       // passed through as null (never serializeMoney(null), never "1.0000").
@@ -836,10 +1158,12 @@ export function PosLayout() {
     // Save state for confirmation modal
     setCompletedInvoice(savedInvoice);
     setCompletedCustomer(customer);
-    setCompletedItems([...cartItems]);
+    setCompletedItems([...itemsAtCheckout]);
 
-    // Clear active cart & customer for next sale
-    setCartItems([]);
+    // Clear active cart & customer for next sale (and every by-amount field —
+    // the next sale of the same product must not open in a stale amount mode).
+    writeCart([]);
+    resetAllAmountState();
     setAllowSystemCustomer(true);
     void getSystemCashCustomer(tenantId).then((system) => {
       setSelectedCustomer(system);
@@ -862,7 +1186,8 @@ export function PosLayout() {
   }
 
   function handleStartNewSale() {
-    setCartItems([]);
+    writeCart([]);
+    resetAllAmountState();
     setAllowSystemCustomer(true);
     setCompletedInvoice(null);
     setCompletedCustomer(null);
@@ -902,6 +1227,30 @@ export function PosLayout() {
       setIsSyncingProducts(false);
     }
   }
+
+  // The desktop panel and the mobile drawer render the SAME cart panel with the
+  // SAME props — one object, so the two can never drift apart.
+  const cartPanelProps = {
+    items: cartItems,
+    customer: selectedCustomer,
+    exchangeRate: dailyExchangeRate,
+    onUpdateQuantity: handleUpdateQuantity,
+    onSetQuantity: handleSetQuantity,
+    onChangeUnit: handleChangeUnit,
+    onRemoveItem: handleRemoveItem,
+    onClearCart: handleClearCart,
+    onOpenCustomerModal: () => setIsCustomerModalOpen(true),
+    onOpenPaymentModal: openPaymentModal,
+    lineModes,
+    lineAmounts,
+    amountErrors,
+    stockWarnings,
+    onToggleLineMode: handleToggleLineMode,
+    onLineAmountChange: handleLineAmountChange,
+    onLineQuickQuantity: handleLineQuickQuantity,
+    // Blocks checkout: an unreadable cart total, or an amount field the cart refused.
+    cartInconsistent: cartBlocked,
+  };
 
   return (
     <div className="relative flex h-[calc(100dvh-8.5rem)] flex-col gap-3" dir="rtl">
@@ -995,6 +1344,15 @@ export function PosLayout() {
           )}
         </div>
       )}
+      {cartBlocked && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs font-bold text-red-800"
+        >
+          <AlertTriangle className="size-4 shrink-0 text-red-600" aria-hidden />
+          {CART_INCONSISTENT_MESSAGE}
+        </div>
+      )}
 
       {/*
         [v4.1 — T4d §6.3] Offline void panel.
@@ -1072,18 +1430,7 @@ export function PosLayout() {
 
         {/* LEFT SIDE (in RTL): persistent cart panel */}
         <div className="hidden min-h-0 flex-col overflow-hidden lg:col-span-5 lg:flex xl:col-span-4">
-          <CartPanel
-            items={cartItems}
-            customer={selectedCustomer}
-            exchangeRate={dailyExchangeRate}
-            onUpdateQuantity={handleUpdateQuantity}
-            onSetQuantity={handleSetQuantity}
-            onChangeUnit={handleChangeUnit}
-            onRemoveItem={handleRemoveItem}
-            onClearCart={handleClearCart}
-            onOpenCustomerModal={() => setIsCustomerModalOpen(true)}
-            onOpenPaymentModal={() => setIsPaymentModalOpen(true)}
-          />
+          <CartPanel {...cartPanelProps} />
         </div>
       </div>
 
@@ -1166,23 +1513,7 @@ export function PosLayout() {
             <DrawerDescription>تفاصيل الأصناف وإتمام الدفع</DrawerDescription>
           </DrawerHeader>
           <div className="flex h-full flex-1 flex-col overflow-hidden pt-2">
-            <CartPanel
-              items={cartItems}
-              customer={selectedCustomer}
-              exchangeRate={dailyExchangeRate}
-              onUpdateQuantity={handleUpdateQuantity}
-              onSetQuantity={handleSetQuantity}
-              onChangeUnit={handleChangeUnit}
-              onRemoveItem={handleRemoveItem}
-              onClearCart={handleClearCart}
-              onOpenCustomerModal={() => {
-                setIsCustomerModalOpen(true);
-              }}
-              onOpenPaymentModal={() => {
-                setIsPaymentModalOpen(true);
-              }}
-              isMobileDrawer
-            />
+            <CartPanel {...cartPanelProps} isMobileDrawer />
           </div>
         </DrawerContent>
       </Drawer>
