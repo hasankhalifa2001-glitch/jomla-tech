@@ -8,6 +8,11 @@
  * amber card. State, the Survivor/Duplicate rules, the merge request and the
  * BroadcastChannel eviction are unchanged.
  *
+ * [v6.1] The comparison cards also show how many balance adjustments
+ * (previous debts / corrections) each account carries, and the copy and the
+ * success toast mention them: a merge re-points those rows to the survivor
+ * together with invoices and payments.
+ *
  * NOTE: `sm:max-w-4xl` is deliberate — components/ui/dialog.tsx bakes in a
  * `sm:` max-width, and a bare `max-w-*` would lose to it in tailwind-merge.
  */
@@ -28,6 +33,7 @@ import {
   Users,
   AlertTriangle,
   FileText,
+  ClipboardList,
   CreditCard,
   Building2,
   Phone,
@@ -50,6 +56,7 @@ export interface CustomerSummaryItem {
   isSystemGenerated: boolean;
   invoiceCount?: number;
   paymentCount?: number;
+  adjustmentCount?: number;
 }
 
 interface MergeCustomersModalProps {
@@ -124,6 +131,9 @@ function CompareCard({
         </InfoRow>
         <InfoRow icon={<FileText className="size-3.5" aria-hidden />} label="عدد الفواتير:">
           <span className="font-extrabold tabular-nums text-zinc-800">{customer.invoiceCount ?? 0}</span>
+        </InfoRow>
+        <InfoRow icon={<ClipboardList className="size-3.5" aria-hidden />} label="عدد تعديلات الرصيد:">
+          <span className="font-extrabold tabular-nums text-zinc-800">{customer.adjustmentCount ?? 0}</span>
         </InfoRow>
       </div>
     </div>
@@ -203,7 +213,7 @@ export function MergeCustomersModal({
       await broadcastCustomerMerged(tenantId, duplicate.id, survivor.id);
 
       toast.success("تم دمج حسابات الزبائن بنجاح", {
-        description: `تم نقل ${data.repointedInvoicesCount ?? 0} فاتورة و${data.repointedPaymentsCount ?? 0} دفعة إلى حساب ${survivor.name}.`,
+        description: `تم نقل ${data.repointedInvoicesCount ?? 0} فاتورة و${data.repointedPaymentsCount ?? 0} دفعة و${data.repointedAdjustmentsCount ?? 0} تعديل رصيد إلى حساب ${survivor.name}.`,
       });
 
       handleOpenChange(false);
@@ -233,7 +243,7 @@ export function MergeCustomersModal({
                 دمج حسابات الزبائن المكررة
               </DialogTitle>
               <DialogDescription className="mt-0.5 text-xs leading-relaxed text-zinc-500">
-                نقل كافة الفواتير والدفعات من الحساب المكرر إلى الحساب الأساسي مع إيقاف الحساب المكرر نهائياً.
+                نقل كافة الفواتير والدفعات وتعديلات الرصيد (الديون السابقة) من الحساب المكرر إلى الحساب الأساسي مع إيقاف الحساب المكرر نهائياً.
               </DialogDescription>
             </div>
           </div>
@@ -347,7 +357,7 @@ export function MergeCustomersModal({
                   htmlFor="merge-confirm-checkbox"
                   className="cursor-pointer text-xs font-semibold leading-relaxed text-zinc-800"
                 >
-                  أؤكد مراجعة بيانات الزبونين أعلاه، وأوافق على نقل كافة الفواتير والدفعات نهائياً إلى حساب{" "}
+                  أؤكد مراجعة بيانات الزبونين أعلاه، وأوافق على نقل كافة الفواتير والدفعات وتعديلات الرصيد نهائياً إلى حساب{" "}
                   <span className="font-bold text-emerald-700 underline">{survivor.name}</span> وإلغاء تنشيط حساب{" "}
                   <span className="font-bold text-rose-700 underline">{duplicate.name}</span>.
                 </label>

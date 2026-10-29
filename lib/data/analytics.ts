@@ -74,9 +74,12 @@
  *
  * outstandingDebtSYP    = SUM over active customers of computeBalanceSYP(
  *                         [SUM(invoice.debtAmountSYP)], [SUM(independent
- *                         payments)]) — the T4e ledger equation re-used from
- *                         lib/ledger/balance.ts, fed with per-customer totals
- *                         from two groupBy queries instead of every row.
+ *                         payments)], [SUM(balance adjustments)]) — the T4e
+ *                         ledger equation (extended by schema v6.1 with
+ *                         opening-balance / correction adjustments) re-used
+ *                         from lib/ledger/balance.ts, fed with per-customer
+ *                         totals from three groupBy queries instead of every
+ *                         row.
  *
  * EVENT-DATE ACCOUNTING: a void counts on the day IT was created, not on the
  * day of the sale it reverses. Yesterday's report therefore never changes
@@ -202,7 +205,10 @@ export interface AnalyticsKpis {
     netProfitSYP: string;
     /** COMPLETED invoices issued today (event-dated; see the definition above). */
     invoiceCount: number;
-    /** T4e's ledger equation, summed across every active customer. */
+    /**
+     * T4e's ledger equation (including [v6.1] opening-balance / correction
+     * adjustments), summed across every active customer.
+     */
     outstandingDebtSYP: string;
 }
 
@@ -548,6 +554,10 @@ interface RawRepaymentGroupRow {
     _sum: { amountSYP: DecimalLike | null };
 }
 
+interface RawAdjustmentGroupRow {
+    customerId: string;
+    _sum: { amountSYP: DecimalLike | null };
+}
 
 export interface AnalyticsOptions {
     range: AnalyticsRange;
@@ -576,7 +586,7 @@ export async function getAnalyticsDashboard(
 
     // Independent reads, one batch. Every `where` carries an explicit
     // `tenantId` as well as relying on the extension. No raw SQL.
-    const [invoices, items, activeCustomers, debtGroups, repaymentGroups, tenant, alertSets] =
+    const [invoices, items, activeCustomers, debtGroups, repaymentGroups, adjustmentGroups, tenant, alertSets] =
         await Promise.all([
             db.invoice.findMany({
                 where: { tenantId, createdAt: { gte: windowStart, lt: windowEnd } },
@@ -610,8 +620,9 @@ export async function getAnalyticsDashboard(
             }) as Promise<RawActiveCustomerRow[]>,
 
             // Per-customer SUM of debtAmountSYP across EVERY invoice status
-            // (void mirrors are negative, so reversals net out) — what T4e's
-            // balance equation consumes, without loading every invoice row.
+            // (void mirrors are negative, so reversals net out) — the first of
+            // the three inputs T4e's balance equation consumes, without
+            // loading every invoice row.
             callGroupBy(db.invoice.groupBy, {
                 by: ["customerId"],
                 where: { tenantId },
@@ -626,6 +637,15 @@ export async function getAnalyticsDashboard(
                 where: { tenantId, invoiceId: null },
                 _sum: { amountSYP: true },
             }) as Promise<RawRepaymentGroupRow[]>,
+
+            // [v6.1] Per-customer SUM of adjustment amountSYP — opening balances
+            // and corrections (signed) — the third input of the balance
+            // equation below.
+            callGroupBy(db.customerBalanceAdjustment.groupBy, {
+                by: ["customerId"],
+                where: { tenantId },
+                _sum: { amountSYP: true },
+            }) as Promise<RawAdjustmentGroupRow[]>,
 
             db.tenant.findUnique({
                 where: { id: tenantId },
@@ -776,7 +796,7 @@ export async function getAnalyticsDashboard(
     const withUnitName = (list: ProductAggregate[]): ProductAggregate[] =>
         list.map((a) => ({ ...a, baseUnitName: baseUnitNameByProduct.get(a.productId) ?? "" }));
 
-    // === CUSTOMER BALANCES (T4e's equation, per active customer) ===
+    // === CUSTOMER BALANCES (T4e's equation + [v6.1] adjustments, per active customer) ===
     const debtByCustomer = new Map<string, string>();
     for (const g of debtGroups) {
         debtByCustomer.set(g.customerId, g._sum.debtAmountSYP ? dstr(g._sum.debtAmountSYP) : "0");
@@ -784,6 +804,10 @@ export async function getAnalyticsDashboard(
     const repaidByCustomer = new Map<string, string>();
     for (const g of repaymentGroups) {
         repaidByCustomer.set(g.customerId, g._sum.amountSYP ? dstr(g._sum.amountSYP) : "0");
+    }
+    const adjustedByCustomer = new Map<string, string>();
+    for (const g of adjustmentGroups) {
+        adjustedByCustomer.set(g.customerId, g._sum.amountSYP ? dstr(g._sum.amountSYP) : "0");
     }
 
     // Both outputs (the KPI total and the ranking) derive from these SAME
@@ -793,7 +817,8 @@ export async function getAnalyticsDashboard(
     for (const c of activeCustomers) {
         const balanceSYP = computeBalanceSYP(
             [debtByCustomer.get(c.id) ?? "0"],
-            [repaidByCustomer.get(c.id) ?? "0"]
+            [repaidByCustomer.get(c.id) ?? "0"],
+            [adjustedByCustomer.get(c.id) ?? "0"]
         );
         outstandingDebtSYP = addMoney(outstandingDebtSYP, balanceSYP);
         // Only a POSITIVE balance is a "large balance" — a customer who has

@@ -38,6 +38,13 @@ const mergeCustomersSchema = z.object({
  *      RESOLVED survivingCustomerId
  *   3. Identifies and re-points all CustomerPayments from mergedCustomerId ->
  *      the RESOLVED survivingCustomerId
+ *   3b. [v6.1] Identifies and re-points all CustomerBalanceAdjustments
+ *      (opening balances / corrections) from mergedCustomerId -> the RESOLVED
+ *      survivingCustomerId. This customerId re-point is the ONLY mutation an
+ *      adjustment row ever receives (append-only, never edited or deleted).
+ *      Without it the merged-away customer's carried-over debt would be
+ *      silently orphaned on the deactivated row and the survivor's balance
+ *      would be wrong.
  *   4. Deactivates the duplicate customer (isActive: false)
  *   5. Writes summary CustomerMergeLog (against the RESOLVED survivor)
  *   6. Refreshes B2BOrderRequest.matchedCustomerId for PENDING_REVIEW orders
@@ -48,7 +55,8 @@ const mergeCustomersSchema = z.object({
  *      happened it is inert and feeds no downstream calculation, so leaving it
  *      stale after a merge is a display-only historical artifact, not a
  *      correctness gap. The `status` filter below is load-bearing.
- *   7. Writes CustomerMergeLogItem append-only audit trail rows for every re-pointed record
+ *   7. Writes CustomerMergeLogItem append-only audit trail rows for every
+ *      re-pointed record (invoices, payments and [v6.1] balance adjustments)
  *
  * [FIX — v4.5, this revision — closes a real "merge into a dead end" bug]
  * Every OTHER write path that resolves a customerId before a financial write
@@ -86,9 +94,9 @@ const mergeCustomersSchema = z.object({
  * FIX: survivingCustomerId is resolved via resolveActiveCustomerId() as the
  * very first operation inside the transaction — before the existence
  * lookups, before any read. Every subsequent step in this route (the
- * survivor existence/isSystemGenerated/isActive checks, the invoice/payment
- * re-pointing, the CustomerMergeLog write, the B2BOrderRequest refresh) uses
- * ONLY the resolved ID from that point forward. A defensive
+ * survivor existence/isSystemGenerated/isActive checks, the invoice/payment/
+ * adjustment re-pointing, the CustomerMergeLog write, the B2BOrderRequest
+ * refresh) uses ONLY the resolved ID from that point forward. A defensive
  * `!survivor.isActive` check is also added as a second, independent
  * backstop — structurally this should now be unreachable given the
  * resolution above, but costs nothing to keep as defense-in-depth against a
@@ -119,13 +127,18 @@ const mergeCustomersSchema = z.object({
  * 409 status, instead of leaking Prisma's raw constraint-violation text
  * ("Unique constraint failed on the fields: (`mergedCustomerId`)") to the
  * client. An unrelated P2002 is never mislabeled as "already merged" —
- * checked against error.meta.target including "mergedCustomerId"
- * specifically, never a substring match on the error message.
+ * checked against error.meta.target (either shape Prisma can report: an
+ * array of field names, or the constraint-name string) including
+ * "mergedCustomerId" specifically, never a substring match on the error
+ * message.
  *
  * Known Limitation:
  * Does not place a database-level row lock on Customer (avoids distributed lock contention with
  * offline writers). Writes arriving after or concurrent with the merge are redirected by
- * resolveActiveCustomerId().
+ * resolveActiveCustomerId(). Writes that COMMIT concurrently with the merge's own reads
+ * (an invoice, a payment or — [v6.1] — a balance adjustment landing on the duplicate after
+ * this transaction listed its records) are not re-pointed and stay on the deactivated row;
+ * this is the same accepted limitation the invoice and payment paths already carry.
  */
 export async function POST(req: Request) {
   try {
@@ -269,13 +282,29 @@ export async function POST(req: Request) {
           });
         }
 
-        // 6. Deactivate the duplicate customer
+        // 6. [v6.1] Re-point CustomerBalanceAdjustments — scoped strictly to
+        // adjustmentIds to prevent audit desync. Target is now the RESOLVED
+        // survivor. The only mutation any adjustment row may ever see is this
+        // customerId re-point (append-only, never edited or deleted otherwise).
+        const adjustmentRows = await tx.customerBalanceAdjustment.findMany({
+          where: { tenantId, customerId: mergedCustomerId },
+          select: { id: true },
+        });
+        const adjustmentIds = adjustmentRows.map((r) => r.id);
+        if (adjustmentIds.length > 0) {
+          await tx.customerBalanceAdjustment.updateMany({
+            where: { tenantId, id: { in: adjustmentIds }, customerId: mergedCustomerId },
+            data: { customerId: resolvedSurvivingCustomerId },
+          });
+        }
+
+        // 7. Deactivate the duplicate customer
         await tx.customer.update({
           where: { id: mergedCustomerId, tenantId },
           data: { isActive: false },
         });
 
-        // 7. Write summary CustomerMergeLog — against the RESOLVED survivor,
+        // 8. Write summary CustomerMergeLog — against the RESOLVED survivor,
         // so this log row itself always points at a real, currently-active
         // final destination, never at an intermediate/dead-end node.
         const mergeLog = await tx.customerMergeLog.create({
@@ -287,7 +316,7 @@ export async function POST(req: Request) {
           },
         });
 
-        // 8. Refresh matchedCustomerId on PENDING_REVIEW B2BOrderRequests
+        // 9. Refresh matchedCustomerId on PENDING_REVIEW B2BOrderRequests
         // ONLY. The status filter is load-bearing, not incidental — see
         // item 6 of this route's header: an APPROVED order's
         // matchedCustomerId is historical/display-only and is
@@ -304,8 +333,9 @@ export async function POST(req: Request) {
           },
         });
 
-        // 9. CustomerMergeLogItem — append-only audit trail rows for every
-        // re-pointed record
+        // 10. CustomerMergeLogItem — append-only audit trail rows for every
+        // re-pointed record (the SAME id lists the updateMany calls above
+        // were scoped to, so the log can never drift from what was moved).
         const logItemsData: PrismaTypes.CustomerMergeLogItemCreateManyInput[] = [
           ...invoiceIds.map((recId) => ({
             tenantId,
@@ -317,6 +347,12 @@ export async function POST(req: Request) {
             tenantId,
             mergeLogId: mergeLog.id,
             recordType: CustomerMergeRecordType.PAYMENT,
+            recordId: recId,
+          })),
+          ...adjustmentIds.map((recId) => ({
+            tenantId,
+            mergeLogId: mergeLog.id,
+            recordType: CustomerMergeRecordType.ADJUSTMENT,
             recordId: recId,
           })),
         ];
@@ -332,27 +368,33 @@ export async function POST(req: Request) {
           resolvedSurvivingCustomerId,
           repointedInvoicesCount: invoiceIds.length,
           repointedPaymentsCount: paymentIds.length,
+          repointedAdjustmentsCount: adjustmentIds.length,
         };
       });
     } catch (txError) {
       // [FIX — v4.5] Narrow P2002 handling — a genuine race between two
       // concurrent merge requests for the same mergedCustomerId. Checked
-      // against error.meta.target specifically, never a substring match
-      // on the error message, so an unrelated P2002 (a different unique
-      // constraint entirely) is never mislabeled as "already merged."
+      // against error.meta.target specifically (array of field names OR the
+      // constraint-name string), never a substring match on the error
+      // message, so an unrelated P2002 (a different unique constraint
+      // entirely) is never mislabeled as "already merged."
       if (
         txError instanceof Prisma.PrismaClientKnownRequestError &&
-        txError.code === "P2002" &&
-        Array.isArray(txError.meta?.target) &&
-        (txError.meta.target as string[]).includes("mergedCustomerId")
+        txError.code === "P2002"
       ) {
-        return NextResponse.json(
-          {
-            error: "CONCURRENCY_ERROR",
-            message: "تم دمج هذا الزبون بالفعل ضمن عملية أخرى متزامنة — يرجى تحديث الصفحة.",
-          },
-          { status: 409 }
-        );
+        const target = txError.meta?.target;
+        const hitsMergedCustomerId = Array.isArray(target)
+          ? (target as string[]).includes("mergedCustomerId")
+          : typeof target === "string" && target.includes("mergedCustomerId");
+        if (hitsMergedCustomerId) {
+          return NextResponse.json(
+            {
+              error: "CONCURRENCY_ERROR",
+              message: "تم دمج هذا الزبون بالفعل ضمن عملية أخرى متزامنة — يرجى تحديث الصفحة.",
+            },
+            { status: 409 }
+          );
+        }
       }
       throw txError;
     }
@@ -364,6 +406,8 @@ export async function POST(req: Request) {
       mergedCustomerId,
       repointedInvoicesCount: mergeResult.repointedInvoicesCount,
       repointedPaymentsCount: mergeResult.repointedPaymentsCount,
+      // [v6.1] The merge comparison screen's toast reads this.
+      repointedAdjustmentsCount: mergeResult.repointedAdjustmentsCount,
       message: "تم دمج حسابات الزبائن بنجاح.",
     });
   } catch (error) {

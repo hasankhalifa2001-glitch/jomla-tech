@@ -99,6 +99,8 @@ export const TENANT_SCOPED_MODELS = new Set([
   // meant a query against the cost-price audit trail would have run
   // completely unscoped the moment a caller's own `where` omitted tenantId.
   "CostPriceChangeLog",
+  // [v6.1] Customer balance adjustments (opening balances / corrections).
+  "CustomerBalanceAdjustment",
 ]);
 
 // Operations that read/target existing rows and must be scoped via `where`.

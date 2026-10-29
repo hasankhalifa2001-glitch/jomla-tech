@@ -55,6 +55,9 @@ export const STORE_ERROR = {
   // [T6b — additive] Subscription approval: the request has no receipt image,
   // so adoption cannot proceed until the merchant uploads one.
   RECEIPT_REQUIRED: "RECEIPT_REQUIRED",
+  // [v6.1] The client reused an idempotencyKey with a different payload —
+  // the request is rejected, not silently replayed.
+  IDEMPOTENCY_KEY_REUSED: "IDEMPOTENCY_KEY_REUSED",
 } as const;
 
 export type StoreErrorCode = (typeof STORE_ERROR)[keyof typeof STORE_ERROR];

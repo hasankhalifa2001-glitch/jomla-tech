@@ -41,7 +41,8 @@ import {
 } from "@/lib/offline";
 import { compareMoney } from "@/lib/utils/money";
 import {
-  parseAmountInput,
+  parseQuantityInput,
+  AMBIGUOUS_COMMA_RE,
   formatQuantityText,
 } from "@/lib/pos/by-amount-ui";
 import { cn } from "@/lib/utils";
@@ -113,15 +114,30 @@ function resolvePriceOrNull(
  * text while focused so typing "0." or "1.5" is never fought by the cart value,
  * and commits only valid positive numbers (the parent routes them through
  * setLineQuantity, which normalizes to 4 dp and clears any amount override).
+ *
+ * Commas are AMBIGUOUS in a quantity ("0,5" vs "1,000"), so they are refused,
+ * never guessed: nothing is committed and `onHint` tells the cashier to use
+ * the dot. While the text is refused the field shows what was typed, flagged
+ * red, and the cart keeps its previous quantity; on blur the field snaps back
+ * to the real cart value.
  */
 function QuantityField({
   value,
   onCommit,
+  onHint,
 }: {
   value: number;
   onCommit: (quantity: number) => void;
+  /** Reports an Arabic hint while the typed text is refused; null clears it. */
+  onHint?: (message: string | null) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  const [invalid, setInvalid] = useState(false);
+
+  const report = (message: string | null) => {
+    setInvalid(message !== null);
+    onHint?.(message);
+  };
 
   return (
     <input
@@ -130,6 +146,7 @@ function QuantityField({
       lang="en"
       dir="ltr"
       aria-label="الكمية"
+      aria-invalid={invalid ? true : undefined}
       value={draft ?? formatQuantityText(value)}
       onFocus={(e) => {
         setDraft(formatQuantityText(value));
@@ -138,13 +155,39 @@ function QuantityField({
       onChange={(e) => {
         const text = e.target.value;
         setDraft(text);
-        const parsed = parseAmountInput(text);
-        if (parsed === null) return;
+
+        if (text.trim() === "") {
+          report(null);
+          return;
+        }
+
+        const parsed = parseQuantityInput(text);
+        if (parsed === null) {
+          report(
+            AMBIGUOUS_COMMA_RE.test(text)
+              ? "استخدم النقطة (.) للكسور"
+              : "كمية غير صالحة"
+          );
+          return;
+        }
+
         const qty = Number(parsed);
-        if (Number.isFinite(qty) && qty > 0) onCommit(qty);
+        if (!Number.isFinite(qty) || qty <= 0) {
+          report("الكمية يجب أن تكون أكبر من صفر");
+          return;
+        }
+
+        report(null);
+        onCommit(qty);
       }}
-      onBlur={() => setDraft(null)}
-      className="h-10 w-16 border-0 bg-transparent text-center text-sm font-extrabold tabular-nums text-slate-900 focus:outline-none sm:h-9"
+      onBlur={() => {
+        setDraft(null); // snaps back to the real cart value
+        report(null);
+      }}
+      className={cn(
+        "h-10 w-16 border-0 text-center text-sm font-extrabold tabular-nums focus:outline-none sm:h-9",
+        invalid ? "bg-red-50 text-red-700" : "bg-transparent text-slate-900"
+      )}
     />
   );
 }
@@ -181,6 +224,18 @@ export function CartPanel({
       return { totals: EMPTY_TOTALS, totalsFailed: true };
     }
   }, [items, exchangeRate]);
+
+  // Quantity-field hints (refused text), keyed by cart line id. They live here,
+  // not inside the stepper, because the stepper has `overflow-hidden`.
+  const [qtyHints, setQtyHints] = useState<Record<string, string>>({});
+  const setQtyHint = (id: string, message: string | null) =>
+    setQtyHints((prev) => {
+      if ((prev[id] ?? null) === message) return prev;
+      const next = { ...prev };
+      if (message === null) delete next[id];
+      else next[id] = message;
+      return next;
+    });
 
   const hasAmountErrors = Object.keys(amountErrors).length > 0;
   const blocked = cartInconsistent || totalsFailed || hasAmountErrors;
@@ -332,6 +387,7 @@ export function CartPanel({
             const isAmountMode = baseUnit && lineModes[item.id] === "amount";
             const amountError = amountErrors[item.id];
             const notice = lineNotices[item.id];
+            const qtyHint = qtyHints[item.id];
             const hasOverride = item.lineTotalOverrideSYP !== undefined;
 
             return (
@@ -406,6 +462,7 @@ export function CartPanel({
                     <QuantityField
                       value={item.quantity}
                       onCommit={(qty) => onSetQuantity(item.id, qty)}
+                      onHint={(message) => setQtyHint(item.id, message)}
                     />
                     <button
                       type="button"
@@ -418,6 +475,13 @@ export function CartPanel({
                     </button>
                   </div>
                 </div>
+
+                {/* Refused quantity text (e.g. a comma): nothing was committed */}
+                {qtyHint && (
+                  <p role="alert" className="mt-1 text-[11px] font-semibold text-red-700">
+                    {qtyHint}
+                  </p>
+                )}
 
                 {/* base-unit lines only: quick weights (D7) + low-key mode switch (D10) */}
                 {baseUnit && (

@@ -67,6 +67,7 @@ const {
         invoiceItem: { findMany: vi.fn() },
         customer: { findMany: vi.fn() },
         customerPayment: { groupBy: vi.fn() },
+        customerBalanceAdjustment: { groupBy: vi.fn() },
         tenant: { findUnique: vi.fn() },
         product: { findMany: vi.fn() },
     };
@@ -232,6 +233,10 @@ const repaymentGroups: any[] = [
     { customerId: "cust-3", _sum: { amountSYP: "5000" } },
     { customerId: "cust-4", _sum: { amountSYP: "15000" } }, // overpaid → negative balance
 ];
+const adjustmentGroups: any[] = [
+    { customerId: "cust-1", _sum: { amountSYP: "5000" } },
+    { customerId: "cust-2", _sum: { amountSYP: "-2000" } },
+];
 
 const DAY_MS = 86400000;
 
@@ -293,6 +298,7 @@ beforeEach(() => {
     );
     fakeDb.invoice.groupBy.mockImplementation(async () => debtGroups);
     fakeDb.customerPayment.groupBy.mockImplementation(async () => repaymentGroups);
+    fakeDb.customerBalanceAdjustment.groupBy.mockImplementation(async () => adjustmentGroups);
     fakeDb.tenant.findUnique.mockImplementation(async () => ({ dailyExchangeRate: "15000" }));
     fakeDb.product.findMany.mockImplementation(async ({ where }: any) =>
         baseUnitRows.filter((p) => where.id.in.includes(p.id))
@@ -473,9 +479,10 @@ describe("T4h — data layer KPIs (fixed clock, independent recomputation)", () 
             new Decimal(dash.kpis.grossProfitSYP).plus(dash.kpis.returnsProfitSYP).toString()
         );
 
-        // T4e's equation over ACTIVE customers only: (50000−20000) + 0 + (10000−15000).
-        const expectedDebt = computeBalanceSYP(["50000", "0", "10000"], ["20000", "0", "15000"]);
-        expectMoneyEq(expectedDebt, 25000);
+        // v6.1: T4e's equation over ACTIVE customers only, with adjustments:
+        // cust-1: 50000−20000+5000 = 35000; cust-2: 0−0+(−2000) = −2000; cust-4: 10000−15000+0 = −5000
+        const expectedDebt = computeBalanceSYP(["50000", "0", "10000"], ["20000", "0", "15000"], ["5000", "-2000", "0"]);
+        expectMoneyEq(expectedDebt, 28000);
         expectMoneyEq(dash.kpis.outstandingDebtSYP, expectedDebt);
         // The informational current rate travels as a Decimal string.
         expectMoneyEq(dash.exchangeRate!, 15000);
@@ -893,10 +900,10 @@ describe("T4h — alerts (gateway contract, ordering, counts, no deadlines)", ()
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 
         const large = dash.alerts.largeBalances;
-        // cust-2 is zero, cust-4 is negative (overpaid), cust-3 is inactive.
+        // v6.1: cust-1: 50000−20000+5000 = 35000 (adjustment added); cust-2 is zero, cust-4 is negative (overpaid), cust-3 is inactive.
         expect(large.count).toBe(1);
         expect(large.items[0].customerId).toBe("cust-1");
-        expectMoneyEq(large.items[0].balanceSYP, 30000);
+        expectMoneyEq(large.items[0].balanceSYP, 35000);
         // The alert body carries NO payment-deadline concept — exactly three keys.
         expect(Object.keys(large.items[0]).sort()).toEqual(["balanceSYP", "customerId", "customerName"]);
     });
@@ -912,6 +919,7 @@ describe("T4h — alerts (gateway contract, ordering, counts, no deadlines)", ()
             many.map((c, i) => ({ customerId: c.id, _sum: { debtAmountSYP: String((i + 1) * 1000) } }))
         );
         fakeDb.customerPayment.groupBy.mockImplementation(async () => []);
+        fakeDb.customerBalanceAdjustment.groupBy.mockImplementation(async () => []);
 
         const dash = await getAnalyticsDashboard(fakeDb, TENANT_ID, { range: 7, now: NOW });
 

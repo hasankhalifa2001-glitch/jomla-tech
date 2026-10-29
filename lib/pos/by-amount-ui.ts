@@ -31,11 +31,22 @@ function toAsciiDigits(text: string): string {
 }
 
 /** Thousands separators we accept and discard: "," "٬" (U+066C) "،" (U+060C)
- * and any whitespace (including no-break spaces). */
+ * and any whitespace (including no-break spaces). AMOUNT field only. */
 const THOUSANDS_SEPARATORS_RE = /[,٬،\s]/g;
 
 /** Arabic decimal separator "٫" (U+066B) -> ".". */
 const ARABIC_DECIMAL_SEPARATOR_RE = /٫/g;
+
+/**
+ * Comma-like characters ("," "٬" "،"). In a QUANTITY they are ambiguous
+ * ("0,5" is half a kilo, "1,000" is a thousand pieces), so the quantity
+ * parser rejects them instead of guessing. Exported so the UI can show the
+ * right hint ("use the dot for fractions").
+ *
+ * No `g` flag on purpose: a global regex keeps `lastIndex` between `.test()`
+ * calls and gives alternating results.
+ */
+export const AMBIGUOUS_COMMA_RE = /[,٬،]/;
 
 /** Strips leading zeros but keeps one digit ("0005" -> "5", "000" -> "0"). */
 function trimLeadingZeros(digits: string): string {
@@ -43,25 +54,15 @@ function trimLeadingZeros(digits: string): string {
 }
 
 /**
- * Parses what the cashier typed into a normalized ASCII decimal string, or
- * null when it is not a usable amount.
+ * Shared tail of both parsers. Takes text that is ALREADY ASCII with "." as
+ * the only possible decimal separator and no grouping characters, and returns
+ * a normalized decimal string or null.
  *
- *  - ASCII, Arabic-Indic and Persian digits are accepted, mixed freely.
- *  - "," "٬" "،" and spaces are thousands separators and are discarded.
- *  - "." and "٫" are the decimal separator: at most ONE, at most 4 decimals.
- *    A trailing separator ("5000.") parses as the integer; ".5" as "0.5".
- *  - Empty input, ".", letters ("5000abc"), a second separator ("1.2.3"), a
- *    minus sign, more than 4 decimals, or more than 14 integer digits -> null.
- *
- * It does NOT judge the VALUE: "0" parses to "0" and the funnel rejects it
- * with its own Arabic message. The result is a string, never a number, so no
- * precision is lost before applyLineAmountOverride normalizes it to 4 dp.
+ *  - At most ONE ".", at most 4 decimals, at most 14 integer digits.
+ *  - A trailing separator ("5000.") parses as the integer; ".5" as "0.5".
+ *  - Empty input, ".", letters, a second separator, a minus sign -> null.
  */
-export function parseAmountInput(text: string): string | null {
-    const normalized = toAsciiDigits(text)
-        .replace(THOUSANDS_SEPARATORS_RE, "")
-        .replace(ARABIC_DECIMAL_SEPARATOR_RE, ".");
-
+function parseNormalizedDecimal(normalized: string): string | null {
     const match = /^(\d*)(?:\.(\d*))?$/.exec(normalized);
     if (!match) return null;
 
@@ -75,6 +76,54 @@ export function parseAmountInput(text: string): string | null {
     if (integer.length > MAX_INTEGER_DIGITS) return null;
 
     return fraction === "" ? integer : `${integer}.${fraction}`;
+}
+
+/**
+ * Parses what the cashier typed in the AMOUNT field into a normalized ASCII
+ * decimal string, or null when it is not a usable amount.
+ *
+ *  - ASCII, Arabic-Indic and Persian digits are accepted, mixed freely.
+ *  - "," "٬" "،" and spaces are thousands separators and are discarded.
+ *  - "." and "٫" are the decimal separator: at most ONE, at most 4 decimals.
+ *    A trailing separator ("5000.") parses as the integer; ".5" as "0.5".
+ *  - Empty input, ".", letters ("5000abc"), a second separator ("1.2.3"), a
+ *    minus sign, more than 4 decimals, or more than 14 integer digits -> null.
+ *
+ * It does NOT judge the VALUE: "0" parses to "0" and the funnel rejects it
+ * with its own Arabic message. The result is a string, never a number, so no
+ * precision is lost before applyLineAmountOverride normalizes it to 4 dp.
+ *
+ * Do NOT use this for quantities: it deletes commas as thousands separators,
+ * so "0,5" would become "5". Use parseQuantityInput.
+ */
+export function parseAmountInput(text: string): string | null {
+    return parseNormalizedDecimal(
+        toAsciiDigits(text)
+            .replace(THOUSANDS_SEPARATORS_RE, "")
+            .replace(ARABIC_DECIMAL_SEPARATOR_RE, ".")
+    );
+}
+
+/**
+ * Parses what the cashier typed in the QUANTITY field.
+ *
+ *  - "." and "٫" are the decimal separator; whitespace is ignored
+ *    ("1 000" -> "1000").
+ *  - A comma ("," "٬" "،") is AMBIGUOUS ("0,5" = half a kilo, or "1,000" =
+ *    a thousand pieces?) and this codebase never guesses, so any comma makes
+ *    the input invalid (null). The UI tells the cashier to use the dot.
+ *  - Everything else follows parseNormalizedDecimal (max 4 decimals, max 14
+ *    integer digits, no letters, no minus sign).
+ *
+ * Like parseAmountInput it does not judge the VALUE: "0" parses to "0" and
+ * the field itself refuses quantities <= 0.
+ */
+export function parseQuantityInput(text: string): string | null {
+    const ascii = toAsciiDigits(text)
+        .replace(/\s/g, "")
+        .replace(ARABIC_DECIMAL_SEPARATOR_RE, ".");
+    if (AMBIGUOUS_COMMA_RE.test(ascii)) return null;
+    return parseNormalizedDecimal(ascii);
 }
 
 /**

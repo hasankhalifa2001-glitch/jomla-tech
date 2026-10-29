@@ -17,14 +17,17 @@ import { computeBalanceSYP } from "@/lib/ledger/balance";
  * debt balance, for T4a's refreshCustomerCache() to populate Dexie's
  * cachedCustomers table.
  *
- * Debt formula — per T1's Customer model:
- *   net debt (SYP) = SUM(Invoice.debtAmountSYP) − SUM(CustomerPayment.amountSYP WHERE invoiceId IS NULL)
+ * Debt formula — per T1's Customer model, v6.1:
+ *   net debt (SYP) = SUM(Invoice.debtAmountSYP)
+ *                  + SUM(CustomerBalanceAdjustment.amountSYP)
+ *                  − SUM(CustomerPayment.amountSYP WHERE invoiceId IS NULL)
  *
- * CustomerPayment.invoiceId is non-null for a sale-time payment (already
- * reflected inside that invoice's own debtAmountSYP at creation) and null
- * for an independent later repayment — only the latter is ever subtracted
- * here. Including invoiceId-having payments in this sum would double-count
- * a sale-time payment against the same debt it already reduced.
+ * A positive adjustment INCREASES what the customer owes; a negative one
+ * decreases it. CustomerPayment.invoiceId is non-null for a sale-time payment
+ * (already reflected inside that invoice's own debtAmountSYP at creation)
+ * and null for an independent later repayment — only the latter is ever
+ * subtracted here. Including invoiceId-having payments in this sum would
+ * double-count a sale-time payment against the same debt it already reduced.
  *
  * cachedBalanceDebtUSD is NOT a sum of each historical invoice's own
  * debtAmountUSD — those were each frozen at a different transaction-time
@@ -117,6 +120,13 @@ export async function GET() {
           where: { invoiceId: null, tenantId },
           select: { amountSYP: true },
         },
+        // Opening-balance / correction entries for this customer (v6.1).
+        // Explicit tenantId filter — same defense-in-depth as invoices/payments.
+        // Only amountSYP is selected; adjustmentCount is derived from the array length.
+        balanceAdjustments: {
+          where: { tenantId },
+          select: { amountSYP: true },
+        },
       },
       orderBy: {
         createdAt: "desc",
@@ -124,13 +134,14 @@ export async function GET() {
     });
 
     const mappedCustomers = customers.map((c) => {
-      // [T4e repayment] Delegated to lib/ledger/balance.ts's computeBalanceSYP —
-      // the ONE implementation of this formula. The two arrays handed over are
+      // [T4e repayment / v6.1] Delegated to lib/ledger/balance.ts's computeBalanceSYP —
+      // the ONE implementation of this formula. The three arrays handed over are
       // backed by the SAME indexed relation reads this route always did (one
       // grouped query for the whole page, no N+1); only the arithmetic moved.
       const debtSYP = computeBalanceSYP(
         c.invoices.map((inv) => inv.debtAmountSYP.toString()),
-        c.payments.map((pay) => pay.amountSYP.toString())
+        c.payments.map((pay) => pay.amountSYP.toString()),
+        c.balanceAdjustments.map((adj) => adj.amountSYP.toString())
       );
 
       // Informational only — a single conversion of the final balance at
@@ -158,6 +169,9 @@ export async function GET() {
         // [v4.2] T4e Addendum: Customer merge comparison screen requires invoice & payment counts
         invoiceCount: c.invoices.length,
         paymentCount: c.payments.length,
+        // [v6.1] Adjustment entries count — feeds the merge comparison screen
+        // and the previous-debts entry screen's duplicate/balance hints.
+        adjustmentCount: c.balanceAdjustments.length,
       };
     });
 

@@ -26,19 +26,26 @@
  * [v4.5 — polish pass, presentation only] An initial-letter avatar tile tinted
  * by state (debt / settled / cash), a balance panel that reads at a glance, a
  * full-width 44px repayment button, and a card that fills its grid cell so
- * rows align. The guard, the props, the badges' meaning and the data shown are
- * unchanged. Light mode only.
+ * rows align. Light mode only.
+ *
+ * [v6.1] "عرض تعديلات الرصيد" opens the read-only adjustment history. It is
+ * available to ADMIN and CASHIER alike (viewing is read-only for both), and is
+ * shown only for a real customer that actually has adjustments — the system
+ * cash customer can never receive one, and an always-present button on a card
+ * with nothing behind it would only be noise. Money comparisons here go through
+ * lib/utils/money.ts (compareMoney), never native Number.
  */
 
 import { useState } from "react";
-import { Building2, CreditCard, FileText, Phone, Wallet } from "lucide-react";
+import { Building2, CreditCard, FileText, History, List, Phone, Wallet } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { formatMoney } from "@/lib/utils/money";
+import { compareMoney, formatMoney } from "@/lib/utils/money";
 import { canShowRepaymentButton, FAILED_SYNC_LABEL, PENDING_SYNC_LABEL } from "@/lib/ledger/repayment-ui";
 import { RepaymentModal, type RepaymentTarget } from "./repayment-modal";
+import { AdjustmentsHistoryDrawer } from "./adjustments-history-drawer";
 
 export interface LedgerCustomerCardData {
   id: string;
@@ -49,6 +56,7 @@ export interface LedgerCustomerCardData {
   cachedBalanceDebtUSD?: string;
   isSystemGenerated: boolean;
   invoiceCount?: number;
+  adjustmentCount?: number;
 }
 
 export interface RepaymentAppliedResult {
@@ -78,11 +86,13 @@ export function CustomerCard({
   onRepaymentApplied,
 }: CustomerCardProps) {
   const [isRepaymentOpen, setIsRepaymentOpen] = useState(false);
+  const [isAdjustmentsOpen, setIsAdjustmentsOpen] = useState(false);
 
   const balanceSYP = customer.cachedBalanceDebtSYP;
   const canRepay = canShowRepaymentButton(isAdmin, balanceSYP, customer.isSystemGenerated);
-  const showPendingSync = !!pendingRepaymentSYP && Number(pendingRepaymentSYP) > 0;
+  const showPendingSync = isPositiveMoney(pendingRepaymentSYP);
   const failedForCard = failedRepayments ?? [];
+  const hasAdjustments = !customer.isSystemGenerated && (customer.adjustmentCount ?? 0) > 0;
 
   const repaymentTarget: RepaymentTarget = {
     id: customer.id,
@@ -90,7 +100,7 @@ export function CustomerCard({
     balanceSYP,
   };
 
-  const inDebt = showDebt(balanceSYP);
+  const inDebt = isPositiveMoney(balanceSYP);
   const initial = Array.from(customer.name.trim())[0] ?? "؟";
 
   // Avatar tint follows the account's state: cash bucket → neutral,
@@ -181,6 +191,13 @@ export function CustomerCard({
             <span>عدد الفواتير:</span>
             <span className="font-bold tabular-nums text-zinc-800">{customer.invoiceCount ?? 0}</span>
           </div>
+          <div className="flex items-center gap-2">
+            <List className="size-3.5 shrink-0 text-zinc-400" aria-hidden />
+            <span>تعديلات الرصيد:</span>
+            <span className="font-bold tabular-nums text-zinc-800">
+              {customer.adjustmentCount ?? 0}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -218,6 +235,18 @@ export function CustomerCard({
             </Button>
           </div>
         )}
+
+        {hasAdjustments && (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setIsAdjustmentsOpen(true)}
+            className="mt-2 h-10 w-full gap-2 rounded-xl border-zinc-200 text-xs font-semibold text-zinc-700 hover:bg-zinc-50"
+          >
+            <History className="size-3.5" aria-hidden />
+            <span>عرض تعديلات الرصيد</span>
+          </Button>
+        )}
       </div>
 
       {canRepay && (
@@ -230,12 +259,30 @@ export function CustomerCard({
           onSuccess={onRepaymentApplied}
         />
       )}
+
+      {hasAdjustments && (
+        <AdjustmentsHistoryDrawer
+          open={isAdjustmentsOpen}
+          onOpenChange={setIsAdjustmentsOpen}
+          customerId={customer.id}
+          customerName={customer.name}
+        />
+      )}
     </div>
   );
 }
 
-/** Display-only "is this customer in debt" flag, safe against bad input. */
-function showDebt(balanceSYP: string): boolean {
-  const value = Number(balanceSYP);
-  return Number.isFinite(value) && value > 0;
+/**
+ * Display-only "is this amount strictly positive" check, through money.ts.
+ * compareMoney fails loud on a malformed string (by design, for ledger maths);
+ * a card must not crash the whole ledger page over one bad display value, so
+ * a malformed or missing amount simply reads as "not positive".
+ */
+function isPositiveMoney(amount: string | undefined): boolean {
+  if (!amount) return false;
+  try {
+    return compareMoney(amount, "0") > 0;
+  } catch {
+    return false;
+  }
 }

@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { Users, Search, RefreshCw, AlertCircle, BookOpen, X } from "lucide-react";
+import Link from "next/link";
+import { Users, Search, RefreshCw, AlertCircle, BookOpen, X, PlusCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -15,11 +16,29 @@ interface LedgerClientProps {
 }
 
 /**
+ * URL of the ADMIN-only previous-debts entry screen. It is a sibling folder of
+ * the existing ledger page (app/(dashboard)/ledger/previous-debts), so its URL
+ * is "<ledger URL>/previous-debts". Route groups such as (dashboard) never
+ * appear in a URL, so with the ledger at app/(dashboard)/ledger/page.tsx this
+ * is "/ledger/previous-debts". If the real ledger URL differs (a rewrite, a
+ * basePath, or a "/dashboard" prefix), change ONLY this constant.
+ * The page itself rejects a CASHIER server-side; this button is just the
+ * entry point and is absent (not disabled) for a CASHIER.
+ */
+const PREVIOUS_DEBTS_HREF = "/ledger/previous-debts";
+
+/**
  * [v4.5 — polish pass, presentation only] Gradient icon tile header, a search
  * field with a clear button and a count pill, mirrored skeleton cards while
  * loading, a retryable error banner, and a light staggered entrance for the
  * cards. Every fetch, state transition and prop passed to CustomerCard /
  * MergeCustomersModal below is unchanged.
+ *
+ * [v6.1] The ADMIN-only "إضافة ديون سابقة" button lives in the header next to
+ * the merge button (both are ADMIN-only management actions) and navigates
+ * client-side with next/link. This component remounts on every visit, so the
+ * initial fetch below always shows balances that include a debt that was just
+ * entered on the previous-debts screen.
  */
 
 /** Gentle entrance; the delay is capped so long lists don't feel slow. */
@@ -153,7 +172,21 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        {/* flex-wrap: with two ADMIN buttons + the refresh icon, a 375px screen
+            wraps them onto a second line instead of overflowing. */}
+        <div className="flex flex-wrap items-center gap-2">
+          {isAdmin && (
+            <Button
+              asChild
+              className="h-10 flex-1 gap-2 rounded-xl bg-emerald-600 text-sm font-bold text-white shadow-sm shadow-emerald-600/25 transition-all hover:bg-emerald-700 active:scale-[0.98] sm:flex-none"
+            >
+              <Link href={PREVIOUS_DEBTS_HREF}>
+                <PlusCircle className="size-4" aria-hidden />
+                <span>إضافة ديون سابقة</span>
+              </Link>
+            </Button>
+          )}
+
           {isAdmin && (
             <Button
               variant="default"
@@ -278,7 +311,9 @@ export function LedgerClient({ tenantId, isAdmin }: LedgerClientProps) {
         </div>
       )}
 
-      {/* Customer Merge Confirmation Modal */}
+      {/* Customer Merge Confirmation Modal.
+          `customers` is passed whole, so each item's adjustmentCount (from
+          GET /api/customers) reaches the comparison cards unchanged. */}
       {isAdmin && (
         <MergeCustomersModal
           open={isMergeModalOpen}

@@ -55,6 +55,7 @@ const { mockState, mockSessionState } = vi.hoisted(() => {
   const state = {
     payments: [] as any[],
     mergeLogs: [] as any[],
+    adjustments: [] as any[],
     customers: new Map<string, any>(),
     invoices: [] as any[],
     dailyExchangeRate: "14375.5000" as string | null,
@@ -62,6 +63,7 @@ const { mockState, mockSessionState } = vi.hoisted(() => {
     reset() {
       state.payments.length = 0;
       state.mergeLogs.length = 0;
+      state.adjustments.length = 0;
       state.customers.clear();
       state.invoices.length = 0;
       state.dailyExchangeRate = "14375.5000";
@@ -103,6 +105,13 @@ const { mockState, mockSessionState } = vi.hoisted(() => {
     invoice: {
       findMany: vi.fn(async ({ where }: any) =>
         state.invoices.filter((i) => i.customerId === where?.customerId)
+      ),
+    },
+    customerBalanceAdjustment: {
+      findMany: vi.fn(async ({ where }: any) =>
+        state.adjustments?.filter((a: any) =>
+          a.tenantId === where?.tenantId && a.customerId === where?.customerId
+        ) ?? []
       ),
     },
     tenant: {
@@ -332,7 +341,8 @@ describe("recordRepayment() — happy path & money correctness", () => {
     // same balance — server and ledger screen cannot drift apart.
     const recompute = computeBalanceSYP(
       mockState.invoices.map((i) => i.debtAmountSYP),
-      mockState.payments.filter((p) => p.invoiceId === null).map((p) => p.amountSYP)
+      mockState.payments.filter((p) => p.invoiceId === null).map((p) => p.amountSYP),
+      mockState.adjustments.map((a) => a.amountSYP)
     );
     expect(recompute).toBe(refAfter);
   });
@@ -600,17 +610,17 @@ describe("computeBalanceSYP — the ledger formula", () => {
       .minus(repayments.reduce((acc, r) => acc.plus(r), new Decimal(0)))
       .toFixed(4);
 
-    expect(computeBalanceSYP(debts, repayments)).toBe(reference);
+    expect(computeBalanceSYP(debts, repayments, [])).toBe(reference);
   });
 
   it("nets a VOIDED invoice's mirror debt back to zero (negative debt participates)", () => {
     const debts = ["500000.0000", "-500000.0000"]; // original + its void mirror
-    expect(computeBalanceSYP(debts, [])).toBe("0.0000");
+    expect(computeBalanceSYP(debts, [], [])).toBe("0.0000");
   });
 
   it("ignores null/undefined entries instead of producing NaN", () => {
-    expect(computeBalanceSYP(["100000.0000", null as never], [])).toBe("100000.0000");
-    expect(computeBalanceSYP(["100000.0000"], ["100000.0000", undefined as never])).toBe("0.0000");
+    expect(computeBalanceSYP(["100000.0000", null as never], [], [])).toBe("100000.0000");
+    expect(computeBalanceSYP(["100000.0000"], ["100000.0000", undefined as never], [])).toBe("0.0000");
   });
 });
 

@@ -436,9 +436,9 @@ describe("T4b — Offline-First POS Interface (Sale Flow + Walk-in Customer)", (
       expect(invoice.customerId).toBe("cust-real-1");
 
       // Critical invariant: NO batchId is written to invoice or invoice items
-      expect((invoice as any).batchId).toBeUndefined();
+      expect((invoice as unknown as Record<string, unknown>).batchId).toBeUndefined();
       for (const item of invoice.items) {
-        expect((item as any).batchId).toBeUndefined();
+        expect((item as unknown as Record<string, unknown>).batchId).toBeUndefined();
       }
 
       // Verify invoice exists in Dexie

@@ -13,6 +13,10 @@ export type AppAction =
   | "ledger:void_invoice"
   | "ledger:merge_customers"
   | "ledger:view_failed_sync"
+  // [v6.1] /dashboard/ledger — add a previous debt or correction
+  // (POST /api/ledger/adjustments). ADMIN only; CASHIER can view balances
+  // but can never add or correct anything.
+  | "ledger:add_balance_adjustment"
   | "orders:view"
   // [ADDED — T5b] /dashboard/orders — reject a pending B2B order.
   // ADMIN-only; CASHIER is read-only. Split out from the legacy
@@ -107,6 +111,11 @@ export const ROLE_CAPABILITY_MATRIX: Record<AppAction, Record<UserRole, boolean>
   },
   // /dashboard/ledger (T4e) — failed-sync items view
   "ledger:view_failed_sync": {
+    ADMIN: true,
+    CASHIER: false,
+  },
+  // /dashboard/ledger (T4e) — add a previous debt / correction (ADMIN only).
+  "ledger:add_balance_adjustment": {
     ADMIN: true,
     CASHIER: false,
   },
