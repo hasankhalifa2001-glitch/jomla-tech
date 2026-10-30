@@ -554,6 +554,84 @@ datasource db {
 // `prisma migrate deploy`. Then `prisma generate`.
 // ============================================================================
 
+// ============================================================================
+// [v6.2] SALE-TIME PRICE OVERRIDE (ADMIN edits a line's price or adds a
+// discount while selling) — closes a gap reported by merchants: they sell
+// the same product at different prices to different customers, and the POS
+// only ever sold at the catalog price. The need is a ONE-OFF change inside
+// the current sale: the product's catalog price (ProductUnit.priceWholesale)
+// never changes.
+//
+// THE FIX — two ADDITIVE, defaulted/nullable columns, nothing else. No new
+// model, no enum change, no index, no existing column changed, dropped or
+// retyped:
+//   - InvoiceItem.listUnitPriceSYP  Decimal(18,4)?  — the catalog price of
+//     the sold unit, in SYP, at the moment of the sale.
+//   - Invoice.hasPriceOverride      Boolean @default(false) — true when at
+//     least one line of the invoice carries a listUnitPriceSYP.
+//
+// HOW THE EXISTING PRICE FIELD IS USED. InvoiceItem.unitPriceSYP already
+// stores the price the customer actually paid per unit (frozen at sale
+// time). It stays THE final price: totals, profit
+// (Invoice.totalSYP − Σ InvoiceItem.costAmountSYP), voids and receipts keep
+// reading it exactly as before. A discount, whether the admin typed it as a
+// percentage, as an amount, or as a new price, is only an INPUT convenience:
+// the UI converts it into a final unit price and nothing about how it was
+// typed is stored. The discount of a line is derived on read:
+//     listUnitPriceSYP − unitPriceSYP   (per sold unit)
+//
+// SEMANTICS (application layer, enforced by the writing code and tests):
+//   - listUnitPriceSYP is written ONLY when the final unitPriceSYP differs
+//     from the catalog price; otherwise it stays NULL. NULL therefore means
+//     "sold at the catalog price" and is also the value of every row that
+//     existed before this revision. Written once with the line, never updated.
+//   - Invoice.hasPriceOverride is written in the SAME $transaction as the
+//     items and always equals "at least one item has a non-null
+//     listUnitPriceSYP". It is a denormalized flag for cheap filtering (the
+//     sales-log "price edited" filter); the items are the source of truth.
+//     Never updated after creation.
+//   - For a unit priced in USD (ProductUnit.pricingCurrency), the list price
+//     is the SYP figure derived through the same conversion the POS used at
+//     sale time (frozen rate), never today's rate. There is no USD
+//     counterpart for listUnitPriceSYP; unitPriceUSD stays derived from the
+//     FINAL unitPriceSYP through deriveUsd() as before.
+//   - ADMIN-only in this revision. Who edited the price is the invoice's own
+//     userId (an ADMIN); no separate "overridden by" column is needed. The
+//     offline POS enforces it in the UI, and the sync engine re-checks it on
+//     the server: an invoice with a price override is accepted only when its
+//     author is an ADMIN according to the database at sync time, never
+//     according to a cached session. Restricted actions are rejected
+//     server-side, not just hidden.
+//   - Selling below the batch cost is allowed: the ADMIN sees a warning (cost
+//     is visible to ADMIN only); it never blocks the sale.
+//   - A void row copies listUnitPriceSYP from the original line and
+//     hasPriceOverride from the original invoice (null stays null, false
+//     stays false). The sales-log "price edited" filter excludes VOIDED
+//     rows, so a cancellation never appears as a price edit.
+//   - Dexie: pending offline invoices created before the app update do not
+//     carry the new fields; every reader must tolerate their absence
+//     (undefined). They are plain non-indexed value fields; no Dexie version
+//     bump is expected (verify).
+//
+// OUT OF SCOPE (later revisions): a discount on the invoice total, customer
+// price lists or price tiers, CASHIER price edits (with a discount limit or
+// admin approval), B2B storefront prices.
+//
+// MIGRATION — READ BEFORE RUNNING ANYTHING. Like v6.1 this change MUST NOT
+// be applied by editing the baseline migration and running
+// `prisma migrate reset`: the production database holds real merchant data.
+// Take a database backup first, then on the DEVELOPMENT database run
+// `prisma migrate dev --name add_invoice_price_override` (creates a NEW
+// migration folder). The generated SQL must contain EXACTLY two statements,
+// and nothing else:
+//     ALTER TABLE "InvoiceItem" ADD COLUMN "listUnitPriceSYP" DECIMAL(18,4);
+//     ALTER TABLE "Invoice" ADD COLUMN "hasPriceOverride" BOOLEAN NOT NULL DEFAULT false;
+// Any DROP, any change to an existing column, or any other statement means
+// STOP and investigate. Existing rows get NULL / false. Apply it to
+// production with `prisma migrate deploy` BEFORE deploying the application
+// code that writes the new columns, then `prisma generate`.
+// ============================================================================
+
 enum UserRole {
   ADMIN
   CASHIER
@@ -637,29 +715,29 @@ model Tenant {
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
 
-  users                 User[]
-  products              Product[]
-  productUnits          ProductUnit[]
+  users                      User[]
+  products                   Product[]
+  productUnits               ProductUnit[]
   // [v4.5] tenant-scoped, per T1's isolation rules
-  productUnitBarcodes   ProductUnitBarcode[]
-  productBatches        ProductBatch[]
+  productUnitBarcodes        ProductUnitBarcode[]
+  productBatches             ProductBatch[]
   // [v4.7]
-  productReceipts       ProductReceipt[]
-  customers             Customer[]
-  invoices              Invoice[]
-  invoiceItems          InvoiceItem[]
-  customerPayments      CustomerPayment[]
+  productReceipts            ProductReceipt[]
+  customers                  Customer[]
+  invoices                   Invoice[]
+  invoiceItems               InvoiceItem[]
+  customerPayments           CustomerPayment[]
   // [v6.1]
   customerBalanceAdjustments CustomerBalanceAdjustment[]
-  subscriptions         Subscription[]
-  b2bOrderRequests      B2BOrderRequest[]
-  customerMergeLogs     CustomerMergeLog[]
-  customerMergeLogItems CustomerMergeLogItem[]
-  stockAdjustments      StockAdjustment[]
-  batchDeletionLogs     BatchDeletionLog[]
-  baseUnitChangeLogs    BaseUnitChangeLog[]
+  subscriptions              Subscription[]
+  b2bOrderRequests           B2BOrderRequest[]
+  customerMergeLogs          CustomerMergeLog[]
+  customerMergeLogItems      CustomerMergeLogItem[]
+  stockAdjustments           StockAdjustment[]
+  batchDeletionLogs          BatchDeletionLog[]
+  baseUnitChangeLogs         BaseUnitChangeLog[]
   // [v4.2]
-  costPriceChangeLogs   CostPriceChangeLog[]
+  costPriceChangeLogs        CostPriceChangeLog[]
 
   systemCustomerId     String?               @unique
   systemCustomer       Customer?             @relation("TenantSystemCustomer", fields: [systemCustomerId], references: [id], onDelete: Restrict)
@@ -681,17 +759,17 @@ model User {
   tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   invoices Invoice[]
 
-  reviewedB2BOrderRequests B2BOrderRequest[]
-  customerMergeLogs        CustomerMergeLog[]
-  stockAdjustments         StockAdjustment[]
-  batchDeletionLogs        BatchDeletionLog[]
-  baseUnitChangeLogs       BaseUnitChangeLog[]
+  reviewedB2BOrderRequests   B2BOrderRequest[]
+  customerMergeLogs          CustomerMergeLog[]
+  stockAdjustments           StockAdjustment[]
+  batchDeletionLogs          BatchDeletionLog[]
+  baseUnitChangeLogs         BaseUnitChangeLog[]
   // [v4.2]
-  costPriceChangeLogs      CostPriceChangeLog[]
+  costPriceChangeLogs        CostPriceChangeLog[]
   // [v4.7]
-  productReceipts          ProductReceipt[]
+  productReceipts            ProductReceipt[]
   // [v6.0] subscriptions this user (a platform admin) approved/rejected
-  reviewedSubscriptions    Subscription[]
+  reviewedSubscriptions      Subscription[]
   // [v6.1] opening-balance / correction entries this user recorded
   customerBalanceAdjustments CustomerBalanceAdjustment[]
 
@@ -1074,9 +1152,9 @@ model Customer {
 
   offlineId String? @unique
 
-  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  invoices Invoice[]
-  payments CustomerPayment[]
+  tenant             Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoices           Invoice[]
+  payments           CustomerPayment[]
   // [v6.1] opening-balance / correction entries — see CustomerBalanceAdjustment
   balanceAdjustments CustomerBalanceAdjustment[]
 
@@ -1222,6 +1300,14 @@ model Invoice {
 
   voidReason String?
 
+  // [v6.2] true when at least one InvoiceItem of this invoice carries a
+  // non-null listUnitPriceSYP (an ADMIN changed a line's price or added a
+  // discount during the sale). Denormalized flag for cheap filtering (the
+  // sales-log "price edited" filter); the items stay the source of truth.
+  // Written once, in the same $transaction as the items; never updated.
+  // false for every invoice that existed before v6.2. See the [v6.2] header.
+  hasPriceOverride Boolean @default(false)
+
   tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   user     User          @relation(fields: [userId], references: [id], onDelete: Restrict)
   customer Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
@@ -1290,6 +1376,16 @@ model InvoiceItem {
   // [v4.9] NULLABLE — null when the parent invoice has no frozen
   // exchangeRateUsed (sale and void rows alike). Derived only via deriveUsd().
   unitPriceUSD Decimal? @db.Decimal(18, 4)
+
+  // [v6.2] The CATALOG price of the sold unit, in SYP, at the moment of the
+  // sale — written ONLY when an ADMIN made the final unitPriceSYP differ from
+  // it (a one-off price edit or a discount). NULL = sold at the catalog price
+  // (and every row that existed before v6.2). unitPriceSYP above stays THE
+  // final price everything reads; the line's discount is derived on read as
+  // listUnitPriceSYP − unitPriceSYP. SYP only (no USD counterpart). Written
+  // once with the line, never updated. A void row copies it from the original
+  // line (null stays null). See the [v6.2] header note.
+  listUnitPriceSYP Decimal? @db.Decimal(18, 4)
 
   // [v4.2] T4g's frozen cost basis for this line, computed once at commit
   // time (T4c sync or T5 B2B approval):

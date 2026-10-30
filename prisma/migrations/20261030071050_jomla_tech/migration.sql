@@ -227,6 +227,7 @@ CREATE TABLE "Invoice" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "voidsInvoiceId" TEXT,
     "voidReason" TEXT,
+    "hasPriceOverride" BOOLEAN NOT NULL DEFAULT false,
 
     CONSTRAINT "Invoice_pkey" PRIMARY KEY ("id")
 );
@@ -243,6 +244,7 @@ CREATE TABLE "InvoiceItem" (
     "baseQuantity" DECIMAL(18,4) NOT NULL,
     "unitPriceSYP" DECIMAL(18,4) NOT NULL,
     "unitPriceUSD" DECIMAL(18,4),
+    "listUnitPriceSYP" DECIMAL(18,4),
     "costAmountSYP" DECIMAL(18,4) NOT NULL,
 
     CONSTRAINT "InvoiceItem_pkey" PRIMARY KEY ("id")
