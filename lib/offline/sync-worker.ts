@@ -97,12 +97,15 @@
  * Dexie with any status change — it is simply left out of that pass's
  * payload entirely, exactly like a RETRY_LATER server response, so it's
  * naturally reconsidered on the next pass with zero extra bookkeeping.
+ * (One deliberate exception, added in the [FIX — VOID OF A FAILED ORIGINAL]
+ * note below: a void whose ORIGINAL sale is locally FAILED is marked FAILED
+ * itself, with a clear reason, instead of being left PENDING forever.)
  *
  * Chunk sizes are deliberately conservative (customers/payments are
  * cheaper per-item than invoices, hence the larger size) and are exported
  * constants so they can be tuned without hunting through the function body.
  *
- * [FIX — CONNECTION-LEVEL ERRORS, this revision] Closes a real
+ * [FIX — CONNECTION-LEVEL ERRORS, prior revision] Closes a real
  * misclassification bug on the SERVER side (app/api/sync/route.ts's
  * isRetryableTxError()) that this file's own status handling below simply
  * trusted: a raw database CONNECTION failure (e.g. Postgres or the
@@ -118,6 +121,62 @@
  * messages as retryable, exactly like the existing deadlock/serialization
  * handling. See retryFailedInvoice() below for the client-side manual
  * safety net for any invoice already stuck FAILED from before that fix.
+ *
+ * [FIX — v6.2, ACTOR ATTRIBUTION FOR PAYMENTS] /api/sync resolves the author
+ * of EVERY record (sale, void and repayment) from the DATABASE by the
+ * `createdByUserId` the device queued with it, and falls back to whoever is
+ * running the sync only when it is absent. Invoices and voids already
+ * forwarded it (buildInvoicePayload), but buildPaymentPayload dropped it:
+ * a repayment queued by an ADMIN and synced while a CASHIER was logged in on
+ * the same device reached the server with no author, was attributed to the
+ * CASHIER, and was rejected FAILED ("تسجيل الدفعات متاح فقط لحساب المدير") —
+ * a TERMINAL status that is never auto-retried (policy point 3 above).
+ * buildPaymentPayload now forwards createdByUserId exactly like
+ * buildInvoicePayload does. A record queued without it (older rows) keeps the
+ * previous behaviour on the server (the syncing session's user).
+ *
+ * [FIX — CUSTOMER DEPENDENCY ON A CHUNK-LEVEL FAILURE] The stage-1 comment
+ * promised that an invoice/payment whose walk-in customer was never confirmed
+ * would be withheld, but the filters only checked `customerBlockedThisPass`
+ * (customers the server explicitly answered RETRY_LATER for). When a whole
+ * customer chunk failed at the network/HTTP level NO customer from it got any
+ * answer, so none was "blocked" and their invoices WERE sent: the server could
+ * not find the customer and returned a terminal FAILED, which is never
+ * auto-retried — a valid sale lost to a passing network hiccup. The rule is now
+ * stated once, in isCustomerDependencyUnresolved(): a record is withheld
+ * (left PENDING, retried next pass) while its walk-in customer is still in this
+ * pass's pending set and was neither confirmed SYNCED nor answered FAILED. A
+ * customer that FAILED outright still lets its records through, so they
+ * surface their own clear error for manual review instead of waiting forever.
+ *
+ * [FIX — VOID OF A FAILED ORIGINAL, this revision] The stage-3 filter used to
+ * look for a void's original sale ONLY inside this pass's PENDING set. An
+ * original that is locally FAILED (for example a sale the server rejected, such
+ * as a price-edited sale whose author was not an ADMIN) is not in that set, so
+ * the filter concluded "synced in an earlier pass" and SENT the void. The
+ * server has no such sale, answers "the original invoice was not synced yet",
+ * and that is a terminal FAILED with a misleading reason — even though the real
+ * problem is the original. submitOfflineVoid() allows voiding any local
+ * invoice whose status is not SYNCED, so the case is reachable. Stage 3 now
+ * resolves each void's original from Dexie (ONE anyOf query for the whole
+ * pass, never one query per void) and decides per void:
+ *   - original FAILED  -> the void is NOT sent; it is marked FAILED locally
+ *     with an explicit Arabic reason (the sale never reached the server, so
+ *     there is nothing there to void). After the original is fixed and
+ *     re-queued with retryFailedInvoice(), the void must be re-queued the same
+ *     way (it is FAILED too) — retryFailedInvoice() works on any invoice row.
+ *   - original PENDING -> sent only if the original was confirmed SYNCED in
+ *     THIS pass; otherwise deferred (left PENDING, counted in
+ *     deferredInvoices), exactly as before.
+ *   - original SYNCED (an earlier pass) or not found locally -> sent; the
+ *     server remains the authority for anything this device cannot see.
+ * The old per-void `saleInvoices.some(...)` scan (O(n^2) on a big backlog) is
+ * gone with it.
+ *
+ * NOTE (by design, not a bug): the server answers RETRY_LATER — not FAILED —
+ * when a NON-ADMIN session tries to sync a record created by ANOTHER user.
+ * Such a record simply stays PENDING on this device (and keeps counting in
+ * getPendingRecordsCount) until its author, or an ADMIN, runs the sync.
  */
 
 import { getOfflineDb, isOfflineDbSupported, type OfflineInvoice } from "./db";
@@ -258,6 +317,10 @@ function buildInvoicePayload(inv: OfflineInvoice) {
       quantity: it.quantity,
       unitPriceSYP: it.unitPriceSYP,
       unitPriceUSD: it.unitPriceUSD,
+      // [v6.2] Catalog price snapshot at sale time — null when sold at the
+      // catalog price (no override). A pre-v6.2 row has no such key
+      // (undefined) and is sent as null.
+      listUnitPriceSYP: it.listUnitPriceSYP ?? null,
     })),
     totalSYP: inv.totalSYP,
     totalUSD: inv.totalUSD,
@@ -269,6 +332,9 @@ function buildInvoicePayload(inv: OfflineInvoice) {
     paymentMethod: inv.paymentMethod,
     voidsOfflineInvoiceId: inv.voidsOfflineInvoiceId,
     voidReason: inv.voidReason,
+    // [v6.2] The record's real author — /api/sync resolves its role from the
+    // database (never from the payload) to gate price overrides and voids.
+    createdByUserId: inv.createdByUserId,
     createdAt: inv.createdAt,
   };
 }
@@ -286,6 +352,9 @@ function buildPaymentPayload(p: {
   paymentMethod: string;
   receiptNo?: string;
   notes?: string;
+  // [v6.2] The ADMIN who queued this repayment. OPTIONAL: rows queued before
+  // this field existed do not carry it.
+  createdByUserId?: string;
   createdAt: Date | string;
 }) {
   return {
@@ -300,6 +369,10 @@ function buildPaymentPayload(p: {
     paymentMethod: p.paymentMethod,
     receiptNo: p.receiptNo,
     notes: p.notes,
+    // [FIX — v6.2] Was missing: without it the server attributed a
+    // repayment to the syncing session's user and rejected an ADMIN's
+    // repayment (terminal FAILED) whenever a CASHIER session ran the sync.
+    createdByUserId: p.createdByUserId,
     createdAt: p.createdAt,
   };
 }
@@ -387,16 +460,42 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
   // TransientDependencyError mechanism.
   // ==========================================================================
 
+  // O(1) lookups by offlineId (processChunkResults used to .find() through the
+  // whole pending array for every server result: O(n^2) on a big backlog).
+  const pendingCustomerById = new Map(pendingCustomers.map((c) => [c.offlineId, c]));
+  const pendingInvoiceById = new Map(pendingInvoices.map((i) => [i.offlineId, i]));
+  const pendingPaymentById = new Map(pendingPayments.map((p) => [p.offlineId, p]));
+
   // offlineCustomerId -> true once a chunk response confirms SYNCED this pass.
   const customerSyncedThisPass = new Set<string>();
-  // offlineCustomerId -> true if left RETRY_LATER (or never attempted due to
-  // an earlier chunk-level network failure) anywhere in stage 1 this pass.
-  // A customer NOT in this set and NOT in customerSyncedThisPass either was
-  // FAILED outright — those invoices/payments are still sent (see the
-  // file-header FIX note and t4c's own TransientDependencyError doc: a
-  // genuinely-failed dependency should surface its OWN clear "customer not
-  // found"-class error for manual review, not be silently withheld forever).
+  // offlineCustomerId -> true if the server answered RETRY_LATER for it in
+  // stage 1 this pass. (A customer that got NO answer at all — a chunk-level
+  // network failure — is not in any set; isCustomerDependencyUnresolved()
+  // below covers that case too.)
   const customerBlockedThisPass = new Set<string>();
+  // offlineCustomerId -> true if the server answered FAILED for it. Records
+  // depending on a FAILED customer are still sent on purpose: a genuinely
+  // failed dependency should surface its OWN clear "customer not found"-class
+  // error for manual review, not be silently withheld forever.
+  const customerFailedThisPass = new Set<string>();
+
+  /**
+   * True while a walk-in customer this record depends on is still unresolved
+   * in THIS pass: it is one of this pass's pending customers and was neither
+   * confirmed SYNCED nor answered FAILED (RETRY_LATER, or never answered
+   * because its chunk failed). Such a record must NOT be sent — the server has
+   * no record of that customer and would answer a terminal FAILED. A customer
+   * that is not pending at all was synced in an earlier pass and is fine.
+   */
+  const isCustomerDependencyUnresolved = (offlineCustomerId: string | undefined): boolean => {
+    if (!offlineCustomerId) return false; // real customerId / system customer
+    if (customerBlockedThisPass.has(offlineCustomerId)) return true;
+    return (
+      pendingCustomerById.has(offlineCustomerId) &&
+      !customerSyncedThisPass.has(offlineCustomerId) &&
+      !customerFailedThisPass.has(offlineCustomerId)
+    );
+  };
   // offlineId (of a SALE invoice) -> true once confirmed SYNCED this pass,
   // OR already known SYNCED from a prior pass (i.e. not in pendingInvoices
   // at all, since only PENDING rows were fetched above). Used to gate
@@ -412,7 +511,7 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
   ): Promise<void> {
     if (kind === "customers") {
       for (const res of data.customers || []) {
-        const local = pendingCustomers.find((c) => c.offlineId === res.offlineId);
+        const local = pendingCustomerById.get(res.offlineId);
         if (!local || local.id === undefined) continue;
 
         if (res.status === "SYNCED") {
@@ -441,6 +540,7 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
           customerBlockedThisPass.add(res.offlineId);
         } else {
           summary.failedCustomers++;
+          customerFailedThisPass.add(res.offlineId);
           summary.errors.push(res.error || `Customer ${res.offlineId} failed`);
           await db.offlineCustomers.update(local.id, {
             status: "FAILED",
@@ -453,7 +553,7 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
 
     if (kind === "invoices") {
       for (const res of data.invoices || []) {
-        const local = pendingInvoices.find((i) => i.offlineId === res.offlineId);
+        const local = pendingInvoiceById.get(res.offlineId);
         if (!local || local.id === undefined) continue;
 
         const isSale = !local.voidsOfflineInvoiceId;
@@ -485,7 +585,7 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
 
     // payments
     for (const res of data.payments || []) {
-      const local = pendingPayments.find((p) => p.offlineId === res.offlineId);
+      const local = pendingPaymentById.get(res.offlineId);
       if (!local || local.id === undefined) continue;
 
       if (res.status === "SYNCED") {
@@ -521,13 +621,12 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
     if (!result.ok) {
       // A chunk-level network/HTTP failure — none of this chunk's items got
       // any server response at all, so none of them are added to either
-      // customerSyncedThisPass or customerBlockedThisPass. They simply stay
-      // PENDING in Dexie (untouched), exactly like a single RETRY_LATER
-      // item would — no status write, naturally retried next pass. Every
-      // invoice/payment depending on one of these customers is therefore
-      // ALSO deferred below (via the "not synced AND not blocked" check,
-      // which still correctly withholds them — see the invoice/payment
-      // filtering logic in stages 2-4).
+      // customerSyncedThisPass, customerBlockedThisPass or
+      // customerFailedThisPass. They simply stay PENDING in Dexie
+      // (untouched), exactly like a single RETRY_LATER item would — no status
+      // write, naturally retried next pass. Every invoice/payment depending
+      // on one of these customers is ALSO deferred below, via
+      // isCustomerDependencyUnresolved() (pending + not synced + not failed).
       summary.success = false;
       summary.errors.push(result.error);
       continue;
@@ -542,9 +641,9 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
   const saleInvoices = pendingInvoices.filter((inv) => !inv.voidsOfflineInvoiceId);
 
   const sendableSaleInvoices = saleInvoices.filter((inv) => {
-    if (!inv.offlineCustomerId) return true; // customerId (real) or system customer — no dependency
-    if (customerBlockedThisPass.has(inv.offlineCustomerId)) return false; // known-blocked this pass
-    return true; // synced this pass, synced earlier, or failed outright — see note below
+    // Withheld while its walk-in customer is unresolved this pass; sent when
+    // there is no dependency, the customer synced (now or earlier) or FAILED.
+    return !isCustomerDependencyUnresolved(inv.offlineCustomerId);
   });
   summary.deferredInvoices += saleInvoices.length - sendableSaleInvoices.length;
 
@@ -567,23 +666,65 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
   // ==========================================================================
   // STAGE 3 — Void invoices, chunked, sent only after ALL stage-2 chunks have
   // been attempted. Filtered by original-sale dependency.
+  //
+  // [FIX — VOID OF A FAILED ORIGINAL] Each void's original sale is resolved
+  // from Dexie with ONE anyOf query (never one query per void) and the void is
+  // routed by that original's LOCAL status — see the file-header note.
   // ==========================================================================
   const voidInvoices = pendingInvoices.filter((inv) => inv.voidsOfflineInvoiceId);
 
-  const sendableVoidInvoices = voidInvoices.filter((inv) => {
+  const voidOriginalIds = [...new Set(voidInvoices.map((v) => v.voidsOfflineInvoiceId!))];
+  const localOriginals =
+    voidOriginalIds.length > 0
+      ? await db.offlineInvoices.where("offlineId").anyOf(voidOriginalIds).toArray()
+      : [];
+  const localOriginalById = new Map(
+    localOriginals
+      .filter((o) => o.tenantId === scopedTenantId)
+      .map((o) => [o.offlineId, o])
+  );
+
+  const sendableVoidInvoices: OfflineInvoice[] = [];
+
+  for (const inv of voidInvoices) {
     const originalOfflineId = inv.voidsOfflineInvoiceId!;
-    // The original might belong to an EARLIER, already-synced pass (not in
-    // pendingInvoices at all, since only PENDING rows were fetched) — that
-    // case is legitimate and must be sendable. Only exclude when the
-    // original is a member of THIS pass's pending set AND did not confirm
-    // SYNCED during stage 2 above.
-    const originalIsPartOfThisPendingSet = saleInvoices.some(
-      (s) => s.offlineId === originalOfflineId
-    );
-    if (!originalIsPartOfThisPendingSet) return true; // synced in an earlier pass
-    return saleConfirmedThisPassOrEarlier.has(originalOfflineId);
-  });
-  summary.deferredInvoices += voidInvoices.length - sendableVoidInvoices.length;
+    const original = localOriginalById.get(originalOfflineId);
+
+    if (original?.status === "FAILED") {
+      // The sale never reached the server, so there is nothing there to void.
+      // Sending the void would only earn a terminal FAILED with a misleading
+      // "original not synced yet" reason; mark it FAILED here with the real one.
+      // After the original is fixed and re-queued (retryFailedInvoice), this
+      // void must be re-queued the same way.
+      if (inv.id !== undefined) {
+        await db.offlineInvoices.update(inv.id, {
+          status: "FAILED",
+          failureReason:
+            "الفاتورة الأصلية فشلت مزامنتها — عالجها أولاً ثم أعد محاولة الإلغاء.",
+        });
+      }
+      summary.failedInvoices++;
+      summary.errors.push(
+        `Void ${inv.offlineId}: original invoice ${originalOfflineId} is FAILED`
+      );
+      continue;
+    }
+
+    if (original?.status === "PENDING") {
+      // Part of this pass's pending set: send only once the original was
+      // confirmed SYNCED during stage 2 above; otherwise defer to a later pass.
+      if (saleConfirmedThisPassOrEarlier.has(originalOfflineId)) {
+        sendableVoidInvoices.push(inv);
+      } else {
+        summary.deferredInvoices++;
+      }
+      continue;
+    }
+
+    // Original SYNCED in an earlier pass, or not found on this device: send it
+    // and let the server (the authority for anything not visible here) decide.
+    sendableVoidInvoices.push(inv);
+  }
 
   for (const invoiceChunk of chunk(sendableVoidInvoices, INVOICE_CHUNK_SIZE)) {
     const result = await postSyncChunk({
@@ -606,9 +747,7 @@ export async function syncPendingRecords(tenantId: string): Promise<SyncSummary>
   // as stage 2).
   // ==========================================================================
   const sendablePayments = pendingPayments.filter((p) => {
-    if (!p.offlineCustomerId) return true;
-    if (customerBlockedThisPass.has(p.offlineCustomerId)) return false;
-    return true;
+    return !isCustomerDependencyUnresolved(p.offlineCustomerId);
   });
   summary.deferredPayments = pendingPayments.length - sendablePayments.length;
 
@@ -740,6 +879,11 @@ export async function getPendingRecordsCount(tenantId?: string): Promise<number>
  * invoice doesn't exist locally, belongs to a different tenant, or isn't
  * currently FAILED (e.g. a second click while a retry is already
  * in flight and has already resolved it).
+ *
+ * [NOTE — void of a failed original] It works on a void row exactly like on a
+ * sale row. When a sale and its void are BOTH FAILED (the void was failed
+ * locally because the sale failed — see the stage-3 note in the file header),
+ * re-queue the SALE first, let it sync, then re-queue the void.
  */
 export async function retryFailedInvoice(
   tenantId: string,

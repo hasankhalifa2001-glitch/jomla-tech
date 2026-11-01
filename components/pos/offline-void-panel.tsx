@@ -118,6 +118,15 @@ export interface OfflineVoidPanelProps {
   tenantId?: string;
   isAdmin: boolean;
   /**
+   * [v6.2] The id of the signed-in user. Stored as createdByUserId on the
+   * queued void so /api/sync resolves the voiding ADMIN from the DATABASE even
+   * when a CASHIER session later runs the sync (otherwise the void is rejected
+   * with a terminal FAILED). Optional so existing callers compile, but
+   * submitOfflineVoid() warns in development when it is missing — the POS
+   * layout must pass it.
+   */
+  actorUserId?: string;
+  /**
    * The SAME triggerSync instance owned by pos-layout.tsx's own top-level
    * useSyncWorker(tenantId) call — passed down rather than this panel
    * mounting a second, independent useSyncWorker() of its own. Two
@@ -158,7 +167,7 @@ function Pill({
   );
 }
 
-export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoidPanelProps) {
+export function OfflineVoidPanel({ tenantId, isAdmin, actorUserId, triggerSync }: OfflineVoidPanelProps) {
   const { rows, originals, localVoids } = usePendingOfflineInvoices(tenantId);
   const [voidTarget, setVoidTarget] = useState<PendingOfflineInvoiceRow | null>(null);
   const [voidReason, setVoidReason] = useState("");
@@ -231,6 +240,8 @@ export function OfflineVoidPanel({ tenantId, isAdmin, triggerSync }: OfflineVoid
         offlineInvoiceId: voidTarget.invoice.offlineId,
         voidReason,
         actorRole: isAdmin ? "ADMIN" : "CASHIER",
+        // [v6.2] The voiding ADMIN — see OfflineVoidPanelProps.actorUserId.
+        actorUserId,
       });
       // No manual refetch anywhere — usePendingOfflineInvoices is a live
       // query and updates automatically the instant the write commits

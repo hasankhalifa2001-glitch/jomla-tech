@@ -22,7 +22,7 @@ export type PaymentMethod =
   | "OTHER";
 
 // ============================================================================
-// [FIX — review pass 8, this revision] Two real gaps closed:
+// [FIX — review pass 8] Two real gaps closed:
 //
 //   1. Neither createOfflineInvoiceRecord nor createOfflineVoidRecord ever
 //      checked the SIGN of paidAmountSYP — every other financial field in
@@ -45,6 +45,40 @@ export type PaymentMethod =
 //
 // See all prior review-pass notes preserved below for the full history of
 // this file's defense-in-depth financial-invariant checks.
+//
+// ----------------------------------------------------------------------------
+// [FIX — review pass 11, v6.2 HARDENING] Four gaps closed in this revision:
+//
+//   1. ONE DEFINITION OF "EFFECTIVE PRICE OVERRIDE". The server
+//      (app/api/sync/route.ts) stores listUnitPriceSYP only when it DIFFERS
+//      from unitPriceSYP (numeric comparison), and gates exactly that case on
+//      an ADMIN author. This file used to store ANY non-null catalog price, so
+//      a line whose catalog price merely equalled its final price made the
+//      local record say hasPriceOverride: true while the server stored false.
+//      hasEffectiveListPrice() / normalizeListUnitPrice() below are the single
+//      client-side definition (equal => null), used by both factories' callers
+//      and by lib/offline/pos-service.ts. Keep them byte-for-byte equivalent
+//      to the server's own predicate if either is ever edited.
+//
+//   2. LEGACY TOLERANCE. Pending Dexie rows queued before v6.2 carry neither
+//      OfflineInvoice.hasPriceOverride nor OfflineInvoiceItem.listUnitPriceSYP.
+//      Both are now typed OPTIONAL so TypeScript forces every reader to handle
+//      `undefined`; invoiceHasPriceOverride() is the one tolerant reader.
+//      Both are plain, non-indexed value fields, so no Dexie version bump is
+//      needed (the index lists below are unchanged).
+//
+//   3. ACTOR ATTRIBUTION. /api/sync resolves a record's author from the
+//      DATABASE using `createdByUserId` and falls back to whoever happens to be
+//      running the sync when it is absent. For v6.2 that matters: an ADMIN's
+//      price-edited sale synced while a CASHIER is logged in on the same device
+//      would be rejected FAILED (terminal, never retried) even though an ADMIN
+//      made it. OfflineInvoice and OfflinePayment now carry an optional
+//      createdByUserId which the factories persist when given. NOTE: the
+//      sync worker must forward it in the request payload.
+//
+//   4. SIGN GUARD ON PRICES. createOfflineInvoiceRecord now rejects a negative
+//      unitPriceSYP or listUnitPriceSYP (the server already did). A price of 0
+//      is allowed (free/bonus lines) — see the server's "price >= 0" rule.
 // ============================================================================
 
 export interface OfflineInvoiceItem {
@@ -67,6 +101,18 @@ export interface OfflineInvoiceItem {
    * (a SYP-only sale that never needed a rate).
    */
   unitPriceUSD: string | null;
+  /**
+   * [v6.2] Catalog price snapshot at sale time — the catalog price the
+   * cashier saw. Null when sold at the catalog price (no override). Set
+   * only when an ADMIN edited the line's price or added a one-off discount
+   * AND the final price actually differs from it (see
+   * normalizeListUnitPrice). SYP only.
+   *
+   * OPTIONAL on purpose: records created before v6.2 omit this key, so every
+   * reader MUST treat `undefined` exactly like `null`. Plain non-indexed value
+   * field, no Dexie version bump.
+   */
+  listUnitPriceSYP?: string | null;
 }
 
 export interface OfflineInvoice {
@@ -83,6 +129,17 @@ export interface OfflineInvoice {
   customerId?: string;
   offlineCustomerId?: string;
   items: OfflineInvoiceItem[];
+  /**
+   * [v6.2] true when at least one line carries an EFFECTIVE price override
+   * (a non-null listUnitPriceSYP that differs from unitPriceSYP). Computed by
+   * the factory from the items; copied from the original invoice on voids.
+   * Denormalized flag mirroring Invoice.hasPriceOverride for cheap local
+   * filtering.
+   *
+   * OPTIONAL on purpose: pending rows queued before v6.2 do not carry it.
+   * Read it ONLY through invoiceHasPriceOverride() (undefined => false).
+   */
+  hasPriceOverride?: boolean;
   /** AUTHORITATIVE. */
   totalSYP: string;
   /** Derived/informational. */
@@ -100,6 +157,14 @@ export interface OfflineInvoice {
   paymentMethod?: PaymentMethod;
   voidsOfflineInvoiceId?: string;
   voidReason?: string;
+  /**
+   * [v4.8 FIX 5 / v6.2] The user who CREATED this record on the device. The
+   * sync server looks this user up in the database (never trusting a
+   * client-sent role) to decide whether the author was an ADMIN — which is
+   * what gates price overrides and voids. Absent on records queued before this
+   * field existed; the server then falls back to the syncing session's user.
+   */
+  createdByUserId?: string;
   createdAt: Date;
   status: OfflineSyncStatus;
   failureReason?: string;
@@ -129,6 +194,8 @@ export interface OfflinePayment {
   paymentMethod: PaymentMethod;
   receiptNo?: string;
   notes?: string;
+  /** [v6.2] See OfflineInvoice.createdByUserId. */
+  createdByUserId?: string;
   createdAt: Date;
   status: OfflineSyncStatus;
   failureReason?: string;
@@ -510,10 +577,11 @@ export class OfflineDatabase extends Dexie {
     // that already opened this database at an earlier version. This does
     // NOT apply to a plain value field's TypeScript type or nullability
     // (e.g. OfflineInvoice's USD fields, CachedProductUnit.conversionFactor's
-    // type) as long as that field is not part of any indexed key above —
-    // only offlineId/tenantId/customerId/offlineCustomerId/status/
-    // createdAt are indexed on offlineInvoices, and only id/tenantId/
-    // isActive on cachedProducts.
+    // type, [v6.2] OfflineInvoice.hasPriceOverride / createdByUserId and
+    // OfflineInvoiceItem.listUnitPriceSYP) as long as that field is not part
+    // of any indexed key above — only offlineId/tenantId/customerId/
+    // offlineCustomerId/status/createdAt are indexed on offlineInvoices, and
+    // only id/tenantId/isActive on cachedProducts.
   }
 }
 
@@ -568,6 +636,61 @@ export async function resetOfflineDbForTests(): Promise<void> {
   });
 }
 
+// ============================================================================
+// [v6.2] PRICE-OVERRIDE HELPERS — the ONE client-side definition.
+//
+// "Effective override" = the line carries a catalog price AND it differs
+// (numerically, never as strings: "100" and "100.0000" are the same price)
+// from the final unit price. This is the same predicate the sync server uses
+// both to gate an ADMIN author and to decide what it stores, so a record
+// built here and the row the server writes can never disagree about whether
+// an invoice "has a price override".
+// ============================================================================
+
+/**
+ * True when `item` carries a catalog price that differs from its final price.
+ * Tolerates `undefined` (pre-v6.2 rows). May throw MoneyError on a malformed
+ * decimal — callers validate prices first (see assertValidLinePrices in
+ * pos-service.ts and the factory guards below).
+ */
+export function hasEffectiveListPrice(item: {
+  unitPriceSYP: MoneyInput;
+  listUnitPriceSYP?: MoneyInput | null;
+}): boolean {
+  if (item.listUnitPriceSYP === undefined || item.listUnitPriceSYP === null) return false;
+  return (
+    compareMoney(serializeMoney(item.listUnitPriceSYP), serializeMoney(item.unitPriceSYP)) !== 0
+  );
+}
+
+/**
+ * Normalizes a catalog-price snapshot against the line's final price:
+ *   - absent / null            -> null (sold at the catalog price)
+ *   - equal to the final price -> null (there is no override to record)
+ *   - otherwise                -> the serialized 4-dp catalog price
+ * Throws on a negative catalog price (a catalog price of 0 is allowed).
+ */
+export function normalizeListUnitPrice(
+  listUnitPriceSYP: MoneyInput | null | undefined,
+  finalUnitPriceSYP: MoneyInput
+): string | null {
+  if (listUnitPriceSYP === undefined || listUnitPriceSYP === null) return null;
+  const list = serializeMoney(listUnitPriceSYP);
+  if (compareMoney(list, 0) < 0) {
+    throw new Error("listUnitPriceSYP must not be negative.");
+  }
+  return compareMoney(list, serializeMoney(finalUnitPriceSYP)) === 0 ? null : list;
+}
+
+/**
+ * The ONE tolerant reader for the denormalized invoice flag. A pending row
+ * queued before v6.2 has no `hasPriceOverride` (undefined) and means "no
+ * override" — never treat a missing flag as true.
+ */
+export function invoiceHasPriceOverride(invoice: { hasPriceOverride?: boolean }): boolean {
+  return invoice.hasPriceOverride === true;
+}
+
 export function createOfflineInvoiceRecord(data: {
   tenantId: string;
   offlineId?: string;
@@ -580,12 +703,19 @@ export function createOfflineInvoiceRecord(data: {
     unitId: string;
     quantity: MoneyInput;
     unitPriceSYP: MoneyInput;
+    // [v6.2] Catalog price snapshot at sale time — null when sold at the
+    // catalog price (no override). Optional for backward compatibility with
+    // records created before v6.2. A value equal to unitPriceSYP is
+    // normalized to null (no effective override).
+    listUnitPriceSYP?: MoneyInput | null;
   }>;
   totalSYP: MoneyInput;
   exchangeRateUsed?: MoneyInput | null;
   paidAmountSYP: MoneyInput;
   debtAmountSYP: MoneyInput;
   paymentMethod?: PaymentMethod;
+  /** [v6.2] The user who created this sale on the device (see OfflineInvoice). */
+  createdByUserId?: string;
   createdAt?: Date;
   status?: OfflineSyncStatus;
   failureReason?: string;
@@ -605,15 +735,28 @@ export function createOfflineInvoiceRecord(data: {
     throw new Error("An offline invoice must have at least one line item.");
   }
 
-  const serializedItems = data.items.map((item) => ({
-    productId: item.productId,
-    unitId: item.unitId,
-    quantity: serializeMoney(item.quantity),
-    unitPriceSYP: serializeMoney(item.unitPriceSYP),
-  }));
+  const serializedItems = data.items.map((item) => {
+    const unitPriceSYP = serializeMoney(item.unitPriceSYP);
+    return {
+      productId: item.productId,
+      unitId: item.unitId,
+      quantity: serializeMoney(item.quantity),
+      unitPriceSYP,
+      // [v6.2] Catalog price snapshot, normalized: null when absent, null
+      // (pre-v6.2) or EQUAL to the final price — only a genuine difference is
+      // kept, exactly like the sync server. Throws on a negative value.
+      listUnitPriceSYP: normalizeListUnitPrice(item.listUnitPriceSYP, unitPriceSYP),
+    };
+  });
 
   if (serializedItems.some((item) => compareMoney(item.quantity, 0) <= 0)) {
     throw new Error("Every line item on a sale must have a strictly positive quantity.");
+  }
+
+  // [v6.2] The server rejects a negative unit price; reject it here too so a
+  // bad record never reaches the queue. A price of 0 is allowed (free line).
+  if (serializedItems.some((item) => compareMoney(item.unitPriceSYP, 0) < 0)) {
+    throw new Error("unitPriceSYP must not be negative.");
   }
 
   const requiresExchangeRate = data.requiresExchangeRate ?? true;
@@ -703,7 +846,14 @@ export function createOfflineInvoiceRecord(data: {
       unitPriceSYP: item.unitPriceSYP,
       // [v4.9] Single helper decides "USD unavailable" — null when no rate.
       unitPriceUSD: deriveUsd(item.unitPriceSYP, rateUsed),
+      // [v6.2] Catalog price snapshot carried on the persisted record —
+      // already normalized above (null unless it genuinely differs).
+      listUnitPriceSYP: item.listUnitPriceSYP,
     })),
+    // [v6.2] true when at least one line carries an EFFECTIVE override
+    // (a non-null snapshot, which after normalization always differs from the
+    // final price). Written once here; never updated after.
+    hasPriceOverride: serializedItems.some((item) => item.listUnitPriceSYP !== null),
     totalSYP,
     totalUSD,
     exchangeRateUsed: rateUsed,
@@ -712,6 +862,7 @@ export function createOfflineInvoiceRecord(data: {
     debtAmountSYP: debtSYP,
     debtAmountUSD,
     paymentMethod: data.paymentMethod,
+    createdByUserId: data.createdByUserId?.trim() || undefined,
     createdAt: data.createdAt || new Date(),
     status: data.status || "PENDING",
     failureReason: data.failureReason,
@@ -732,6 +883,11 @@ export function createOfflineVoidRecord(data: {
     unitId: string;
     quantity: MoneyInput;
     unitPriceSYP: MoneyInput;
+    // [v6.2] Catalog price snapshot copied from the original line
+    // (null stays null, undefined — a pre-v6.2 original — becomes null).
+    // Never from the payload. NOT normalized against the price: a void
+    // mirrors its original line verbatim.
+    listUnitPriceSYP?: MoneyInput | null;
   }>;
   originalTotalSYP?: MoneyInput;
   totalSYP?: MoneyInput;
@@ -740,6 +896,11 @@ export function createOfflineVoidRecord(data: {
   originalDebtAmountSYP?: MoneyInput;
   paidAmountSYP?: MoneyInput;
   debtAmountSYP?: MoneyInput;
+  // [v6.2] Copied from the original invoice (undefined/false stay false,
+  // true stays true). Never derived from the void's own items.
+  hasPriceOverride?: boolean;
+  /** [v6.2] The ADMIN who queued this void on the device (see OfflineInvoice). */
+  createdByUserId?: string;
   createdAt?: Date;
   status?: OfflineSyncStatus;
   failureReason?: string;
@@ -770,6 +931,12 @@ export function createOfflineVoidRecord(data: {
     unitId: item.unitId,
     quantity: serializeMoney(item.quantity),
     unitPriceSYP: serializeMoney(item.unitPriceSYP),
+    // [v6.2] Catalog price snapshot copied from the original line
+    // (null/undefined stay null).
+    listUnitPriceSYP:
+      item.listUnitPriceSYP === undefined || item.listUnitPriceSYP === null
+        ? null
+        : serializeMoney(item.listUnitPriceSYP),
   }));
 
   if (serializedItems.some((item) => compareMoney(item.quantity, 0) >= 0)) {
@@ -878,6 +1045,8 @@ export function createOfflineVoidRecord(data: {
       unitPriceSYP: item.unitPriceSYP,
       // [v4.9] Null stays null on void rows via the single helper.
       unitPriceUSD: deriveUsd(item.unitPriceSYP, rateUsed),
+      // [v6.2] Catalog price snapshot copied from the original line.
+      listUnitPriceSYP: item.listUnitPriceSYP,
     })),
     totalSYP,
     totalUSD,
@@ -889,6 +1058,10 @@ export function createOfflineVoidRecord(data: {
     paymentMethod: undefined,
     voidsOfflineInvoiceId: data.voidsOfflineInvoiceId,
     voidReason: data.voidReason,
+    // [v6.2] Copied from the original invoice; never derived from items.
+    // `=== true` so a pre-v6.2 original (undefined) yields false.
+    hasPriceOverride: data.hasPriceOverride === true,
+    createdByUserId: data.createdByUserId?.trim() || undefined,
     createdAt: data.createdAt || new Date(),
     status: data.status || "PENDING",
     failureReason: data.failureReason,
@@ -907,6 +1080,8 @@ export function createOfflinePaymentRecord(data: {
   paymentMethod: PaymentMethod;
   receiptNo?: string;
   notes?: string;
+  /** [v6.2] The ADMIN who queued this repayment on the device. */
+  createdByUserId?: string;
   createdAt?: Date;
   status?: OfflineSyncStatus;
   failureReason?: string;
@@ -951,6 +1126,7 @@ export function createOfflinePaymentRecord(data: {
     paymentMethod: data.paymentMethod,
     receiptNo: data.receiptNo,
     notes: data.notes,
+    createdByUserId: data.createdByUserId?.trim() || undefined,
     createdAt: data.createdAt || new Date(),
     status: data.status || "PENDING",
     failureReason: data.failureReason,

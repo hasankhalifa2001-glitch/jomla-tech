@@ -9,12 +9,12 @@
  * - cachedTenantSettings: Daily exchange rate
  *
  * TENANT SCOPING POLICY:
- * - WRITE paths (submitOfflineSale, submitOfflineVoid, createOfflineWalkInCustomer,
- *   seedSampleOfflineData) require a real, non-empty tenantId and throw
- *   otherwise. A write is the only path that can create durable,
- *   tenant-attributable data — falling back to a shared sentinel key here
- *   risks silently filing a real sale, customer, or seeded demo data under
- *   a bucket no legitimate tenant will ever query again.
+ * - WRITE paths (submitOfflineSale, submitOfflineVoid, submitOfflinePayment,
+ *   createOfflineWalkInCustomer, seedSampleOfflineData) require a real,
+ *   non-empty tenantId and throw otherwise. A write is the only path that can
+ *   create durable, tenant-attributable data — falling back to a shared
+ *   sentinel key here risks silently filing a real sale, customer, or seeded
+ *   demo data under a bucket no legitimate tenant will ever query again.
  * - READ paths (getOfflineProducts, getOfflineCustomers,
  *   getOfflineInvoicesList, listPendingOfflineInvoices,
  *   findMatchingCustomerByPhone) fall back to a
@@ -106,7 +106,7 @@
  *      on a paidAmountSYP === 0 sale; this normalization makes that
  *      invariant hold here regardless of what the UI passed in.
  *
- * [FIX — review pass 9, this revision] Two gaps closed:
+ * [FIX — review pass 9] Two gaps closed:
  *   1. CartLineItem.conversionFactor was typed `number` — the only
  *      Decimal-precision field on this entire file (and one of the very
  *      few anywhere in the codebase) not typed as a decimal-serialized
@@ -136,7 +136,7 @@
  *      product's batches always land on the base unit and copy that
  *      pattern elsewhere without the same justification.
  *
- * [FIX — review pass 10, REVISED this revision] getOfflineProducts()'s
+ * [FIX — review pass 10, REVISED] getOfflineProducts()'s
  * totalCachedStock previously reflected ONLY the last-synced server
  * snapshot (cachedProducts.batches) — it never accounted for sales
  * already recorded locally in offlineInvoices but not yet synced. Since
@@ -151,7 +151,7 @@
  * reversed stock back with no special-casing, since the same summation
  * handles both signs uniformly.
  *
- * [FIX — REVISED, this revision — a real "phantom unit" bug closed] The
+ * [FIX — REVISED — a real "phantom unit" bug closed] The
  * original version of this fix included EVERY invoice whose status was
  * not SYNCED — i.e. `status !== "SYNCED"` — in the local subtraction,
  * covering both PENDING and FAILED. That's correct for a SALE that ends
@@ -217,6 +217,51 @@
  *   - submitOfflineSale() compares the override-inclusive cart total EXACTLY
  *     against payload.totalSYP; the tolerance only ever applies per line,
  *     inside calculateCartTotals() and the db.ts factories.
+ *
+ * [v6.2 — SALE-TIME PRICE OVERRIDE, review pass 11 HARDENING]
+ * An ADMIN may change a line's unit price (or give a one-off discount) for
+ * THIS sale only. The catalog price (ProductUnit.priceWholesale) never
+ * changes; the final price is CartLineItem.unitPriceSYP and the catalog price
+ * the cashier saw is kept in CartLineItem.listUnitPriceSYP — NULL whenever the
+ * final price equals the catalog price. Changes in this revision:
+ *   1. PRICE FUNNEL. Like quantity/amount (D8), the price fields are written
+ *      ONLY through pure funnel functions — applyLinePriceOverride,
+ *      clearLinePriceOverride, refreshLineCatalogPrice — which keep
+ *      unitPriceSYP, unitPriceUSD and listUnitPriceSYP in step and finish with
+ *      reconcileLineOverride() so a by-amount line keeps its AMOUNT (D9).
+ *      changeLineUnit() now also resets listUnitPriceSYP to null: a stale
+ *      catalog snapshot of the OLD unit must never survive a unit switch (it
+ *      would have produced a phantom "discount" on the new unit).
+ *      These functions are role-agnostic by design; gating the UI to ADMIN is
+ *      the UI's job and submitOfflineSale() re-enforces it (item 2).
+ *   2. ADMIN GATE. A cart with an EFFECTIVE override (hasEffectiveListPrice,
+ *      db.ts — catalog price present AND different from the final price) is
+ *      rejected unless payload.actorRole === "ADMIN" and payload.actorUserId is
+ *      given. The server re-checks the author's role from the database at sync
+ *      time; this is the first, local layer. Failing closed: a missing role is
+ *      NOT treated as ADMIN.
+ *   3. LOCAL CATALOG CHECK. For every line that carries an effective override,
+ *      the catalog price is re-derived from the device's cached catalog
+ *      (resolveUnitPriceSYP, same conversion the cart used) and compared with
+ *      the line's snapshot. A mismatch means the cart is stale (the catalog was
+ *      refreshed after the line was added): the sale is rejected BEFORE being
+ *      saved so a wrong snapshot can never become a fake discount in the
+ *      reports. Purely local — it can never drop a sale that already happened,
+ *      and it deliberately does NOT run for lines without an override.
+ *   4. PRICE SIGN GUARD. A negative unit/catalog price is rejected up front
+ *      (the server rejects it too). A price of 0 is allowed (free/bonus line).
+ *   5. ACTOR ATTRIBUTION. submitOfflineSale / submitOfflineVoid /
+ *      submitOfflinePayment accept `actorUserId` and persist it as
+ *      createdByUserId on the queued record. /api/sync resolves the author's
+ *      role from the DATABASE by that id; without it the server falls back to
+ *      whoever runs the sync, which would wrongly reject an ADMIN's
+ *      price-edited sale/void/repayment when a CASHIER session syncs it
+ *      (terminal FAILED, never retried). The id is optional in the types so
+ *      existing callers still compile, but a dev-only console.warn fires when
+ *      it is missing — the POS UI must pass it everywhere.
+ *   6. LEGACY TOLERANCE. CartLineItem.listUnitPriceSYP is optional (a cart
+ *      persisted before v6.2 rehydrates without it) and every reader treats
+ *      `undefined` like `null`.
  */
 
 import {
@@ -234,6 +279,9 @@ import {
   // reused unchanged, so a locally-queued repayment is byte-for-byte the shape
   // T4c already knows how to resolve.
   createOfflinePaymentRecord,
+  // [v6.2] The ONE client-side definition of an effective price override.
+  hasEffectiveListPrice,
+  normalizeListUnitPrice,
   type PaymentMethod,
   type CachedProduct,
   // [v4.5] The flat barcode index row type — see db.ts's CachedProductBarcode.
@@ -258,6 +306,7 @@ import {
   convertCurrency,
   serializeMoney,
   addMoney,
+  deriveUsd,
   MoneyError,
   quantityFromAmount,
   type MoneyInput,
@@ -305,11 +354,23 @@ export interface CartLineItem {
    */
   conversionFactor: string;
   quantity: number;
-  // [v3.6] AUTHORITATIVE.
+  // [v3.6] AUTHORITATIVE. [v6.2] This is the FINAL price the customer pays —
+  // equal to the catalog price unless an ADMIN overrode it for this sale.
   unitPriceSYP: string;
   // [v3.6] Derived/informational — null if no exchange rate was cached
   // when this line was added to the cart.
   unitPriceUSD: string | null;
+  /**
+   * [v6.2] Catalog price snapshot at sale time — null when sold at the
+   * catalog price (no override). Set only when an ADMIN edited the line's
+   * price or added a one-off discount AND the final price differs from it.
+   * Written ONLY through the price funnel below (applyLinePriceOverride,
+   * clearLinePriceOverride, refreshLineCatalogPrice, changeLineUnit).
+   *
+   * OPTIONAL: a cart persisted before v6.2 rehydrates without this key —
+   * `undefined` means exactly what `null` means.
+   */
+  listUnitPriceSYP?: string | null;
   // [T4b] The merchant's own pricing denomination for this specific unit —
   // SYP is always authoritative on the cart. Used by cartNeedsExchangeRate().
   pricingCurrency: "USD" | "SYP";
@@ -372,6 +433,19 @@ export interface OfflineSalePayload {
    * server (/api/sync) does not check it.
    */
   firstTimeCreditConfirmed?: boolean;
+  /**
+   * [v6.2] The role of the user making this sale. REQUIRED to be "ADMIN" when
+   * any cart line carries an effective price override — a missing value is
+   * NOT treated as ADMIN (fail closed). Not needed for an ordinary sale.
+   */
+  actorRole?: OfflineActorRole;
+  /**
+   * [v6.2] The id of the user making this sale; stored as createdByUserId on
+   * the queued record so /api/sync can resolve the author's role from the
+   * database. REQUIRED when the cart has an effective price override; strongly
+   * recommended always (see the file header, item 5).
+   */
+  actorUserId?: string;
 }
 
 export interface DuplicatePhoneMatch {
@@ -652,6 +726,22 @@ function resolveTenantId(tenantId?: string): string {
 }
 
 /**
+ * [v6.2] Dev-only signal that a write path was called without the acting
+ * user's id. Without it /api/sync attributes the record to whoever happens to
+ * run the sync, which can wrongly reject an ADMIN-only record (price override,
+ * void, repayment) when a CASHIER session syncs it. Silent in production.
+ */
+function warnMissingActorUserId(writePath: string): void {
+  if (process.env.NODE_ENV !== "production") {
+    console.warn(
+      `[pos-service] ${writePath} was called without actorUserId — the queued ` +
+      "record will carry no createdByUserId, so /api/sync will attribute it to " +
+      "the syncing session's user instead of its real author."
+    );
+  }
+}
+
+/**
  * [D1] Single source of truth for "is this line the base unit?" Wraps the
  * factor-equals-1 check using compareMoney. Every place that needs to enforce
  * by-amount = base-unit-only must use this helper and no other comparison.
@@ -660,6 +750,17 @@ function resolveTenantId(tenantId?: string): string {
  */
 export function isBaseUnitLine(item: { conversionFactor: string }): boolean {
   return compareMoney(item.conversionFactor, "1") === 0;
+}
+
+/**
+ * [v6.2] True when at least one cart line carries an EFFECTIVE price override
+ * (a catalog snapshot that differs from the final price). Tolerates a cart
+ * persisted before v6.2 (no snapshot key). Use it to badge the cart and to
+ * decide whether checkout needs an ADMIN actor; submitOfflineSale() applies
+ * the same predicate to enforce it.
+ */
+export function cartHasPriceOverride(items: CartLineItem[]): boolean {
+  return items.some((item) => hasEffectiveListPrice(item));
 }
 
 export function calculateCartTotals(
@@ -724,11 +825,12 @@ export function calculateCartTotals(
 }
 
 // ============================================================================
-// [D8] CART FUNNEL — the ONLY code allowed to write `quantity` or
-// `lineTotalOverrideSYP` on a cart line that can carry an amount override.
-// Every function is pure (returns a new array, never mutates), exported, and
-// leaves every line in a state calculateCartTotals() accepts. Components call
-// these and never edit those two fields themselves.
+// [D8] CART FUNNEL — the ONLY code allowed to write `quantity`,
+// `lineTotalOverrideSYP` or (v6.2) the price fields `unitPriceSYP` /
+// `unitPriceUSD` / `listUnitPriceSYP` on a cart line that can carry an amount
+// or price override. Every function is pure (returns a new array, never
+// mutates), exported, and leaves every line in a state calculateCartTotals()
+// accepts. Components call these and never edit those fields themselves.
 // ============================================================================
 
 /** Returns a copy of the line with the `lineTotalOverrideSYP` key REMOVED
@@ -743,6 +845,15 @@ function requireLine(items: CartLineItem[], cartId: string): CartLineItem {
   const line = items.find((i) => i.id === cartId);
   if (!line) throw new Error("سطر السلة غير موجود.");
   return line;
+}
+
+/**
+ * [v6.2] USD display figure for a SYP price, via the ONE helper that decides
+ * "USD unavailable" (deriveUsd: null when the rate is null/empty/<= 0).
+ */
+function usdFor(priceSYP: string, exchangeRate: MoneyInput | null | undefined): string | null {
+  if (exchangeRate === null || exchangeRate === undefined) return null;
+  return deriveUsd(priceSYP, serializeMoney(exchangeRate));
 }
 
 /**
@@ -842,6 +953,140 @@ export function reconcileLineOverride(
 }
 
 /**
+ * [v6.2 — PRICE FUNNEL] Sets a line's FINAL unit price for THIS sale only (a
+ * one-off price edit or discount). The caller supplies only the final price;
+ * the catalog price is derived from the line itself — the existing snapshot if
+ * the line is already overridden, otherwise the line's current unit price — so
+ * the caller can never pass a wrong catalog figure.
+ *
+ *   - A discount typed as a percentage / an amount / a new price is converted
+ *     to a final price by the UI; nothing about how it was typed is stored.
+ *   - A price EQUAL to the catalog price ends the override (snapshot -> null).
+ *   - A price of 0 is allowed (free/bonus line); a negative price throws.
+ *   - A price ABOVE the catalog is allowed too (the derived "discount" is then
+ *     negative — the UI should label it an increase).
+ *   - unitPriceUSD is re-derived from the new final price with the rate given
+ *     (null when there is no usable rate).
+ *   - Finishes with reconcileLineOverride (D9): a by-amount line keeps its
+ *     AMOUNT and its quantity is re-derived at the new price; if that is
+ *     impossible (e.g. price 0) the amount mode is cleared and the outcome says
+ *     so — the UI must show it.
+ *
+ * ADMIN-only is NOT decided here (this module is pure); the UI gates it and
+ * submitOfflineSale() enforces it.
+ */
+export function applyLinePriceOverride(
+  items: CartLineItem[],
+  cartId: string,
+  finalPriceSYP: string,
+  exchangeRate: MoneyInput | null
+): ReconcileOverrideResult {
+  const item = requireLine(items, cartId);
+
+  const finalPrice = serializeMoney(finalPriceSYP);
+  if (compareMoney(finalPrice, 0) < 0) {
+    throw new Error("سعر البيع لا يمكن أن يكون سالباً.");
+  }
+
+  // The catalog price this line was added at: the existing snapshot when the
+  // line is already overridden, otherwise its current (= catalog) unit price.
+  const catalogPrice = item.listUnitPriceSYP ?? item.unitPriceSYP;
+
+  const next = items.map((i) =>
+    i.id === cartId
+      ? {
+        ...i,
+        unitPriceSYP: finalPrice,
+        unitPriceUSD: usdFor(finalPrice, exchangeRate),
+        listUnitPriceSYP: normalizeListUnitPrice(catalogPrice, finalPrice),
+      }
+      : i
+  );
+
+  return reconcileLineOverride(next, cartId);
+}
+
+/**
+ * [v6.2 — PRICE FUNNEL] Removes a line's price override: the final price goes
+ * back to the catalog price snapshot and the snapshot is cleared. A no-op
+ * ("unchanged") when the line has no override. Like applyLinePriceOverride it
+ * finishes with reconcileLineOverride so a by-amount line stays coherent.
+ */
+export function clearLinePriceOverride(
+  items: CartLineItem[],
+  cartId: string,
+  exchangeRate: MoneyInput | null
+): ReconcileOverrideResult {
+  const item = requireLine(items, cartId);
+
+  if (item.listUnitPriceSYP === undefined || item.listUnitPriceSYP === null) {
+    return { items, outcome: "unchanged" };
+  }
+
+  const catalogPrice = serializeMoney(item.listUnitPriceSYP);
+
+  const next = items.map((i) =>
+    i.id === cartId
+      ? {
+        ...i,
+        unitPriceSYP: catalogPrice,
+        unitPriceUSD: usdFor(catalogPrice, exchangeRate),
+        listUnitPriceSYP: null,
+      }
+      : i
+  );
+
+  return reconcileLineOverride(next, cartId);
+}
+
+/**
+ * [v6.2 — PRICE FUNNEL] Call this wherever a line's CATALOG price is refreshed
+ * (the daily exchange rate changed for a USD-priced unit, or the cached catalog
+ * was re-synced) INSTEAD of overwriting unitPriceSYP directly:
+ *   - a line WITHOUT an override simply follows the new catalog price;
+ *   - a line WITH an override keeps the ADMIN's final price and only has its
+ *     catalog snapshot updated (if the new catalog price now equals the final
+ *     price, the override ends and the snapshot becomes null).
+ * Overwriting unitPriceSYP directly would silently erase an ADMIN's edit, or
+ * leave a stale snapshot that shows up as a fake discount. Finishes with
+ * reconcileLineOverride (D9).
+ */
+export function refreshLineCatalogPrice(
+  items: CartLineItem[],
+  cartId: string,
+  newCatalogPriceSYP: string,
+  exchangeRate: MoneyInput | null
+): ReconcileOverrideResult {
+  const item = requireLine(items, cartId);
+
+  const catalogPrice = serializeMoney(newCatalogPriceSYP);
+  if (compareMoney(catalogPrice, 0) < 0) {
+    throw new Error("سعر الكتالوج لا يمكن أن يكون سالباً.");
+  }
+
+  const hasOverride = item.listUnitPriceSYP !== undefined && item.listUnitPriceSYP !== null;
+
+  const next = items.map((i) => {
+    if (i.id !== cartId) return i;
+    if (!hasOverride) {
+      return {
+        ...i,
+        unitPriceSYP: catalogPrice,
+        unitPriceUSD: usdFor(catalogPrice, exchangeRate),
+        listUnitPriceSYP: null,
+      };
+    }
+    // Keep the ADMIN's final price; refresh only the catalog snapshot.
+    return {
+      ...i,
+      listUnitPriceSYP: normalizeListUnitPrice(catalogPrice, i.unitPriceSYP),
+    };
+  });
+
+  return reconcileLineOverride(next, cartId);
+}
+
+/**
  * [D8] Adds one unit to a cart line (scan/repeat on the same product).
  * All arithmetic goes through money.ts (never native `+`), so fractional
  * quantities such as 0.3333 stay exact. On an amount line the override grows
@@ -897,6 +1142,12 @@ export function setLineQuantity(
  * by-amount is base-unit only, so switching units exits "بالمبلغ" mode. It does
  * NOT touch the quantity; re-deriving after a PRICE refresh is
  * reconcileLineOverride's D9 job.
+ *
+ * [v6.2] ALSO resets listUnitPriceSYP to null: `fields.unitPriceSYP` is the NEW
+ * unit's catalog price, so any price override (and its catalog snapshot) made
+ * on the OLD unit is dropped. Keeping the old snapshot would compare it with
+ * the new unit's price and invent a phantom discount. The UI should tell the
+ * ADMIN that the price edit was reset.
  */
 export function changeLineUnit(
   items: CartLineItem[],
@@ -912,7 +1163,9 @@ export function changeLineUnit(
 ): CartLineItem[] {
   requireLine(items, cartId);
 
-  return items.map((i) => (i.id === cartId ? { ...withoutOverride(i), ...fields } : i));
+  return items.map((i) =>
+    i.id === cartId ? { ...withoutOverride(i), ...fields, listUnitPriceSYP: null } : i
+  );
 }
 
 /**
@@ -1083,7 +1336,7 @@ export async function getOfflineProducts(
   const db = getOfflineDb();
   const products = await db.cachedProducts.where("tenantId").equals(scopedTenantId).toArray();
 
-  // [FIX — review pass 10, REVISED this revision] totalCachedStock must
+  // [FIX — review pass 10, REVISED] totalCachedStock must
   // reflect the last-synced server snapshot (p.batches) ADJUSTED for
   // everything recorded locally but not yet confirmed synced — see the
   // file-header FIX note for the full reasoning, including the "phantom
@@ -1416,6 +1669,34 @@ export async function createOfflineWalkInCustomer(
   };
 }
 
+/**
+ * [v6.2] Rejects a cart whose prices cannot be sold: a malformed or NEGATIVE
+ * final price, or a negative catalog snapshot (the sync server rejects both).
+ * A price of 0 is allowed (free/bonus line). MoneyError (a non-numeric price)
+ * is translated into an Arabic message naming the offending product.
+ */
+function assertValidLinePrices(items: CartLineItem[]): void {
+  for (const item of items) {
+    try {
+      if (compareMoney(serializeMoney(item.unitPriceSYP), 0) < 0) {
+        throw new Error(`سعر الوحدة لا يمكن أن يكون سالباً ("${item.product.name}").`);
+      }
+      if (
+        item.listUnitPriceSYP !== undefined &&
+        item.listUnitPriceSYP !== null &&
+        compareMoney(serializeMoney(item.listUnitPriceSYP), 0) < 0
+      ) {
+        throw new Error(`سعر الكتالوج لا يمكن أن يكون سالباً ("${item.product.name}").`);
+      }
+    } catch (err) {
+      if (err instanceof MoneyError) {
+        throw new Error(`سعر غير صالح للصنف "${item.product.name}" — أعد إضافة السطر.`);
+      }
+      throw err;
+    }
+  }
+}
+
 export async function submitOfflineSale(
   tenantId: string | undefined,
   payload: OfflineSalePayload
@@ -1432,6 +1713,11 @@ export async function submitOfflineSale(
   if (!payload.items || payload.items.length === 0) {
     throw new Error("لا يمكن إتمام عملية البيع لسلة فارغة.");
   }
+
+  // [v6.2] Price sanity first: every later check (the override predicate, the
+  // cart totals) may do arithmetic on these prices, so reject a malformed or
+  // negative one here with a clear message instead of a raw MoneyError.
+  assertValidLinePrices(payload.items);
 
   // [FIX — review pass 4, T4b] Conditional exchange-rate requirement — a
   // rate is only ever needed to resolve a USD-priced item's SYP price. A
@@ -1451,24 +1737,56 @@ export async function submitOfflineSale(
     );
   }
 
-  // [D1 defense in depth] For every line that carries an amount override,
-  // re-resolve its unit from the CACHED catalog and require the base unit
-  // (factor exactly 1). The cart line's own conversionFactor must not be the
-  // only evidence: a stale or tampered line could claim factor 1 while the
-  // cached unit says otherwise. A product or unit that cannot be found in the
-  // cache is rejected too. Only runs for carts that actually carry an override,
-  // and reads just the products involved (never the whole catalog).
-  const overrideLines = payload.items.filter((item) => item.lineTotalOverrideSYP !== undefined);
-  if (overrideLines.length > 0) {
+  // [v6.2] ADMIN gate (local layer — /api/sync re-checks the author's role
+  // from the DATABASE). Re-enforced HERE on purpose: the POS UI hides the
+  // price editor for a CASHIER, but a UI bug or a direct call must not be able
+  // to queue a price-edited sale. Fails CLOSED: a missing actorRole is not
+  // treated as ADMIN. Only an EFFECTIVE override counts (hasEffectiveListPrice:
+  // catalog snapshot present AND different from the final price) — exactly the
+  // predicate the server uses, so the two layers agree on what is gated.
+  const hasPriceOverrideLine = cartHasPriceOverride(payload.items);
+  if (hasPriceOverrideLine) {
+    if (payload.actorRole !== "ADMIN") {
+      throw new Error("تعديل سعر البيع متاح فقط لحساب المدير (ADMIN).");
+    }
+    if (!payload.actorUserId || !payload.actorUserId.trim()) {
+      throw new Error(
+        "تعذّر تحديد هوية المدير الذي عدّل السعر — أعد تسجيل الدخول ثم أعد المحاولة."
+      );
+    }
+  }
+  if (!payload.actorUserId || !payload.actorUserId.trim()) {
+    warnMissingActorUserId("submitOfflineSale");
+  }
+
+  // [D1 defense in depth + v6.2 local catalog check] Re-resolve, from the
+  // CACHED catalog, the unit of every line that needs verifying:
+  //   - a line with an AMOUNT override must be on the base unit (factor
+  //     exactly 1) — the cart line's own conversionFactor must not be the only
+  //     evidence: a stale or tampered line could claim factor 1 while the
+  //     cached unit says otherwise;
+  //   - a line with an EFFECTIVE PRICE override must carry a catalog snapshot
+  //     equal to the catalog price the device would resolve right now
+  //     (resolveUnitPriceSYP — same conversion the cart used). A difference
+  //     means the cart is stale (the catalog was refreshed after the line was
+  //     added) and the snapshot would become a fake discount in the reports.
+  // A product or unit that cannot be found in the cache is rejected too. Only
+  // runs for carts that actually carry such a line, and reads just the
+  // products involved (never the whole catalog). It never runs for plain lines
+  // and it is purely local: it can only stop a sale BEFORE it is saved.
+  const cacheCheckLines = payload.items.filter(
+    (item) => item.lineTotalOverrideSYP !== undefined || hasEffectiveListPrice(item)
+  );
+  if (cacheCheckLines.length > 0) {
     const cacheDb = getOfflineDb();
-    const productIds = [...new Set(overrideLines.map((item) => item.product.id))];
+    const productIds = [...new Set(cacheCheckLines.map((item) => item.product.id))];
     const cachedRows = await cacheDb.cachedProducts.bulkGet(productIds);
     const cachedById = new Map<string, CachedProduct>();
     for (const row of cachedRows) {
       if (row && row.tenantId === scopedTenantId) cachedById.set(row.id, row);
     }
 
-    for (const item of overrideLines) {
+    for (const item of cacheCheckLines) {
       const cachedProduct = cachedById.get(item.product.id);
       const cachedUnit = cachedProduct?.units?.find((u) => u.id === item.unitId);
       if (!cachedProduct || !cachedUnit) {
@@ -1477,8 +1795,21 @@ export async function submitOfflineSale(
           "حدّث البيانات ثم أعد المحاولة."
         );
       }
-      if (!isBaseUnitLine(cachedUnit)) {
+      if (item.lineTotalOverrideSYP !== undefined && !isBaseUnitLine(cachedUnit)) {
         throw new Error("البيع بالمبلغ متاح فقط للوحدة الأساسية.");
+      }
+      if (hasEffectiveListPrice(item)) {
+        const currentCatalogPrice = resolveUnitPriceSYP(
+          cachedUnit,
+          cachedProduct,
+          payload.exchangeRateUsed
+        );
+        if (compareMoney(currentCatalogPrice, item.listUnitPriceSYP as string) !== 0) {
+          throw new Error(
+            `سعر الكتالوج للصنف "${item.product.name}" تغيّر منذ إضافته للسلة — ` +
+            "احذف السطر وأضفه من جديد ثم عدّل السعر."
+          );
+        }
       }
     }
   }
@@ -1556,6 +1887,7 @@ export async function submitOfflineSale(
   // rather than trusting the caller to have already cleared it for a
   // fully-on-credit sale. createOfflineInvoiceRecord (db.ts) throws if
   // paymentMethod is set while paidAmountSYP === 0 — this makes that
+  // invariant hold here regardless of what the UI passed in.
   const normalizedPaymentMethod =
     compareMoney(payload.paidAmountSYP, 0) === 0 ? undefined : payload.paymentMethod;
 
@@ -1564,6 +1896,9 @@ export async function submitOfflineSale(
     unitId: item.unitId,
     quantity: item.quantity,
     unitPriceSYP: item.unitPriceSYP,
+    // [v6.2] Catalog price snapshot carried from the cart line. The factory
+    // normalizes it (equal to the final price, or absent -> null).
+    listUnitPriceSYP: item.listUnitPriceSYP ?? null,
   }));
 
   const isWalkIn = customer.type === "WALK_IN";
@@ -1595,6 +1930,9 @@ export async function submitOfflineSale(
     paidAmountSYP: payload.paidAmountSYP,
     debtAmountSYP: payload.debtAmountSYP,
     paymentMethod: normalizedPaymentMethod,
+    // [v6.2] Who made this sale — lets /api/sync resolve the author's role
+    // from the database instead of falling back to the syncing session.
+    createdByUserId: payload.actorUserId?.trim() || undefined,
     createdAt: new Date(),
     status: "PENDING",
   });
@@ -1804,12 +2142,21 @@ export async function listPendingOfflineInvoices(
  *      rejected (the offline mirror of the @unique constraint on
  *      Invoice.voidsInvoiceId that applies once both rows sync).
  *
- * [FIX — T4d v4.1, this revision] Guards 4 through 8 AND the eventual write
+ * [FIX — T4d v4.1] Guards 4 through 8 AND the eventual write
  * now all run inside ONE Dexie read-write transaction on
  * [offlineInvoices, cachedCustomers] — see the file-header FIX note
  * ("submitOfflineVoid()'s guard 7...") for the full race-condition this
  * closes. Guards 1-3 stay outside the transaction since they need no data
  * from it and there's nothing to gain by holding a table lock for them.
+ *
+ * [v6.2] The void mirrors the original line by line: each original line keeps
+ * its OWN price and its catalog snapshot (listUnitPriceSYP, null stays null),
+ * and the original invoice's hasPriceOverride is copied (a pre-v6.2 original
+ * with no flag yields false). Lines of one product/unit sold at DIFFERENT
+ * prices therefore stay separate lines — the sync server groups a void by
+ * product + unit + price, so they must never be merged here. `actorUserId` is
+ * stored as createdByUserId so the server resolves the voiding ADMIN from the
+ * database even when a CASHIER session runs the sync.
  *
  * On success the reversed record is derived (negated sold-unit item
  * quantities, negated money via the same lib/utils/money.ts discipline as the
@@ -1825,6 +2172,12 @@ export async function submitOfflineVoid(
     offlineInvoiceId: string;
     voidReason: string;
     actorRole: OfflineVoidActorRole;
+    /**
+     * [v6.2] The id of the ADMIN queuing this void; stored as createdByUserId
+     * (see the doc comment above). Optional so existing callers compile, but a
+     * dev-only warning fires when it is missing — the UI must pass it.
+     */
+    actorUserId?: string;
   }
 ): Promise<OfflineInvoice> {
   // Guard 1 — a real tenant is required, exactly like every other write path
@@ -1854,6 +2207,9 @@ export async function submitOfflineVoid(
     throw new Error("يجب تحديد سبب الإلغاء.");
   }
   const trimmedReason = params.voidReason.trim();
+
+  const actorUserId = params.actorUserId?.trim() || undefined;
+  if (!actorUserId) warnMissingActorUserId("submitOfflineVoid");
 
   const db = getOfflineDb();
 
@@ -1929,6 +2285,15 @@ export async function submitOfflineVoid(
         // rate was never required. Reusing that equivalence avoids inventing
         // a requirement the original sale never had.
         requiresExchangeRate: original.exchangeRateUsed !== null,
+        // [v6.2] Copied from the original invoice; never derived from items.
+        // `=== true`: an original queued before v6.2 has no flag (undefined)
+        // and yields false.
+        hasPriceOverride: original.hasPriceOverride === true,
+        // [v6.2] The voiding ADMIN, so the server resolves the author's role
+        // from the database regardless of who runs the sync.
+        createdByUserId: actorUserId,
+        // One void line per ORIGINAL line, in order: lines of the same
+        // product/unit sold at different prices must stay separate.
         items: original.items.map((item) => ({
           productId: item.productId,
           // The ORIGINAL sold unit — never the base unit, and no conversion here.
@@ -1940,6 +2305,9 @@ export async function submitOfflineVoid(
           // Deliberately NOT negated: negating the price as well would
           // double-negate the line total and break the ledger's zero-sum property.
           unitPriceSYP: item.unitPriceSYP,
+          // [v6.2] Copy the original line's catalog-price snapshot
+          // (null / a pre-v6.2 undefined stay null). Never from the payload.
+          listUnitPriceSYP: item.listUnitPriceSYP ?? null,
         })),
         // Money is negated by the factory itself, from these originals, via the
         // same subtractMoney("0", …) discipline the online route uses.
@@ -2008,11 +2376,21 @@ export async function submitOfflineVoid(
  * cached rate is the only rate this device actually has. That stored rate is
  * passed to recordRepayment as frozenRate at sync time (same rule as an
  * invoice's exchangeRateUsed).
+ *
+ * [v6.2] `actorUserId` is stored as createdByUserId so /api/sync (whose Payment
+ * pass is ADMIN-only) resolves the repaying ADMIN from the database even when a
+ * CASHIER session runs the sync.
  */
 export interface OfflineRepaymentParams {
   customerId: string;
   amountSYP: MoneyInput;
   actorRole: OfflineActorRole;
+  /**
+   * [v6.2] The id of the ADMIN recording this repayment; stored as
+   * createdByUserId. Optional so existing callers compile, but a dev-only
+   * warning fires when it is missing — the UI must pass it.
+   */
+  actorUserId?: string;
   paymentMethod?: PaymentMethod;
   receiptNo?: string;
   notes?: string;
@@ -2077,6 +2455,9 @@ export async function submitOfflinePayment(
     );
   }
 
+  const actorUserId = params.actorUserId?.trim() || undefined;
+  if (!actorUserId) warnMissingActorUserId("submitOfflinePayment");
+
   const db = getOfflineDb();
 
   const paymentRecord = await db.transaction(
@@ -2128,6 +2509,8 @@ export async function submitOfflinePayment(
         paymentMethod: params.paymentMethod ?? "CASH",
         receiptNo: params.receiptNo?.trim() || undefined,
         notes: params.notes?.trim() || undefined,
+        // [v6.2] The repaying ADMIN — see this function's doc.
+        createdByUserId: actorUserId,
         createdAt: new Date(),
         status: "PENDING",
       });

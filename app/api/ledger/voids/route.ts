@@ -258,6 +258,9 @@ export async function POST(req: Request) {
           voidsInvoiceId: originalInvoice.id,
           // already trimmed by voidBodySchema
           voidReason,
+          // [v6.2] Copied from the original invoice; never from the payload
+          // (null stays null, false stays false).
+          hasPriceOverride: originalInvoice.hasPriceOverride,
         },
       });
 
@@ -288,6 +291,9 @@ export async function POST(req: Request) {
             baseQuantity: subtractMoney("0", item.baseQuantity.toString()),
             unitPriceSYP: item.unitPriceSYP,
             unitPriceUSD: item.unitPriceUSD,
+            // [v6.2] Copy the original line's catalog-price snapshot
+            // (null stays null).
+            listUnitPriceSYP: item.listUnitPriceSYP,
             // [v4.4, T4g] A voided line always carries a NEGATIVE costAmountSYP
             // — the negation of the ORIGINAL line's frozen cost basis, read
             // straight off the stored row (never recomputed from the batch's
@@ -318,7 +324,7 @@ export async function POST(req: Request) {
       }
 
       return { voidInvoice, voidItems };
-    });
+    }, { maxWait: 10_000, timeout: 20_000 });
 
     return NextResponse.json({
       success: true,

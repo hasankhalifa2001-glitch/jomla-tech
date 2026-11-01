@@ -19,8 +19,8 @@
  * GET /api/invoices independently forces userId = session.user.id
  * server-side; GET /api/invoices/[id] independently re-checks ownership for
  * a CASHIER opening an id directly. `isAdmin` here only decides which
- * CONTROLS exist (staff filter, void button) — a forged request that ignores
- * it still fails on the server.
+ * CONTROLS exist (staff filter, void button, price-edited filter) — a forged
+ * request that ignores it still fails on the server.
  *
  * [PAGINATION] Cursor-based, 25 rows per request (the API caps `limit` at
  * 100). "Load more" raises the requested page depth and the loader re-walks
@@ -95,6 +95,19 @@
  * and an inline clear button; selects are 40px tall for touch; the results
  * summary is a pill with a live count; "load more" is full-width on phones.
  * All fetching / derived-loading / re-walk logic above is untouched.
+ *
+ * [v6.2 — "price edited" filter, FIX] ADMIN-only toggle: shows invoices that
+ * carry a price override (Invoice.hasPriceOverride), excluding VOIDED rows —
+ * the exclusion itself is done server-side (app/api/invoices/route.ts and
+ * lib/data/invoices.ts); this component only sends `priceEdited=true`.
+ * An earlier revision of this file kept the toggle's state but never sent it,
+ * never included it in `requestKey` (so toggling it did not even reload),
+ * never counted it as an active filter and never cleared it — and rendered
+ * the control with a SelectValue inside a <button>. All of that is fixed:
+ * the flag is part of buildQuery's output and its dependencies, part of
+ * `requestKey`, counted by `activeFilterCount` and reset by
+ * handleClearFilters. It is never sent for a CASHIER (the control is absent
+ * for them, and only ADMINs can create overrides anyway).
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -108,6 +121,7 @@ import {
     Search,
     ShieldCheck,
     SlidersHorizontal,
+    Tag,
     X,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -212,6 +226,13 @@ export function SalesLogClient() {
     const [customerNameDraft, setCustomerNameDraft] = useState("");
     const [customerNameFilter, setCustomerNameFilter] = useState("");
 
+    // [v6.2] "price edited" filter — ADMIN-only: shows invoices carrying a
+    // price override, excluding VOIDED rows. Handled server-side; the UI
+    // only toggles the flag (and only ever SENDS it for an ADMIN — see
+    // `priceEditedActive` below).
+    const [priceEditedFilter, setPriceEditedFilter] = useState(false);
+    const priceEditedActive = isAdmin && priceEditedFilter;
+
     // How many 25-row pages the user has currently paged through. Reset to 1
     // by every filter change; left untouched by a post-void re-fetch so the
     // user keeps their position (see the file header's re-walk rationale).
@@ -237,6 +258,8 @@ export function SalesLogClient() {
         customerNameFilter,
         isAdmin,
         isAdmin ? staffFilter : "ALL",
+        // [v6.2] part of the key, so toggling the filter triggers a reload.
+        priceEditedActive,
         pagesLoaded,
         reloadToken,
     ]);
@@ -256,8 +279,16 @@ export function SalesLogClient() {
         if (paymentFilter !== "ALL") count += 1;
         if (customerNameFilter) count += 1;
         if (isAdmin && staffFilter !== "ALL") count += 1;
+        if (priceEditedActive) count += 1;
         return count;
-    }, [statusFilter, paymentFilter, customerNameFilter, isAdmin, staffFilter]);
+    }, [
+        statusFilter,
+        paymentFilter,
+        customerNameFilter,
+        isAdmin,
+        staffFilter,
+        priceEditedActive,
+    ]);
 
     // [v4.2] Debounce the free-text customer-name filter — settles 350ms
     // after the user stops typing before it resets paging and reaches
@@ -290,10 +321,21 @@ export function SalesLogClient() {
             // and not sending it makes the intended scope explicit at the one
             // place a future refactor might be tempted to "simplify" it away.
             if (isAdmin && staffFilter !== "ALL") params.set("userId", staffFilter);
+            // [v6.2] The route parses this STRICTLY ("true" | "false"); the
+            // VOIDED-row exclusion is applied server-side.
+            if (priceEditedActive) params.set("priceEdited", "true");
             if (cursor) params.set("cursor", cursor);
             return params;
         },
-        [customerNameFilter, isAdmin, paymentFilter, range, staffFilter, statusFilter]
+        [
+            customerNameFilter,
+            isAdmin,
+            paymentFilter,
+            priceEditedActive,
+            range,
+            staffFilter,
+            statusFilter,
+        ]
     );
 
     /**
@@ -413,6 +455,8 @@ export function SalesLogClient() {
         setStatusFilter("ALL");
         setPaymentFilter("ALL");
         setStaffFilter("ALL");
+        // [v6.2]
+        setPriceEditedFilter(false);
         setCustomerNameDraft("");
     };
 
@@ -544,7 +588,7 @@ export function SalesLogClient() {
                         <Label className={FILTER_LABEL}>اسم الزبون</Label>
                         <div className="group relative">
                             <Search
-                                className="pointer-events-none absolute end-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-400 transition-colors group-focus-within:text-emerald-600"
+                                className="pointer-events-none absolute inset-e-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-400 transition-colors group-focus-within:text-emerald-600"
                                 aria-hidden
                             />
                             <Input
@@ -561,7 +605,7 @@ export function SalesLogClient() {
                                     type="button"
                                     aria-label="مسح اسم الزبون"
                                     onClick={() => setCustomerNameDraft("")}
-                                    className="absolute start-1.5 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded-md text-zinc-400 transition-all hover:bg-zinc-100 hover:text-zinc-700 active:scale-90 motion-safe:animate-in fade-in zoom-in-75 duration-150"
+                                    className="absolute inset-s-1.5 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded-md text-zinc-400 transition-all hover:bg-zinc-100 hover:text-zinc-700 active:scale-90 motion-safe:animate-in fade-in zoom-in-75 duration-150"
                                 >
                                     <X className="h-3.5 w-3.5" />
                                 </button>
@@ -664,6 +708,59 @@ export function SalesLogClient() {
                                     ))}
                                 </SelectContent>
                             </Select>
+                        </div>
+                    )}
+
+                    {/* [v6.2] ADMIN-only "price edited" toggle. A plain toggle
+                        button (NOT a Select): on = only invoices that carry a
+                        price override, VOIDED rows excluded (server-side). */}
+                    {isAdmin && (
+                        <div className="flex flex-col gap-1.5">
+                            <Label className={FILTER_LABEL}>تعديل السعر</Label>
+                            <button
+                                type="button"
+                                aria-pressed={priceEditedFilter}
+                                disabled={loading}
+                                onClick={() => {
+                                    resetPaging();
+                                    setPriceEditedFilter((p) => !p);
+                                }}
+                                className={cn(
+                                    FILTER_TRIGGER,
+                                    "flex items-center justify-between gap-2 border border-input bg-white px-3 shadow-xs",
+                                    "hover:bg-zinc-50 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60",
+                                    priceEditedFilter &&
+                                    "border-emerald-300 bg-emerald-50/50 text-emerald-800 hover:bg-emerald-50"
+                                )}
+                            >
+                                <span className="inline-flex items-center gap-1.5">
+                                    <Tag
+                                        className={cn(
+                                            "h-3.5 w-3.5",
+                                            priceEditedFilter ? "text-emerald-600" : "text-zinc-400"
+                                        )}
+                                    />
+                                    فواتير معدّلة السعر فقط
+                                </span>
+                                <span
+                                    className={cn(
+                                        "rounded-full px-1.5 py-0.5 text-[10px] font-bold",
+                                        priceEditedFilter
+                                            ? "bg-emerald-600 text-white"
+                                            : "bg-zinc-100 text-zinc-500"
+                                    )}
+                                >
+                                    {priceEditedFilter ? "مفعّل" : "معطّل"}
+                                </span>
+                            </button>
+                            {/* The server returns an empty page for this filter combined
+                                with the "ملغاة" status (a cancellation is never a price
+                                edit); say so instead of leaving a silent empty table. */}
+                            {priceEditedFilter && statusFilter === "VOIDED" && (
+                                <p className="text-[10px] font-medium leading-snug text-amber-700">
+                                    الفواتير الملغاة لا تُحتسب كتعديل سعر — اختر حالة أخرى لتظهر نتائج.
+                                </p>
+                            )}
                         </div>
                     )}
                 </div>

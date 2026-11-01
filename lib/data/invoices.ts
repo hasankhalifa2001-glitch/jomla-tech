@@ -50,6 +50,9 @@ export interface InvoiceLogFilters {
     userId?: string;
     /** [v4.2] Case-insensitive partial match against Customer.name. */
     customerName?: string;
+    // [v6.2] When true, only invoices with at least one price-override line
+    // are returned. VOIDED rows are excluded (see where clause below).
+    priceEdited?: boolean;
     cursor?: string;
     limit: number;
 }
@@ -66,6 +69,9 @@ export interface InvoiceLogRow {
     paymentStatus: PaymentStatusBadge;
     voidsInvoiceId: string | null;
     voidedByInvoiceId: string | null;
+    // [v6.2] true when at least one line carries a price override. Used by
+    // the sales-log "price edited" filter.
+    hasPriceOverride: boolean;
     user: { id: string; name: string };
     customer: { id: string; name: string; isSystemGenerated: boolean };
 }
@@ -85,6 +91,8 @@ const INVOICE_LOG_SELECT = {
     exchangeRateUsed: true,
     voidsInvoiceId: true,
     voidedBy: { select: { id: true } },
+    // [v6.2] Denormalized flag for the "price edited" filter.
+    hasPriceOverride: true,
     user: { select: { id: true, name: true } },
     customer: { select: { id: true, name: true, isSystemGenerated: true } },
 } satisfies Prisma.InvoiceSelect;
@@ -104,6 +112,8 @@ function toLogRow(row: RawInvoiceLogRow): InvoiceLogRow {
         paymentStatus: derivePaymentStatus(row.totalSYP.toString(), row.paidAmountSYP.toString()),
         voidsInvoiceId: row.voidsInvoiceId,
         voidedByInvoiceId: row.voidedBy?.id ?? null,
+        // [v6.2]
+        hasPriceOverride: row.hasPriceOverride,
         user: row.user,
         customer: row.customer,
     };
@@ -131,6 +141,16 @@ export async function listInvoicesForTenant(
     tenantId: string,
     filters: InvoiceLogFilters
 ): Promise<InvoiceLogPage> {
+    // [v6.2] "price edited" never includes VOIDED rows (a void copies
+    // hasPriceOverride from its original), so asking for both can only match
+    // nothing. Guarded HERE as well as in app/api/invoices/route.ts: without
+    // it, status=VOIDED + priceEdited=true would fall through to the where
+    // clause below and return the void rows, because `hasPriceOverride: true`
+    // alone matches them. Any other caller of this function stays correct.
+    if (filters.priceEdited && filters.status === "VOIDED") {
+        return { items: [], nextCursor: null };
+    }
+
     const where: Prisma.InvoiceWhereInput = {
         tenantId,
         createdAt: { gte: filters.from, lte: filters.to },
@@ -139,6 +159,12 @@ export async function listInvoicesForTenant(
         // [v4.2] Relational filter — standard typed Prisma where, not raw SQL.
         ...(filters.customerName && {
             customer: { name: { contains: filters.customerName, mode: "insensitive" } },
+        }),
+        // [v6.2] "price edited" filter: invoices carrying an override,
+        // excluding VOIDED rows.
+        ...(filters.priceEdited && {
+            hasPriceOverride: true,
+            ...(!filters.status && { status: { not: "VOIDED" } }),
         }),
     };
 
@@ -250,11 +276,20 @@ export async function listInvoicesForTenant(
 // log showed "0.8333" and "0.1667 طرد" for one carton, and the per-line
 // profit was computed from the rounded quantity (a 3-way split summed to
 // 0.9999). Rows are now COLLAPSED here into one line per
-// (product, sold unit, unit price): the quantity is the SUM of the exact
-// baseQuantity values divided ONCE by the sold unit's factor
+// (product, sold unit, unit price, catalog price): the quantity is the SUM
+// of the exact baseQuantity values divided ONCE by the sold unit's factor
 // (units.ts → saleQuantityFromBase), and revenue/profit are computed from
 // that exact quantity. The per-batch breakdown is preserved in `batches`
 // for an optional drill-down. InvoiceItem.quantity is no longer read at all.
+//
+// [v6.2 — FIX, collapse key] The collapse key now also includes
+// listUnitPriceSYP. Two lines with the same product, unit and FINAL price
+// but different catalog-price snapshots (one sold at the catalog price =
+// null, one an ADMIN override whose final price happens to equal it) are
+// different sale lines and must never merge: merging would keep only the
+// first row's listUnitPriceSYP and show a wrong discount (or none) for the
+// whole combined quantity. Rows of ONE sale line that FIFO split across
+// batches all carry the same listUnitPriceSYP, so they still collapse.
 // ---------------------------------------------------------------------
 export interface InvoiceDetailBatchShare {
     batchId: string;
@@ -287,6 +322,12 @@ export interface InvoiceDetailItem {
     unitPriceSYP: string;
     // [v4.9] Nullable — null when the parent invoice has no frozen rate.
     unitPriceUSD: string | null;
+    // [v6.2] Catalog-price snapshot for this line: null when sold at the
+    // catalog price (no override). The per-unit discount is derived on read
+    // as listUnitPriceSYP − unitPriceSYP; the line's total discount is that
+    // times `quantity` (so it comes out negative on a void line, where the
+    // quantity is negative and the prices are copied unchanged).
+    listUnitPriceSYP: string | null;
     /** unitPriceSYP × quantity, via money.ts — the line's revenue in SYP. */
     lineTotalSYP: string;
     /**
@@ -413,6 +454,9 @@ export async function findInvoiceDetail(
                     // NOT selected — nothing here may derive from it.
                     baseQuantity: true,
                     unitPriceSYP: true, unitPriceUSD: true,
+                    // [v6.2] Catalog-price snapshot: null when sold at the
+                    // catalog price (no override).
+                    listUnitPriceSYP: true,
                     costAmountSYP: includeProfit,
                 },
             },
@@ -426,10 +470,18 @@ export async function findInvoiceDetail(
 
     const groups = new Map<string, RawItem[]>();
     for (const item of invoice.items as RawItem[]) {
-        // Same product + same SOLD unit + same price = one sale line that
-        // FIFO split across batches. A different price for the same unit is
-        // a different line and must never be merged.
-        const key = `${item.productId}|${item.unitId}|${item.unitPriceSYP.toString()}`;
+        // Same product + same SOLD unit + same price + same catalog-price
+        // snapshot = one sale line that FIFO split across batches. A
+        // different price for the same unit is a different line and must
+        // never be merged. [v6.2] The catalog-price snapshot is part of the
+        // key (null encoded as ""), so an overridden line and a
+        // catalog-price line with an identical final price stay separate.
+        const key = [
+            item.productId,
+            item.unitId,
+            item.unitPriceSYP.toString(),
+            item.listUnitPriceSYP?.toString() ?? "",
+        ].join("|");
         const list = groups.get(key);
         if (list) list.push(item);
         else groups.set(key, [item]);
@@ -486,6 +538,10 @@ export async function findInvoiceDetail(
             unitPriceSYP: first.unitPriceSYP.toString(),
             // [v4.9] Null-safe per-line USD for SYP-only sales.
             unitPriceUSD: first.unitPriceUSD?.toString() ?? null,
+            // [v6.2] Catalog-price snapshot for this line (null when sold
+            // at the catalog price). Identical across `rows` by
+            // construction of the collapse key above.
+            listUnitPriceSYP: first.listUnitPriceSYP?.toString() ?? null,
             lineTotalSYP,
             ...(profitSYP !== undefined ? { profitSYP } : {}),
         };

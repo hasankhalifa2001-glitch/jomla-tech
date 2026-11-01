@@ -40,15 +40,36 @@
  * row/detail — only its display is gone here.
  *
  * [v4.6 — layout] Header (fixed) / body (scrolls) / footer (print + share).
- * The dialog width needs `sm:max-w-2xl`: DialogContent ships `sm:max-w-lg`,
- * and a plain `max-w-2xl` loses to it from the `sm` breakpoint up, which
+ * The dialog width needs `sm:max-w-3xl`: DialogContent ships `sm:max-w-lg`,
+ * and a plain `max-w-3xl` loses to it from the `sm` breakpoint up, which
  * squeezed everything into ~450px. Lines render as a real table from `sm`
  * (item / qty / unit price / total [/ profit for ADMIN]) and as cards below
  * it; the facts and totals are aligned label/value rows. Light mode only.
+ *
+ * [v6.2 — PRICE-EDITED LINES, FIX] A line whose listUnitPriceSYP is non-null
+ * was sold at a price an ADMIN changed for that one sale. It gets its own
+ * full-width row under the line showing: the catalog price (struck through),
+ * the final price, the per-unit discount (derived on read as
+ * listUnitPriceSYP − unitPriceSYP — nothing about how it was typed is stored)
+ * and the line's total discount (per-unit discount × quantity). A final price
+ * ABOVE the catalog price is labelled "زيادة" instead of "خصم". On a void
+ * line the quantity is negative and the prices are copied unchanged, so the
+ * line's total discount comes out negative — it mirrors the original exactly.
+ * All arithmetic goes through money.ts. The previous revision of this block
+ * had corrupted Arabic text and a grid layout that broke from `sm` up.
+ * `listUnitPriceSYP` is read with `== null` / `?? null` on purpose: an older
+ * payload that lacks the key (undefined) must mean "no price edit", never a
+ * crash inside subtractMoney().
+ *
+ * [v6.2 — below-cost warning, FIX] The amber "sold below cost" cue now needs a
+ * POSITIVE quantity as well as a negative profit. A void line has a negative
+ * quantity and (as the mirror of its original) a negative profit, so the old
+ * profit-only test flagged EVERY void as "sold below cost". The warning text is
+ * also shown once (the phone label OR the inline note, never both).
  */
 
 import { useEffect, useState, type ReactNode } from "react";
-import { AlertCircle, Ban, Link2, Loader2, Package, Receipt } from "lucide-react";
+import { AlertCircle, Ban, Link2, Loader2, Package, Receipt, Tag } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -60,9 +81,9 @@ import {
     DialogTitle,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
-import { formatMoney, multiplyMoney } from "@/lib/utils/money";
+import { compareMoney, formatMoney, multiplyMoney, subtractMoney } from "@/lib/utils/money";
 import { ReceiptActions } from "@/components/receipts/receipt-actions";
-import type { InvoiceDetail } from "./types";
+import type { InvoiceDetail, InvoiceDetailItem } from "./types";
 import { INVOICE_STATUS_CLASSES, INVOICE_STATUS_LABELS, formatRowTimestamp, invoiceReference } from "./sales-log-utils";
 
 interface InvoiceDetailModalProps {
@@ -97,7 +118,70 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
     return (
         <div className="min-w-0 space-y-1">
             <dt className="text-[11px] font-semibold text-zinc-500">{label}</dt>
-            <dd className="break-words text-sm font-bold text-zinc-900">{children}</dd>
+            <dd className="wrap-break-word text-sm font-bold text-zinc-900">{children}</dd>
+        </div>
+    );
+}
+
+/**
+ * [v6.2] The price-edit breakdown of one line. Rendered only when the line's
+ * listUnitPriceSYP is non-null.
+ *
+ *   perUnitDiff  = listUnitPriceSYP − unitPriceSYP        (> 0 discount, < 0 increase)
+ *   lineDiff     = |perUnitDiff| × quantity               (quantity is negative on a void line)
+ */
+function PriceEditBreakdown({ item }: { item: InvoiceDetailItem }) {
+    const listPrice = item.listUnitPriceSYP ?? null;
+    if (listPrice === null) return null;
+
+    const perUnitDiff = subtractMoney(listPrice, item.unitPriceSYP);
+    const isIncrease = compareMoney(perUnitDiff, 0) < 0;
+    const perUnitAbs = isIncrease ? subtractMoney("0", perUnitDiff) : perUnitDiff;
+    const lineDiff = multiplyMoney(perUnitAbs, item.quantity);
+
+    const tone = isIncrease
+        ? { box: "border-sky-200 bg-sky-50/70", text: "text-sky-800", strong: "text-sky-900" }
+        : { box: "border-amber-200 bg-amber-50/70", text: "text-amber-800", strong: "text-amber-900" };
+
+    return (
+        <div
+            className={cn(
+                "col-span-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg border px-3 py-2 text-[11px] sm:order-6 sm:col-span-full",
+                tone.box
+            )}
+        >
+            <span className={cn("inline-flex items-center gap-1 font-extrabold", tone.text)}>
+                <Tag className="h-3 w-3" />
+                تعديل سعر
+            </span>
+
+            <span className={tone.text}>
+                سعر الكتالوج:{" "}
+                <Money className="font-bold text-zinc-500 line-through decoration-zinc-400">
+                    {formatMoney(listPrice, "SYP")} ل.س
+                </Money>
+            </span>
+
+            <span className={tone.text}>
+                السعر النهائي:{" "}
+                <Money className={cn("font-extrabold", tone.strong)}>
+                    {formatMoney(item.unitPriceSYP, "SYP")} ل.س
+                </Money>
+            </span>
+
+            <span className={tone.text}>
+                {isIncrease ? "زيادة" : "خصم"} الوحدة:{" "}
+                <Money className={cn("font-extrabold", tone.strong)}>
+                    {formatMoney(perUnitAbs, "SYP")} ل.س
+                </Money>
+            </span>
+
+            <span className={tone.text}>
+                إجمالي {isIncrease ? "الزيادة" : "الخصم"}:{" "}
+                <Money className={cn("font-extrabold", tone.strong)}>
+                    {formatMoney(lineDiff, "SYP")} ل.س
+                </Money>
+            </span>
         </div>
     );
 }
@@ -137,6 +221,12 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
             <ul className="divide-y divide-zinc-100">
                 {detail.items.map((item, i) => {
                     const lineSYP = multiplyMoney(item.unitPriceSYP, item.quantity);
+                    // [v6.2] Below cost = a SALE line (quantity > 0) with negative
+                    // profit. Never true on a void line (negative quantity).
+                    const belowCost =
+                        item.profitSYP !== undefined &&
+                        compareMoney(item.quantity, "0") > 0 &&
+                        compareMoney(item.profitSYP, "0") < 0;
 
                     return (
                         <li
@@ -150,7 +240,7 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
                         >
                             {/* Item + unit */}
                             <div className="min-w-0">
-                                <p className="break-words text-sm font-extrabold leading-snug text-zinc-900">
+                                <p className="wrap-break-word text-sm font-extrabold leading-snug text-zinc-900">
                                     {item.productName}
                                 </p>
                                 <span className="mt-1 inline-block rounded-md bg-zinc-100 px-1.5 py-0.5 text-[11px] font-bold text-zinc-600">
@@ -180,13 +270,25 @@ function LineItemsTable({ detail }: { detail: InvoiceDetail }) {
                                 </span>
                             </div>
 
-                            {/* [v4.4, T4c2] ADMIN-only per-line profit. */}
+                            {/* [v4.4, T4c2] ADMIN-only per-line profit. [v6.2, Rule 4] Below-cost warning: negative profit = sold below batch cost. ADMIN-only, never blocks the sale. */}
                             {item.profitSYP !== undefined && (
-                                <p className="col-span-2 text-[11px] font-bold text-emerald-700 sm:order-5 sm:col-span-1 sm:text-end">
-                                    <span className="sm:hidden">الربح: </span>
+                                <p className={cn(
+                                    "col-span-2 text-[11px] font-bold sm:order-5 sm:col-span-1 sm:text-end",
+                                    belowCost ? "text-amber-700" : "text-emerald-700"
+                                )}>
+                                    <span className="sm:hidden">{belowCost ? "بيع بأقل من التكلفة: " : "الربح: "}</span>
                                     <Money className="sm:text-xs">{formatMoney(item.profitSYP, "SYP")} ل.س</Money>
+                                    {belowCost && (
+                                        <span className="ms-1 hidden text-[10px] opacity-70 sm:inline">أقل من التكلفة</span>
+                                    )}
                                 </p>
                             )}
+
+                            {/* [v6.2] Catalog price / final price / derived discount.
+                                Full-width row under the line (order-6 so it sits
+                                after the profit cell on sm+). Renders nothing for
+                                a line sold at the catalog price. */}
+                            <PriceEditBreakdown item={item} />
                         </li>
                     );
                 })}
@@ -304,6 +406,9 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
 
     const open = Boolean(invoiceId);
     const ready = !loading && !error && detail !== null;
+
+    // [v6.2] True when at least one line was sold at an ADMIN-edited price.
+    const hasEditedLines = detail?.items.some((item) => (item.listUnitPriceSYP ?? null) !== null) ?? false;
 
     return (
         <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -438,6 +543,13 @@ export function InvoiceDetailModal({ invoiceId, onOpenChange, onNavigate }: Invo
                                             <Package className="h-4 w-4" />
                                         </span>
                                         الأصناف
+                                        {/* [v6.2] at-a-glance marker that this invoice has edited prices */}
+                                        {hasEditedLines && (
+                                            <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800">
+                                                <Tag className="h-3 w-3" />
+                                                تعديل سعر
+                                            </span>
+                                        )}
                                     </h3>
                                     <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-bold tabular-nums text-zinc-600">
                                         {detail.items.length.toLocaleString("ar-SY")}

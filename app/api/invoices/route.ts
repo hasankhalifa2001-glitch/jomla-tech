@@ -59,6 +59,16 @@ import { listInvoicesForTenant, type PaymentStatusBadge } from "@/lib/data/invoi
  * effect whatsoever despite passing validation. Now destructured and
  * forwarded like every other filter field.
  *
+ * [v6.2 — priceEdited filter] Backed by Invoice.hasPriceOverride and
+ * EXCLUDING VOIDED rows (a void copies the flag from its original, so it
+ * must never appear as a price edit). Two guards, both here and in
+ * lib/data/invoices.ts:
+ *   - the query param is parsed STRICTLY ("true" | "false"): the previous
+ *     z.coerce.boolean() would have turned "false" into true;
+ *   - priceEdited=true combined with status=VOIDED can never match
+ *     anything by definition, so it short-circuits to an empty page
+ *     instead of returning void rows.
+ *
  * [KNOWN SIMPLIFICATION — flagged, not yet resolved] "Today" (the default
  * date range when `from`/`to` are omitted) is computed in UTC day
  * boundaries, since Tenant carries no timezone field in schema.prisma.
@@ -82,6 +92,12 @@ const querySchema = z.object({
     userId: z.string().min(1).optional(),
     // [v4.2]
     customerName: z.string().min(1).max(200).optional(),
+    // [v6.2] Strict string -> boolean. z.coerce.boolean() would turn the
+    // string "false" into true (any non-empty string is truthy).
+    priceEdited: z
+        .enum(["true", "false"])
+        .transform((v) => v === "true")
+        .optional(),
     cursor: z.string().min(1).optional(),
     limit: z.coerce.number().int().positive().max(MAX_LIMIT).default(DEFAULT_LIMIT),
 });
@@ -125,7 +141,16 @@ export async function GET(req: NextRequest) {
     let { userId } = parsed.data;
     // [FIX — v4.2] customerName added here — previously missing, which
     // meant it was validated but never actually used below.
-    const { from, to, status, paymentStatus, customerName, cursor, limit } = parsed.data;
+    const {
+        from,
+        to,
+        status,
+        paymentStatus,
+        customerName,
+        priceEdited,
+        cursor,
+        limit,
+    } = parsed.data;
 
     if (session.user.role === "CASHIER") {
         // Discarded, never merely validated — see file-header note.
@@ -139,6 +164,14 @@ export async function GET(req: NextRequest) {
         }
     }
 
+    // [v6.2] "price edited" never includes VOIDED rows, so asking for both
+    // can only ever match nothing — answer with an empty page directly
+    // (a void row copies hasPriceOverride from its original and would
+    // otherwise be returned by the hasPriceOverride condition alone).
+    if (priceEdited === true && status === "VOIDED") {
+        return NextResponse.json({ success: true, items: [], nextCursor: null });
+    }
+
     const { from: defaultFrom, to: defaultTo } = defaultTodayRangeUTC();
 
     try {
@@ -150,6 +183,8 @@ export async function GET(req: NextRequest) {
             userId,
             // [FIX — v4.2] Previously missing — see file-header note above.
             customerName,
+            // [v6.2] "price edited" filter (excludes VOIDED rows server-side).
+            priceEdited,
             cursor,
             limit,
         });

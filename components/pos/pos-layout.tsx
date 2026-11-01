@@ -20,6 +20,11 @@ import {
   changeLineUnit,
   isBaseUnitLine,
   cartExceedsKnownStock,
+  // [v6.2] The PRICE FUNNEL — the only code allowed to write a line's price
+  // fields — and the predicate that says whether a line carries an override.
+  applyLinePriceOverride,
+  clearLinePriceOverride,
+  cartHasPriceOverride,
   // [camera + hardware barcode scanning] Re-exported via lib/offline/index.ts's
   // `export * from "./barcode-lookup"` — imported from the barrel like
   // everything else in this block.
@@ -30,6 +35,9 @@ import {
   type SelectedCustomer,
   type OfflineInvoice,
   type PaymentMethod,
+  type OfflineActorRole,
+  type OverrideOutcome,
+  type ReconcileOverrideResult,
 } from "@/lib/offline";
 import { BarcodeScannerModal } from "@/components/inventory/BarcodeScannerModal";
 import { ProductCatalog, ProductSearchBar } from "./product-catalog";
@@ -70,7 +78,12 @@ import {
   Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { compareMoney, addMoney, MoneyError, QuantityFromAmountError } from "@/lib/utils/money";
+import {
+  compareMoney,
+  addMoney,
+  MoneyError,
+  QuantityFromAmountError,
+} from "@/lib/utils/money";
 import {
   parseAmountInput,
   formatQuantityText,
@@ -315,6 +328,15 @@ export function PosLayout() {
   const { data: session } = useSessionWithOfflineFallback();
   const tenantId = session?.tenantId;
 
+  // [v6.2] The acting user. `isAdmin` only decides which CONTROLS exist (the
+  // price editor); the real enforcement is submitOfflineSale() (local) and
+  // /api/sync (server, role read from the DATABASE).
+  const isAdmin = session?.role === "ADMIN";
+  const actorRole = session?.role as OfflineActorRole | undefined;
+  // `userId` is a real field of useSessionWithOfflineFallback()'s claims
+  // (live AND offline-cached), so no cast is needed.
+  const actorUserId = session?.userId;
+
   // [FIX — empty-cache deadlock] `isReady` requires products AND customers
   // AND an exchange rate to ALL be cached (lib/offline/hooks.ts), which is
   // deliberately strict (T4a's contract) and must not change. A brand-new
@@ -357,6 +379,15 @@ export function PosLayout() {
   const [lineModes, setLineModes] = useState<Record<string, LineInputMode>>({});
   const [lineAmounts, setLineAmounts] = useState<Record<string, string>>({});
   const [amountErrors, setAmountErrors] = useState<Record<string, string>>({});
+  // [v6.2] A short visible notice per cart line (D9): shown when a price edit
+  // re-derived or cleared a by-amount line, or when a unit change dropped a
+  // price override. Presentation only.
+  const [lineNotices, setLineNotices] = useState<Record<string, string>>({});
+  // NOTE (v6.2): there is deliberately NO parallel "price edits" state here any
+  // more. The edited price lives ON the cart line (unitPriceSYP + the catalog
+  // snapshot listUnitPriceSYP) and is written only by the pos-service price
+  // funnel, so totals, the USD figure and the saved invoice can never disagree
+  // with what the editor shows.
   const [selectedCustomer, setSelectedCustomer] = useState<SelectedCustomer | null>(null);
 
   // [D8] The latest cart, readable synchronously from any handler.
@@ -658,12 +689,13 @@ export function PosLayout() {
   // [D8] THE CART WRITE FUNNEL (component side)
   //
   // Every change to the cart in this component goes through writeCart() or
-  // commitCart(). commitCart() runs a pure pos-service funnel function
-  // (setLineQuantity, addUnitToLine, applyLineAmountOverride, clearLineOverride,
-  // changeLineUnit) against the latest cart, catches whatever it throws, and
-  // reports it — it never throws into React and never leaves the cart half
-  // changed. This component never sets `quantity` or the amount override on a
-  // line itself.
+  // commitCart() (or commitPriceChange() for the v6.2 price funnel). They run a
+  // pure pos-service funnel function (setLineQuantity, addUnitToLine,
+  // applyLineAmountOverride, clearLineOverride, changeLineUnit,
+  // applyLinePriceOverride, clearLinePriceOverride) against the latest cart,
+  // catch whatever it throws, and report it — they never throw into React and
+  // never leave the cart half changed. This component never sets `quantity`,
+  // the amount override or any price field on a line itself.
   // ---------------------------------------------------------------------------
   function writeCart(next: CartLineItem[]) {
     cartRef.current = next;
@@ -682,17 +714,23 @@ export function PosLayout() {
     }
   }
 
-  /** Forgets everything the UI remembers about one line's by-amount input. */
+  /** Forgets everything the UI remembers about one line's by-amount input (and its notice). */
   function resetAmountState(cartId: string) {
     setLineModes((prev) => omitKey(prev, cartId));
     setLineAmounts((prev) => omitKey(prev, cartId));
     setAmountErrors((prev) => omitKey(prev, cartId));
+    setLineNotices((prev) => omitKey(prev, cartId));
   }
 
   function resetAllAmountState() {
     setLineModes({});
     setLineAmounts({});
     setAmountErrors({});
+    setLineNotices({});
+  }
+
+  function setLineNotice(cartId: string, message: string) {
+    setLineNotices((prev) => ({ ...prev, [cartId]: message }));
   }
 
   /** After the funnel changed an amount line's override (scan-repeat), show the new amount in its field. */
@@ -701,6 +739,43 @@ export function PosLayout() {
     if (override === undefined) return;
     const text = overrideToFieldText(override);
     setLineAmounts((prev) => ({ ...prev, [cartId]: text }));
+  }
+
+  /**
+   * [v6.2 / D9] What the cashier must be told after a PRICE change reconciled a
+   * by-amount line. Never silent: a re-derived quantity or a cleared amount mode
+   * both change what the customer pays for, so they surface as a line notice.
+   */
+  function applyPriceOutcome(cartId: string, outcome: OverrideOutcome) {
+    if (outcome === "rederived") {
+      syncAmountText(cartId);
+      setLineNotice(cartId, "تغيّرت الكمية لتبقى مطابقة للمبلغ المكتوب بعد تعديل السعر.");
+    } else if (outcome === "cleared") {
+      resetAmountState(cartId);
+      setLineNotice(cartId, "أُلغي وضع «بالمبلغ» لهذا السطر لأن السعر الجديد لا يسمح به.");
+    } else {
+      setLineNotices((prev) => omitKey(prev, cartId));
+    }
+  }
+
+  /**
+   * [v6.2] Runs one pos-service PRICE funnel function against the latest cart.
+   * Same contract as commitCart (never throws into React, keeps the previous
+   * cart on failure) plus the funnel's reconcile outcome.
+   */
+  function commitPriceChange(
+    cartId: string,
+    compute: (prev: CartLineItem[]) => ReconcileOverrideResult,
+    fallbackMessage = "تعذّر تعديل السعر."
+  ): CommitResult {
+    try {
+      const { items, outcome } = compute(cartRef.current);
+      writeCart(items);
+      applyPriceOutcome(cartId, outcome);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: messageFromError(error, fallbackMessage) };
+    }
   }
 
   /** Opens the payment step, unless the cart cannot be totalled or an amount field is invalid. */
@@ -765,6 +840,10 @@ export function PosLayout() {
       quantity: 1,
       unitPriceSYP,
       unitPriceUSD,
+      // [v6.2] Catalog price snapshot — null means "sold at the catalog price"
+      // (no override yet). It is written ONLY by the price funnel, when an
+      // ADMIN edits the line's price or adds a discount.
+      listUnitPriceSYP: null,
       // [T4b] Preserved from resolveCartLinePrices so cartNeedsExchangeRate
       // can inspect items without re-reading the unit from the catalog.
       pricingCurrency,
@@ -772,7 +851,8 @@ export function PosLayout() {
 
     // [D8] A repeat add goes through addUnitToLine: a normal line gets exact
     // 4-dp arithmetic; an amount line grows its override by the unit price so
-    // the line stays consistent (and stays in amount mode).
+    // the line stays consistent (and stays in amount mode). An ADMIN's price
+    // edit on the line is kept: the unit price does not change on a repeat add.
     const result = commitCart((prev) =>
       alreadyInCart ? addUnitToLine(prev, cartItemId) : [...prev, newItem]
     );
@@ -790,6 +870,41 @@ export function PosLayout() {
       });
     }
     return { ok: true, cartId: cartItemId };
+  }
+
+  // [v6.2] ADMIN-only: sets a line's FINAL unit price for THIS sale only (a
+  // one-off price edit or a discount). The panel converts whatever the ADMIN
+  // typed (a new price, an amount off, a percentage off) into a final price;
+  // nothing about how it was typed is stored. The catalog snapshot is derived by
+  // the funnel from the line itself, never supplied by the UI. The catalog price
+  // (ProductUnit.priceWholesale) is never touched.
+  //
+  // Re-enforced here on purpose: the panel hides the editor for a CASHIER, but a
+  // UI bug must not be able to queue a price edit. submitOfflineSale() and
+  // /api/sync enforce it again (the server reads the author's role from the DB).
+  function handleEditLinePrice(cartId: string, finalPriceSYP: string): CommitResult {
+    if (!isAdmin) {
+      const message = "تعديل سعر البيع متاح فقط لحساب المدير (ADMIN).";
+      toast.error(message);
+      return { ok: false, message };
+    }
+    if (!cartRef.current.some((line) => line.id === cartId)) {
+      return { ok: false, message: "سطر السلة غير موجود." };
+    }
+
+    return commitPriceChange(
+      cartId,
+      (prev) => applyLinePriceOverride(prev, cartId, finalPriceSYP, dailyExchangeRate),
+      "قيمة السعر غير صالحة."
+    );
+  }
+
+  /** [v6.2] Puts a line back to its catalog price (drops the one-off edit). */
+  function handleClearLinePrice(cartId: string) {
+    const result = commitPriceChange(cartId, (prev) =>
+      clearLinePriceOverride(prev, cartId, dailyExchangeRate)
+    );
+    if (!result.ok) toast.error(result.message);
   }
 
   // [barcode -> cart bridge]
@@ -930,6 +1045,10 @@ export function PosLayout() {
   // [v3.6] FIX — rebuilds ALL price fields returned by
   // resolveCartLinePrices() on a unit change (previously only
   // `unitPriceUSD` was written, silently dropping `unitPriceSYP`).
+  //
+  // [v6.2] changeLineUnit() also DROPS any price override on the line (the old
+  // unit's catalog snapshot must never survive onto the new unit — it would
+  // invent a phantom discount). The ADMIN is told, never silently.
   function handleChangeUnit(cartId: string, newUnitId: string) {
     const item = cartRef.current.find((line) => line.id === cartId);
     if (!item) return;
@@ -949,6 +1068,8 @@ export function PosLayout() {
       return;
     }
 
+    const hadPriceOverride = cartHasPriceOverride([item]);
+
     // [D8/D10] changeLineUnit drops any override (by-amount is base-unit only)
     // and keeps the quantity as it was.
     const result = commitCart((prev) =>
@@ -966,6 +1087,9 @@ export function PosLayout() {
       return;
     }
     resetAmountState(cartId);
+    if (hadPriceOverride) {
+      setLineNotice(cartId, "أُلغي تعديل السعر لأن الوحدة تغيّرت — عدّله من جديد إن لزم.");
+    }
   }
 
   function handleRemoveItem(cartId: string) {
@@ -1101,6 +1225,11 @@ export function PosLayout() {
   // [FIX] An explicit triggerSync() right after a successful checkout
   // gives the cashier fast, deterministic feedback instead of depending
   // solely on the hook's own 2-second debounce.
+  //
+  // [v6.2] Passes the acting user (`actorRole` + `actorUserId`). Without them
+  // submitOfflineSale() rejects any cart that carries a price override (it fails
+  // closed on a missing role), and the queued record would carry no
+  // createdByUserId, so /api/sync could not tell who authored it.
   async function handleConfirmCheckout(paymentData: {
     paidAmountSYP: string;
     debtAmountSYP: string;
@@ -1153,6 +1282,9 @@ export function PosLayout() {
       debtAmountSYP: paymentData.debtAmountSYP,
       paymentMethod: paymentData.paymentMethod,
       firstTimeCreditConfirmed: paymentData.firstTimeCreditConfirmed,
+      // [v6.2] Who is making this sale — see this function's header note.
+      actorRole,
+      actorUserId,
     });
 
     // Save state for confirmation modal
@@ -1245,11 +1377,16 @@ export function PosLayout() {
     lineAmounts,
     amountErrors,
     stockWarnings,
+    lineNotices,
     onToggleLineMode: handleToggleLineMode,
     onLineAmountChange: handleLineAmountChange,
     onLineQuickQuantity: handleLineQuickQuantity,
     // Blocks checkout: an unreadable cart total, or an amount field the cart refused.
     cartInconsistent: cartBlocked,
+    // [v6.2] ADMIN-only price/discount editing, routed through the price funnel.
+    isAdmin,
+    onEditLinePrice: handleEditLinePrice,
+    onClearLinePrice: handleClearLinePrice,
   };
 
   return (
@@ -1369,7 +1506,8 @@ export function PosLayout() {
       */}
       <OfflineVoidPanel
         tenantId={tenantId}
-        isAdmin={session?.role === "ADMIN"}
+        isAdmin={isAdmin}
+        actorUserId={actorUserId}
         triggerSync={triggerSync}
       />
 

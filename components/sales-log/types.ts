@@ -35,6 +35,10 @@ export interface InvoiceLogRow {
     voidsInvoiceId: string | null;
     /** Set only when some OTHER invoice voids THIS one — the reverse side of the same self-relation. */
     voidedByInvoiceId: string | null;
+    // [v6.2] true when at least one line carries a price override. A VOIDED
+    // row copies the flag from its original, so a table that badges this must
+    // skip rows whose status is VOIDED.
+    hasPriceOverride: boolean;
     user: { id: string; name: string };
     customer: { id: string; name: string; isSystemGenerated: boolean };
 }
@@ -44,17 +48,35 @@ export interface InvoiceLogPage {
     nextCursor: string | null;
 }
 
+/** One batch's exact share of a collapsed sale line (base unit). */
+export interface InvoiceDetailBatchShare {
+    batchId: string;
+    baseQuantity: string;
+}
+
 export interface InvoiceDetailItem {
     id: string;
     productId: string;
     productName: string;
     unitId: string;
     unitName: string;
+    /** @deprecated First batch only — use `batches`. */
     batchId: string;
+    /** [v4.8] Per-batch breakdown of the collapsed line (exact, base unit). */
+    batches?: InvoiceDetailBatchShare[];
+    /** Collapsed, exact quantity in the SOLD unit. Negative on a void line. */
     quantity: string;
+    /** [v4.8] Σ baseQuantity of the collapsed rows, in the base unit. */
+    baseQuantity?: string;
     unitPriceSYP: string;
     // [v4.9] Nullable per-line USD.
     unitPriceUSD: string | null;
+    // [v6.2] Catalog price snapshot at sale time — null when sold at the
+    // catalog price (no override). The per-unit discount is derived on read
+    // as listUnitPriceSYP − unitPriceSYP.
+    listUnitPriceSYP: string | null;
+    /** unitPriceSYP × quantity, computed server-side via money.ts. */
+    lineTotalSYP?: string;
     /** [v4.4, T4c2] ADMIN-only profit in SYP. Omitted for a CASHIER. */
     profitSYP?: string;
 }

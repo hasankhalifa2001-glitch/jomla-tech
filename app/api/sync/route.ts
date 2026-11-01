@@ -143,7 +143,7 @@ export const dynamic = "force-dynamic";
  * ALSO stores `baseQuantity`: the exact base-unit amount deducted from its
  * batch, copied straight from the FIFO allocation (never divided). `quantity`
  * is display-only from here on. A void restores `baseQuantity` as-is and the
- * "is it a full reversal" check compares SUM(baseQuantity) per product/unit.
+ * "is it a full reversal" check sums `baseQuantity` per group.
  *
  * (2) PER-ITEM STOCK DEDUCTION (same-product lines in one cart).
  * commitFifoAllocation() only READS batches. The sale path used to run it for
@@ -226,6 +226,8 @@ export const dynamic = "force-dynamic";
  * at all. Void payload items are now merged by the same key (quantities
  * summed, differing unit prices rejected) before being compared with the
  * original groups.
+ * [v6.2 — SUPERSEDED IN PART: the key now also includes the unit PRICE and
+ * differing prices are no longer rejected; see the v6.2 FIX note below.]
  *
  * (5) SALE-ONLY SANITY BOUNDS. For a sale, paid and debt must be >= 0 and
  * unit prices must be >= 0 (the shared debt = total − paid check alone let a
@@ -264,6 +266,57 @@ export const dynamic = "force-dynamic";
  * the whole request with 400. These fields are informational on the server
  * (USD is always re-derived via deriveUsd; a void copies the original), so
  * absent == null is the only sensible reading.
+ * ============================================================================
+ *
+ * ============================================================================
+ * [v6.2] SALE-TIME PRICE OVERRIDE
+ *
+ * A sale line may carry `listUnitPriceSYP` (the catalog price the cashier
+ * saw). Rules enforced here:
+ *   - "Effective override" has ONE definition, hasEffectiveListPrice():
+ *     listUnitPriceSYP is non-null AND differs from unitPriceSYP (compared
+ *     with compareMoney, never as raw strings). Equal prices => no override.
+ *   - An invoice with an effective override is accepted only when its
+ *     author is an ADMIN according to the DATABASE (resolveActor), never a
+ *     cached session. Rejection is per invoice (FAILED); the batch goes on.
+ *   - listUnitPriceSYP is written only for effective overrides, otherwise
+ *     NULL. Invoice.hasPriceOverride = "any written item has it", written in
+ *     the same transaction as the items.
+ *   - A void copies listUnitPriceSYP from the ORIGINAL line and
+ *     hasPriceOverride from the ORIGINAL invoice — never from the payload.
+ *   - Selling below cost is allowed; a price of 0 is allowed (>= 0 only).
+ *   - Quantity/base-unit/FIFO/cost logic is untouched.
+ *
+ * [v6.2 FIX — OFFLINE VOID OF A MIXED-PRICE INVOICE]
+ * Before v6.2 one product/unit always carried ONE price inside an invoice,
+ * so the void path grouped the original lines by productId::unitId and
+ * rejected any price difference inside a group. With price overrides an
+ * ADMIN can sell 5 pieces at the catalog price and 3 at a reduced price in
+ * the SAME invoice, which made such an invoice impossible to void offline
+ * (the online void copies row by row and was never affected). The void path
+ * now groups by productId::unitId::PRICE:
+ *   - the original lines are split into price groups, and so are the void
+ *     payload's lines; prices are compared numerically (samePriceSYP ->
+ *     compareMoney), never as strings, so "100" and "100.0000" are one price;
+ *   - every payload group must match exactly one original group of the same
+ *     product, unit and price, and the group counts must be equal;
+ *   - the full-reversal check (base units, v4.8) runs PER PRICE GROUP;
+ *   - the old "differing unit prices" rejections are gone: the grouping
+ *     itself guarantees one price per group.
+ * The CLIENT's void payload must therefore list one line per price group
+ * (never merge lines of one product/unit that were sold at different prices).
+ *
+ * [v6.2 KNOWN LIMIT — what the ADMIN gate does NOT protect against]
+ * The server enforces the ADMIN requirement on every override the client
+ * DECLARES (a listUnitPriceSYP that differs from unitPriceSYP). It cannot
+ * detect an UNDECLARED price change: the server never knows which catalog
+ * price the device showed, so a modified device can send a lower
+ * unitPriceSYP with listUnitPriceSYP = null and it is stored as an ordinary
+ * sale. This is not new with v6.2 (the unit price has always come from the
+ * device). Re-deriving the price, or rejecting a mismatch with the CURRENT
+ * catalog price, was deliberately NOT done: the catalog can change between
+ * the sale and the sync, and rejecting would drop sales that really
+ * happened. Detection is after the fact (sales log / profit, ADMIN only).
  * ============================================================================
  */
 
@@ -319,6 +372,11 @@ const offlineInvoiceItemSchema = z.object({
   quantity: quantityString,
   unitPriceSYP: z.string().min(1),
   unitPriceUSD: nullableMoneyString,
+  // [v6.2] Catalog price snapshot at sale time: null when sold at the
+  // catalog price (no override). Present only when an ADMIN edited the
+  // line's price or added a one-off discount. SYP only. Records queued
+  // before v6.2 omit the key: absent == null.
+  listUnitPriceSYP: nullableMoneyString,
   batchId: z.string().min(1).optional(),
 });
 
@@ -502,6 +560,27 @@ function absQty(q: string): string {
   return compareMoney(q, 0) < 0 ? subtractMoney("0", q) : q;
 }
 
+// [v6.2] Numeric price equality for SYP unit prices — never a string
+// comparison ("100" and "100.0000" are the same price). Used by the void
+// path to build and match price groups, and by hasEffectiveListPrice().
+function samePriceSYP(a: string, b: string): boolean {
+  return compareMoney(serializeMoney(a), serializeMoney(b)) === 0;
+}
+
+// [v6.2] THE single definition of an "effective" price override: the line
+// carries a catalog price AND it differs from the final unit price. Used by
+// both the ADMIN gate and the listUnitPriceSYP write, so a CASHIER invoice
+// whose catalog price merely equals the final price is never rejected, and
+// what is gated is exactly what is stored. Comparison is numeric
+// (compareMoney), never string equality ("100" vs "100.0000").
+function hasEffectiveListPrice(item: {
+  unitPriceSYP: string;
+  listUnitPriceSYP: string | null;
+}): boolean {
+  if (item.listUnitPriceSYP === null) return false;
+  return !samePriceSYP(item.listUnitPriceSYP, item.unitPriceSYP);
+}
+
 // Shared, human-readable Arabic message for every RETRY_LATER push below —
 // kept as one constant so the wording never drifts between the three passes.
 const RETRY_LATER_MESSAGE =
@@ -654,7 +733,7 @@ export async function POST(req: NextRequest) {
   function isSyncItemPreLock(createdAt: string): boolean {
     if (!syncLocked) return true;
     if (syncPending) return false;
-    if (syncLockAtMs == null) return false;   // ← التغيير الوحيد
+    if (syncLockAtMs == null) return false;
     const ms = new Date(createdAt).getTime();
     if (Number.isNaN(ms)) return false;
     return ms <= syncLockAtMs;
@@ -709,24 +788,23 @@ export async function POST(req: NextRequest) {
   // [v4.8] Actor resolution (FIX 5). The creator's role always comes from the
   // DATABASE, never from the payload.
   const actorCache = new Map<string, { id: string; role: ActorRole } | null>();
-  async function resolveActor(createdByUserId?: string): Promise<ActorResolution> {
-    if (!createdByUserId || createdByUserId === userId) {
-      return { kind: "ok", actor: { userId, role: userRole } };
-    }
-    // A non-ADMIN session may only sync its own records.
-    if (userRole !== "ADMIN") return { kind: "deferred" };
 
-    if (!actorCache.has(createdByUserId)) {
+  async function resolveActor(createdByUserId?: string): Promise<ActorResolution> {
+    const targetId = createdByUserId ?? userId;
+    // A non-ADMIN session may only sync its own records.
+    if (targetId !== userId && userRole !== "ADMIN") return { kind: "deferred" };
+
+    if (!actorCache.has(targetId)) {
       const found = await prisma.user.findFirst({
-        where: { id: createdByUserId, tenantId },
+        where: { id: targetId, tenantId, isActive: true },
         select: { id: true, role: true },
       });
       actorCache.set(
-        createdByUserId,
+        targetId,
         found ? { id: found.id, role: found.role as ActorRole } : null
       );
     }
-    const cached = actorCache.get(createdByUserId);
+    const cached = actorCache.get(targetId);
     return cached
       ? { kind: "ok", actor: { userId: cached.id, role: cached.role } }
       : { kind: "invalid" };
@@ -898,6 +976,30 @@ export async function POST(req: NextRequest) {
       }
       const actor = resolvedActor.actor;
 
+      // [v6.2] A SALE carrying an effective price override is ADMIN-only.
+      // "Effective" = hasEffectiveListPrice() (catalog price present AND
+      // different from the final price) — the very same predicate that
+      // decides what gets stored, so the gate and the write can never
+      // disagree. The author's role comes from the database via
+      // resolveActor, never from a cached session. Reject this invoice only
+      // — the rest of the batch proceeds independently. (Voids never carry
+      // an override; their catalog prices are copied from the original.)
+      // KNOWN LIMIT: this gates DECLARED overrides only — see the v6.2
+      // KNOWN LIMIT note in the file header.
+      if (!isVoidItem) {
+        const payloadHasPriceOverride = inv.items.some((it) =>
+          hasEffectiveListPrice(it)
+        );
+        if (payloadHasPriceOverride && actor.role !== "ADMIN") {
+          invoiceResults.push({
+            offlineId: inv.offlineId,
+            status: "FAILED",
+            error: "تعديل سعر البيع متاح فقط لحساب المدير (ADMIN).",
+          });
+          return;
+        }
+      }
+
       if (isVoidItem && actor.role !== "ADMIN") {
         invoiceResults.push({
           offlineId: inv.offlineId,
@@ -943,6 +1045,19 @@ export async function POST(req: NextRequest) {
             }
             if (inv.items.some((it) => compareMoney(serializeMoney(it.unitPriceSYP), 0) < 0)) {
               throw new Error("سعر الوحدة لا يمكن أن يكون سالباً.");
+            }
+            // [v6.2] Optional catalog-price snapshot: when present it must
+            // be a valid non-negative decimal (serializeMoney throws a
+            // MoneyError on a malformed value). Void payloads never carry
+            // it, so this check is sale-only.
+            if (
+              inv.items.some(
+                (it) =>
+                  it.listUnitPriceSYP !== null &&
+                  compareMoney(serializeMoney(it.listUnitPriceSYP), 0) < 0
+              )
+            ) {
+              throw new Error("سعر الكتالوج للوحدة لا يمكن أن يكون سالباً.");
             }
           }
 
@@ -1010,6 +1125,9 @@ export async function POST(req: NextRequest) {
               // rate, never negated — same rule as unitPriceSYP).
               // Nullable: null when the original had no frozen rate.
               unitPriceUSD: string | null;
+              // [v6.2] The original line's catalog-price snapshot, copied
+              // verbatim onto the void line (null stays null).
+              listUnitPriceSYP: string | null;
               // [v4.4, T4g] The original line's FROZEN cost basis, carried
               // straight off the original InvoiceItem row — never
               // recomputed from the batch's current costPricePerBaseUnit,
@@ -1018,107 +1136,138 @@ export async function POST(req: NextRequest) {
               // (original + void) sum to exactly zero per line.
               costAmountSYP: string;
             }
-            interface OriginalGroup {
+
+            // [v6.2 FIX] One group per (productId, unitId, PRICE). Before
+            // price overrides a product/unit had a single price per invoice,
+            // so the group key was productId::unitId and a price difference
+            // inside a group was an error. Now one invoice may legitimately
+            // sell the same product/unit at several prices (5 at catalog +
+            // 3 discounted); each price is its own group, so such an invoice
+            // can be voided offline. Prices are matched with samePriceSYP
+            // (numeric), never as strings, so no canonical string form of
+            // money is assumed. `matched` guards against one original group
+            // being claimed by two payload groups.
+            interface OriginalPriceGroup {
+              unitPriceSYP: string;
               batches: OriginalBatchPortion[];
               totalBaseQuantity: string;
+              matched: boolean;
             }
 
-            const originalByProductUnit = new Map<string, OriginalGroup>();
+            const originalByProductUnit = new Map<string, OriginalPriceGroup[]>();
             for (const item of originalInvoice.items) {
               const key = `${item.productId}::${item.unitId}`;
-              const group = originalByProductUnit.get(key) ?? { batches: [], totalBaseQuantity: "0" };
+              const groups = originalByProductUnit.get(key) ?? [];
+              const itemPrice = item.unitPriceSYP.toString();
+              let group = groups.find((g) => samePriceSYP(g.unitPriceSYP, itemPrice));
+              if (!group) {
+                group = {
+                  unitPriceSYP: itemPrice,
+                  batches: [],
+                  totalBaseQuantity: "0",
+                  matched: false,
+                };
+                groups.push(group);
+              }
               group.batches.push({
                 batchId: item.batchId,
                 quantity: item.quantity.toString(),
                 baseQuantity: item.baseQuantity.toString(),
                 unitPriceSYP: item.unitPriceSYP.toString(),
                 unitPriceUSD: item.unitPriceUSD?.toString() ?? null,
+                // [v6.2] Copy the original line's catalog-price snapshot
+                // (null stays null).
+                listUnitPriceSYP: item.listUnitPriceSYP?.toString() ?? null,
                 costAmountSYP: item.costAmountSYP.toString(),
               });
               group.totalBaseQuantity = sumMoney([
                 group.totalBaseQuantity,
                 item.baseQuantity.toString(),
               ]);
-              originalByProductUnit.set(key, group);
+              originalByProductUnit.set(key, groups);
             }
 
-            // [v4.9 FIX 4] Merge the void payload's items by the SAME
-            // productId::unitId key used for the original groups. Without
-            // this, a payload like [A, A] against an original {A, B} passed
-            // the count check (2 === 2), restored A's group twice and never
-            // restored B; and a legitimate payload with the same product/
-            // unit on two cart lines could never match a single original
-            // group. Quantities are summed (all negative, so the sum stays
-            // negative); differing unit prices for one key are rejected.
-            const voidByKey = new Map<
-              string,
-              { productId: string; unitId: string; quantity: string; unitPriceSYP: string }
-            >();
+            // [v4.9 FIX 4, revised by v6.2 FIX] Merge the void payload's
+            // items by productId + unitId + PRICE (same grouping as the
+            // original lines above). Lines with the same key (a product/unit
+            // added as two cart lines at the same price) are summed — all
+            // quantities are negative, so the sum stays negative. Lines of
+            // the same product/unit with DIFFERENT prices are different
+            // groups, no longer an error.
+            interface VoidPriceGroup {
+              productId: string;
+              unitId: string;
+              unitPriceSYP: string;
+              quantity: string;
+            }
+            const voidGroups: VoidPriceGroup[] = [];
             for (const it of inv.items) {
-              const key = `${it.productId}::${it.unitId}`;
-              const prev = voidByKey.get(key);
-              if (!prev) {
-                voidByKey.set(key, {
+              const existingGroup = voidGroups.find(
+                (g) =>
+                  g.productId === it.productId &&
+                  g.unitId === it.unitId &&
+                  samePriceSYP(g.unitPriceSYP, it.unitPriceSYP)
+              );
+              if (existingGroup) {
+                existingGroup.quantity = sumMoney([existingGroup.quantity, it.quantity]);
+              } else {
+                voidGroups.push({
                   productId: it.productId,
                   unitId: it.unitId,
-                  quantity: it.quantity,
                   unitPriceSYP: it.unitPriceSYP,
+                  quantity: it.quantity,
                 });
-              } else {
-                if (
-                  compareMoney(
-                    serializeMoney(prev.unitPriceSYP),
-                    serializeMoney(it.unitPriceSYP)
-                  ) !== 0
-                ) {
-                  throw new Error("أسعار مختلفة لنفس المنتج/الوحدة في بنود الإلغاء.");
-                }
-                prev.quantity = sumMoney([prev.quantity, it.quantity]);
               }
             }
 
-            if (originalByProductUnit.size !== voidByKey.size) {
+            let originalGroupCount = 0;
+            for (const groups of originalByProductUnit.values()) {
+              originalGroupCount += groups.length;
+            }
+            if (originalGroupCount !== voidGroups.length) {
               throw new Error(
-                "عدد عناصر الإلغاء لا يطابق عدد المنتجات/الوحدات المختلفة بالفاتورة الأصلية."
+                "عدد بنود الإلغاء لا يطابق عدد المنتجات/الوحدات/الأسعار المختلفة بالفاتورة الأصلية."
               );
             }
 
             const matchedGroups: Array<{
               productId: string;
               unitId: string;
-              group: OriginalGroup;
+              group: OriginalPriceGroup;
             }> = [];
 
-            for (const voidItem of voidByKey.values()) {
+            for (const voidItem of voidGroups) {
               const key = `${voidItem.productId}::${voidItem.unitId}`;
-              const group = originalByProductUnit.get(key);
-              if (!group) {
+              const candidates = originalByProductUnit.get(key);
+              if (!candidates) {
                 throw new Error(
                   `المنتج/الوحدة (${voidItem.productId}/${voidItem.unitId}) لا يطابق أي بند بالفاتورة الأصلية.`
                 );
               }
 
-              const priceMismatch = group.batches.some(
-                (b) =>
-                  compareMoney(serializeMoney(voidItem.unitPriceSYP), serializeMoney(b.unitPriceSYP)) !== 0
+              const group = candidates.find(
+                (g) => !g.matched && samePriceSYP(g.unitPriceSYP, voidItem.unitPriceSYP)
               );
-              if (priceMismatch) {
+              if (!group) {
                 throw new Error(
-                  `سعر عنصر الإلغاء (${voidItem.unitPriceSYP}) لا يطابق السعر الأصلي لـ ` +
+                  `سعر عنصر الإلغاء (${voidItem.unitPriceSYP}) لا يطابق أي سعر بيع أصلي لـ ` +
                   `${voidItem.productId}/${voidItem.unitId}.`
                 );
               }
+              group.matched = true;
 
               // [v4.8] "Full reversal" is judged in BASE units against the
               // exact sum of what was deducted — comparing the rounded
               // sale-unit pieces (0.8333 + 0.1667, or 0.3333 x 3) could
               // never equal the clean quantity the cashier voids.
+              // [v6.2] Now evaluated per price group.
               const voidUnitFactor = await getUnitConversionFactor(tx, tenantId, voidItem.unitId);
               const voidBaseQty = toBaseUnit(absQty(voidItem.quantity), voidUnitFactor).toFixed(4);
               if (compareMoney(voidBaseQty, group.totalBaseQuantity) !== 0) {
                 throw new Error(
                   `كمية عنصر الإلغاء (${absQty(voidItem.quantity)}) لا تطابق الكمية الأصلية المباعة ` +
-                  `لـ ${voidItem.productId}/${voidItem.unitId} — الإلغاء يجب أن يكون استرجاعاً كاملاً، ` +
+                  `لـ ${voidItem.productId}/${voidItem.unitId} بسعر ${voidItem.unitPriceSYP} — ` +
+                  "الإلغاء يجب أن يكون استرجاعاً كاملاً، " +
                   "أي تصحيح جزئي يُسجَّل كدفعة (CustomerPayment) بدلاً من إلغاء."
                 );
               }
@@ -1195,6 +1344,9 @@ export async function POST(req: NextRequest) {
                 syncedAt: new Date(),
                 voidsInvoiceId: originalInvoice.id,
                 voidReason: inv.voidReason,
+                // [v6.2] Copied from the original invoice; never from the
+                // payload (null stays null, false stays false).
+                hasPriceOverride: originalInvoice.hasPriceOverride,
                 createdAt: new Date(inv.createdAt),
               },
               select: { id: true },
@@ -1218,6 +1370,11 @@ export async function POST(req: NextRequest) {
                     // [v4.9] original USD unit price, verbatim (not negated,
                     // not recomputed) — same rule as unitPriceSYP.
                     unitPriceUSD: portion.unitPriceUSD,
+                    // [v6.2] original catalog-price snapshot, verbatim
+                    // (not negated; null stays null) — same rule as
+                    // unitPriceSYP, so the line discount derived on read
+                    // (list − unit price) stays identical on the void row.
+                    listUnitPriceSYP: portion.listUnitPriceSYP,
                     // [v4.4, T4g] The negated ORIGINAL frozen cost — via
                     // subtractMoney("0", …), the same negation discipline
                     // used for quantity/paid/debt above, never a raw
@@ -1286,6 +1443,9 @@ export async function POST(req: NextRequest) {
             batchId: string;
             unitPriceSYP: string;
             unitPriceUSD: string | null;
+            // [v6.2] Catalog price snapshot for this line: null when sold at
+            // the catalog price (no effective override).
+            listUnitPriceSYP: string | null;
             // sale-unit quantity — DISPLAY ONLY (rounded by construction)
             quantitySold: string;
             // [v4.8] exact base-unit amount deducted from batchId; copied
@@ -1328,6 +1488,12 @@ export async function POST(req: NextRequest) {
 
             const unitPriceSYP = serializeMoney(item.unitPriceSYP);
             const itemUnitPriceUSD = deriveUsd(unitPriceSYP, exchangeRateUsed);
+            // [v6.2] Catalog price snapshot at sale time: written only for
+            // an effective override (hasEffectiveListPrice — the same
+            // predicate as the ADMIN gate); otherwise null.
+            const listPriceSYP = hasEffectiveListPrice(item)
+              ? serializeMoney(item.listUnitPriceSYP as string)
+              : null;
 
             const resolution = await commitFifoAllocation(tx, {
               tenantId,
@@ -1345,6 +1511,7 @@ export async function POST(req: NextRequest) {
                 batchId: alloc.batchId,
                 unitPriceSYP,
                 unitPriceUSD: itemUnitPriceUSD,
+                listUnitPriceSYP: listPriceSYP,
                 quantitySold: fromBaseUnit(alloc.allocatedQty, soldUnitFactor).toFixed(4),
                 deductQtyInBaseUnit: alloc.allocatedQty,
                 // [v4.4, T4g] Frozen here, once — see the interface note.
@@ -1388,6 +1555,7 @@ export async function POST(req: NextRequest) {
                 batchId: overdrawBatchId,
                 unitPriceSYP,
                 unitPriceUSD: itemUnitPriceUSD,
+                listUnitPriceSYP: listPriceSYP,
                 quantitySold: fromBaseUnit(shortfall, soldUnitFactor).toFixed(4),
                 deductQtyInBaseUnit: shortfall,
                 costAmountSYP: multiplyMoney(shortfall, overdrawCost),
@@ -1406,6 +1574,13 @@ export async function POST(req: NextRequest) {
             resolvedAllocations.push(...itemAllocations);
           }
 
+          // [v6.2] true iff at least one stored line carries a catalog
+          // price, i.e. an effective override. Written in the SAME
+          // transaction as the items.
+          const hasPriceOverride = resolvedAllocations.some(
+            (a) => a.listUnitPriceSYP !== null
+          );
+
           const invoice = await tx.invoice.create({
             data: {
               tenantId,
@@ -1423,6 +1598,9 @@ export async function POST(req: NextRequest) {
               offlineId: inv.offlineId,
               syncedAt: new Date(),
               createdAt: new Date(inv.createdAt),
+              // [v6.2] Written in the same transaction as the items; never
+              // updated after creation.
+              hasPriceOverride,
             },
             select: { id: true },
           });
@@ -1440,6 +1618,9 @@ export async function POST(req: NextRequest) {
                 baseQuantity: alloc.deductQtyInBaseUnit,
                 unitPriceSYP: alloc.unitPriceSYP,
                 unitPriceUSD: alloc.unitPriceUSD,
+                // [v6.2] Catalog price snapshot for this line (null when
+                // sold at the catalog price).
+                listUnitPriceSYP: alloc.listUnitPriceSYP,
                 // [v4.4, T4g] REQUIRED, non-nullable — the frozen cost basis
                 // for this line. See ResolvedAllocation's note above.
                 costAmountSYP: alloc.costAmountSYP,

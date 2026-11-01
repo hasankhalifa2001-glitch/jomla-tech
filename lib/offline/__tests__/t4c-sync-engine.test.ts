@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
- * T4c — /api/sync test suite (v4.8 + T6c/D10)
+ * T4c — /api/sync test suite (v4.8 + T6c/D10 + v6.2)
  *
  * Runs the REAL route handler (app/api/sync/route.ts), the REAL fifo.ts and
  * the REAL batch-locking.ts against an in-memory, TRANSACTIONAL fake of the
@@ -9,7 +9,8 @@
  *
  * Mocked: auth, tenant-scope (raw lock query is recorded, not executed),
  * base-unit, units (decimal.js re-implementation of toBaseUnit/fromBaseUnit),
- * resolve-active, repayment, subscription status (getFreshEffectiveStatus).
+ * resolve-active, repayment, subscription status (getFreshEffectiveStatus),
+ * role-matrix (only for the online void route tests).
  *
  * KNOWN LIMIT (same as T3c's note): this fake is single-threaded, so it proves
  * the LOGIC (per-line deduction, void math, ordering of lock vs write, status
@@ -18,6 +19,19 @@
  *
  * Product fixtures: P1 has base unit "P1-base" (factor 1, "قطعة") and
  * "P1-pack" (factor 24, "طرد"). P2 has base unit "P2-base" only.
+ *
+ * [v6.2 / this revision]
+ *  - FIX: seeded users now carry isActive: true. The route resolves the
+ *    record's author with `where: { id, tenantId, isActive: true }`, and the
+ *    fake matches strictly, so users seeded without the flag were "not found"
+ *    and every sale/void/payment failed with "المستخدم ... غير موجود" (this was
+ *    the cause of the 40 failing tests).
+ *  - ADD: sale-time price override (ADMIN gate, listUnitPriceSYP /
+ *    hasPriceOverride storage), offline void of an invoice that sold the same
+ *    product/unit at several prices (void groups by product/unit/PRICE), the
+ *    online void route copying price + catalog fields row by row, and a
+ *    characterization test for the documented limit (an UNDECLARED lower price
+ *    is accepted as an ordinary sale).
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { NextRequest } from "next/server";
@@ -124,10 +138,28 @@ vi.mock("@/lib/auth/tenant", async () => {
     };
 });
 
+// [v6.2] Only the online void route (/api/ledger/voids) uses the role matrix.
+// Mocked so these tests exercise the void LOGIC, not the matrix itself: the
+// "ledger:void_invoice" permission is ADMIN-only, like the real matrix.
+vi.mock("@/lib/auth/role-matrix", async () => {
+    const { NextResponse } = await import("next/server");
+    class ForbiddenRoleError extends Error { }
+    return {
+        ForbiddenRoleError,
+        assertRolePermission: (role: string, permission: string) => {
+            if (permission === "ledger:void_invoice" && role !== "ADMIN") {
+                throw new ForbiddenRoleError("forbidden");
+            }
+        },
+        forbiddenRoleResponse: () => NextResponse.json({ error: "FORBIDDEN" }, { status: 403 }),
+    };
+});
+
 import { POST } from "@/app/api/sync/route";
 import { commitFifoAllocation } from "@/lib/inventory/fifo";
 import { assertTenantWritable } from "@/lib/auth/tenant";
 import { recordRepaymentIdempotent } from "@/lib/ledger/repayment";
+import { getTenantDb } from "@/lib/db/tenant-scope";
 
 // ----------------------------------------------------------------------------
 // In-memory transactional fake of the Prisma tx/client
@@ -164,6 +196,15 @@ function p2002(field: string) {
 
 function makeDb(store: Store) {
     let seq = 0;
+
+    // Shared by invoice.findFirst / invoice.findUnique.
+    const loadInvoice = ({ where, include }: any) => {
+        const row = store.invoices.find((i) => matches(i, where));
+        if (!row) return null;
+        return include?.items
+            ? { ...row, items: store.invoiceItems.filter((it) => it.invoiceId === row.id) }
+            : { ...row };
+    };
 
     const tx = {
         tenant: {
@@ -204,14 +245,12 @@ function makeDb(store: Store) {
             },
         },
         invoice: {
-            findFirst: async ({ where, include }: any) => {
-                if (where.voidsInvoiceId && h.hideVoidLookup) return null;
-                const row = store.invoices.find((i) => matches(i, where));
-                if (!row) return null;
-                return include?.items
-                    ? { ...row, items: store.invoiceItems.filter((it) => it.invoiceId === row.id) }
-                    : { ...row };
+            findFirst: async (args: any) => {
+                if (args.where.voidsInvoiceId && h.hideVoidLookup) return null;
+                return loadInvoice(args);
             },
+            // [v6.2] used by the online void route (/api/ledger/voids)
+            findUnique: async (args: any) => loadInvoice(args),
             create: async ({ data }: any) => {
                 if (data.offlineId && store.invoices.some((i) => i.offlineId === data.offlineId)) {
                     throw p2002("offlineId");
@@ -286,6 +325,20 @@ interface LineIn {
     unitId: string;
     quantity: string;
     price: string;
+    // [v6.2] catalog price the device claims it showed. undefined => the key
+    // is omitted from the payload (an old client); null => explicit null.
+    list?: string | null;
+}
+
+function mapLine(i: LineIn, quantity: string) {
+    return {
+        productId: i.productId ?? "P1",
+        unitId: i.unitId,
+        quantity,
+        unitPriceSYP: i.price,
+        unitPriceUSD: null,
+        ...(i.list !== undefined ? { listUnitPriceSYP: i.list } : {}),
+    };
 }
 
 function saleInvoice(o: {
@@ -303,13 +356,7 @@ function saleInvoice(o: {
     return {
         offlineId: o.offlineId,
         customerId: o.customerId ?? "cust-cash",
-        items: o.items.map((i) => ({
-            productId: i.productId ?? "P1",
-            unitId: i.unitId,
-            quantity: i.quantity,
-            unitPriceSYP: i.price,
-            unitPriceUSD: null,
-        })),
+        items: o.items.map((i) => mapLine(i, i.quantity)),
         totalSYP: total.toFixed(4),
         totalUSD: null,
         exchangeRateUsed: o.rate === undefined ? "135" : o.rate,
@@ -340,13 +387,7 @@ function voidInvoice(o: {
         voidsOfflineInvoiceId: o.voids,
         voidReason: "سبب الإلغاء",
         customerId: o.customerId ?? "cust-cash",
-        items: o.items.map((i) => ({
-            productId: i.productId ?? "P1",
-            unitId: i.unitId,
-            quantity: `-${new Decimal(i.quantity).abs().toString()}`,
-            unitPriceSYP: i.price,
-            unitPriceUSD: null,
-        })),
+        items: o.items.map((i) => mapLine(i, `-${new Decimal(i.quantity).abs().toString()}`)),
         totalSYP: total.negated().toFixed(4),
         totalUSD: null,
         exchangeRateUsed: o.rate === undefined ? "135" : o.rate,
@@ -394,10 +435,15 @@ beforeEach(() => {
         graceDaysLeft: 0,
     };
 
+    // [v6.2 FIX] isActive: true is REQUIRED — the route looks the author up
+    // with `isActive: true` and this fake matches strictly.
     store.users.push(
-        { id: "admin1", tenantId: "t1", role: "ADMIN" },
-        { id: "cashier1", tenantId: "t1", role: "CASHIER" },
-        { id: "cashier2", tenantId: "t1", role: "CASHIER" }
+        { id: "admin1", tenantId: "t1", role: "ADMIN", isActive: true },
+        { id: "cashier1", tenantId: "t1", role: "CASHIER", isActive: true },
+        { id: "cashier2", tenantId: "t1", role: "CASHIER", isActive: true },
+        // a deactivated user of this tenant, and an ADMIN of ANOTHER tenant
+        { id: "ex-cashier", tenantId: "t1", role: "CASHIER", isActive: false },
+        { id: "foreign-admin", tenantId: "t2", role: "ADMIN", isActive: true }
     );
     store.customers.push(
         { id: "cust-cash", tenantId: "t1", isSystemGenerated: true, offlineId: null },
@@ -407,6 +453,8 @@ beforeEach(() => {
 
     vi.mocked(assertTenantWritable).mockClear();
     vi.mocked(recordRepaymentIdempotent).mockClear();
+    // [v6.2] the online void route gets its DB through getTenantDb(tenantId)
+    vi.mocked(getTenantDb).mockImplementation((() => h.db) as any);
 });
 
 // ----------------------------------------------------------------------------
@@ -776,6 +824,22 @@ describe("T4c — نسب العملية للمستخدم الصحيح (createdBy
         expect(json.invoices[0].status).toBe("FAILED");
     });
 
+    it("منشئ معطّل (isActive=false) أو من متجر آخر → FAILED ولا يُكتب شيء", async () => {
+        seedBatch("A", "P1", "100", "2026-12-01");
+        const { json } = await postSync({
+            invoices: [
+                saleInvoice({ offlineId: "s-off", createdByUserId: "ex-cashier", items: [{ unitId: "P1-base", quantity: "1", price: PIECE_PRICE }] }),
+                saleInvoice({ offlineId: "s-foreign", createdByUserId: "foreign-admin", items: [{ unitId: "P1-base", quantity: "1", price: PIECE_PRICE }] }),
+            ],
+        });
+        const byId = Object.fromEntries(json.invoices.map((r: any) => [r.offlineId, r]));
+        expect(byId["s-off"].status).toBe("FAILED");
+        expect(byId["s-off"].error).toMatch(/غير موجود/);
+        expect(byId["s-foreign"].status).toBe("FAILED");
+        expect(store.invoices).toHaveLength(0);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
     it("إلغاء أنشأه كاشير (يزامنه مدير) → FAILED: الدور يُؤخذ من قاعدة البيانات", async () => {
         seedBatch("A", "P1", "100", "2026-12-01");
         await postSync({
@@ -814,12 +878,14 @@ describe("T4c — الدفعات (PASS 3)", () => {
         h.session = { user: { id: "cashier1", tenantId: "t1", role: "CASHIER" } };
         const { json } = await postSync({ payments: [payment()] });
         expect(json.payments[0].status).toBe("FAILED");
+        expect(json.payments[0].error).toMatch(/ADMIN/);
         expect(recordRepaymentIdempotent).not.toHaveBeenCalled();
     });
 
     it("دفعة أنشأها كاشير ويزامنها مدير → FAILED (دور المنشئ لا دور الجلسة)", async () => {
         const { json } = await postSync({ payments: [payment({ createdByUserId: "cashier1" })] });
         expect(json.payments[0].status).toBe("FAILED");
+        expect(json.payments[0].error).toMatch(/ADMIN/);
         expect(recordRepaymentIdempotent).not.toHaveBeenCalled();
     });
 });
@@ -1222,6 +1288,8 @@ describe("T4c — تحقق لكل عنصر بدل رفض الطلب كله (v4.9
             ],
         });
         expect(json.invoices[0].status).toBe("FAILED");
+        // الدمج بنفس السعر يعطي مجموعة وحدة مقابل مجموعتين أصليتين
+        expect(json.invoices[0].error).toMatch(/عدد/);
         expect([qty("A"), qty("C")]).toEqual(before);
     });
 });
@@ -1471,5 +1539,703 @@ describe("T4c — فحوصات ساكنة للتسامح (تعريف واحد)",
         expect(src).toMatch(/compareMoney\(totalSYP, expectedVoidTotalSYP\) !== 0/);
         expect(src).toMatch(/compareMoney\(paidSYP, expectedVoidPaidSYP\) !== 0/);
         expect(src).toMatch(/compareMoney\(debtSYP, expectedVoidDebtSYP\) !== 0/);
+    });
+});
+
+// ============================================================================
+// [v6.2] SALE-TIME PRICE OVERRIDE — gate + storage
+//
+// "Effective override" = the line carries listUnitPriceSYP AND it differs
+// (numerically) from the final unitPriceSYP. Only an ADMIN author (looked up in
+// the DATABASE) may sync such an invoice; the catalog price is stored only for
+// effective overrides; Invoice.hasPriceOverride mirrors "any stored line has
+// it". Catalog price: 1000 per piece, cost 10 per piece throughout.
+// ============================================================================
+describe("T4c — v6.2: تعديل سعر البيع (بوابة ADMIN والتخزين)", () => {
+    const seedA = () => seedBatch("A", "P1", "100", "2026-12-01", "10");
+    const line = (price: string, list?: string | null, q = "10"): LineIn => ({
+        unitId: "P1-base",
+        quantity: q,
+        price,
+        list,
+    });
+
+    it("ADMIN: سعر أقل من الكتالوج (900 مقابل 1000) يُخزَّن، و hasPriceOverride = true", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("900", "1000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(inv.hasPriceOverride).toBe(true);
+        expect(eq(inv.totalSYP, "9000")).toBe(true);
+        const [item] = itemsOf(inv.id);
+        expect(eq(item.unitPriceSYP, "900")).toBe(true); // السعر النهائي هو المعتمد
+        expect(eq(item.listUnitPriceSYP, "1000")).toBe(true); // لقطة الكتالوج
+        expect(eq(qty("A"), "90")).toBe(true);
+    });
+
+    it("ADMIN: سعر أعلى من الكتالوج (زيادة) يُقبل أيضاً ويُعلَّم override", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("1200", "1000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(inv.hasPriceOverride).toBe(true);
+        expect(eq(itemsOf(inv.id)[0].listUnitPriceSYP as string, "1000")).toBe(true);
+    });
+
+    it("list يساوي السعر النهائي (بصيغ مختلفة أو بغياب المفتاح) ليس override: null/false", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [
+                saleInvoice({ offlineId: "same-fmt", items: [line("1000", "1000.0000", "1")] }),
+                saleInvoice({ offlineId: "no-key", items: [line("1000", undefined, "1")] }),
+                saleInvoice({ offlineId: "null-key", items: [line("1000", null, "1")] }),
+            ],
+        });
+
+        expect(json.invoices.map((r: any) => r.status)).toEqual(["SYNCED", "SYNCED", "SYNCED"]);
+        for (const id of ["same-fmt", "no-key", "null-key"]) {
+            const inv = store.invoices.find((i) => i.offlineId === id);
+            expect(inv.hasPriceOverride, id).toBe(false);
+            expect(itemsOf(inv.id).every((i) => i.listUnitPriceSYP === null), id).toBe(true);
+        }
+    });
+
+    it("كاشير بتعديل سعر فعلي → FAILED برسالة ADMIN ولا يُكتب شيء ولا يُخصم مخزون", async () => {
+        seedA();
+        h.session = { user: { id: "cashier1", tenantId: "t1", role: "CASHIER" } };
+
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("900", "1000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/ADMIN/);
+        expect(store.invoices).toHaveLength(0);
+        expect(store.invoiceItems).toHaveLength(0);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("كاشير: list = السعر النهائي بصيغتين مختلفتين ليس override فيمرّ ويُخزَّن null", async () => {
+        seedA();
+        h.session = { user: { id: "cashier1", tenantId: "t1", role: "CASHIER" } };
+
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("1000", "1000.0000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(inv.userId).toBe("cashier1");
+        expect(inv.hasPriceOverride).toBe(false);
+        expect(itemsOf(inv.id)[0].listUnitPriceSYP).toBeNull();
+    });
+
+    it("مدير يزامن فاتورة كاشير فيها override → FAILED: الدور من قاعدة البيانات لا من الجلسة", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [
+                saleInvoice({ offlineId: "s1", createdByUserId: "cashier1", items: [line("900", "1000")] }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/ADMIN/);
+        expect(store.invoices).toHaveLength(0);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("كاشير يزامن فاتورة مدير فيها override → RETRY_LATER (لا يُكتب شيء، وتتزامن مع جلسة المدير)", async () => {
+        seedA();
+        h.session = { user: { id: "cashier1", tenantId: "t1", role: "CASHIER" } };
+        const body = {
+            invoices: [
+                saleInvoice({ offlineId: "s1", createdByUserId: "admin1", items: [line("900", "1000")] }),
+            ],
+        };
+
+        const deferred = await postSync(body);
+        expect(deferred.json.invoices[0].status).toBe("RETRY_LATER");
+        expect(store.invoices).toHaveLength(0);
+
+        h.session = { user: { id: "admin1", tenantId: "t1", role: "ADMIN" } };
+        const retried = await postSync(body);
+        expect(retried.json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(inv.userId).toBe("admin1");
+        expect(inv.hasPriceOverride).toBe(true);
+    });
+
+    it("فاتورة بسطرين: سطر معدّل وسطر عادي → list فقط على المعدّل و hasPriceOverride = true", async () => {
+        seedA();
+        seedBatch("C", "P2", "10", "2026-12-01", "10");
+
+        const { json } = await postSync({
+            invoices: [
+                saleInvoice({
+                    offlineId: "s1",
+                    items: [
+                        { productId: "P1", unitId: "P1-base", quantity: "2", price: "900", list: "1000" },
+                        { productId: "P2", unitId: "P2-base", quantity: "1", price: "1000" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(inv.hasPriceOverride).toBe(true);
+        const rows = itemsOf(inv.id);
+        const p1 = rows.find((r) => r.productId === "P1");
+        const p2 = rows.find((r) => r.productId === "P2");
+        expect(eq(p1.listUnitPriceSYP, "1000")).toBe(true);
+        expect(p2.listUnitPriceSYP).toBeNull();
+    });
+
+    it("سطر معدّل موزّع FIFO على دفعتين: الصفّان يحملان نفس السعر النهائي ونفس سعر الكتالوج", async () => {
+        seedBatch("A", "P1", "20", "2026-12-01", "10");
+        seedBatch("B", "P1", "100", "2027-06-01", "10");
+
+        const { json } = await postSync({
+            invoices: [
+                saleInvoice({
+                    offlineId: "s1",
+                    items: [{ unitId: "P1-pack", quantity: "1", price: "20000", list: "24000" }],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(eq(inv.totalSYP, "20000")).toBe(true);
+        const rows = itemsOf(inv.id);
+        expect(rows).toHaveLength(2);
+        for (const r of rows) {
+            expect(eq(r.unitPriceSYP, "20000")).toBe(true);
+            expect(eq(r.listUnitPriceSYP, "24000")).toBe(true);
+        }
+        expect(rows.reduce((s, r) => s.plus(r.baseQuantity), new Decimal(0)).eq(24)).toBe(true);
+    });
+
+    it("سعر نهائي صفر مسموح (هدية) والتكلفة تبقى مسجلة", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s0", items: [line("0", "1000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s0");
+        expect(eq(inv.totalSYP, "0")).toBe(true);
+        expect(inv.hasPriceOverride).toBe(true);
+        const [item] = itemsOf(inv.id);
+        expect(eq(item.unitPriceSYP, "0")).toBe(true);
+        expect(eq(item.costAmountSYP, "100")).toBe(true); // 10 قطع x 10
+        expect(store.payments).toHaveLength(0); // لا مدفوع → لا دفعة
+    });
+
+    it("سعر نهائي سالب → FAILED ولا يتغير المخزون", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("-100", "1000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(store.invoices).toHaveLength(0);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("سعر كتالوج سالب (من مدير) → FAILED برسالة الكتالوج ولا يتغير شيء", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("900", "-1000")] })],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/الكتالوج/);
+        expect(store.invoices).toHaveLength(0);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("سعر كتالوج غير صالح ('abc') → FAILED لهذه الفاتورة فقط والباقي يُزامَن", async () => {
+        seedA();
+        const { status, json } = await postSync({
+            invoices: [
+                saleInvoice({ offlineId: "s_bad", items: [line("900", "abc")] }),
+                saleInvoice({ offlineId: "s_ok", items: [line("1000", undefined)] }),
+            ],
+        });
+
+        expect(status).toBe(200);
+        const byId = Object.fromEntries(json.invoices.map((r: any) => [r.offlineId, r.status]));
+        expect(byId.s_bad).toBe("FAILED");
+        expect(byId.s_ok).toBe("SYNCED");
+        expect(eq(qty("A"), "90")).toBe(true); // خصم s_ok فقط
+        expect(store.invoices).toHaveLength(1);
+    });
+
+    it("التكلفة المجمّدة لا تتأثر بالسعر: الربح = الإجمالي − Σ التكلفة يتغير بالسعر فقط", async () => {
+        seedA();
+        const { json } = await postSync({
+            invoices: [
+                saleInvoice({ offlineId: "plain", items: [line("1000", undefined)] }),
+                saleInvoice({ offlineId: "disc", items: [line("900", "1000")] }),
+            ],
+        });
+        expect(json.invoices.map((r: any) => r.status)).toEqual(["SYNCED", "SYNCED"]);
+
+        const profit = (offlineId: string) => {
+            const inv = store.invoices.find((i) => i.offlineId === offlineId);
+            const cost = itemsOf(inv.id).reduce((s, i) => s.plus(i.costAmountSYP), new Decimal(0));
+            return { cost, profit: new Decimal(inv.totalSYP).minus(cost) };
+        };
+        expect(profit("plain").cost.eq(100)).toBe(true);
+        expect(profit("disc").cost.eq(100)).toBe(true); // نفس التكلفة
+        expect(profit("plain").profit.eq(9900)).toBe(true);
+        expect(profit("disc").profit.eq(8900)).toBe(true);
+    });
+
+    // CHARACTERIZATION TEST — documents an ACCEPTED limit (decision 2026-10-30),
+    // it is not a bug report: the server never knows which catalog price the
+    // device showed, so it only gates DECLARED overrides. Re-deriving the price
+    // or rejecting a mismatch with the CURRENT catalog would drop real sales
+    // whenever the catalog changed between the sale and the sync. If this test
+    // ever fails because someone made the server reject such a sale, that is a
+    // deliberate product decision to revisit, not a regression to patch around.
+    it("حد معروف: سعر أقل بدون إعلان override يُقبل كبيع عادي (السيرفر لا يعرف سعر الكتالوج)", async () => {
+        seedA();
+        h.session = { user: { id: "cashier1", tenantId: "t1", role: "CASHIER" } };
+
+        const { json } = await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [line("500", null)] })],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const inv = store.invoices.find((i) => i.offlineId === "s1");
+        expect(inv.hasPriceOverride).toBe(false);
+        expect(itemsOf(inv.id)[0].listUnitPriceSYP).toBeNull();
+        expect(eq(inv.totalSYP, "5000")).toBe(true);
+    });
+});
+
+// ============================================================================
+// [v6.2] OFFLINE VOID OF AN INVOICE THAT SOLD THE SAME PRODUCT/UNIT AT SEVERAL
+// PRICES. The void path groups by productId::unitId::PRICE (numeric price
+// match). The client's void payload must list one line per price group.
+//
+// Fixture: P1 piece sold as 5 @ 1000 (catalog) + 3 @ 800 (list 1000) = 7400.
+// ============================================================================
+describe("T4c — v6.2: إلغاء أوفلاين لفاتورة فيها أكثر من سعر لنفس المنتج/الوحدة", () => {
+    const seedA = () => seedBatch("A", "P1", "100", "2026-12-01", "10");
+
+    const mixedSale = (offlineId = "s1") =>
+        saleInvoice({
+            offlineId,
+            items: [
+                { unitId: "P1-base", quantity: "5", price: "1000" },
+                { unitId: "P1-base", quantity: "3", price: "800", list: "1000" },
+            ],
+        });
+
+    async function syncMixedSale(): Promise<string> {
+        const r = await postSync({ invoices: [mixedSale()] });
+        expect(r.json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "92")).toBe(true);
+        return r.json.invoices[0].realId as string;
+    }
+
+    it("إلغاء كامل بسطرين (5 @ 1000 و 3 @ 800) → SYNCED والمخزون يرجع 100 والمجموع صفر", async () => {
+        seedA();
+        const saleId = await syncMixedSale();
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "5", price: "1000" },
+                        { unitId: "P1-base", quantity: "3", price: "800" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "100")).toBe(true);
+
+        const original = store.invoices.find((i) => i.id === saleId);
+        const voided = store.invoices.find((i) => i.offlineId === "v1");
+        expect(voided.hasPriceOverride).toBe(true); // منسوخ من الأصل
+        expect(new Decimal(original.totalSYP).plus(voided.totalSYP).isZero()).toBe(true);
+        expect(new Decimal(original.totalUSD).plus(voided.totalUSD).isZero()).toBe(true);
+
+        const voidRows = itemsOf(voided.id);
+        expect(voidRows).toHaveLength(2);
+        const five = voidRows.find((r) => eq(r.baseQuantity, "-5"));
+        const three = voidRows.find((r) => eq(r.baseQuantity, "-3"));
+        // الأسعار تُنسخ كما هي (موجبة) ولقطة الكتالوج تُنسخ من السطر الأصلي
+        expect(eq(five.unitPriceSYP, "1000")).toBe(true);
+        expect(five.listUnitPriceSYP).toBeNull();
+        expect(eq(three.unitPriceSYP, "800")).toBe(true);
+        expect(eq(three.listUnitPriceSYP, "1000")).toBe(true);
+
+        const all = [...itemsOf(original.id), ...voidRows];
+        expect(all.reduce((s, i) => s.plus(i.baseQuantity), new Decimal(0)).isZero()).toBe(true);
+        expect(all.reduce((s, i) => s.plus(i.costAmountSYP), new Decimal(0)).isZero()).toBe(true);
+    });
+
+    it("الإلغاء يتجاهل listUnitPriceSYP القادم بالـ payload (يُنسخ من الأصل فقط)", async () => {
+        seedA();
+        await postSync({
+            invoices: [saleInvoice({ offlineId: "s1", items: [{ unitId: "P1-base", quantity: "10", price: "1000" }] })],
+        });
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [{ unitId: "P1-base", quantity: "10", price: "1000", list: "999" }],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        const voided = store.invoices.find((i) => i.offlineId === "v1");
+        expect(voided.hasPriceOverride).toBe(false);
+        expect(itemsOf(voided.id).every((i) => i.listUnitPriceSYP === null)).toBe(true);
+    });
+
+    it("أسعار مبدّلة بين المجموعتين (5 @ 800 و 3 @ 1000) → FAILED والمخزون بلا تغيير", async () => {
+        seedA();
+        await syncMixedSale();
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "5", price: "800" },
+                        { unitId: "P1-base", quantity: "3", price: "1000" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/كمية/);
+        expect(eq(qty("A"), "92")).toBe(true);
+        expect(store.invoices.some((i) => i.offlineId === "v1")).toBe(false);
+    });
+
+    it("سعر إلغاء لا يطابق أي سعر بيع أصلي (700) → FAILED", async () => {
+        seedA();
+        await syncMixedSale();
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "5", price: "1000" },
+                        { unitId: "P1-base", quantity: "3", price: "700" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/سعر/);
+        expect(eq(qty("A"), "92")).toBe(true);
+    });
+
+    it("عقد الكلاينت: دمج سطرين بسعرين مختلفين بسطر وحدة (8 @ 1000) → FAILED", async () => {
+        seedA();
+        await syncMixedSale();
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [{ unitId: "P1-base", quantity: "8", price: "1000" }],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("FAILED");
+        expect(json.invoices[0].error).toMatch(/عدد/);
+        expect(eq(qty("A"), "92")).toBe(true);
+    });
+
+    it("مقارنة السعر رقمية: '1000.0000' و '800.00' تطابق 1000 و 800", async () => {
+        seedA();
+        await syncMixedSale();
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "5", price: "1000.0000" },
+                        { unitId: "P1-base", quantity: "3", price: "800.00" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("سطران بنفس السعر المخفّض (5 + 3 @ 800) يُدمجان بمجموعة وحدة والإلغاء بسطر 8 @ 800 ينجح", async () => {
+        seedA();
+        await postSync({
+            invoices: [
+                saleInvoice({
+                    offlineId: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "5", price: "800", list: "1000" },
+                        { unitId: "P1-base", quantity: "3", price: "800", list: "1000" },
+                    ],
+                }),
+            ],
+        });
+        expect(eq(qty("A"), "92")).toBe(true);
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [{ unitId: "P1-base", quantity: "8", price: "800" }],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("العكس: بيع بسطر 8 @ 800 والإلغاء بسطرين (5 + 3 @ 800) يُدمجان ويُقبلان", async () => {
+        seedA();
+        await postSync({
+            invoices: [
+                saleInvoice({
+                    offlineId: "s1",
+                    items: [{ unitId: "P1-base", quantity: "8", price: "800", list: "1000" }],
+                }),
+            ],
+        });
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-base", quantity: "5", price: "800" },
+                        { unitId: "P1-base", quantity: "3", price: "800" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("طرد بسعرين مع تقسيم FIFO (24000 و 20000): الإلغاء يرجّع A=20 و B=100 بالضبط", async () => {
+        seedBatch("A", "P1", "20", "2026-12-01", "10");
+        seedBatch("B", "P1", "100", "2027-06-01", "10");
+
+        const sale = await postSync({
+            invoices: [
+                saleInvoice({
+                    offlineId: "s1",
+                    items: [
+                        { unitId: "P1-pack", quantity: "1", price: "24000" },
+                        { unitId: "P1-pack", quantity: "1", price: "20000", list: "24000" },
+                    ],
+                }),
+            ],
+        });
+        expect(sale.json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "0")).toBe(true);
+        expect(eq(qty("B"), "72")).toBe(true); // 100 - 4 - 24
+        expect(itemsOf(sale.json.invoices[0].realId)).toHaveLength(3); // A:20, B:4, B:24
+
+        const { json } = await postSync({
+            invoices: [
+                voidInvoice({
+                    offlineId: "v1",
+                    voids: "s1",
+                    items: [
+                        { unitId: "P1-pack", quantity: "1", price: "24000" },
+                        { unitId: "P1-pack", quantity: "1", price: "20000" },
+                    ],
+                }),
+            ],
+        });
+
+        expect(json.invoices[0].status).toBe("SYNCED");
+        expect(eq(qty("A"), "20")).toBe(true);
+        expect(eq(qty("B"), "100")).toBe(true);
+        const voided = store.invoices.find((i) => i.offlineId === "v1");
+        expect(voided.hasPriceOverride).toBe(true);
+        const voidRows = itemsOf(voided.id);
+        expect(voidRows).toHaveLength(3);
+        expect(voidRows.filter((r) => r.listUnitPriceSYP !== null)).toHaveLength(1);
+    });
+});
+
+// ============================================================================
+// [v6.2] ONLINE VOID — POST /api/ledger/voids copies every line verbatim (price,
+// catalog snapshot, USD) and restores InvoiceItem.baseQuantity per row, so a
+// mixed-price invoice is never a problem there. The route is imported
+// dynamically so a load problem in it can only fail THESE tests.
+// ============================================================================
+describe("T4c — v6.2: الإلغاء الأونلاين (/api/ledger/voids) ينسخ السعر والكتالوج بند ببند", () => {
+    const seedA = () => seedBatch("A", "P1", "100", "2026-12-01", "10");
+
+    async function callOnlineVoid(invoiceId: string) {
+        const { POST: voidsPOST } = await import("@/app/api/ledger/voids/route");
+        const res = await voidsPOST(
+            new Request("http://localhost/api/ledger/voids", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ invoiceId, voidReason: "سبب الإلغاء" }),
+            })
+        );
+        return { status: res.status, json: await res.json() };
+    }
+
+    async function syncSale(items: LineIn[]): Promise<string> {
+        const r = await postSync({ invoices: [saleInvoice({ offlineId: "s1", items })] });
+        expect(r.json.invoices[0].status).toBe("SYNCED");
+        return r.json.invoices[0].realId as string;
+    }
+
+    it("فاتورة بسعرين: 200 والمخزون يرجع بالضبط والسعر/الكتالوج/hasPriceOverride تُنسخ والمجموع صفر", async () => {
+        seedA();
+        const saleId = await syncSale([
+            { unitId: "P1-base", quantity: "5", price: "1000" },
+            { unitId: "P1-base", quantity: "3", price: "800", list: "1000" },
+        ]);
+        expect(eq(qty("A"), "92")).toBe(true);
+
+        const { status, json } = await callOnlineVoid(saleId);
+
+        expect(status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(json.voidItemsCount).toBe(2);
+        expect(eq(qty("A"), "100")).toBe(true);
+
+        const original = store.invoices.find((i) => i.id === saleId);
+        const voided = store.invoices.find((i) => i.id === json.voidInvoiceId);
+        expect(voided.status).toBe("VOIDED");
+        expect(voided.voidsInvoiceId).toBe(saleId);
+        expect(voided.hasPriceOverride).toBe(true);
+        expect(new Decimal(original.totalSYP).plus(voided.totalSYP).isZero()).toBe(true);
+        expect(new Decimal(original.totalUSD).plus(voided.totalUSD).isZero()).toBe(true);
+
+        const voidRows = itemsOf(voided.id);
+        const five = voidRows.find((r) => eq(r.baseQuantity, "-5"));
+        const three = voidRows.find((r) => eq(r.baseQuantity, "-3"));
+        expect(eq(five.unitPriceSYP, "1000")).toBe(true);
+        expect(five.listUnitPriceSYP).toBeNull();
+        expect(eq(three.unitPriceSYP, "800")).toBe(true);
+        expect(eq(three.listUnitPriceSYP, "1000")).toBe(true);
+
+        const all = [...itemsOf(original.id), ...voidRows];
+        expect(all.reduce((s, i) => s.plus(i.baseQuantity), new Decimal(0)).isZero()).toBe(true);
+        expect(all.reduce((s, i) => s.plus(i.costAmountSYP), new Decimal(0)).isZero()).toBe(true);
+    });
+
+    it("فاتورة عادية: hasPriceOverride = false و listUnitPriceSYP = null على الإلغاء", async () => {
+        seedA();
+        const saleId = await syncSale([{ unitId: "P1-base", quantity: "10", price: "1000" }]);
+
+        const { status, json } = await callOnlineVoid(saleId);
+
+        expect(status).toBe(200);
+        const voided = store.invoices.find((i) => i.id === json.voidInvoiceId);
+        expect(voided.hasPriceOverride).toBe(false);
+        expect(itemsOf(voided.id).every((i) => i.listUnitPriceSYP === null)).toBe(true);
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("إلغاء ثانٍ لنفس الفاتورة → 400 INVALID_STATE والمخزون لا يتضاعف", async () => {
+        seedA();
+        const saleId = await syncSale([{ unitId: "P1-base", quantity: "10", price: "1000" }]);
+        const first = await callOnlineVoid(saleId);
+        expect(first.status).toBe(200);
+
+        const second = await callOnlineVoid(saleId);
+
+        expect(second.status).toBe(400);
+        expect(second.json.error).toBe("INVALID_STATE");
+        expect(eq(qty("A"), "100")).toBe(true);
+    });
+
+    it("جلسة كاشير → 403 ولا يُكتب شيء", async () => {
+        seedA();
+        const saleId = await syncSale([{ unitId: "P1-base", quantity: "10", price: "1000" }]);
+        h.session = { user: { id: "cashier1", tenantId: "t1", role: "CASHIER" } };
+
+        const { status } = await callOnlineVoid(saleId);
+
+        expect(status).toBe(403);
+        expect(store.invoices.filter((i) => i.status === "VOIDED")).toHaveLength(0);
+        expect(eq(qty("A"), "90")).toBe(true);
+    });
+});
+
+// ============================================================================
+// [v6.2] STATIC SCANS — keep the override rules from drifting apart.
+// ============================================================================
+describe("T4c — v6.2: فحوصات ساكنة (بوابة واحدة، نسخ عند الإلغاء، تجميع بالسعر)", () => {
+    const code = (rel: string) =>
+        readFileSync(path.resolve(process.cwd(), rel), "utf8")
+            .replace(/\/\*[\s\S]*?\*\//g, "")
+            .replace(/^\s*\/\/.*$/gm, "");
+
+    it("sync route: البوابة والكتابة تستخدمان نفس الدالة hasEffectiveListPrice", () => {
+        const src = code("app/api/sync/route.ts");
+        expect(src).toMatch(/function hasEffectiveListPrice\(/);
+        expect(src).toMatch(/hasEffectiveListPrice\(it\)/); // البوابة
+        expect(src).toMatch(/hasEffectiveListPrice\(item\)\s*\?\s*serializeMoney/); // الكتابة
+    });
+
+    it("sync route: hasPriceOverride للبيع يُحسب من البنود المخزّنة لا من الـ payload", () => {
+        const src = code("app/api/sync/route.ts");
+        expect(src).toMatch(/const hasPriceOverride\s*=\s*resolvedAllocations\.some\(/);
+    });
+
+    it("sync route: الإلغاء ينسخ listUnitPriceSYP و hasPriceOverride من الأصل", () => {
+        const src = code("app/api/sync/route.ts");
+        expect(src).toMatch(/hasPriceOverride:\s*originalInvoice\.hasPriceOverride/);
+        expect(src).toMatch(/listUnitPriceSYP:\s*portion\.listUnitPriceSYP/);
+    });
+
+    it("sync route: الإلغاء يجمّع بالسعر (samePriceSYP) ولا بقي الرفض القديم لاختلاف الأسعار", () => {
+        const src = code("app/api/sync/route.ts");
+        expect(src).toMatch(/samePriceSYP\(/);
+        expect(src).not.toMatch(/voidByKey/);
+        expect(src).not.toMatch(/priceMismatch/);
+    });
+
+    it("voids route: ينسخ listUnitPriceSYP و hasPriceOverride من الأصل", () => {
+        const src = code("app/api/ledger/voids/route.ts");
+        expect(src).toMatch(/hasPriceOverride:\s*originalInvoice\.hasPriceOverride/);
+        expect(src).toMatch(/listUnitPriceSYP:\s*item\.listUnitPriceSYP/);
     });
 });

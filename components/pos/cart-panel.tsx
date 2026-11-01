@@ -5,7 +5,16 @@
  *
  * Presentation only. Every cart mutation is delegated to the callbacks that
  * PosLayout routes through the pos-service funnel (D8): this file never writes
- * `quantity` or `lineTotalOverrideSYP` itself.
+ * `quantity`, `lineTotalOverrideSYP` or any price field itself.
+ *
+ * [v6.2 — PRICE EDITOR] An ADMIN can change a line's unit price (or give a
+ * discount) for THIS sale only. The editor converts whatever was typed — a new
+ * price, an amount off, or a percentage off — into ONE final unit price and
+ * hands it to `onEditLinePrice`; nothing about how it was typed is kept. All
+ * arithmetic goes through lib/utils/money.ts. The catalog price shown/struck
+ * here is read from the line's own `listUnitPriceSYP` snapshot (or, on a line
+ * that is not overridden, its current unit price) — never supplied by the UI.
+ * The editor is absent (not disabled) for a CASHIER; the server enforces it too.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -15,11 +24,15 @@ import {
   CreditCard,
   Info,
   Minus,
+  Pencil,
   Plus,
+  RotateCcw,
   ShoppingCart,
+  Tag,
   Trash2,
   User,
   UserPlus,
+  X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -35,12 +48,20 @@ import {
   resolveUnitPriceSYP,
   isSystemCashCustomer,
   cartNeedsExchangeRate,
+  cartHasPriceOverride,
   isBaseUnitLine,
   type CartLineItem,
   type SelectedCustomer,
 } from "@/lib/offline";
-import { compareMoney } from "@/lib/utils/money";
 import {
+  compareMoney,
+  MoneyError,
+  multiplyMoney,
+  subtractMoney,
+  toDecimal,
+} from "@/lib/utils/money";
+import {
+  parseAmountInput,
   parseQuantityInput,
   AMBIGUOUS_COMMA_RE,
   formatQuantityText,
@@ -51,6 +72,7 @@ import { Money } from "./money";
 
 type LineInputMode = "qty" | "amount";
 type CartTotals = ReturnType<typeof calculateCartTotals>;
+type PriceEditResult = { ok: true } | { ok: false; message: string };
 
 interface CartPanelProps {
   items: CartLineItem[];
@@ -78,6 +100,12 @@ interface CartPanelProps {
   isMobileDrawer?: boolean;
   /** Blocks checkout: unreadable cart total, or an amount field the cart refused. */
   cartInconsistent?: boolean;
+  // [v6.2] ADMIN-only price/discount editing.
+  isAdmin?: boolean;
+  /** Sets the line's FINAL unit price (SYP decimal string). Returns the funnel's outcome. */
+  onEditLinePrice?: (cartId: string, finalPriceSYP: string) => PriceEditResult;
+  /** Puts the line back to its catalog price. */
+  onClearLinePrice?: (cartId: string) => void;
 }
 
 /** [D7] Quick weight buttons — applied by the parent through setLineQuantity. */
@@ -192,6 +220,223 @@ function QuantityField({
   );
 }
 
+// ---------------------------------------------------------------------------
+// [v6.2] PRICE / DISCOUNT EDITOR (ADMIN only)
+// ---------------------------------------------------------------------------
+
+type PriceEditMode = "price" | "amount" | "percent";
+
+const PRICE_EDIT_MODES: ReadonlyArray<{ value: PriceEditMode; label: string; unit: string }> = [
+  { value: "price", label: "سعر جديد", unit: "ل.س" },
+  { value: "amount", label: "خصم بمبلغ", unit: "ل.س" },
+  { value: "percent", label: "خصم بنسبة", unit: "%" },
+];
+
+type FinalPriceResult =
+  | { ok: true; price: string }
+  | { ok: false; message: string | null };
+
+/**
+ * Converts what the ADMIN typed into ONE final unit price (SYP), relative to the
+ * line's CATALOG price. A discount's input form is only a convenience: the
+ * result is a plain final price and nothing about how it was typed survives.
+ * All arithmetic is money.ts (decimal), never native. Empty text -> not ready
+ * (message null, nothing shown); anything unusable -> an Arabic message.
+ */
+function computeFinalPrice(catalogPrice: string, mode: PriceEditMode, text: string): FinalPriceResult {
+  if (text.trim() === "") return { ok: false, message: null };
+
+  try {
+    if (mode === "percent") {
+      const pct = parseQuantityInput(text);
+      if (pct === null) {
+        return {
+          ok: false,
+          message: AMBIGUOUS_COMMA_RE.test(text) ? "استخدم النقطة (.) للكسور" : "نسبة غير صالحة",
+        };
+      }
+      if (compareMoney(pct, 0) < 0 || compareMoney(pct, 100) > 0) {
+        return { ok: false, message: "النسبة يجب أن تكون بين 0 و100" };
+      }
+      // pct / 100 carried at 8 dp, then applied to the catalog price once.
+      const fraction = toDecimal(pct).dividedBy(100).toFixed(8);
+      const discount = multiplyMoney(catalogPrice, fraction);
+      return { ok: true, price: subtractMoney(catalogPrice, discount) };
+    }
+
+    const amount = parseAmountInput(text);
+    if (amount === null) return { ok: false, message: "قيمة غير صالحة — أدخل أرقاماً فقط" };
+
+    if (mode === "amount") {
+      if (compareMoney(amount, 0) < 0) return { ok: false, message: "الخصم لا يمكن أن يكون سالباً" };
+      if (compareMoney(amount, catalogPrice) > 0) {
+        return { ok: false, message: "الخصم أكبر من سعر الكتالوج" };
+      }
+      return { ok: true, price: subtractMoney(catalogPrice, amount) };
+    }
+
+    // mode === "price"
+    if (compareMoney(amount, 0) < 0) return { ok: false, message: "السعر لا يمكن أن يكون سالباً" };
+    return { ok: true, price: amount };
+  } catch (error) {
+    if (error instanceof MoneyError) return { ok: false, message: "قيمة غير صالحة" };
+    throw error;
+  }
+}
+
+/**
+ * The editor body for ONE line. Owns its own draft state (mode + text + error),
+ * so the panel itself holds only "which line is open". Applying calls the
+ * parent's price funnel; the funnel's refusal (if any) is shown inline.
+ */
+function LinePriceEditor({
+  item,
+  onApply,
+  onClose,
+}: {
+  item: CartLineItem;
+  onApply: (finalPriceSYP: string) => PriceEditResult;
+  onClose: () => void;
+}) {
+  const [mode, setMode] = useState<PriceEditMode>("price");
+  const [text, setText] = useState("");
+  const [applyError, setApplyError] = useState<string | null>(null);
+
+  // The catalog price this line was added at: the snapshot when already
+  // overridden, otherwise the current (= catalog) unit price.
+  const catalogPrice = item.listUnitPriceSYP ?? item.unitPriceSYP;
+  const preview = computeFinalPrice(catalogPrice, mode, text);
+  const activeMode = PRICE_EDIT_MODES.find((m) => m.value === mode) ?? PRICE_EDIT_MODES[0];
+  const isZero = preview.ok && compareMoney(preview.price, 0) === 0;
+
+  const apply = () => {
+    if (!preview.ok) return;
+    const result = onApply(preview.price);
+    if (result.ok) {
+      onClose();
+    } else {
+      setApplyError(result.message);
+    }
+  };
+
+  return (
+    <div className="mt-1.5 space-y-2 rounded-lg border border-emerald-200 bg-emerald-50 p-2.5">
+      <div className="flex items-center justify-between gap-2 text-[11px]">
+        <span className="font-bold text-emerald-800">سعر الكتالوج</span>
+        <Money value={catalogPrice} compact className="font-extrabold text-emerald-900" />
+      </div>
+
+      {/* How the ADMIN prefers to type it — only an input convenience. */}
+      <div
+        role="group"
+        aria-label="طريقة التعديل"
+        className="flex items-center overflow-hidden rounded-md border border-emerald-200 bg-white text-[11px] font-semibold"
+      >
+        {PRICE_EDIT_MODES.map((m) => (
+          <button
+            key={m.value}
+            type="button"
+            aria-pressed={mode === m.value}
+            onClick={() => {
+              setMode(m.value);
+              setText("");
+              setApplyError(null);
+            }}
+            className={cn(
+              "h-8 flex-1 px-2 transition-colors",
+              mode === m.value ? "bg-emerald-600 text-white" : "text-slate-600 hover:bg-emerald-50"
+            )}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      <div
+        className={cn(
+          "flex items-center gap-2 rounded-lg border bg-white px-2.5 py-1.5",
+          !preview.ok && preview.message ? "border-red-300" : "border-emerald-200"
+        )}
+      >
+        <input
+          type="text"
+          inputMode="decimal"
+          lang="en"
+          dir="ltr"
+          autoFocus
+          aria-label={activeMode.label}
+          aria-invalid={!preview.ok && preview.message ? true : undefined}
+          value={text}
+          onChange={(e) => {
+            setText(e.target.value);
+            setApplyError(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              apply();
+            } else if (e.key === "Escape") {
+              onClose();
+            }
+          }}
+          placeholder="0"
+          className="h-9 min-w-0 flex-1 border-0 bg-transparent text-center text-sm font-extrabold tabular-nums text-slate-900 focus:outline-none"
+        />
+        <span className="text-[11px] font-semibold text-slate-500">{activeMode.unit}</span>
+      </div>
+
+      {!preview.ok && preview.message && (
+        <p role="alert" className="text-[11px] font-semibold text-red-700">
+          {preview.message}
+        </p>
+      )}
+
+      {preview.ok && (
+        <div className="flex items-center justify-between gap-2 rounded-lg bg-white px-2.5 py-1.5 text-[11px]">
+          <span className="font-bold text-slate-600">السعر النهائي للوحدة</span>
+          <Money value={preview.price} compact className="font-extrabold text-emerald-700" />
+        </div>
+      )}
+
+      {isZero && (
+        <div className="flex items-start gap-1 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1">
+          <AlertTriangle className="mt-px size-3.5 shrink-0 text-amber-600" aria-hidden />
+          <span className="text-[11px] font-semibold text-amber-800">
+            السعر صفر — الصنف سيُسجَّل كبضاعة مجانية في هذه الفاتورة.
+          </span>
+        </div>
+      )}
+
+      {applyError && (
+        <p role="alert" className="text-[11px] font-semibold text-red-700">
+          {applyError}
+        </p>
+      )}
+
+      <div className="flex items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          disabled={!preview.ok}
+          onClick={apply}
+          className="h-9 flex-1 bg-emerald-600 text-xs font-bold text-white hover:bg-emerald-700"
+        >
+          تطبيق
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onClose}
+          className="h-9 border-slate-200 text-xs font-semibold"
+        >
+          إلغاء
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function CartPanel({
   items,
   customer,
@@ -213,6 +458,9 @@ export function CartPanel({
   onLineQuickQuantity,
   isMobileDrawer = false,
   cartInconsistent = false,
+  isAdmin = false,
+  onEditLinePrice,
+  onClearLinePrice,
 }: CartPanelProps) {
   // [Never throw during render] calculateCartTotals() rejects a line whose
   // override no longer holds. If that ever happens the panel must not crash:
@@ -236,6 +484,10 @@ export function CartPanel({
       else next[id] = message;
       return next;
     });
+
+  // [v6.2] Which cart line currently has the price/discount editor open. The
+  // editor's own draft lives inside LinePriceEditor (re-mounted per open).
+  const [editingLineId, setEditingLineId] = useState<string | null>(null);
 
   const hasAmountErrors = Object.keys(amountErrors).length > 0;
   const blocked = cartInconsistent || totalsFailed || hasAmountErrors;
@@ -390,6 +642,20 @@ export function CartPanel({
             const qtyHint = qtyHints[item.id];
             const hasOverride = item.lineTotalOverrideSYP !== undefined;
 
+            // [v6.2] An EFFECTIVE price override: the snapshot is present AND
+            // differs from the final price (the same predicate the server uses).
+            const priceEdited = cartHasPriceOverride([item]);
+            const catalogPrice = priceEdited ? (item.listUnitPriceSYP as string) : null;
+            const perUnitDiff =
+              catalogPrice !== null ? subtractMoney(catalogPrice, item.unitPriceSYP) : null;
+            const isIncrease = perUnitDiff !== null && compareMoney(perUnitDiff, 0) < 0;
+            const perUnitDiffAbs =
+              perUnitDiff === null
+                ? null
+                : isIncrease
+                  ? subtractMoney("0", perUnitDiff)
+                  : perUnitDiff;
+
             return (
               <div
                 key={item.id}
@@ -401,9 +667,22 @@ export function CartPanel({
                     <p className="truncate text-sm font-extrabold text-slate-900">
                       {item.product.name}
                     </p>
-                    <p className="mt-0.5 flex items-center gap-1 text-[11px] text-slate-500">
+                    <p className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-slate-500">
                       <span>سعر الجملة</span>
+                      {priceEdited && catalogPrice !== null && (
+                        <Money
+                          value={catalogPrice}
+                          compact
+                          className="font-bold text-slate-400 line-through"
+                        />
+                      )}
                       <Money value={item.unitPriceSYP} compact className="font-bold text-emerald-700" />
+                      {priceEdited && (
+                        <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-50 px-1.5 py-px text-[10px] font-bold text-amber-700 ring-1 ring-amber-200">
+                          <Tag className="size-2.5" aria-hidden />
+                          سعر معدّل
+                        </span>
+                      )}
                     </p>
                   </div>
 
@@ -610,6 +889,68 @@ export function CartPanel({
                       الكمية أكبر من المخزون المسجّل
                     </span>
                   </div>
+                )}
+
+                {/* [v6.2] ADMIN-only: price / discount for THIS sale only.
+                    Absent (not disabled) for a CASHIER; the server enforces it too. */}
+                {isAdmin && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px]">
+                    {priceEdited && perUnitDiffAbs !== null ? (
+                      <>
+                        <span className="font-bold text-amber-800">
+                          {isIncrease ? "زيادة" : "خصم"} الوحدة:
+                        </span>
+                        <Money value={perUnitDiffAbs} compact className="font-extrabold text-amber-900" />
+                      </>
+                    ) : (
+                      <span className="font-semibold text-slate-500">تعديل سعر هذا البيع فقط</span>
+                    )}
+
+                    <span className="ms-auto flex items-center gap-1">
+                      {priceEdited && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingLineId(null);
+                            onClearLinePrice?.(item.id);
+                          }}
+                          className="inline-flex h-8 items-center gap-1 rounded-md px-2 text-[11px] font-bold text-slate-600 transition-colors hover:bg-white hover:text-emerald-700"
+                          title="إرجاع السعر إلى سعر الكتالوج"
+                          aria-label="إرجاع السعر إلى سعر الكتالوج"
+                        >
+                          <RotateCcw className="size-3.5" aria-hidden />
+                          سعر الكتالوج
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setEditingLineId(editingLineId === item.id ? null : item.id)}
+                        className={cn(
+                          "inline-flex h-8 items-center gap-1 rounded-md px-2 text-[11px] font-bold transition-colors",
+                          editingLineId === item.id
+                            ? "bg-emerald-600 text-white"
+                            : "text-emerald-700 hover:bg-white"
+                        )}
+                        aria-expanded={editingLineId === item.id}
+                        aria-label={editingLineId === item.id ? "إغلاق تعديل السعر" : "تعديل السعر أو إضافة خصم"}
+                      >
+                        {editingLineId === item.id ? (
+                          <X className="size-3.5" aria-hidden />
+                        ) : (
+                          <Pencil className="size-3.5" aria-hidden />
+                        )}
+                        {editingLineId === item.id ? "إغلاق" : "سعر / خصم"}
+                      </button>
+                    </span>
+                  </div>
+                )}
+
+                {isAdmin && editingLineId === item.id && onEditLinePrice && (
+                  <LinePriceEditor
+                    item={item}
+                    onApply={(finalPriceSYP) => onEditLinePrice(item.id, finalPriceSYP)}
+                    onClose={() => setEditingLineId(null)}
+                  />
                 )}
               </div>
             );

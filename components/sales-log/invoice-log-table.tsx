@@ -35,9 +35,17 @@
  * a large total; the loading placeholder mirrors the real layout (table rows
  * on desktop, cards on phones); the empty state is friendlier. Row/void/
  * cross-link behaviour and canVoidInvoice() are unchanged.
+ *
+ * [v6.2 — "سعر معدّل" badge] An invoice sold with a one-off price edit
+ * (InvoiceLogRow.hasPriceOverride) gets an amber badge next to its status
+ * badges. A VOID row copies hasPriceOverride from the original it reverses,
+ * so the badge is deliberately NOT shown on VOIDED rows: a cancellation is not
+ * itself a price edit (the server's "priceEdited" filter excludes them for the
+ * same reason). The original keeps its badge, and its line-by-line discount
+ * is shown in the detail view.
  */
 
-import { Ban, Clock, Link2, Loader2, Receipt, User } from "lucide-react";
+import { Ban, Clock, Link2, Loader2, Receipt, Tag, User } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -79,6 +87,15 @@ interface InvoiceLogTableProps {
  */
 function canVoidInvoice(row: InvoiceLogRow, isAdmin: boolean): boolean {
     return isAdmin && row.status === "COMPLETED" && !row.voidsInvoiceId && !row.voidedByInvoiceId;
+}
+
+/**
+ * [v6.2] Whether the "سعر معدّل" badge is shown. Never on a VOIDED row — a void
+ * copies the flag from its original (see the file header). `=== true` so a
+ * payload without the key never badges.
+ */
+function showsPriceEditBadge(row: InvoiceLogRow): boolean {
+    return row.hasPriceOverride === true && row.status !== "VOIDED";
 }
 
 /** Small coloured dot summarising the invoice status at a glance. */
@@ -148,6 +165,15 @@ function BadgesCell({ row }: { row: InvoiceLogRow }) {
             >
                 {INVOICE_STATUS_LABELS[row.status]}
             </Badge>
+            {showsPriceEditBadge(row) && (
+                <Badge
+                    variant="outline"
+                    className="gap-1 border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800"
+                >
+                    <Tag className="h-3 w-3" aria-hidden />
+                    سعر معدّل
+                </Badge>
+            )}
         </div>
     );
 }
