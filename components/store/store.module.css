@@ -548,44 +548,66 @@
 .more:hover {
   text-decoration: underline;
 }
+
+/* ------------------------------------------------------- categories
+ * Desktop: compact horizontal cards in an auto-fill grid (about half the
+ * height of the old stacked cards, and no orphan layout rules to maintain).
+ * Mobile (<= 880px): a 2-row horizontal scroller, see the media query below.
+ * The badge is the category's first letter, not an icon picked by index.
+ */
 .cats {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(176px, 1fr));
+  gap: 12px;
 }
 .cat {
   display: flex;
-  flex-direction: column;
   align-items: center;
   gap: 12px;
+  min-height: 72px;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 20px;
-  padding: 22px 12px;
+  border-radius: 18px;
+  padding: 12px 14px;
   font-weight: 700;
-  font-size: 16px;
-  text-align: center;
+  font-size: 15px;
+  line-height: 1.35;
+  text-align: start;
   transition: transform 0.25s, border-color 0.25s, box-shadow 0.25s;
 }
 .cat:hover {
-  transform: translateY(-4px);
+  transform: translateY(-3px);
   border-color: var(--g300);
   box-shadow: 0 14px 28px rgba(5, 59, 46, 0.1);
 }
 .cico {
-  width: 56px;
-  height: 56px;
-  border-radius: 18px;
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
   background: var(--g50);
   color: var(--g700);
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1;
   transition: background 0.25s, color 0.25s;
 }
 .cat:hover .cico {
   background: var(--g700);
   color: #fff;
+}
+.catName {
+  flex: 1;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  text-wrap: balance;
 }
 
 /* reorder card */
@@ -834,20 +856,7 @@
 .stepper button:hover {
   background: var(--g100);
 }
-/* .qin {
-  width: 52px;
-  height: 44px;
-  border: 0;
-  outline: 0;
-  text-align: center;
-  font-weight: 800;
-  font-size: 16px;
-  background: transparent;
-  color: var(--ink);
-  font-variant-numeric: tabular-nums;
-  -moz-appearance: textfield;
-} */
- .qin {
+.qin {
   width: 52px;
   height: 44px;
   border: 0;
@@ -1720,10 +1729,11 @@
   }
 }
 
-/* scroll-driven reveal where supported (progressive enhancement) */
+/* scroll-driven reveal where supported (progressive enhancement).
+ * .cats is intentionally NOT here: it is a scroll container on mobile, and
+ * a view() timeline on it would fight with its own horizontal scrolling. */
 @supports (animation-timeline: view()) {
   .sec .sh,
-  .cats,
   .prow,
   .steps {
     animation: rise linear both;
@@ -1751,9 +1761,6 @@
 @media (max-width: 1000px) {
   .prow {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .cats {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 @media (max-width: 880px) {
@@ -1835,19 +1842,39 @@
   .sh p {
     display: none;
   }
+
+  /* categories: 2-row horizontal scroller (RTL: starts at the right edge) */
   .cats {
+    grid-template-columns: none;
+    grid-template-rows: repeat(2, auto);
+    grid-auto-flow: column;
+    grid-auto-columns: clamp(148px, 42vw, 200px);
     gap: 10px;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    margin-inline: -16px;
+    padding-inline: 16px;
+    padding-bottom: 6px;
+    scrollbar-width: none;
+  }
+  .cats::-webkit-scrollbar {
+    display: none;
   }
   .cat {
-    padding: 16px 6px;
+    scroll-snap-align: start;
+    min-height: 64px;
+    padding: 10px 12px;
+    gap: 10px;
     font-size: 14px;
     border-radius: 16px;
   }
   .cico {
-    width: 46px;
-    height: 46px;
-    border-radius: 14px;
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    font-size: 18px;
   }
+
   .prow {
     display: flex;
     overflow-x: auto;
@@ -1865,7 +1892,7 @@
     flex: 0 0 80%;
     scroll-snap-align: start;
   }
-    .foot {
+  .foot {
     margin-top: 48px;
     border-radius: 28px 28px 0 0;
     padding-block: 28px 24px;

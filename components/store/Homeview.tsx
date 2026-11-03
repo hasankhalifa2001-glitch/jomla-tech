@@ -1,13 +1,25 @@
 import styles from "./store.module.css";
 import { cx } from "./cx";
 import { cairo } from "./font";
-import { CATEGORY_ICONS, ChevronLeftIcon, PhoneIcon, SearchIcon, WhatsAppIcon } from "./Icons";
+import { ChevronLeftIcon, PhoneIcon, SearchIcon, WhatsAppIcon } from "./Icons";
 import { storePath } from "@/lib/utils/store-href";
 import type { HomeData, StoreProductDTO } from "./types";
 import { StoreShell } from "./Storeshell";
 import { HeaderCartButton } from "./Headercartbutton";
 import { ProductCard } from "./Productcard";
 import { ReorderCard } from "./Reordercard";
+
+/**
+ * First letter of a category label, used as its badge. The leading "ال" is
+ * skipped so "المنظفات" shows "م" and not "ا" for every category that has it.
+ * We deliberately do NOT cycle a fixed icon list by index: the categories are
+ * merchant-defined, so an icon picked by position has no relation to the
+ * category and ends up misleading (a cup on "دخان").
+ */
+function categoryInitial(label: string): string {
+    const name = label.trim().replace(/^ال(?=.{2,})/, "");
+    return Array.from(name)[0] ?? "؟";
+}
 
 /**
  * The storefront home page (T5a §6.3), as a SERVER component: every number and
@@ -17,7 +29,6 @@ import { ReorderCard } from "./Reordercard";
  */
 export function HomeView({ data }: { data: HomeData }) {
     const { store, categories, newest, bestSellers, reorderIndex } = data;
-    const initial = store.name.trim().charAt(0) || "م";
     const quick = categories.slice(0, 3);
     // storePath is the single source of truth for store URLs (lib/utils/store-href.ts).
     const productsHref = storePath(store.slug, "products");
@@ -186,22 +197,20 @@ export function HomeView({ data }: { data: HomeData }) {
                                     <p>تصفح حسب نوع البضاعة</p>
                                 </div>
                             </div>
+                            {/* Desktop: compact wrapping grid. Mobile: 2-row horizontal scroller. */}
                             <div className={styles.cats}>
-                                {categories.map((c, i) => {
-                                    const Icon = CATEGORY_ICONS[i % CATEGORY_ICONS.length];
-                                    return (
-                                        <a
-                                            key={c.key}
-                                            className={styles.cat}
-                                            href={`${productsHref}?category=${encodeURIComponent(c.key)}`}
-                                        >
-                                            <span className={styles.cico}>
-                                                <Icon />
-                                            </span>
-                                            {c.label}
-                                        </a>
-                                    );
-                                })}
+                                {categories.map((c) => (
+                                    <a
+                                        key={c.key}
+                                        className={styles.cat}
+                                        href={`${productsHref}?category=${encodeURIComponent(c.key)}`}
+                                    >
+                                        <span className={styles.cico} aria-hidden="true">
+                                            {categoryInitial(c.label)}
+                                        </span>
+                                        <span className={styles.catName}>{c.label}</span>
+                                    </a>
+                                ))}
                             </div>
                         </section>
                     )}
